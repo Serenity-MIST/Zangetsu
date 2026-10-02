@@ -11,12 +11,19 @@ import 'zmode_source_prefs.dart';
 
 /// Thrown by playback when a metadata title has no source at all.
 class NoSourceMatch implements Exception {
-  const NoSourceMatch(this.canonical, {this.outcomes = const []});
+  const NoSourceMatch(
+    this.canonical, {
+    this.outcomes = const [],
+    this.selectedSourceName,
+  });
   final ZCanonical canonical;
 
   /// What each candidate did, when this came from a full sweep. Empty when
   /// there was nothing to ask. See `sweepFailureDetail`.
   final List<({String sourceId, String name, SweepReason reason})> outcomes;
+
+  /// Set when a user-selected source alone was checked.
+  final String? selectedSourceName;
 
   @override
   String toString() => 'No installed source has $canonical';
@@ -79,8 +86,7 @@ class SourceMatcher {
   /// source can't forget it.
   void Function(ZCanonical)? _onSourceChanged;
 
-  void bindSourceChanged(void Function(ZCanonical) fn) =>
-      _onSourceChanged = fn;
+  void bindSourceChanged(void Function(ZCanonical) fn) => _onSourceChanged = fn;
 
   void _sourceChanged(ZCanonical c) => _onSourceChanged?.call(c);
 
@@ -121,30 +127,81 @@ class SourceMatcher {
       return null;
     }
 
-    List<MediaItem> results;
-    try {
-      results = await _sources.search(title, sourceId: sourceId);
-    } catch (e) {
-      // Mihon/Aniyomi/LNReader report a challenge by THROWING, and this catch
-      // used to drop it on the floor — the source just vanished from matching
-      // with nothing recording why, and the solve action had nothing to gate
-      // on. Record it exactly as a suppressed JS search does, so the shield
-      // can be shown for the sources that actually need it and only those.
-      if (e is CloudflareRequiredException) {
-        final host = Uri.tryParse(e.url)?.host ?? '';
-        if (host.isNotEmpty) {
-          CfSolveNeeded.needsSolve(host, e.url, sourceId: sourceId);
+    // Searching one name is how a source that HAS the show still misses it.
+    //
+    // The catalogue hands over two: the romaji name and the English one. This
+    // asked only for the first, so a source indexing by the other came back
+    // with nothing and was recorded as not having the title at all. Measured
+    // on a real device: `animecube -> 0 results for "Otome Kaijuu Caraméliser"`
+    // — a show that source lists as "Kaiju Girl Caramelise".
+    //
+    // The second name is only asked for when the first FINDS NOTHING USABLE,
+    // so a title that already resolves costs exactly what it did before. The
+    // extra request is spent only where the alternative was a guaranteed miss.
+    Future<List<MediaItem>?> searchFor(String q) async {
+      try {
+        return await _sources.search(q, sourceId: sourceId);
+      } catch (e) {
+        // Mihon/Aniyomi/LNReader report a challenge by THROWING, and this
+        // catch used to drop it on the floor — the source just vanished from
+        // matching with nothing recording why, and the solve action had
+        // nothing to gate on. Record it exactly as a suppressed JS search
+        // does, so the shield can be shown for the sources that actually need
+        // it and only those.
+        if (e is CloudflareRequiredException) {
+          final host = Uri.tryParse(e.url)?.host ?? '';
+          if (host.isNotEmpty) {
+            CfSolveNeeded.needsSolve(host, e.url, sourceId: sourceId);
+          }
         }
+        debugPrint('[zmode] $sourceId search THREW for "$q": $e');
+        return null;
       }
-      debugPrint('[zmode] $sourceId search THREW for "$title": $e');
-      return null;
     }
+
+    var results = await searchFor(title);
+    if (results == null) return null;
     // A source that searched fine but title-missed and one that came back
     // empty because it was blocked both just vanish from matching, so say
     // which happened — otherwise "no source has this" is undebuggable.
     debugPrint('[zmode] $sourceId -> ${results.length} results for "$title"');
-    final hit = bestTitleMatch(results, title, altTitle: altTitle, wantedMalId: malId);
-    if (hit == null || !titleMatches(hit, title, altTitle: altTitle, wantedMalId: malId)) {
+    var hit = bestTitleMatch(
+      results,
+      title,
+      altTitle: altTitle,
+      wantedMalId: malId,
+    );
+    var matched =
+        hit != null &&
+        titleMatches(hit, title, altTitle: altTitle, wantedMalId: malId);
+
+    // Only worth a second request when there IS another name and it is
+    // actually different — "One Piece" twice is two round trips for one
+    // answer, and normalizeTitle is the same comparison the acceptance check
+    // uses, so "Re:Zero" and "rezero" count as the same name here too.
+    final alt = altTitle?.trim() ?? '';
+    if (!matched &&
+        alt.isNotEmpty &&
+        normalizeTitle(alt) != normalizeTitle(title)) {
+      debugPrint('[zmode] $sourceId · nothing for "$title", trying "$alt"');
+      final second = await searchFor(alt);
+      if (second == null) return null;
+      debugPrint('[zmode] $sourceId -> ${second.length} results for "$alt"');
+      final altHit = bestTitleMatch(
+        second,
+        title,
+        altTitle: altTitle,
+        wantedMalId: malId,
+      );
+      if (altHit != null &&
+          titleMatches(altHit, title, altTitle: altTitle, wantedMalId: malId)) {
+        results = second;
+        hit = altHit;
+        matched = true;
+      }
+    }
+
+    if (!matched) {
       // Remember the no, so the next open of this title skips this source
       // instead of paying for the same search again (see [MatchStore.missTtl])
       // — but "couldn't ask" is not "doesn't have it". A source whose search
@@ -159,12 +216,16 @@ class SourceMatcher {
       );
       return null;
     }
-    debugPrint('[zmode] $sourceId MATCHED "$title" -> "${hit.title}"');
+    // `matched` is only true when `hit` is non-null, but `hit` is reassignable
+    // now (the second search can replace it), so it does not promote — pin it
+    // to a final here rather than sprinkling `!` through the constructor.
+    final found = hit!;
+    debugPrint('[zmode] $sourceId MATCHED "$title" -> "${found.title}"');
     final m = SourceMatch(
-      sourceId: hit.sourceId,
-      showUrl: hit.url,
-      showId: hit.id,
-      showTitle: hit.title,
+      sourceId: found.sourceId,
+      showUrl: found.url,
+      showId: found.id,
+      showTitle: found.title,
       pinned: false,
     );
     await _store.save(c, m);
@@ -220,7 +281,13 @@ class SourceMatcher {
       '[source-matcher] matchOn · "$sourceId" → fresh search '
       'for "$title"',
     );
-    return resolveOn(c, sourceId, title: title, altTitle: altTitle, malId: malId);
+    return resolveOn(
+      c,
+      sourceId,
+      title: title,
+      altTitle: altTitle,
+      malId: malId,
+    );
   }
 
   /// *A* source for this title: honours the stored selection when it's set
@@ -237,22 +304,28 @@ class SourceMatcher {
   /// the network work and the wait.
   final Map<String, Future<SourceMatch?>> _inFlight = {};
 
-
   Future<SourceMatch?> resolve(
     ZCanonical c, {
     required String title,
     String? altTitle,
     int? malId,
+    bool Function()? abandoned,
   }) {
     final running = _inFlight[c.key];
     if (running != null) return running;
     // Braces, NOT an arrow: Map.remove returns the removed value, and
     // whenComplete awaits a returned Future — an arrow here hands it the very
     // future being completed, so it waits on itself and never finishes.
-    final f = _resolve(c, title: title, altTitle: altTitle, malId: malId)
-        .whenComplete(() {
-      _inFlight.remove(c.key);
-    });
+    final f =
+        _resolve(
+          c,
+          title: title,
+          altTitle: altTitle,
+          malId: malId,
+          abandoned: abandoned,
+        ).whenComplete(() {
+          _inFlight.remove(c.key);
+        });
     _inFlight[c.key] = f;
     return f;
   }
@@ -262,7 +335,14 @@ class SourceMatcher {
     required String title,
     String? altTitle,
     int? malId,
+    bool Function()? abandoned,
   }) async {
+    if (abandoned?.call() ?? false) {
+      debugPrint(
+        '[source-matcher] _resolve · abandoned before source selection',
+      );
+      return null;
+    }
     final candidates = _candidates(c.kind);
     // A per-title pin ("Wrong title?" or the picker) is a firm choice — it
     // wins over everything else, including an explicit kind default.
@@ -330,14 +410,36 @@ class SourceMatcher {
       '${sweep.length > 5 ? "…" : ""})',
     );
     for (final s in sweep) {
-      final m = await matchOn(c, s.id, title: title, altTitle: altTitle, malId: malId);
+      // The viewer left: stop before the next source. Going back out of a detail
+      // screen used to leave this sweep running, so tapping titles quickly piled
+      // up one live search per screen and each new tap waited behind all the
+      // abandoned ones. Checking between sources — not just before the sweep —
+      // is what stops a pile mid-build, since the sweep may run through many
+      // sources and only the between-sources check can end it without waiting
+      // for the current one to finish.
+      final left = abandoned?.call() ?? false;
+      if (left) {
+        debugPrint(
+          '[source-matcher] _resolve · abandoned before "${s.id}", viewer left',
+        );
+        return null;
+      }
+      final m = await matchOn(
+        c,
+        s.id,
+        title: title,
+        altTitle: altTitle,
+        malId: malId,
+      );
       if (m != null) {
         debugPrint('[source-matcher] _resolve · AUTO → ${s.id}');
         if (isReading) await _prefs.rememberLastGood(c.kind, s.id);
         return m;
       }
     }
-    debugPrint('[source-matcher] _resolve · AUTO → null (no candidate matched)');
+    debugPrint(
+      '[source-matcher] _resolve · AUTO → null (no candidate matched)',
+    );
     return null;
   }
 
@@ -366,7 +468,7 @@ class SourceMatcher {
     debugPrint('[source-matcher] selectedFor($kind) → null (no kind default)');
     return null;
   }
-  
+
   /// This title's own source: a per-title pin first, else the explicit kind
   /// default, else — for reading — the source reading settled on, else null,
   /// meaning Auto Resolve is in effect for it.
@@ -415,7 +517,13 @@ class SourceMatcher {
     String? altTitle,
     int? malId,
   }) async {
-    final m = await matchOn(c, sourceId, title: title, altTitle: altTitle, malId: malId);
+    final m = await matchOn(
+      c,
+      sourceId,
+      title: title,
+      altTitle: altTitle,
+      malId: malId,
+    );
     if (m == null) {
       // The source has nothing for this title — but the user still CHOSE it,
       // and that has to stick. Returning here without writing anything left
@@ -502,7 +610,7 @@ class SourceMatcher {
     _sourceChanged(c);
     return m;
   }
-  
+
   /// Browsing a source directly and opening a show there: a choice about
   /// THIS show, so unlike [pinManual] the kind default is left alone — one
   /// tap here must never silently re-point every other title of the kind.

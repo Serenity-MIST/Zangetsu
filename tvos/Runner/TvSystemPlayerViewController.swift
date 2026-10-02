@@ -12,6 +12,7 @@ final class TvSystemPlayerViewController: AVPlayerViewController, AVPlayerViewCo
     private var companionOptionsVersion = 0
     private var companionResolving = false
 
+    /// Reports AVKit playback and capabilities; system TV controls are deliberately unavailable.
     func companionState() -> [String: Any] {
         let position = player?.currentTime().seconds ?? 0
         let duration = player?.currentItem?.duration.seconds ?? 0
@@ -39,10 +40,12 @@ final class TvSystemPlayerViewController: AVPlayerViewController, AVPlayerViewCo
                 "volumeLabel": "Player volume", "volume": Int((player?.volume ?? 0) * 100),
                 "volumeAvailable": true, "qualitySelection": false]
     }
+    /// Returns the active stream and headers for a validated companion handoff request.
     func companionStream() -> [String: Any] {
         guard let asset = player?.currentItem?.asset as? AVURLAsset else { return [:] }
         return ["index": episodeIndex, "url": asset.url.absoluteString, "headers": headers, "subtitles": subtitles]
     }
+    /// Dispatches explicit AVKit actions and validates option versions before changing tracks.
     func companionCommand(_ c: [String: Any], result: @escaping FlutterResult) {
         let action = c["action"] as? String ?? ""
         func fail(_ message: String) { result(FlutterError(code: "player", message: message, details: nil)) }
@@ -187,6 +190,8 @@ final class TvSystemPlayerViewController: AVPlayerViewController, AVPlayerViewCo
     private var appliedVttOffset: Double = 0
     private var lastSubtitleURL: URL?
     private var probedVttEncodeSkew = false
+    private var streamMimeType: String?
+    private var assetResourceLoader: TVAssetResourceLoader?
 
     convenience init(
         channel: FlutterMethodChannel,
@@ -214,7 +219,8 @@ final class TvSystemPlayerViewController: AVPlayerViewController, AVPlayerViewCo
             loadStream(
                 url: args["url"] as? String,
                 positionMs: (args["positionMs"] as? NSNumber)?.int64Value ?? 0,
-                episodeLabel: args["episodeLabel"] as? String ?? episodeLabelText
+                episodeLabel: args["episodeLabel"] as? String ?? episodeLabelText,
+                mimeType: args["mimeType"] as? String
             )
             startSaveLoop()
             refreshSourcesCache()
@@ -441,11 +447,14 @@ final class TvSystemPlayerViewController: AVPlayerViewController, AVPlayerViewCo
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         if isBeingDismissed || presentingViewController == nil {
+            assetResourceLoader?.invalidate()
+            assetResourceLoader = nil
             finishIfNeeded()
         }
     }
 
     deinit {
+        assetResourceLoader?.invalidate()
         tearDownObservers()
         tearDownCaptionWindow()
         saveTimer?.invalidate()
@@ -538,12 +547,20 @@ final class TvSystemPlayerViewController: AVPlayerViewController, AVPlayerViewCo
         return [:]
     }
 
-    private func loadStream(url: String?, positionMs: Int64, episodeLabel: String) {
+    private func loadStream(
+        url: String?,
+        positionMs: Int64,
+        episodeLabel: String,
+        mimeType: String?
+    ) {
         guard let urlStr = url, let u = URL(string: urlStr) else {
             finishIfNeeded(error: "Invalid stream URL")
             return
         }
         episodeLabelText = episodeLabel
+        streamMimeType = mimeType
+        assetResourceLoader?.invalidate()
+        assetResourceLoader = nil
         tearDownObservers()
         skipIntervals = []
         autoSkippedStarts = []
@@ -567,7 +584,7 @@ final class TvSystemPlayerViewController: AVPlayerViewController, AVPlayerViewCo
         appliedVttOffset = 0
         lastSubtitleURL = nil
         probedVttEncodeSkew = false
-        streamIsHls = urlStr.lowercased().contains(".m3u8")
+        streamIsHls = TVAssetResourceLoader.isHLS(url: u, mimeType: mimeType)
         logSubtitleTiming(
             "loadStream hls=\(streamIsHls) posMs=\(positionMs) subs=\(subtitles.count) " +
             "delay=\(Self.fmtDelta(captionDelaySeconds)) \(u.absoluteString)"
@@ -589,8 +606,29 @@ final class TvSystemPlayerViewController: AVPlayerViewController, AVPlayerViewCo
             probeHlsMediaEpoch(playlist: u)
         }
 
-        let opts = headers.isEmpty ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers]
-        let asset = AVURLAsset(url: u, options: opts)
+        let needsResourceLoader = TVAssetResourceLoader.requiresResourceLoader(headers: headers)
+        let assetURL = needsResourceLoader ? (TVAssetResourceLoader.assetURL(for: u) ?? u) : u
+        var assetOptions: [String: Any] = [:]
+        if !needsResourceLoader,
+           let userAgent = headers.first(where: {
+               $0.key.caseInsensitiveCompare("User-Agent") == .orderedSame
+           })?.value {
+            assetOptions[AVURLAssetHTTPUserAgentKey] = userAgent
+        }
+        if !needsResourceLoader, TVAssetResourceLoader.shouldOverrideMIMEType(mimeType),
+           let mimeType {
+            assetOptions[AVURLAssetOverrideMIMETypeKey] = mimeType
+        }
+        let asset = AVURLAsset(url: assetURL, options: assetOptions.isEmpty ? nil : assetOptions)
+        if needsResourceLoader, assetURL != u {
+            let loader = TVAssetResourceLoader(
+                headers: headers,
+                rootURL: u,
+                mimeTypeHint: mimeType
+            )
+            asset.resourceLoader.setDelegate(loader, queue: loader.delegateQueue)
+            assetResourceLoader = loader
+        }
         let item = AVPlayerItem(asset: asset)
         item.externalMetadata = makeMetadata(title: titleText, subtitle: episodeLabel)
 
@@ -766,7 +804,10 @@ final class TvSystemPlayerViewController: AVPlayerViewController, AVPlayerViewCo
                     ?? (src["quality"] as? String)
                     ?? "Server \(i + 1)"
                 let url = src["url"] as? String
-                let currentUrl = (player?.currentItem?.asset as? AVURLAsset)?.url.absoluteString
+                let currentAssetURL = (player?.currentItem?.asset as? AVURLAsset)?.url
+                let currentUrl = currentAssetURL
+                    .flatMap { TVAssetResourceLoader.upstreamURL(for: $0) }?.absoluteString
+                    ?? currentAssetURL?.absoluteString
                 let selected = url != nil && url == currentUrl
                 return UIAction(title: label, state: selected ? .on : .off) { [weak self] _ in
                     self?.playSource(src)
@@ -1168,7 +1209,12 @@ final class TvSystemPlayerViewController: AVPlayerViewController, AVPlayerViewCo
         let skew = (src["subtitleSkewSeconds"] as? NSNumber)?.doubleValue ?? 0
         providerSubtitleSkewApplied = abs(skew) >= 0.05
         persistProgress()
-        loadStream(url: url, positionMs: 0, episodeLabel: episodeLabelText)
+        loadStream(
+            url: url,
+            positionMs: 0,
+            episodeLabel: episodeLabelText,
+            mimeType: src["mimeType"] as? String
+        )
         rebuildTransportMenus()
     }
 
@@ -2098,6 +2144,7 @@ final class TvSystemPlayerViewController: AVPlayerViewController, AVPlayerViewCo
                 guard let map = result as? [String: Any],
                       let url = map["url"] as? String else { return }
                 self.headers = Self.parseHeaders(map["headers"])
+                self.streamMimeType = map["mimeType"] as? String
                 if let s = map["subtitles"] as? [[String: String]] {
                     self.subtitles = s
                 } else if let s = map["subtitles"] as? [[String: Any]] {
@@ -2115,7 +2162,12 @@ final class TvSystemPlayerViewController: AVPlayerViewController, AVPlayerViewCo
                     ?? (index < self.episodeLabels.count
                         ? self.episodeLabels[index]
                         : "Episode \(index + 1)")
-                self.loadStream(url: url, positionMs: forceReload ? 0 : pos, episodeLabel: label)
+                self.loadStream(
+                    url: url,
+                    positionMs: forceReload ? 0 : pos,
+                    episodeLabel: label,
+                    mimeType: self.streamMimeType
+                )
                 self.refreshSourcesCache(rebuildMenus: true)
             }
         }

@@ -912,6 +912,7 @@
 	"builtInPlayer": "Reproductor integrado",
 	"otherApps": "Otras apps",
 	"seeAll2": "Ver todo",
+	"webView": "WebView",
 	"openInBrowser": "Abrir en el navegador",
 	"copyLink": "Copiar enlace",
 	"removeTracking": "Quitar tracking",
@@ -1025,6 +1026,7 @@
 		}
 	},
 	"sort": "Clasificar",
+	"shuffle": "Elegir al azar",
 	"giveItAName": "Ponle un nombre",
 	"youAlreadyHaveThatOne": "Ya tienes ese",
 	"thatNameIsTaken": "Ese nombre ya está ocupado.",

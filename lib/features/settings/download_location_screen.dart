@@ -82,7 +82,11 @@ class _DownloadLocationScreenState extends State<DownloadLocationScreen> {
                     const SizedBox(width: 14),
                     Expanded(
                       child: Text(
-                        prefs.locationLabel ?? context.l10n.downloadsZangetsu,
+                        downloadDestinationLabel(
+                          keepPrivate: prefs.keepPrivate,
+                          locationLabel: prefs.locationLabel,
+                          publicFallback: context.l10n.downloadsZangetsu,
+                        ),
                         style: AppText.body,
                       ),
                     ),
@@ -91,7 +95,11 @@ class _DownloadLocationScreenState extends State<DownloadLocationScreen> {
               ),
             ],
           ),
-          if (_volumes.isNotEmpty) ...[
+          // While the private toggle is on, a picked folder is OVERRIDDEN — the
+          // file never leaves app storage. Offering the drive list and the
+          // folder picker then is a lie: they look actionable but change
+          // nothing. Hide them instead, so the screen states one truth.
+          if (!prefs.keepPrivate && _volumes.isNotEmpty) ...[
             SettingsSectionLabel(context.l10n.availableDrives),
             SettingsCard(
               children: [
@@ -116,32 +124,60 @@ class _DownloadLocationScreenState extends State<DownloadLocationScreen> {
               ],
             ),
           ],
-          SettingsCard(
-            children: [
-              SettingsTile(
-                icon: Icons.folder_open_outlined,
-                title: context.l10n.chooseFolder,
-                onTap: () async {
-                  final uri = await FileDownloader().uri.pickDirectory(
-                    persistedUriPermission: true,
-                  );
-                  if (uri == null) return; // canceled
-                  await sl<DownloadPrefs>().setLocation(
-                    uri.toString(),
-                    folderLabelFromUri(uri),
-                  );
-                  if (mounted) setState(() {});
-                },
-              ),
-              if (prefs.locationUri != null)
+          if (!prefs.keepPrivate)
+            SettingsCard(
+              children: [
                 SettingsTile(
-                  icon: Icons.restore_rounded,
-                  title: context.l10n.resetToDefault,
+                  icon: Icons.folder_open_outlined,
+                  title: context.l10n.chooseFolder,
                   onTap: () async {
-                    await sl<DownloadPrefs>().setLocation(null, null);
+                    final uri = await FileDownloader().uri.pickDirectory(
+                      persistedUriPermission: true,
+                    );
+                    if (uri == null) return; // canceled
+                    await sl<DownloadPrefs>().setLocation(
+                      uri.toString(),
+                      folderLabelFromUri(uri),
+                    );
                     if (mounted) setState(() {});
                   },
                 ),
+                if (prefs.locationUri != null)
+                  SettingsTile(
+                    icon: Icons.restore_rounded,
+                    title: context.l10n.resetToDefault,
+                    onTap: () async {
+                      await sl<DownloadPrefs>().setLocation(null, null);
+                      if (mounted) setState(() {});
+                    },
+                  ),
+              ],
+            ),
+          // Its own section label, like every other group on this screen: without
+          // one the toggle card butts straight against the folder card above and
+          // reads as part of it. This is the gap that separates them.
+          SettingsSectionLabel(context.l10n.privacy),
+          SettingsCard(
+            children: [
+              SettingsTile(
+                icon: Icons.lock_outline_rounded,
+                title: context.l10n.keepDownloadsPrivate,
+                subtitle: context.l10n.keepDownloadsPrivateSubtitle,
+                subtitleMaxLines: null,
+                onTap: () async {
+                  await prefs.setKeepPrivate(!prefs.keepPrivate);
+                  if (mounted) setState(() {});
+                },
+                trailing: Switch.adaptive(
+                  value: prefs.keepPrivate,
+                  activeThumbColor: AppColors.accent,
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  onChanged: (v) async {
+                    await prefs.setKeepPrivate(v);
+                    if (mounted) setState(() {});
+                  },
+                ),
+              ),
             ],
           ),
           Padding(

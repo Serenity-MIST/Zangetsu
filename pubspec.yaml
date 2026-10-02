@@ -16,7 +16,7 @@ publish_to: "none" # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 2.1.1+11330
+version: 2.2.0+13502
 
 environment:
   sdk: ^3.11.5
@@ -94,6 +94,11 @@ dependencies:
   # Lazy HTML rendering for the novel reader (RenderMode.sliverList) — only the
   # on-screen paragraphs are built, so long chapters scroll without jank.
   flutter_widget_from_html: ^0.15.3
+  # DOM parsing for EPUB export — walks scraped chapter HTML to serialise it
+  # as well-formed XHTML rather than regexing it. Already in the tree
+  # transitively (flutter_widget_from_html), now a direct dependency since we
+  # use it ourselves.
+  html: ^0.15.6
   # Dominant-colour extraction for the colour-matched hero banner
   palette_generator: ^0.3.3+3
 
@@ -162,7 +167,13 @@ dependencies:
   fluttertoast: ^10.0.0
   dynamic_color: ^2.1.0
 dev_dependencies:
+  # Test-only: gives the EPUB tests a REAL XML parse, which catches what a
+  # hand-rolled tag-balance check cannot (an unescaped '&', a bad attribute)
+  # — exactly what a strict e-reader rejects the whole file over.
+  xml: ^6.5.0
   flutter_test:
+    sdk: flutter
+  integration_test:
     sdk: flutter
   flutter_lints: ^6.0.0
   build_runner: ^2.4.13
@@ -272,6 +283,7 @@ flutter:
     - assets/icon/app_icon.png
     # Launcher-icon previews for the Appearance picker (mipmaps are not
     # reachable from Dart, so the choices are bundled as normal assets).
+    - assets/icon/preview_crescent.png
     - assets/icon/preview_default.png
     - assets/icon/preview_classic.png
     # New Zangetsu mark (black bg keyed out) — for the mode-switch transition.

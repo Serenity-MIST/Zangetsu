@@ -12,8 +12,8 @@ import UIKit
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
-    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "BetaAppleServices") {
-      BetaAppleServices.register(messenger: registrar.messenger(), presenter: nil)
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "AppleCompanionServices") {
+      AppleCompanionServices.register(messenger: registrar.messenger(), presenter: nil)
     }
 
     // Novel-fetch channel: the iOS twin of Android's NovelHttp. The LNReader

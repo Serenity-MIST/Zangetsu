@@ -78,12 +78,12 @@ class _SourcePickerSheetState extends State<_SourcePickerSheet> {
               ),
             ),
             Padding(
-              padding: const EdgeInsets.only(right: 8),
+              padding: const EdgeInsetsDirectional.only(end: 8),
               child: Text(context.l10n.downloadChooseServer, style: AppText.title),
             ),
             const SizedBox(height: 4),
             Padding(
-              padding: const EdgeInsets.only(right: 8),
+              padding: const EdgeInsetsDirectional.only(end: 8),
               child: Text(
                 widget.title,
                 style: AppText.caption,
@@ -149,7 +149,7 @@ class _SourcePickerSheetState extends State<_SourcePickerSheet> {
         // title/subtitle so TalkBack doesn't hear them twice.
         child: ExcludeSemantics(
           child: ListTile(
-            contentPadding: const EdgeInsets.only(right: 8),
+            contentPadding: const EdgeInsetsDirectional.only(end: 8),
             leading: Icon(Icons.download_rounded, color: AppColors.accent),
             title: Text(
               label,
@@ -163,7 +163,7 @@ class _SourcePickerSheetState extends State<_SourcePickerSheet> {
       );
     }
     return ListTile(
-      contentPadding: const EdgeInsets.only(right: 8),
+      contentPadding: const EdgeInsetsDirectional.only(end: 8),
       leading: Icon(Icons.download_rounded, color: AppColors.accent),
       title: Text(
         label,
@@ -431,6 +431,40 @@ class _DownloadSheetState extends State<_DownloadSheet> {
       _filtered.isNotEmpty &&
       _filtered.every((e) => _selectedIds.contains(e.id));
 
+  Future<void> _pickCustomRange() async {
+    final episodes = _seasonEps;
+    if (episodes.isEmpty) return;
+
+    final range = await showModalBottomSheet<({int from, int to})>(
+      context: context,
+      backgroundColor: AppColors.surface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => ChapterDownloadRangeSheet(
+        chapters: episodes,
+        initialFromIndex: 0,
+        initialToIndex: (episodes.length - 1).clamp(0, 9),
+        unavailableUrls: const {},
+        isChapter: false,
+      ),
+    );
+    if (range == null || !mounted) return;
+
+    final updated = replaceSeasonSelectionWithRange(
+      selectedIds: _selectedIds,
+      seasonEpisodes: episodes,
+      fromIndex: range.from,
+      toIndex: range.to,
+    );
+    setState(() {
+      _selectedIds
+        ..clear()
+        ..addAll(updated);
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     if (widget.minimal) return _buildMinimal(context);
@@ -480,7 +514,7 @@ class _DownloadSheetState extends State<_DownloadSheet> {
                 children: [
                   for (final c in widget.availableCategories)
                     Padding(
-                      padding: const EdgeInsets.only(right: 8),
+                      padding: const EdgeInsetsDirectional.only(end: 8),
                       child: _categoryChip(c),
                     ),
                 ],
@@ -510,9 +544,27 @@ class _DownloadSheetState extends State<_DownloadSheet> {
                   ),
                   style: AppText.overline,
                 ),
-                _textBtn(
-                  _allSeasonSelected ? context.l10n.clear : context.l10n.selectAll,
-                  _allSeasonSelected ? _clearSeason : _selectAllInSeason,
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      tooltip: context.l10n.customRange,
+                      onPressed: _seasonEps.isEmpty ? null : _pickCustomRange,
+                      visualDensity: VisualDensity.compact,
+                      constraints: const BoxConstraints.tightFor(
+                        width: 36,
+                        height: 36,
+                      ),
+                      padding: EdgeInsets.zero,
+                      icon: const Icon(Icons.tune_rounded, size: 20),
+                    ),
+                    _textBtn(
+                      _allSeasonSelected
+                          ? context.l10n.clear
+                          : context.l10n.selectAll,
+                      _allSeasonSelected ? _clearSeason : _selectAllInSeason,
+                    ),
+                  ],
                 ),
               ],
             ),
@@ -521,7 +573,7 @@ class _DownloadSheetState extends State<_DownloadSheet> {
               height: 118,
               child: _filtered.isEmpty && _query.isNotEmpty
                   ? Align(
-                      alignment: Alignment.centerLeft,
+                      alignment: AlignmentDirectional.centerStart,
                       child: Text(
                         context.l10n.noEpisodesMatch,
                         style: AppText.body.copyWith(
@@ -710,7 +762,7 @@ class _DownloadSheetState extends State<_DownloadSheet> {
                   Padding(
                     padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
                     child: Align(
-                      alignment: Alignment.centerLeft,
+                      alignment: AlignmentDirectional.centerStart,
                       child: Text(context.l10n.startFrom, style: AppText.headline),
                     ),
                   ),
@@ -819,7 +871,7 @@ class _DownloadSheetState extends State<_DownloadSheet> {
             Padding(
               padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
               child: Align(
-                alignment: Alignment.centerLeft,
+                alignment: AlignmentDirectional.centerStart,
                 child: Text(context.l10n.playerInfoSource, style: AppText.headline),
               ),
             ),
@@ -1494,7 +1546,7 @@ class _ThumbnailProgressBar extends StatelessWidget {
           const ColoredBox(color: Color(0x80000000), child: SizedBox.expand()),
           FractionallySizedBox(
             widthFactor: fraction,
-            alignment: Alignment.centerLeft,
+            alignment: AlignmentDirectional.centerStart,
             child: ColoredBox(color: AppColors.accent),
           ),
         ],

@@ -28,10 +28,11 @@ class _EpisodesTab extends StatefulWidget {
     this.nextAiringEpisode,
     this.nextAiringAt,
     required this.onOpen,
-    this.onPickPlayer,
+    this.onEpisodeMenu,
     this.onRefresh,
     required this.onDownload,
     this.onDownloadMany,
+    this.resumeChapter,
     this.onSwitchSource,
     this.isReading = false,
   });
@@ -83,7 +84,7 @@ class _EpisodesTab extends StatefulWidget {
 
   /// Long-press an episode → pick which player opens it, this once. Null on
   /// the reading path: a chapter opens the reader, so there's nothing to pick.
-  final void Function(int fullIndex)? onPickPlayer;
+  final void Function(int fullIndex)? onEpisodeMenu;
 
   /// Force-refresh the list past the 10-min source cache (header ↻ button).
   /// Null hides the button.
@@ -96,6 +97,10 @@ class _EpisodesTab extends StatefulWidget {
   /// Queue a run of chapters in one go. Null for video, where downloading is
   /// per-episode through the source picker.
   final Future<void> Function(List<Episode> eps)? onDownloadMany;
+
+  /// Reading resume target from ReadStore / ReadHistory. Batch download starts
+  /// here instead of at chapter one; an unfinished chapter is included.
+  final Episode? resumeChapter;
 
   /// True for reading types — the section header reads "Chapters" instead
   /// of "Episodes" (single-season case only; multi-season keeps the season
@@ -179,8 +184,16 @@ class _EpisodesTabState extends State<_EpisodesTab> {
     Episode ep,
   ) {
     final store = sl<ReadStore>();
-    final mark = store.get(widget.sourceId, widget.showId, ep.id);
-    final done = store.finished(widget.sourceId, widget.showId, ep.id);
+    // Read marks are keyed by the SOURCE that owns the chapters, which is
+    // [downloadSourceId] (`detail.sourceId`) — not [sourceId], which for a
+    // metadata title is the `zm` pseudo-source. The reader writes under the
+    // real source for the same reason it fetches pages with it, so looking
+    // them up under `zm` found nothing and a finished chapter never dimmed.
+    final readSource = widget.downloadSourceId.isNotEmpty
+        ? widget.downloadSourceId
+        : widget.sourceId;
+    final mark = store.get(readSource, widget.showId, ep.id);
+    final done = store.finished(readSource, widget.showId, ep.id);
     final inProgress = mark != null && !done && mark.total > 0;
     final watched =
         done ||
@@ -369,23 +382,52 @@ class _EpisodesTabState extends State<_EpisodesTab> {
     );
   }
 
-  /// "Download next N" over the chapters that aren't saved yet, counting from
-  /// the top of the list as displayed — so it follows the user's sort order
-  /// instead of guessing at chapter numbers the source may not provide.
+  /// Opens the chapter batch sheet. "Next N" follows the reader's saved
+  /// resume target, while "All" retains its original whole-list behavior.
   void _openBulkDownload(List<Episode> eps) {
     final store = sl<ChapterDownloadStore>();
-    final pending = eps
-        .where((e) => !store.isDownloaded(widget.downloadSourceId, e.url))
-        .toList();
+    final downloader = sl<ChapterDownloader>();
+    final unavailableUrls = <String>{};
+    for (final chapter in eps) {
+      final id = ChapterDownload.idFor(widget.downloadSourceId, chapter.url);
+      if (store.isDownloaded(widget.downloadSourceId, chapter.url) ||
+          downloader.isBusy(id)) {
+        unavailableUrls.add(chapter.url);
+      }
+    }
+    final pending = selectChapterDownloadRange(
+      chapters: eps,
+      fromIndex: 0,
+      toIndex: eps.length - 1,
+      unavailableUrls: unavailableUrls,
+    );
 
     if (pending.isEmpty) {
       showAppToast(context, context.l10n.everyChapterIsAlreadyDownloaded);
       return;
     }
 
-    // Only offer counts that mean something — "Next 25" on a 6-chapter list is
-    // just "All" wearing a hat.
-    final counts = [10, 25, 50].where((n) => n < pending.length).toList();
+    final resume = widget.resumeChapter;
+    final startIndex = resolveChapterDownloadStartIndex(
+      chapters: eps,
+      resumeChapterId: resume?.id,
+      resumeChapterUrl: resume?.url,
+      resumeChapterNumber: resume?.number,
+    );
+    // We only need to know whether each offered preset can be filled. Capping
+    // this probe at the largest preset avoids allocating the entire tail of a
+    // very long chapter list merely to build the sheet.
+    final fromResume = selectNextChapterDownloads(
+      chapters: eps,
+      startIndex: startIndex,
+      count: 50,
+      unavailableUrls: unavailableUrls,
+    );
+    final counts = [
+      for (final n in [10, 25, 50])
+        if (fromResume.length >= n && !(startIndex == 0 && pending.length == n))
+          n,
+    ];
 
     showModalBottomSheet<void>(
       context: context,
@@ -425,20 +467,76 @@ class _EpisodesTabState extends State<_EpisodesTab> {
               ),
             ),
             for (final n in counts)
-              ListTile(
-                leading: Icon(
-                  Icons.file_download_outlined,
-                  color: AppColors.accent,
-                ),
-                title: Text(
-                  context.l10n.nextCount(n),
-                  style: AppText.body.copyWith(color: AppColors.textPrimary),
-                ),
-                onTap: () {
-                  Navigator.pop(sheetContext);
-                  _enqueueAll(pending.take(n).toList());
+              Builder(
+                builder: (context) {
+                  final chapters = selectNextChapterDownloads(
+                    chapters: eps,
+                    startIndex: startIndex,
+                    count: n,
+                    unavailableUrls: unavailableUrls,
+                  );
+                  final first = eps.indexOf(chapters.first);
+                  final last = eps.indexOf(chapters.last);
+                  return ListTile(
+                    leading: Icon(
+                      Icons.file_download_outlined,
+                      color: AppColors.accent,
+                    ),
+                    title: Text(
+                      context.l10n.nextCount(n),
+                      style: AppText.body.copyWith(
+                        color: AppColors.textPrimary,
+                      ),
+                    ),
+                    subtitle: Text(
+                      '${chapterNumberLabel(eps, first)} – '
+                      '${chapterNumberLabel(eps, last)}',
+                      style: AppText.caption.copyWith(
+                        color: AppColors.textSecondary,
+                      ),
+                    ),
+                    onTap: () {
+                      Navigator.pop(sheetContext);
+                      _enqueueAll(chapters);
+                    },
+                  );
                 },
               ),
+            ListTile(
+              leading: Icon(Icons.tune_rounded, color: AppColors.accent),
+              title: Text(
+                context.l10n.custom,
+                style: AppText.body.copyWith(color: AppColors.textPrimary),
+              ),
+              onTap: () async {
+                Navigator.pop(sheetContext);
+                final range = await showModalBottomSheet<({int from, int to})>(
+                  context: context,
+                  isScrollControlled: true,
+                  backgroundColor: AppColors.surface,
+                  barrierColor: Colors.black54,
+                  shape: const RoundedRectangleBorder(
+                    borderRadius: BorderRadius.vertical(
+                      top: Radius.circular(20),
+                    ),
+                  ),
+                  builder: (_) => ChapterDownloadRangeSheet(
+                    chapters: eps,
+                    initialFromIndex: startIndex,
+                    initialToIndex: (startIndex + 9).clamp(0, eps.length - 1),
+                    unavailableUrls: unavailableUrls,
+                  ),
+                );
+                if (range == null || !mounted) return;
+                final chapters = selectChapterDownloadRange(
+                  chapters: eps,
+                  fromIndex: range.from,
+                  toIndex: range.to,
+                  unavailableUrls: unavailableUrls,
+                );
+                if (chapters.isNotEmpty) _enqueueAll(chapters);
+              },
+            ),
             ListTile(
               leading: Icon(
                 Icons.download_for_offline_outlined,
@@ -469,35 +567,11 @@ class _EpisodesTabState extends State<_EpisodesTab> {
     // A long series can be thousands of chapters, and one tap shouldn't commit
     // to that much storage and traffic without saying so out loud.
     if (chapters.length > 50) {
-      final ok = await showDialog<bool>(
-        context: context,
-        builder: (dctx) => AlertDialog(
-          backgroundColor: AppColors.surface,
-          title: Text(
-            context.l10n.downloadChaptersQuestion(chapters.length),
-            style: AppText.headline,
-          ),
-          content: Text(
-            context.l10n.chapterOneAtATimeWarning,
-            style: AppText.body,
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dctx, false),
-              child: Text(
-                context.l10n.cancel,
-                style: AppText.button.copyWith(color: AppColors.textSecondary),
-              ),
-            ),
-            TextButton(
-              onPressed: () => Navigator.pop(dctx, true),
-              child: Text(
-                context.l10n.download,
-                style: AppText.button.copyWith(color: AppColors.accent),
-              ),
-            ),
-          ],
-        ),
+      final ok = await AppDialog.confirm(
+        context,
+        title: context.l10n.downloadChaptersQuestion(chapters.length),
+        message: context.l10n.chapterOneAtATimeWarning,
+        confirmLabel: context.l10n.download,
       );
       if (ok != true) return;
       if (!mounted) return;
@@ -530,6 +604,9 @@ class _EpisodesTabState extends State<_EpisodesTab> {
               isInProgress: st.inProgress,
               fraction: st.fraction,
               onTap: () => widget.onOpen(fullIndex),
+              onLongPress: widget.onEpisodeMenu == null
+                  ? null
+                  : () => widget.onEpisodeMenu!(fullIndex),
               onDownload: () => widget.onDownload(ep),
               sourceId: widget.sourceId,
               downloadSourceId: widget.downloadSourceId,
@@ -549,9 +626,9 @@ class _EpisodesTabState extends State<_EpisodesTab> {
             isResume: st.resume,
             fraction: st.fraction,
             onTap: () => widget.onOpen(fullIndex),
-            onLongPress: widget.onPickPlayer == null
+            onLongPress: widget.onEpisodeMenu == null
                 ? null
-                : () => widget.onPickPlayer!(fullIndex),
+                : () => widget.onEpisodeMenu!(fullIndex),
             onDownload: () => widget.onDownload(ep),
             sourceId: widget.sourceId,
             showId: widget.showId,
@@ -587,9 +664,9 @@ class _EpisodesTabState extends State<_EpisodesTab> {
             fraction: st.fraction,
             available: ep.available,
             onTap: () => widget.onOpen(fullIndex),
-            onLongPress: widget.onPickPlayer == null
+            onLongPress: widget.onEpisodeMenu == null
                 ? null
-                : () => widget.onPickPlayer!(fullIndex),
+                : () => widget.onEpisodeMenu!(fullIndex),
           );
         },
       ),
@@ -680,7 +757,7 @@ class _EpisodesHeader extends StatelessWidget {
           // Left: season dropdown pill (multi-season) or a plain label.
           Expanded(
             child: Align(
-              alignment: Alignment.centerLeft,
+              alignment: AlignmentDirectional.centerStart,
               child: hasMultipleSeasons
                   ? Material(
                       color: AppColors.surface2,
@@ -799,7 +876,7 @@ class _SeasonSheet extends StatelessWidget {
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
             child: Align(
-              alignment: Alignment.centerLeft,
+              alignment: AlignmentDirectional.centerStart,
               child: Text(context.l10n.seasons, style: AppText.title),
             ),
           ),
@@ -1097,6 +1174,7 @@ class _ChapterRow extends StatelessWidget {
     required this.isInProgress,
     required this.fraction,
     required this.onTap,
+    this.onLongPress,
     required this.onDownload,
     required this.sourceId,
     required this.downloadSourceId,
@@ -1115,6 +1193,12 @@ class _ChapterRow extends StatelessWidget {
   final bool isInProgress;
   final double fraction;
   final VoidCallback onTap;
+
+  /// The chapter actions menu — mark read, mark this and all above. A chapter
+  /// row is NOT an episode row (that's the point of this class), so it needs
+  /// its own: wiring the menu up to [_EpisodeRow] alone left reading with no
+  /// long-press at all.
+  final VoidCallback? onLongPress;
   final VoidCallback onDownload;
   final String sourceId;
 
@@ -1134,6 +1218,7 @@ class _ChapterRow extends StatelessWidget {
 
     return InkWell(
       onTap: onTap,
+      onLongPress: onLongPress,
       splashColor: AppColors.accentSoft,
       highlightColor: AppColors.surface,
       child: Padding(
@@ -1200,7 +1285,7 @@ class _ChapterRow extends StatelessWidget {
                     const SizedBox(height: 6),
                     FractionallySizedBox(
                       widthFactor: fraction.clamp(0.0, 1.0),
-                      alignment: Alignment.centerLeft,
+                      alignment: AlignmentDirectional.centerStart,
                       child: Container(
                         height: 2,
                         decoration: BoxDecoration(

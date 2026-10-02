@@ -11,7 +11,7 @@ import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/ui/settings_widgets.dart';
-import 'beta_catalogue.dart';
+import 'companion_catalogue.dart';
 import '../../core/models/episode.dart';
 import '../../core/models/video_source.dart';
 import '../../core/playback/resume_store.dart';
@@ -19,6 +19,7 @@ import '../player/player_screen.dart';
 import '../player/tv_native_player.dart';
 import '../home/search_screen.dart';
 
+/// TV receiver setup or mobile remote page, selected by the current app mode.
 class CompanionSettingsScreen extends StatefulWidget {
   const CompanionSettingsScreen({
     super.key,
@@ -34,9 +35,10 @@ class CompanionSettingsScreen extends StatefulWidget {
       _CompanionSettingsScreenState();
 }
 
+/// Owns page-only discovery and dialogs while RemoteSession retains the connection.
 class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
     with WidgetsBindingObserver {
-  static const _channel = BetaCatalogue.channel;
+  static const _channel = CompanionCatalogue.channel;
   final _address = TextEditingController();
   final _pin = TextEditingController();
   final _session = RemoteSession.instance;
@@ -51,6 +53,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
   bool get _tv => sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
 
   @override
+  /// Subscribes the page to the app-owned session and initializes receiver management.
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
@@ -79,6 +82,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
     _screenFocus();
   }
 
+  /// Gives phone volume keys to the remote only while this page is visible.
   void _screenFocus() {
     if (!_tv)
       unawaited(
@@ -98,6 +102,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
   }
 
   @override
+  /// Releases page listeners and key ownership without disconnecting the app session.
   void dispose() {
     if (!_tv && widget.active)
       unawaited(_channel.invokeMethod<void>('remoteScreen', false));
@@ -110,6 +115,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
     super.dispose();
   }
 
+  /// Wraps page actions with busy/error state and guards disposal while awaiting.
   Future<void> _run(Future<void> Function() action) async {
     if (_busy) return;
     setState(() {
@@ -128,6 +134,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
     }
   }
 
+  /// Refreshes TV setup metadata after receiver start, stop or credential revocation.
   Future<void> _loadReceiver([String method = 'receiverState']) =>
       _run(() async {
         final data = await _channel.invokeMapMethod<String, dynamic>(method);
@@ -137,10 +144,12 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
         if (mounted) setState(() => _receiver = data ?? {});
       });
 
+  /// Rebuilds page chrome when shared connection state changes.
   void _onSession() {
     if (mounted) setState(() {});
   }
 
+  /// Delegates a receiver request to the ordered app session.
   Future<Map<String, dynamic>> _command(
     String action, {
     Map<String, dynamic> values = const {},
@@ -154,6 +163,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
     }
   }
 
+  /// Connects the selected Wi-Fi receiver or bonded Bluetooth device through the shared session.
   Future<void> _connect({String? bluetooth}) => _run(
     () => _session.connect({
       'address': _address.text.trim(),
@@ -161,6 +171,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
       if (bluetooth != null) 'bluetooth': bluetooth,
     }),
   );
+  /// Presents labelled choices and returns an index or null when dismissed.
   Future<int?> _choose(String title, List<String> labels) async {
     if (!mounted) return null;
     if (labels.isEmpty) {
@@ -185,6 +196,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
     );
   }
 
+  /// Discovers reachable TVs or enumerates bonded devices, then asks the user to choose.
   Future<void> _find({bool bluetooth = false}) async {
     List<Map<String, dynamic>> devices = [];
     await _run(() async {
@@ -216,6 +228,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
     }
   }
 
+  /// Presents versioned player choices so stale source/track indices cannot select another item.
   Future<void> _options(
     String kind,
     Map<String, dynamic> state, [
@@ -266,6 +279,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
     }
   }
 
+  /// Searches the TV catalogue and resolves the selected episode on the receiver.
   Future<void> _search([String? spoken]) async {
     final catalogue = await _command('catalogues');
     if (!mounted || catalogue['items'] == null) return;
@@ -329,6 +343,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
       );
   }
 
+  /// Obtains the active TV stream and resume point before launching local playback.
   Future<void> _continueOnPhone() async {
     final snapshot = await _command('handoffSnapshot');
     if (!mounted || snapshot['episodes'] == null) return;
@@ -417,6 +432,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
     }
   }
 
+  /// Transfers the local episode and position to the TV, leaving local recovery to the caller.
   Future<void> _continueFromPhone() async {
     final phone = widget.phonePlayback!;
     final catalogue = await _command('catalogues');
@@ -648,6 +664,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
     ];
   }
 
+  /// Embeds the same remote panel in dock/full-screen routes using their available height.
   Widget _mobileRemote() => Scaffold(
     backgroundColor: AppColors.bg,
     appBar: settingsAppBar('Remote', showBack: widget.showBack),
@@ -708,11 +725,13 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
     ),
   );
 
+  /// Requests a platform QR scan and delegates validation to RemoteSession.
   Future<void> _scan() => _run(() async {
     final raw = await _channel.invokeMethod<String>('scanPairing');
     if (raw != null) await _session.connectQr(raw);
   });
 
+  /// Presents pairing, reconnection and transport management outside the compact control panel.
   Future<void> _manage() async {
     await showModalBottomSheet<void>(
       context: context,
@@ -913,6 +932,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
     );
   }
 
+  /// Offers supported text/voice search or phone browsing without hiding traditional controls.
   Future<void> _searchOptions() async {
     final option = await _choose('Search', [
       'Search TV sources',
@@ -940,6 +960,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
     }
   }
 
+  /// Associates a user-selected bonded TV with the already paired companion receiver.
   Future<void> _linkBluetooth() => _run(() async {
     final devices =
         await _channel.invokeListMethod<dynamic>('bluetoothDevices') ?? [];
@@ -957,6 +978,7 @@ class _CompanionSettingsScreenState extends State<CompanionSettingsScreen>
     }
   });
 
+  /// Routes a contextual playback shortcut to its corresponding action sheet.
   void _shortcut(String action) {
     final state = Map<String, dynamic>.of(_playback.value);
     switch (action) {

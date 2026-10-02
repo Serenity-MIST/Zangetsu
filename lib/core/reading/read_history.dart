@@ -1,10 +1,12 @@
 import 'package:flutter/foundation.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
+import 'package:watch_app/core/hive/hive_key.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 
 import '../models/provider_info.dart';
 import '../privacy/incognito_mode.dart';
 import '../supabase/supabase_service.dart';
+import '../zmode/zmode_ids.dart';
 
 /// Parse a persisted [ReadEntry.type] name. Only 'manga'/'novel' are
 /// meaningful here; anything else — including a row saved before this field
@@ -24,6 +26,7 @@ class ReadEntry {
   ReadEntry({
     required this.sourceId,
     required this.showId,
+    this.showUrl,
     required this.title,
     this.cover,
     required this.chapterId,
@@ -36,6 +39,7 @@ class ReadEntry {
   });
 
   final String sourceId, showId, title, chapterId, chapterUrl;
+  final String? showUrl;
   final String? cover;
   final double? chapterNumber;
   final int pos, total, updatedMs;
@@ -43,6 +47,23 @@ class ReadEntry {
   /// manga or novel — which reader [showId]'s chapters open in. See
   /// [readEntryTypeFromName] for the missing/legacy-row default.
   final ProviderType type;
+
+  /// URL used to reopen the title's detail page. Metadata-backed titles have
+  /// a stable ID such as `mal:42`/`al:42` but must be routed by their `zm://`
+  /// URL. Older rows did not store that URL, so recover it from those canonical
+  /// IDs; ordinary source rows keep their previous showId fallback.
+  String get detailUrl {
+    if (showUrl != null && showUrl!.isNotEmpty) return showUrl!;
+    final kind = switch (type) {
+      ProviderType.manga => ZKind.manga,
+      ProviderType.novel => ZKind.novel,
+      _ => null,
+    };
+    if (kind != null && RegExp(r'^(?:al|mal):\d+$').hasMatch(showId)) {
+      return ZmodeIds.showUrl(ZCanonical(kind, showId));
+    }
+    return showId;
+  }
 
   /// Same finished rule as [ReadStore]: total == 1000 is the novel
   /// scroll-permille convention (>=950 counts as done); otherwise last
@@ -68,6 +89,7 @@ class ReadEntry {
   Map<String, dynamic> toJson() => {
     'sourceId': sourceId,
     'showId': showId,
+    'showUrl': detailUrl,
     'title': title,
     'cover': cover,
     'chapterId': chapterId,
@@ -82,6 +104,7 @@ class ReadEntry {
   factory ReadEntry.fromJson(Map<String, dynamic> m) => ReadEntry(
     sourceId: m['sourceId'] as String,
     showId: m['showId'] as String,
+    showUrl: m['showUrl'] as String?,
     title: m['title'] as String? ?? '',
     cover: m['cover'] as String?,
     chapterId: m['chapterId'] as String? ?? '',
@@ -163,10 +186,17 @@ class ReadHistory {
     if (!Hive.isBoxOpen(syncMetaBox)) {
       await openBoxSafely(syncMetaBox);
     }
+    // Same reasoning as [MyListStore.init]: an unreadable box reopens empty
+    // while the pull throttle in [syncMetaBox] survives, which would skip the
+    // very pull that puts the reading history back. Drop it.
+    if (quarantinedBoxes.contains(boxName) && Hive.isBoxOpen(syncMetaBox)) {
+      await Hive.box(syncMetaBox).delete(_syncMetaKey);
+    }
   }
 
   Box<Map> get _box => Hive.box<Map>(boxName);
-  String _key(String sourceId, String showId) => '$sourceId::$showId';
+  String _key(String sourceId, String showId) =>
+      hiveKey('$sourceId::$showId');
   final Map<String, int> _lastCloudPush = {};
 
   /// Persist progress. The local write is ALWAYS immediate (instant resume);
@@ -247,7 +277,7 @@ class ReadHistory {
     var readOk = true;
     try {
       for (final m in await _remote.listFor(uid)) {
-        cloudTimes['${m['source_id']}::${m['show_id']}'] =
+        cloudTimes[hiveKey('${m['source_id']}::${m['show_id']}')] =
             (m['updated_ms'] as num?)?.toInt() ?? 0;
       }
     } catch (_) {
@@ -290,7 +320,7 @@ class ReadHistory {
     try {
       final rows = await _remote.listFor(uid);
       for (final m in rows) {
-        final key = '${m['source_id']}::${m['show_id']}';
+        final key = hiveKey('${m['source_id']}::${m['show_id']}');
         final cloudUpdated = (m['updated_ms'] as num?)?.toInt() ?? 0;
         final localUpdated = (_box.get(key)?['updatedMs'] as num?)?.toInt() ?? -1;
         if (cloudUpdated <= localUpdated) continue; // local is same/newer — keep it

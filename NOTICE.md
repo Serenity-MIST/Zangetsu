@@ -24,11 +24,34 @@ CloudStream (recloudstream)
 Aniyomi / Tachiyomi
   https://github.com/aniyomiorg/aniyomi
   https://github.com/tachiyomiorg/tachiyomi
+  https://github.com/quickdesh/Animiru        (extensions-lib v17 API files)
+  https://github.com/mihonapp/mihon           (Mihon manga-source runtime)
   License: Apache-2.0
   Portions of the Android extension-loading code (files under
   android/app/src/main/kotlin/com/spyou/watch_app/aniyomi/) are derived from
-  Aniyomi/Tachiyomi and retain their original Apache-2.0 headers. The full
-  Apache License 2.0 text is included as LICENSE-Apache-2.0.txt.
+  Aniyomi/Tachiyomi and retain their original Apache-2.0 headers.
+
+  The vendored extension runtime under
+  android/app/src/main/kotlin/eu/kanade/tachiyomi/ is likewise derived from
+  Aniyomi/Tachiyomi and Mihon. Its extensions-lib v16 baseline comes from
+  itsmechinmoy/Dantotsu, and the extensions-lib v17 API files added on top of
+  it are copied verbatim from quickdesh/Animiru branch animiru-new-main, path
+  source-api/, pinned at commit 662e889c9cc8d4be7990f5c130767fc32f182318:
+  animesource/model/{AnimeRelation, SAnimeEpisodeUpdate, SAnimeSeasonUpdate,
+  ThumbnailInfo}.kt and util/JsonExtensions.kt.
+
+  Two v17 files are not vendored (HttpServer, VideoInfo) and AnimeSource.kt
+  carries deliberate deviations, so the vendored surface is v17 minus HttpServer
+  rather than a verbatim v17. See the "Deviations" section of the full
+  attribution for the reasoning and for a known runtime limitation that follows
+  from the missing HttpServer. The full attribution, per-file provenance, and
+  the commit pins for every vendored tree, are in
+  docs/licenses/aniyomi-extensions-lib-NOTICE.md. The full Apache License 2.0
+  text is included as LICENSE-Apache-2.0.txt.
+
+  The Mihon manga-source runtime, which lives under that same
+  eu/kanade/tachiyomi/ path, is a separate ecosystem on a separate version
+  line and was not touched by this change.
 
 Other dependencies (Flutter/Dart packages and Android libraries) are used under
 their respective open-source licenses; refer to each package for details.
@@ -66,11 +89,11 @@ AndroidX Test runner 1.6.2 and ext:junit 1.2.1
 
 Android Bluetooth HID implementation
   API reference: https://developer.android.com/reference/android/bluetooth/BluetoothHidDevice
-  The current BetaConnectionService.java was rewritten during review against the
+  The current RemoteConnectionService.java was rewritten during review against the
   public Android API and the application's control requirements. This statement
   does not certify clean-room provenance or clear earlier implementations in Git
   history. Maintainers should review retained history before incorporating it.
 Device-test media
-  android/app/src/main/assets/beta-test.mp4 was included during prototype testing.
+  android/app/src/main/assets/companion-test.mp4 was included during prototype testing.
   Its origin and redistribution permission have not been established in this review.
   It must be replaced with a documented, permitted fixture or removed before merging.

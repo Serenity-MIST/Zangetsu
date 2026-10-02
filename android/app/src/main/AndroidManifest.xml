@@ -32,16 +32,23 @@
          (no PredictiveBackPageTransitionsBuilder), so this just uses the legacy
          back gesture, which works everywhere. Re-enabling needs both the theme
          transition builder AND a re-test on that device. -->
+    <!-- android:icon below is the brand mark, NOT whichever launcher icon is
+         selected. That one value is what the system shows in the installer,
+         Settings → Apps, notifications, recents and share sheets, and it cannot
+         follow the user's pick: Android resolves it at install time, while the
+         <activity-alias> icons further down only ever affect the home screen.
+         So it names the current mark and stays there — someone who picks Katana
+         or Classic changes their home screen, not this. -->
     <application
         android:label="Zangetsu"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@mipmap/ic_launcher_crescent"
         android:banner="@drawable/tv_banner"
         android:networkSecurityConfig="@xml/network_security_config"
-        android:fullBackupContent="@xml/beta_backup_rules"
-        android:dataExtractionRules="@xml/beta_extraction_rules"
-        android:enableOnBackInvokedCallback="false">
-        <service android:name=".BetaConnectionService" android:exported="false" android:foregroundServiceType="connectedDevice"/>
+        android:fullBackupContent="@xml/companion_backup_rules"
+        android:dataExtractionRules="@xml/companion_extraction_rules"
+        android:enableOnBackInvokedCallback="false" android:supportsRtl="true">
+        <service android:name=".RemoteConnectionService" android:exported="false" android:foregroundServiceType="connectedDevice"/>
         <meta-data android:name="com.google.mlkit.vision.DEPENDENCIES" android:value="barcode_ui"/>
         <!-- flutter_background_service declares this service but without a
              foregroundServiceType, which Android 14+ requires for dataSync.
@@ -106,6 +113,7 @@
                 <data android:scheme="zangetsu" android:host="anilist-auth"/>
                 <data android:scheme="zangetsu" android:host="mal-auth"/>
                 <data android:scheme="zangetsu" android:host="simkl-auth"/>
+                <data android:scheme="zangetsu" android:host="mangabaka-auth"/>
                 <!-- Shared-title deep link: zangetsu://open?d=…&t=… (see OpenLinkService). -->
                 <data android:scheme="zangetsu" android:host="open"/>
                 <data android:scheme="zangetsu" android:host="room"/>
@@ -148,6 +156,18 @@
              Renaming or removing an alias orphans it on users' home screens, so
              these names are permanent once shipped. -->
         <activity-alias
+            android:name=".MainActivityCrescent"
+            android:targetActivity=".MainActivity"
+            android:exported="true"
+            android:enabled="true"
+            android:icon="@mipmap/ic_launcher_crescent"
+            android:label="Zangetsu">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
             android:name=".MainActivityDefault"
             android:targetActivity=".MainActivity"
             android:exported="true"
@@ -163,7 +183,7 @@
             android:name=".MainActivityClassic"
             android:targetActivity=".MainActivity"
             android:exported="true"
-            android:enabled="true"
+            android:enabled="false"
             android:icon="@mipmap/ic_launcher_classic"
             android:label="Zangetsu">
             <intent-filter>
@@ -226,6 +246,15 @@
             android:screenOrientation="landscape"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
+        <!-- Native phone video player (PhonePlayerActivity). Rotates with the
+             device and stays in the app's own task; reached only when the
+             experimental player toggle is on, for devices where libmpv will
+             not load. -->
+        <activity
+            android:name=".PhonePlayerActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
         <!-- Google Cast Framework configuration. -->
         <meta-data
             android:name="com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME"
@@ -239,6 +268,23 @@
              renderer this device handles (1.8.0 shipped with no flag and worked).
              Forcing EnableImpeller=false here black-screened it, so we match
              1.8.0 exactly and leave the default. mpv gpu-next video is separate. -->
+
+        <!-- Lets an external player read a DOWNLOADED episode. A download
+             arrives as a bare filesystem path, which is a URI with no scheme
+             at all: lenient players guess it is a file, a strict one resolves
+             nothing and the launch fails. Android 7+ refuses a file:// handed
+             to another app, so content:// is the only form left. Used ONLY as
+             a fallback after a direct launch finds no activity, so every
+             launch that works today is untouched. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.videoprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/video_paths" />
+        </provider>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

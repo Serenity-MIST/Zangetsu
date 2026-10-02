@@ -359,6 +359,15 @@ class _CsScreenSourceRow extends StatelessWidget {
         padding: const EdgeInsets.fromLTRB(16, 8, 6, 8),
         child: Row(
           children: [
+            Padding(
+              padding: const EdgeInsetsDirectional.only(end: 12),
+              // A loaded plugin has no icon of its own; the catalog entry it
+              // came from does.
+              child: SourceIconTile(
+                name: source.displayName,
+                icon: cloudStreamIconUrls()[source.sourceId],
+              ),
+            ),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -413,32 +422,12 @@ class _CsScreenSourceRow extends StatelessWidget {
 /// [CloudStreamManager.deleteRepo]; shows a context.l10n.removed snackbar on success.
 Future<void> _confirmDeleteCsRepo(BuildContext context, CsRepoGroup group) async {
   final messenger = ScaffoldMessenger.of(context);
-  final ok = await showDialog<bool>(
-    context: context,
-    builder: (ctx) => AlertDialog(
-      backgroundColor: AppColors.surface,
-      title: Text(context.l10n.removeRepository2, style: AppText.headline),
-      content: Text(
-        context.l10n.removeThisRepositoryAndItsSources,
-        style: AppText.body,
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(ctx, false),
-          child: Text(
-            context.l10n.cancel,
-            style: AppText.body.copyWith(color: AppColors.textSecondary),
-          ),
-        ),
-        TextButton(
-          onPressed: () => Navigator.pop(ctx, true),
-          child: Text(
-            context.l10n.removeDownloadTooltip,
-            style: AppText.body.copyWith(color: AppColors.accent),
-          ),
-        ),
-      ],
-    ),
+  final ok = await AppDialog.confirm(
+    context,
+    title: context.l10n.removeRepository2,
+    message: context.l10n.removeThisRepositoryAndItsSources,
+    confirmLabel: context.l10n.removeDownloadTooltip,
+    destructive: true,
   );
   if (ok != true) return;
   await sl<CloudStreamManager>().deleteRepo(group.url);
@@ -660,7 +649,7 @@ class _CsScreenRepoSectionState extends State<_CsScreenRepoSection> {
                     behavior: HitTestBehavior.opaque,
                     onTap: () => _applyCsRepoUpdates(context, group),
                     child: Container(
-                      margin: const EdgeInsets.only(right: 2),
+                      margin: const EdgeInsetsDirectional.only(end: 2),
                       padding: const EdgeInsets.symmetric(
                         horizontal: 10,
                         vertical: 5,
@@ -876,32 +865,12 @@ class _CsScreenPluginRowState extends State<_CsScreenPluginRow> {
 
   Future<void> _uninstall() async {
     final messenger = ScaffoldMessenger.of(context);
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppColors.surface,
-        title: Text(context.l10n.uninstallNameQuestion(widget.plugin.name), style: AppText.headline),
-        content: Text(
-          context.l10n.thisRemovesTheSourceFromYourInstalledList,
-          style: AppText.body,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: Text(
-              context.l10n.cancel,
-              style: AppText.body.copyWith(color: AppColors.textSecondary),
-            ),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: Text(
-              context.l10n.uninstall,
-              style: AppText.body.copyWith(color: AppColors.accent),
-            ),
-          ),
-        ],
-      ),
+    final ok = await AppDialog.confirm(
+      context,
+      title: context.l10n.uninstallNameQuestion(widget.plugin.name),
+      message: context.l10n.thisRemovesTheSourceFromYourInstalledList,
+      confirmLabel: context.l10n.uninstall,
+      destructive: true,
     );
     if (ok != true) return;
     setState(() => _busy = true);
@@ -933,6 +902,13 @@ class _CsScreenPluginRowState extends State<_CsScreenPluginRow> {
       padding: const EdgeInsets.fromLTRB(16, 8, 12, 8),
       child: Row(
         children: [
+          Padding(
+            padding: const EdgeInsetsDirectional.only(end: 12),
+            child: SourceIconTile(
+              name: widget.plugin.name,
+              icon: widget.plugin.iconUrl,
+            ),
+          ),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,

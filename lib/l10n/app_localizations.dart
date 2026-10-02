@@ -5,12 +5,16 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:intl/intl.dart' as intl;
 
+import 'app_localizations_ar.dart';
 import 'app_localizations_de.dart';
 import 'app_localizations_en.dart';
 import 'app_localizations_es.dart';
 import 'app_localizations_fr.dart';
+import 'app_localizations_id.dart';
 import 'app_localizations_it.dart';
 import 'app_localizations_ja.dart';
+import 'app_localizations_pt.dart';
+import 'app_localizations_tr.dart';
 import 'app_localizations_zh.dart';
 
 // ignore_for_file: type=lint
@@ -100,11 +104,15 @@ abstract class AppLocalizations {
   /// A list of this localizations delegate's supported locales.
   static const List<Locale> supportedLocales = <Locale>[
     Locale('en'),
+    Locale('ar'),
     Locale('de'),
     Locale('es'),
     Locale('fr'),
+    Locale('id'),
     Locale('it'),
     Locale('ja'),
+    Locale('pt'),
+    Locale('tr'),
     Locale('zh'),
     Locale('zh', 'TW'),
   ];
@@ -487,6 +495,12 @@ abstract class AppLocalizations {
   /// **'Custom'**
   String get custom;
 
+  /// No description provided for @customRange.
+  ///
+  /// In en, this message translates to:
+  /// **'Custom range'**
+  String get customRange;
+
   /// No description provided for @defaultLabel.
   ///
   /// In en, this message translates to:
@@ -534,6 +548,12 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Testing…'**
   String get testing;
+
+  /// No description provided for @searchOk.
+  ///
+  /// In en, this message translates to:
+  /// **'Search OK'**
+  String get searchOk;
 
   /// No description provided for @working.
   ///
@@ -840,6 +860,60 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Active source'**
   String get activeSource;
+
+  /// No description provided for @streamingServices.
+  ///
+  /// In en, this message translates to:
+  /// **'Streaming Services'**
+  String get streamingServices;
+
+  /// No description provided for @streamingServicesSubtitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Browse what each service carries where you are'**
+  String get streamingServicesSubtitle;
+
+  /// No description provided for @streamingServicesEmpty.
+  ///
+  /// In en, this message translates to:
+  /// **'No services listed for this country'**
+  String get streamingServicesEmpty;
+
+  /// No description provided for @streamingServicesMetadataNote.
+  ///
+  /// In en, this message translates to:
+  /// **'Browsing only — titles still play through your own sources'**
+  String get streamingServicesMetadataNote;
+
+  /// No description provided for @pinAsHomeRow.
+  ///
+  /// In en, this message translates to:
+  /// **'Pin as home row'**
+  String get pinAsHomeRow;
+
+  /// No description provided for @unpinHomeRow.
+  ///
+  /// In en, this message translates to:
+  /// **'Unpin'**
+  String get unpinHomeRow;
+
+  /// No description provided for @pinLimitReached.
+  ///
+  /// In en, this message translates to:
+  /// **'You can pin up to {count} services'**
+  String pinLimitReached(int count);
+
+  /// No description provided for @streamingRegion.
+  ///
+  /// In en, this message translates to:
+  /// **'Streaming region'**
+  String get streamingRegion;
+
+  /// No description provided for @streamingRegionSubtitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Which country\'s catalogue to show'**
+  String get streamingRegionSubtitle;
 
   /// No description provided for @sourceHealth.
   ///
@@ -2413,6 +2487,30 @@ abstract class AppLocalizations {
   /// **'Native TV player'**
   String get nativeTVPlayer;
 
+  /// No description provided for @tvDecoderMode.
+  ///
+  /// In en, this message translates to:
+  /// **'TV decoder priority'**
+  String get tvDecoderMode;
+
+  /// No description provided for @tvDecoderHardwareOnly.
+  ///
+  /// In en, this message translates to:
+  /// **'Hardware only'**
+  String get tvDecoderHardwareOnly;
+
+  /// No description provided for @tvDecoderHardwareFirst.
+  ///
+  /// In en, this message translates to:
+  /// **'Hardware first (software fallback)'**
+  String get tvDecoderHardwareFirst;
+
+  /// No description provided for @tvDecoderSoftwareFirst.
+  ///
+  /// In en, this message translates to:
+  /// **'Software first (hardware fallback)'**
+  String get tvDecoderSoftwareFirst;
+
   /// No description provided for @softwareAudioDolbyDTS.
   ///
   /// In en, this message translates to:
@@ -3326,6 +3424,18 @@ abstract class AppLocalizations {
   /// **'Audio delay'**
   String get audioDelay;
 
+  /// No description provided for @androidPlayer.
+  ///
+  /// In en, this message translates to:
+  /// **'Android Player (Experimental)'**
+  String get androidPlayer;
+
+  /// No description provided for @androidPlayerUnavailable.
+  ///
+  /// In en, this message translates to:
+  /// **'Android Player could not start'**
+  String get androidPlayerUnavailable;
+
   /// No description provided for @audioNormalization.
   ///
   /// In en, this message translates to:
@@ -3625,6 +3735,12 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Find episode'**
   String get findEpisode;
+
+  /// No description provided for @findChapter.
+  ///
+  /// In en, this message translates to:
+  /// **'Find chapter'**
+  String get findChapter;
 
   /// No description provided for @refreshChapters.
   ///
@@ -5036,11 +5152,23 @@ abstract class AppLocalizations {
   /// **'See All'**
   String get seeAll2;
 
+  /// No description provided for @webView.
+  ///
+  /// In en, this message translates to:
+  /// **'WebView'**
+  String get webView;
+
   /// No description provided for @openInBrowser.
   ///
   /// In en, this message translates to:
   /// **'Open in browser'**
   String get openInBrowser;
+
+  /// No description provided for @markAsRead.
+  ///
+  /// In en, this message translates to:
+  /// **'Mark as read'**
+  String get markAsRead;
 
   /// No description provided for @copyLink.
   ///
@@ -5330,6 +5458,12 @@ abstract class AppLocalizations {
   /// **'Sort'**
   String get sort;
 
+  /// No description provided for @shuffle.
+  ///
+  /// In en, this message translates to:
+  /// **'Shuffle'**
+  String get shuffle;
+
   /// No description provided for @giveItAName.
   ///
   /// In en, this message translates to:
@@ -5437,6 +5571,36 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Marked {count} episodes as watched'**
   String markedEpisodesAsWatched(int count);
+
+  /// No description provided for @openInBrowserSubtitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Read this chapter on the source\'s own site'**
+  String get openInBrowserSubtitle;
+
+  /// No description provided for @readingSettings.
+  ///
+  /// In en, this message translates to:
+  /// **'Reading settings'**
+  String get readingSettings;
+
+  /// No description provided for @markedAsRead.
+  ///
+  /// In en, this message translates to:
+  /// **'Marked as read'**
+  String get markedAsRead;
+
+  /// No description provided for @markedUnread.
+  ///
+  /// In en, this message translates to:
+  /// **'Marked unread'**
+  String get markedUnread;
+
+  /// No description provided for @markedChaptersAsRead.
+  ///
+  /// In en, this message translates to:
+  /// **'Marked {count} chapters as read'**
+  String markedChaptersAsRead(int count);
 
   /// No description provided for @downloadChaptersQuestion.
   ///
@@ -6253,6 +6417,18 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'App icon'**
   String get appIcon;
+
+  /// No description provided for @splashStyle.
+  ///
+  /// In en, this message translates to:
+  /// **'Splash'**
+  String get splashStyle;
+
+  /// No description provided for @splashStyleBlurb.
+  ///
+  /// In en, this message translates to:
+  /// **'What plays while the app starts up.'**
+  String get splashStyleBlurb;
 
   /// No description provided for @currentLocation.
   ///
@@ -8636,6 +8812,12 @@ abstract class AppLocalizations {
   /// **'No source has this yet'**
   String get noSourceHasThisYet;
 
+  /// No description provided for @checkedTopSources.
+  ///
+  /// In en, this message translates to:
+  /// **'Checked your top sources — none had this'**
+  String get checkedTopSources;
+
   /// No description provided for @pickTheRightTitle.
   ///
   /// In en, this message translates to:
@@ -8863,6 +9045,108 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Your saved novel list'**
   String get yourSavedNovelList;
+
+  /// No description provided for @epub.
+  ///
+  /// In en, this message translates to:
+  /// **'EPUB'**
+  String get epub;
+
+  /// No description provided for @exportAsEpub.
+  ///
+  /// In en, this message translates to:
+  /// **'Export as EPUB'**
+  String get exportAsEpub;
+
+  /// No description provided for @chaptersDownloadedCount.
+  ///
+  /// In en, this message translates to:
+  /// **'{done} of {total} chapters downloaded'**
+  String chaptersDownloadedCount(int done, int total);
+
+  /// No description provided for @noChaptersDownloadedToExport.
+  ///
+  /// In en, this message translates to:
+  /// **'No chapters downloaded yet — download some first.'**
+  String get noChaptersDownloadedToExport;
+
+  /// No description provided for @allChapters.
+  ///
+  /// In en, this message translates to:
+  /// **'All chapters'**
+  String get allChapters;
+
+  /// No description provided for @startChapter.
+  ///
+  /// In en, this message translates to:
+  /// **'Start'**
+  String get startChapter;
+
+  /// No description provided for @endChapter.
+  ///
+  /// In en, this message translates to:
+  /// **'End'**
+  String get endChapter;
+
+  /// No description provided for @includeChapterNumber.
+  ///
+  /// In en, this message translates to:
+  /// **'Include chapter number'**
+  String get includeChapterNumber;
+
+  /// No description provided for @includeChapterNumberSubtitle.
+  ///
+  /// In en, this message translates to:
+  /// **'\"Chapter 5: Title\" instead of just \"Title\"'**
+  String get includeChapterNumberSubtitle;
+
+  /// No description provided for @fileNameLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'File name'**
+  String get fileNameLabel;
+
+  /// No description provided for @folderLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Folder'**
+  String get folderLabel;
+
+  /// No description provided for @exportingChapterProgress.
+  ///
+  /// In en, this message translates to:
+  /// **'Chapter {done} of {total}'**
+  String exportingChapterProgress(int done, int total);
+
+  /// No description provided for @exportedToFolder.
+  ///
+  /// In en, this message translates to:
+  /// **'Exported to {folder}'**
+  String exportedToFolder(String folder);
+
+  /// No description provided for @epubExportFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Couldn\'t save the EPUB'**
+  String get epubExportFailed;
+
+  /// No description provided for @export.
+  ///
+  /// In en, this message translates to:
+  /// **'Export'**
+  String get export;
+
+  /// No description provided for @keepDownloadsPrivate.
+  ///
+  /// In en, this message translates to:
+  /// **'Keep downloads private'**
+  String get keepDownloadsPrivate;
+
+  /// No description provided for @keepDownloadsPrivateSubtitle.
+  ///
+  /// In en, this message translates to:
+  /// **'New video downloads stay inside Zangetsu instead of the Downloads folder. They are deleted when you uninstall Zangetsu. Chapters and exports are unaffected.'**
+  String get keepDownloadsPrivateSubtitle;
 }
 
 class _AppLocalizationsDelegate
@@ -8876,12 +9160,16 @@ class _AppLocalizationsDelegate
 
   @override
   bool isSupported(Locale locale) => <String>[
+    'ar',
     'de',
     'en',
     'es',
     'fr',
+    'id',
     'it',
     'ja',
+    'pt',
+    'tr',
     'zh',
   ].contains(locale.languageCode);
 
@@ -8904,6 +9192,8 @@ AppLocalizations lookupAppLocalizations(Locale locale) {
 
   // Lookup logic when only language code is specified.
   switch (locale.languageCode) {
+    case 'ar':
+      return AppLocalizationsAr();
     case 'de':
       return AppLocalizationsDe();
     case 'en':
@@ -8912,10 +9202,16 @@ AppLocalizations lookupAppLocalizations(Locale locale) {
       return AppLocalizationsEs();
     case 'fr':
       return AppLocalizationsFr();
+    case 'id':
+      return AppLocalizationsId();
     case 'it':
       return AppLocalizationsIt();
     case 'ja':
       return AppLocalizationsJa();
+    case 'pt':
+      return AppLocalizationsPt();
+    case 'tr':
+      return AppLocalizationsTr();
     case 'zh':
       return AppLocalizationsZh();
   }

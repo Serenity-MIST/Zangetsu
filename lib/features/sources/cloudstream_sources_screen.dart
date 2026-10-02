@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
 import '../../core/app_mode.dart';
+import '../../core/ui/source_icon_tile.dart';
+import '../../core/ui/source_switcher.dart' show cloudStreamIconUrls;
 import '../../core/di/injector.dart';
 import '../../core/provider/cloudstream_provider.dart';
 import '../../core/state/active_source_cubit.dart';
@@ -17,6 +19,7 @@ import '../../core/tv/tv_text_field.dart';
 import '../../core/ui/states.dart';
 import 'source_settings_screen.dart';
 import 'sources_search_field.dart';
+import '../../core/ui/app_dialog.dart';
 import '../../l10n/l10n.dart';
 
 part 'cloudstream_sources_screen_phone.dart';

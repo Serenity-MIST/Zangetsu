@@ -271,6 +271,7 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
       tmdbId: detail.tmdbId ?? widget.item.tmdbId,
       tmdbIsTv: detail.tmdbIsTv,
       imdbId: detail.imdbId ?? widget.item.imdbId,
+      listItem: widget.item,
     );
   }
 
@@ -670,7 +671,7 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
                             const Padding(
                               padding: EdgeInsets.fromLTRB(8, 4, 12, 0),
                               child: Align(
-                                alignment: Alignment.centerLeft,
+                                alignment: AlignmentDirectional.centerStart,
                                 child: TvBackButton(),
                               ),
                             ),
@@ -923,7 +924,7 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
                                 i++
                               )
                                 Padding(
-                                  padding: const EdgeInsets.only(right: 4),
+                                  padding: const EdgeInsetsDirectional.only(end: 4),
                                   child: TvFocusable(
                                     key: ValueKey('tv-detail-tab-$i'),
                                     variant: TvFocusVariant.pill,
@@ -1222,11 +1223,15 @@ class _TvEpisodeListState extends State<_TvEpisodeList> {
 
     final chips = <Widget>[];
     if (widget.hasMultipleSeasons) {
+      final seasons = widget.seasonSet.toList()..sort();
+      final seasonIndex = seasons.indexOf(widget.currentSeason);
       chips.add(
-        _TvSeasonChips(
-          seasons: widget.seasonSet.toList()..sort(),
-          currentSeason: widget.currentSeason,
-          onSelect: widget.onSelectSeason,
+        TvEpisodeRangeChips(
+          count: seasons.length,
+          selected: seasonIndex >= 0 ? seasonIndex : 0,
+          labelFor: (i) => 'Season ${seasons[i]}',
+          onSelect: (i) => widget.onSelectSeason(seasons[i]),
+          chipKey: (i) => ValueKey('tv-season-${seasons[i]}'),
         ),
       );
     }
@@ -1244,75 +1249,13 @@ class _TvEpisodeListState extends State<_TvEpisodeList> {
     if (chips.isEmpty) return listView;
 
     return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const SizedBox(height: 16),
+        const SizedBox(height: 12),
         ...chips,
-        const SizedBox(height: 16),
+        const SizedBox(height: 12),
         Expanded(child: listView),
       ],
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TV season chip row — a horizontal scrollable row of [TvFocusable] season
-// pills.  Shown above the episode list when a title has multiple seasons.
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _TvSeasonChips extends StatelessWidget {
-  const _TvSeasonChips({
-    required this.seasons,
-    required this.currentSeason,
-    required this.onSelect,
-  });
-
-  final List<int> seasons;
-  final int currentSeason;
-  final ValueChanged<int> onSelect;
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      height: 48,
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        itemCount: seasons.length,
-        separatorBuilder: (_, _) => const SizedBox(width: 8),
-        itemBuilder: (_, i) {
-          final s = seasons[i];
-          final selected = s == currentSeason;
-          return TvFocusable(
-            key: ValueKey('tv-season-$s'),
-            variant: TvFocusVariant.pill,
-            onTap: () => onSelect(s),
-            semanticLabel: 'Season $s',
-            builder: (focused) => Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-              decoration: BoxDecoration(
-                // Current season = solid white chip (black text); focus adds the
-                // pill scale-up on top. No red.
-                color: focused
-                    ? null
-                    : (selected ? Colors.white : AppColors.surface2),
-                borderRadius: BorderRadius.circular(20),
-              ),
-              // Excluded — semanticLabel above already announces the season.
-              child: ExcludeSemantics(
-                child: Text(
-                  'Season $s',
-                  style: AppText.caption.copyWith(
-                    color: focused
-                        ? Colors.black
-                        : (selected ? Colors.black : AppColors.textPrimary),
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-            ),
-          );
-        },
-      ),
     );
   }
 }
@@ -1413,7 +1356,7 @@ class _TvEpisodeDescriptionDialogState
               ),
               const SizedBox(height: 20),
               Align(
-                alignment: Alignment.centerRight,
+                alignment: AlignmentDirectional.centerEnd,
                 child: TvFocusable(
                   focusNode: _closeFocus,
                   variant: TvFocusVariant.pill,

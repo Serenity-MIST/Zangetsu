@@ -7,11 +7,14 @@ import '../models/video_source.dart';
 import '../playback/source_health_store.dart';
 import '../di/injector.dart';
 import '../provider/cf_solve_needed.dart';
+import '../provider/cloudstream_provider.dart';
 import '../provider/js_engine.dart';
 import '../provider/provider_manager.dart';
 import '../repository/source_repository.dart';
 import 'match_store.dart';
 import 'source_matcher.dart';
+import 'source_order_prefs.dart';
+import 'source_score_store.dart';
 import 'zmode_ids.dart';
 import 'zmode_source_prefs.dart';
 
@@ -77,6 +80,7 @@ class EpisodeNotAvailable implements Exception {
     this.episode, {
     this.hadTitleMatch = false,
     this.outcomes = const [],
+    this.selectedSourceName,
   });
   final ZCanonical canonical;
   final int episode;
@@ -87,6 +91,9 @@ class EpisodeNotAvailable implements Exception {
 
   /// What each candidate actually did. See [sweepFailureDetail].
   final List<SweepOutcome> outcomes;
+
+  /// Set when a user-selected source alone was checked.
+  final String? selectedSourceName;
 
   @override
   String toString() => hadTitleMatch
@@ -124,6 +131,23 @@ class ResolvedPlayback {
   final int episode;
 }
 
+/// One emission of [PlaybackResolver.resolveProgressive]: the winner so far
+/// plus the streams known to date, in final-list order. `done == true` ends
+/// the stream; no further events follow a done event.
+class ProgressiveResolve {
+  const ProgressiveResolve({
+    required this.match,
+    required this.episodeUrl,
+    required this.streams,
+    required this.done,
+  });
+
+  final SourceMatch match;
+  final String episodeUrl;
+  final List<VideoSource> streams;
+  final bool done;
+}
+
 /// Sweeps installed video sources at play time until one can serve streams for
 /// a metadata episode. Winner is cached for [polledSources] and next-episode
 /// prefetch on the same session.
@@ -141,14 +165,24 @@ class PlaybackResolver {
 
     /// Likewise for [chosenSourceBudget].
     Duration? chosenBudget,
+
+    /// Likewise for [relaxedPerSourceBudget].
+    Duration? relaxedBudget,
+
+    /// Counts a play against the source that served it. Optional — see
+    /// [_scores].
+    SourceScoreStore? scores,
   }) : _budget = perSourceBudget ?? defaultPerSourceBudget,
        _chosenBudget = chosenBudget ?? chosenSourceBudget,
+       _relaxedBudget =
+           relaxedBudget ?? perSourceBudget ?? relaxedPerSourceBudget,
        _matcher = matcher,
        _sources = sources,
        _store = store,
        _prefs = prefs,
        _health = health,
-       _candidates = candidates;
+       _candidates = candidates,
+       _scores = scores;
 
   final SourceMatcher _matcher;
   final SourceRepository _sources;
@@ -156,6 +190,11 @@ class PlaybackResolver {
   final ZSourcePrefs _prefs;
   final SourceHealthStore _health;
   final List<({String id, String name})> Function(ZKind) _candidates;
+
+  /// Counts a play against the source that served it, so Auto Resolve can rank
+  /// on what has actually worked. Optional: every existing test builds this
+  /// resolver without one, and a missing store simply means nothing is counted.
+  final SourceScoreStore? _scores;
   late Future<({String title, String? alt, int? malId})> Function(ZCanonical c)
   _titleLookup;
 
@@ -172,7 +211,11 @@ class PlaybackResolver {
   /// the same metadata url, so a single key would hand a dub request whatever
   /// sub resolved earlier — the same stale-cache shape that made a switched
   /// source keep playing the old one.
-  final Map<String, ({String episodeUrl, String sourceId})> _winners = {};
+  ///
+  /// The winning match is kept too, so [resolveProgressive] can replay it
+  /// without re-sweeping.
+  final Map<String, ({String episodeUrl, String sourceId, SourceMatch match})>
+  _winners = {};
 
   static String _winKey(String zmEpisodeUrl, String category) =>
       '$zmEpisodeUrl|$category';
@@ -188,12 +231,43 @@ class PlaybackResolver {
   /// a second spent in one was a second of frames not drawn.
   ///
   /// That last part is no longer true where [JsEngine.runsOffUiIsolate] — the
-  /// wait is now just a wait. It stays 8s anyway for sources nobody chose:
-  /// with a long source list, being patient with all of them is how a Play tap
-  /// turns into a minute. Patience is spent on the one the viewer picked; see
-  /// [chosenSourceBudget].
+  /// wait is now just a wait — so this 8s is now only the fallback for where
+  /// it IS still true (Apple, which runs JavaScriptCore in-process). There,
+  /// 8s of patience would still be 8s of frozen frames.
+  ///
+  /// Everywhere else, see [relaxedPerSourceBudget].
   static const Duration defaultPerSourceBudget = Duration(seconds: 8);
   final Duration _budget;
+
+  /// What an un-chosen source gets where the wait costs no frames.
+  ///
+  /// 8s was never the source's fault. It bounded UI freeze, and once provider
+  /// JS moved off the UI isolate it stopped bounding anything except total
+  /// sweep length — while still being short enough to throw away a source that
+  /// simply answers slowly. That produced the reported bug directly: a source
+  /// needing ~12s was cut off by Auto Resolve and reported as having nothing,
+  /// then played perfectly the moment the viewer picked it by hand, because a
+  /// hand-picked source gets [chosenSourceBudget] instead.
+  ///
+  /// Same patience for both now, so "Auto Resolve says no, picking it says
+  /// yes" cannot happen. Total sweep length is bounded by the source cap and
+  /// the waves instead — by asking fewer sources and asking them together,
+  /// rather than by giving up on each one early.
+  /// How many candidates a sweep asks at once.
+  ///
+  /// Three, not ten: the sweep stops at the first source that answers, so a
+  /// bigger wave spends requests on titles that were about to work anyway.
+  /// Three roughly thirds the wait when nothing has the episode while asking
+  /// at most two sources more than strictly needed when something does.
+  ///
+  /// Caveat worth knowing: the bundled JS providers share one QuickJS engine
+  /// (`_serialized` in provider_manager.dart), so several of THOSE in one wave
+  /// still run one after another. CloudStream, Aniyomi and Mihon sources are
+  /// native and genuinely overlap, and they are the bulk of a real library.
+  static const int sweepWaveSize = 3;
+
+  static const Duration relaxedPerSourceBudget = Duration(seconds: 20);
+  final Duration _relaxedBudget;
 
   /// What a source the viewer PICKED gets instead — pinned for this title, or
   /// set as the default for the kind. Both are an explicit "use this one", and
@@ -209,10 +283,15 @@ class PlaybackResolver {
   final Duration _chosenBudget;
 
   /// The budget for [sourceId] given the sources this viewer chose.
-  Duration _budgetFor(String sourceId, Set<String> chosen) =>
-      JsEngine.runsOffUiIsolate && chosen.contains(sourceId)
-      ? _chosenBudget
-      : _budget;
+  ///
+  /// Where the wait is free (JS off the UI isolate), a chosen source still gets
+  /// the most patience, and everything else gets [relaxedPerSourceBudget]
+  /// rather than the old 8s. Where it is not free, the tight budget applies to
+  /// everything, chosen or not — exactly as before.
+  Duration _budgetFor(String sourceId, Set<String> chosen) {
+    if (!JsEngine.runsOffUiIsolate) return _budget;
+    return chosen.contains(sourceId) ? _chosenBudget : _relaxedBudget;
+  }
 
   /// The sources the viewer explicitly picked for [c] — the per-title pin and
   /// the kind-wide default. NOT `lastPlayed`: that is the app's own memory of
@@ -308,6 +387,10 @@ class PlaybackResolver {
     if (!_abortSignal.isCompleted) _abortSignal.complete();
     // Fresh signal, so a sweep started after this one isn't born aborted.
     _abortSignal = Completer<void>();
+    // The native hunt behind the in-flight candidate is uncancellable from
+    // here by waiting — tell it to stop so dead servers stop holding a pool
+    // thread to their cap after the screen is gone.
+    unawaited(CloudStreamProvider.cancelInFlightLinks());
   }
 
   /// Completed by [abortSweeps] to wake a sweep blocked on a candidate.
@@ -370,14 +453,317 @@ class PlaybackResolver {
       _noSource.remove(flightKey);
     }
     if (accept != null) {
-      return _resolve(zmEpisodeUrl, fast: fast, category: category, accept: accept);
+      return _resolve(
+        zmEpisodeUrl,
+        fast: fast,
+        category: category,
+        accept: accept,
+      );
     }
     final f = _resolve(zmEpisodeUrl, fast: fast, category: category)
         .whenComplete(() {
-      _inFlight.remove(flightKey);
-    });
+          _inFlight.remove(flightKey);
+        });
     _inFlight[flightKey] = f;
     return f;
+  }
+
+  /// Progressive twin of [resolveForPlayback]: yields the first genuine hit
+  /// without awaiting the rest of the sweep, then keeps yielding late
+  /// arrivals until every wave settles or the viewer leaves.
+  ///
+  /// With Auto Resolve active, uses the same budgets, skip memory
+  /// ([_overBudget]) and abort machinery as [_resolve]. An explicitly selected
+  /// source is resolved alone; its later mirrors are collected by polling.
+  /// Download callers must keep using [resolveForPlayback]: a file needs every
+  /// mirror upfront.
+  ///
+  /// Ordering is candidate order, exactly as [_resolve] reads its waves back:
+  /// a wave's candidates are asked at once, but a hit is yielded only once
+  /// every higher-priority candidate in its wave has answered. The pinned
+  /// source is asked before its wave-mates are even started, so a fast
+  /// non-pinned hit can never slip out ahead of a slow pinned miss — and a
+  /// pinned miss means they are never asked at all.
+  ///
+  /// When a winner is already cached, the first event carries its streams
+  /// immediately (same short-circuit as [sources]) and the stream ends — the
+  /// poll path still collects the rest, exactly as on a replay today.
+  Stream<ProgressiveResolve> resolveProgressive(
+    String zmEpisodeUrl, {
+    String category = 'sub',
+  }) async* {
+    // Read FIRST, before any await — same reason as [_resolve]: a generation
+    // taken after one reads whatever an abort already set, so the sweep it
+    // was meant to stop never sees a change.
+    final gen = _sweepGen;
+    // Derived ONCE per sweep, not per candidate — same reason as [_resolve].
+    final abortFuture = _abortSignal.future.then<_Attempt?>((_) => null);
+    final p = ZmodeIds.parseEpisode(zmEpisodeUrl);
+    if (p == null) {
+      throw ArgumentError('not a metadata episode url: $zmEpisodeUrl');
+    }
+    // A sweep that found nothing is remembered by the full path; a replay
+    // through here answers from that memory instead of paying the sweep again.
+    final flightKey = _winKey(zmEpisodeUrl, category);
+    final miss = _noSource[flightKey];
+    if (miss != null) {
+      if (DateTime.now().difference(miss.at) < noSourceCooldown) {
+        if (!miss.hadTitleMatch) throw NoSourceMatch(p.show);
+        throw EpisodeNotAvailable(p.show, p.episode, hadTitleMatch: true);
+      }
+      _noSource.remove(flightKey);
+    }
+    // Winner-cache short-circuit, same as [sources]: a replay opens on the
+    // cached winner's streams immediately instead of re-sweeping. `fast: true`
+    // is what Play passes on that path today (prefetch/TTL/first-link).
+    final hit = _winners[flightKey];
+    if (hit != null) {
+      // A cached winner is resolved on the foreground Play path. Race the
+      // provider call with the sweep abort so leaving the player does not
+      // wait for a slow native/network lookup to return.
+      final streams = await Future.any<List<VideoSource>>([
+        _sources.sources(hit.episodeUrl, sourceId: hit.sourceId, fast: true),
+        abortFuture.then<List<VideoSource>>(
+          (_) => throw const PlaybackAborted(),
+        ),
+      ]);
+      if (gen != _sweepGen) throw const PlaybackAborted();
+      if (streams.isNotEmpty) {
+        yield ProgressiveResolve(
+          match: hit.match,
+          episodeUrl: hit.episodeUrl,
+          streams: streams,
+          done: true,
+        );
+        return;
+      }
+      // Stale winner: serves nothing anymore. Drop it and sweep fresh rather
+      // than handing playback an empty list.
+      _winners.remove(flightKey);
+    }
+    final t = await _titleLookup(p.show);
+    // Explicit per-title and kind-wide choices both mean use this source, not
+    // merely put it first in an Auto Resolve sweep.
+    final selectedSource = _matcher.sourceForTitle(p.show);
+    final ordered = _orderedCandidates(p.show);
+    if (ordered.isEmpty) {
+      throw NoSourceMatch(p.show);
+    }
+
+    final chosen = _chosenSources(p.show);
+    final dead =
+        _unplayable[_winKey(zmEpisodeUrl, category)] ?? const <String>{};
+    final outcomes = <SweepOutcome>[];
+    void note(String sourceId, SweepReason reason) => outcomes.add((
+      sourceId: sourceId,
+      name: _sources.displayName(sourceId),
+      reason: reason,
+    ));
+
+    var hadTitleMatch = false;
+
+    // One candidate, start to finish — same body as [_resolve]'s `ask`, minus
+    // the download branch: progressive is always the foreground wait.
+    Future<_Attempt?> ask(String sourceId) async {
+      _Attempt? attempt;
+      final budget = _budgetFor(sourceId, chosen);
+      try {
+        final call = _tryCandidate(
+          p,
+          sourceId,
+          t,
+          // Playback needs the first usable link, not every mirror. CloudStream
+          // can return early while its native link session keeps resolving;
+          // the player picks up those later links through pollSources.
+          fast: true,
+          category: category,
+          onTitleMatch: () => hadTitleMatch = true,
+          onMiss: (reason) => note(sourceId, reason),
+        ).timeout(budget);
+        // Stop WAITING when the viewer leaves; the answer underneath is
+        // dropped, exactly as for an over-budget candidate.
+        attempt = await Future.any<_Attempt?>([call, abortFuture]);
+        // The loser still completes. Swallow it, or the TimeoutException
+        // nobody is waiting for surfaces as an unhandled async error.
+        if (attempt == null) {
+          unawaited(call.then<void>((_) {}, onError: (_) {}));
+        }
+      } on TimeoutException {
+        _overBudget[sourceId] = DateTime.now();
+        note(sourceId, SweepReason.timedOut);
+      } catch (_) {
+        note(sourceId, SweepReason.failed);
+      }
+      return attempt;
+    }
+
+    // Streams known to date, in candidate order, URL-deduped. Every event
+    // carries a copy of this — never the last hit alone.
+    final acc = <VideoSource>[];
+    final seenUrls = <String>{};
+    _Attempt? firstHit;
+    var winnerWritten = false;
+
+    // Records one genuine hit and builds its event. Winner cache, last-played
+    // and score go to the FIRST genuine hit in candidate order only — the
+    // single-winner bookkeeping [_resolve] does. Late arrivals only extend
+    // the accumulated list.
+    Future<ProgressiveResolve> recordHit(_Attempt attempt) async {
+      if (!winnerWritten) {
+        winnerWritten = true;
+        firstHit = attempt;
+        _winners[_winKey(zmEpisodeUrl, category)] = (
+          episodeUrl: attempt.episodeUrl,
+          sourceId: attempt.match.sourceId,
+          match: attempt.match,
+        );
+        if (!attempt.match.pinned) {
+          await _store.rememberLastPlayed(p.show, attempt.match.sourceId);
+          await _scores?.bump(attempt.match.sourceId);
+        }
+      }
+      for (final s in attempt.streams) {
+        if (seenUrls.add(s.url)) acc.add(s);
+      }
+      return ProgressiveResolve(
+        match: attempt.match,
+        episodeUrl: attempt.episodeUrl,
+        streams: [...acc],
+        done: false,
+      );
+    }
+
+    // A manually selected source is the whole playback resolution, not merely
+    // the first wave. Finish after its fast links; the player's poll path still
+    // collects late mirrors belonging to this same winning provider.
+    if (selectedSource != null) {
+      final attempt = await ask(selectedSource);
+      if (gen != _sweepGen) throw const PlaybackAborted();
+      if (attempt != null) {
+        final event = await recordHit(attempt);
+        yield ProgressiveResolve(
+          match: event.match,
+          episodeUrl: event.episodeUrl,
+          streams: event.streams,
+          done: true,
+        );
+        return;
+      }
+    }
+
+    for (
+      var start = 0;
+      selectedSource == null && start < ordered.length;
+      start += sweepWaveSize
+    ) {
+      // Same bargain as [_resolve]: a wave already in flight cannot be
+      // recalled, so leaving stops the NEXT wave, not this one.
+      if (gen != _sweepGen) {
+        throw const PlaybackAborted();
+      }
+
+      // The cheap, synchronous rules first — same pre-filter as [_resolve],
+      // so a skipped source never occupies a slot in the wave.
+      final wave = <String>[];
+      for (final sourceId in ordered.skip(start).take(sweepWaveSize)) {
+        if (dead.contains(sourceId)) {
+          note(sourceId, SweepReason.streamsDead);
+          continue;
+        }
+        if (CfSolveNeeded.sourceFlagged(sourceId)) {
+          note(sourceId, SweepReason.cloudflare);
+          continue;
+        }
+        if (_health.isSkippable(sourceId)) {
+          note(sourceId, SweepReason.unhealthy);
+          continue;
+        }
+        if (_recentlyOverBudget(sourceId)) {
+          note(sourceId, SweepReason.cooldown);
+          continue;
+        }
+        wave.add(sourceId);
+      }
+      if (wave.isEmpty) continue;
+
+      // Asked at once, yielded in candidate order: every landing is parked by
+      // candidate id and the wave drains from the front, so a hit is yielded
+      // only once all higher-priority candidates in the wave have answered.
+      final pending = <String, Future<_Attempt?>>{
+        for (final id in wave) id: ask(id),
+      };
+      final verdicts = <String, _Attempt?>{};
+      var cursor = 0;
+      while (verdicts.length < pending.length) {
+        // Fresh wrappers each round over the same ask futures; the landed
+        // VALUE carries its candidate id, so attribution can never slip no
+        // matter how many asks complete in the same microtask. Keyed by
+        // candidate id — never by list position.
+        final landed = await Future.any([
+          for (final entry in pending.entries)
+            if (!verdicts.containsKey(entry.key))
+              entry.value.then<({String id, _Attempt? attempt})>(
+                (a) => (id: entry.key, attempt: a),
+              ),
+        ]);
+        verdicts[landed.id] = landed.attempt;
+        // Same post-wait check as [_resolve]: the wave races the abort
+        // signal, so a null here may mean the viewer left, not a miss.
+        if (gen != _sweepGen) {
+          throw const PlaybackAborted();
+        }
+        while (cursor < wave.length && verdicts.containsKey(wave[cursor])) {
+          final id = wave[cursor++];
+          final attempt = verdicts[id];
+          if (attempt == null) continue;
+          yield await recordHit(attempt);
+        }
+      }
+    }
+
+    final done = firstHit;
+    if (done == null) {
+      // Nothing answered — the same verdicts the full sweep reports, and
+      // the same short-lived memory so the next tap answers instantly.
+      final blocked = _matcher.cfBlockedUrl(p.show.kind);
+      if (blocked != null && !hadTitleMatch) {
+        debugPrint(
+          '[playback] resolveProgressive · CF blocked for kind=${p.show.kind} '
+          'url=$blocked',
+        );
+      }
+      _noSource[_winKey(zmEpisodeUrl, category)] = (
+        at: DateTime.now(),
+        hadTitleMatch: hadTitleMatch,
+      );
+      if (hadTitleMatch) {
+        throw EpisodeNotAvailable(
+          p.show,
+          p.episode,
+          hadTitleMatch: true,
+          outcomes: outcomes,
+          selectedSourceName: selectedSource == null
+              ? null
+              : _sources.displayName(selectedSource),
+        );
+      }
+      throw NoSourceMatch(
+        p.show,
+        outcomes: outcomes,
+        selectedSourceName: selectedSource == null
+            ? null
+            : _sources.displayName(selectedSource),
+      );
+    }
+    // The full accumulation in candidate order — not the last hit alone.
+    // `match` is the recorded winner: the first genuine hit, i.e. what the
+    // full sweep would have returned.
+    yield ProgressiveResolve(
+      match: done.match,
+      episodeUrl: done.episodeUrl,
+      streams: [...acc],
+      done: true,
+    );
   }
 
   Future<ResolvedPlayback> _resolve(
@@ -423,7 +809,8 @@ class PlaybackResolver {
     }
 
     final chosen = _chosenSources(p.show);
-    final dead = _unplayable[_winKey(zmEpisodeUrl, category)] ?? const <String>{};
+    final dead =
+        _unplayable[_winKey(zmEpisodeUrl, category)] ?? const <String>{};
     final outcomes = <SweepOutcome>[];
     void note(String sourceId, SweepReason reason) => outcomes.add((
       sourceId: sourceId,
@@ -432,54 +819,13 @@ class PlaybackResolver {
     ));
 
     var hadTitleMatch = false;
-    for (final sourceId in ordered) {
-      // First thing in the loop, so leaving stops the very next candidate
-      // rather than one more source's worth of blocked UI. Throws instead of
-      // breaking: falling through to the bottom would record a miss, and a
-      // sweep that stopped after two of twenty candidates has no business
-      // telling the next tap that nothing has this episode.
-      if (accept == null && gen != _sweepGen) {
-        debugPrint(
-          '[playback] _resolve · abandoned at $sourceId — the viewer left',
-        );
-        throw const PlaybackAborted();
-      }
-      // Asked already this episode, and its links would not play. Handing
-      // them back a second time is how "every source failed (tried 1)"
-      // happened with twenty more sources sitting untouched.
-      if (dead.contains(sourceId)) {
-        debugPrint(
-          '[playback] _resolve · skip $sourceId (its links did not play)',
-        );
-        note(sourceId, SweepReason.streamsDead);
-        continue;
-      }
-      if (CfSolveNeeded.sourceFlagged(sourceId)) {
-        debugPrint(
-          '[playback] _resolve · skip $sourceId (CF blocked)',
-        );
-        note(sourceId, SweepReason.cloudflare);
-        continue;
-      }
-      if (_health.isSkippable(sourceId)) {
-        debugPrint(
-          '[playback] _resolve · skip $sourceId (unhealthy)',
-        );
-        note(sourceId, SweepReason.unhealthy);
-        continue;
-      }
-      if (_recentlyOverBudget(sourceId)) {
-        debugPrint(
-          '[playback] _resolve · skip $sourceId (over budget recently)',
-        );
-        note(sourceId, SweepReason.cooldown);
-        continue;
-      }
 
+    // One candidate, start to finish. Lifted out of the loop VERBATIM so the
+    // sweep can run several at once without the per-source rules changing: the
+    // try/catch is still per candidate, so one source throwing ("no sources in
+    // response") or hanging cannot kill the others.
+    Future<_Attempt?> ask(String sourceId) async {
       debugPrint('[playback] _resolve · trying $sourceId');
-      // The try/catch is per candidate, not around the sweep: one source
-      // throwing ("no sources in response") or hanging must not kill the
-      // others — fall through to the next candidate instead.
       _Attempt? attempt;
       final budget = _budgetFor(sourceId, chosen);
       try {
@@ -496,8 +842,6 @@ class PlaybackResolver {
           // Stop WAITING when the viewer leaves. The request underneath is not
           // cancellable, so it finishes in the background and its answer is
           // dropped — exactly what already happens to an over-budget one.
-          // A null here falls into the `attempt == null` continue below, and
-          // the top of the loop then throws PlaybackAborted as it always did.
           attempt = await Future.any<_Attempt?>([call, abortFuture]);
           // The loser still completes. Swallow it, or the TimeoutException
           // nobody is waiting for surfaces as an unhandled async error.
@@ -523,46 +867,167 @@ class PlaybackResolver {
           '[playback] _resolve · $sourceId → error during resolution: $e',
         );
       }
-      if (attempt == null) {
-        // A source the viewer PICKED by hand is not a candidate among others.
-        // Walking past it to whatever answers next meant pinning AnimePahe and
-        // silently getting Netflix 25 seconds later — the substitution was
-        // never mentioned, so it read as the pin being ignored. Stop here and
-        // let the failure say what happened to the source they chose.
-        //
-        // Playback only (accept == null): a download sweep is looking for a
-        // file any source can provide, not honouring a viewing choice. And
-        // only when it FAILED — a pin that answers still hands off to the
-        // player's own dead-link failover, which is a different question.
-        // gen check first: the viewer LEAVING is not the pin failing, and the
-        // top of the loop still has to throw PlaybackAborted for it.
-        if (accept == null && sourceId == pinned && gen == _sweepGen) {
-          debugPrint(
-            '[playback] _resolve · $sourceId was pinned by hand and did not '
-            'answer — not substituting another source',
-          );
-          break;
-        }
-        continue;
-      }
+      return attempt;
+    }
 
-      // The caller can require more than "has streams". Downloading does: a
-      // source can play perfectly and still hand back only DASH manifests,
-      // which never become a file. Asking here keeps it to ONE sweep that
-      // walks every candidate — the alternative was re-running the whole
-      // sweep per rejected source, which is quadratic and froze the app.
-      if (accept != null && !accept(attempt.streams)) {
+    // Walked in WAVES rather than one at a time. A sweep that finds nothing
+    // used to be the sum of every candidate's wait; now it is the sum of each
+    // wave's slowest member, which is what a failing Play tap actually costs.
+    //
+    // Deliberately small. The sweep stops at the first source that answers, so
+    // a wave of ten would fire ten requests where one would have done on every
+    // title that works — paying on the common case to speed up the rare one.
+    // Three is enough to cut the wait meaningfully and small enough that the
+    // waste is a rounding error.
+    //
+    // Results are read back in CANDIDATE order, never completion order: the
+    // list is the viewer's own priority, and letting whichever source answers
+    // first win would quietly replace their ordering with a race.
+    outer:
+    for (var start = 0; start < ordered.length; start += sweepWaveSize) {
+      // Once per wave rather than once per candidate. A wave already in flight
+      // cannot be recalled — the requests underneath are not cancellable — so
+      // leaving stops the NEXT wave, not this one. That is the same bargain as
+      // before, just measured in threes.
+      if (accept == null && gen != _sweepGen) {
         debugPrint(
-          '[playback] _resolve · ${attempt.match.sourceId} answered but the '
-          'caller rejected its streams — next candidate',
+          '[playback] _resolve · abandoned before wave at $start — '
+          'the viewer left',
         );
-        continue;
+        throw const PlaybackAborted();
       }
 
-      // A filtered sweep answers a narrower question, so it must not become
-      // the remembered winner: playback would inherit a source picked for
-      // being downloadable rather than for playing well.
-      if (accept != null) {
+      // The cheap, synchronous rules first, so a skipped source never occupies
+      // a slot in the wave. Each still notes its own reason, and still only
+      // for candidates the sweep actually reached — pre-filtering the whole
+      // list would report sources it never got to.
+      final wave = <String>[];
+      for (final sourceId in ordered.skip(start).take(sweepWaveSize)) {
+        // Asked already this episode, and its links would not play. Handing
+        // them back a second time is how "every source failed (tried 1)"
+        // happened with twenty more sources sitting untouched.
+        if (dead.contains(sourceId)) {
+          debugPrint(
+            '[playback] _resolve · skip $sourceId (its links did not play)',
+          );
+          note(sourceId, SweepReason.streamsDead);
+          continue;
+        }
+        if (CfSolveNeeded.sourceFlagged(sourceId)) {
+          debugPrint('[playback] _resolve · skip $sourceId (CF blocked)');
+          note(sourceId, SweepReason.cloudflare);
+          continue;
+        }
+        if (_health.isSkippable(sourceId)) {
+          debugPrint('[playback] _resolve · skip $sourceId (unhealthy)');
+          note(sourceId, SweepReason.unhealthy);
+          continue;
+        }
+        if (_recentlyOverBudget(sourceId)) {
+          debugPrint(
+            '[playback] _resolve · skip $sourceId (over budget recently)',
+          );
+          note(sourceId, SweepReason.cooldown);
+          continue;
+        }
+        wave.add(sourceId);
+      }
+      if (wave.isEmpty) continue;
+
+      // `ask` never throws — every failure inside it is caught and returns
+      // null — so one bad source in a wave cannot take the others down.
+      final answers = await Future.wait([for (final id in wave) ask(id)]);
+
+      // Again on the way out, not only on the way in. Every candidate in the
+      // wave races the abort signal and comes back null the moment it fires,
+      // so the wave itself ends promptly — but if this was the LAST wave the
+      // loop would then fall through to the bottom and report "nothing has
+      // this episode", which is not what happened. The viewer left.
+      if (accept == null && gen != _sweepGen) {
+        debugPrint(
+          '[playback] _resolve · abandoned mid-wave at $start — '
+          'the viewer left',
+        );
+        throw const PlaybackAborted();
+      }
+
+      for (var i = 0; i < wave.length; i++) {
+        final sourceId = wave[i];
+        final attempt = answers[i];
+        if (attempt == null) {
+          // A source the viewer PICKED by hand is not a candidate among others.
+          // Walking past it to whatever answers next meant pinning AnimePahe and
+          // silently getting Netflix 25 seconds later — the substitution was
+          // never mentioned, so it read as the pin being ignored. Stop here and
+          // let the failure say what happened to the source they chose.
+          //
+          // Playback only (accept == null): a download sweep is looking for a
+          // file any source can provide, not honouring a viewing choice. And
+          // only when it FAILED — a pin that answers still hands off to the
+          // player's own dead-link failover, which is a different question.
+          // gen check first: the viewer LEAVING is not the pin failing, and the
+          // top of the loop still has to throw PlaybackAborted for it.
+          if (accept == null && sourceId == pinned && gen == _sweepGen) {
+            debugPrint(
+              '[playback] _resolve · $sourceId was pinned by hand and did not '
+              'answer — not substituting another source',
+            );
+            // The whole sweep, not just this wave: the point is that no OTHER
+            // source gets substituted, and the rest of the wave is other
+            // sources. Their answers are discarded with the loop.
+            break outer;
+          }
+          continue;
+        }
+
+        // The caller can require more than "has streams". Downloading does: a
+        // source can play perfectly and still hand back only DASH manifests,
+        // which never become a file. Asking here keeps it to ONE sweep that
+        // walks every candidate — the alternative was re-running the whole
+        // sweep per rejected source, which is quadratic and froze the app.
+        if (accept != null && !accept(attempt.streams)) {
+          debugPrint(
+            '[playback] _resolve · ${attempt.match.sourceId} answered but the '
+            'caller rejected its streams — next candidate',
+          );
+          continue;
+        }
+
+        // A filtered sweep answers a narrower question, so it must not become
+        // the remembered winner: playback would inherit a source picked for
+        // being downloadable rather than for playing well.
+        if (accept != null) {
+          return ResolvedPlayback(
+            match: attempt.match,
+            episodeUrl: attempt.episodeUrl,
+            streams: attempt.streams,
+            show: p.show,
+            episode: p.episode,
+          );
+        }
+
+        // Written here rather than inside _tryCandidate so an abandoned
+        // (timed-out) candidate that finishes later can never overwrite the
+        // winner of the source we actually settled on.
+        _winners[_winKey(zmEpisodeUrl, category)] = (
+          episodeUrl: attempt.episodeUrl,
+          sourceId: attempt.match.sourceId,
+          match: attempt.match,
+        );
+        // Per-title only — remembered for THIS show's own re-ranking (see
+        // `_orderedCandidates`). This must never write the kind-wide
+        // `ZSourcePrefs` default: that's an explicit, rare user choice (the
+        // "source went quiet" recovery picker), and a single successful
+        // Auto Resolve play silently promoting itself to play EVERY title of
+        // the kind is exactly the bug this design fixes.
+        if (!attempt.match.pinned) {
+          await _store.rememberLastPlayed(p.show, attempt.match.sourceId);
+          await _scores?.bump(attempt.match.sourceId);
+        }
+        debugPrint(
+          '[playback] $zmEpisodeUrl -> ${attempt.match.sourceId} '
+          '(${attempt.streams.length} streams)',
+        );
         return ResolvedPlayback(
           match: attempt.match,
           episodeUrl: attempt.episodeUrl,
@@ -571,32 +1036,6 @@ class PlaybackResolver {
           episode: p.episode,
         );
       }
-
-      // Written here rather than inside _tryCandidate so an abandoned
-      // (timed-out) candidate that finishes later can never overwrite the
-      // winner of the source we actually settled on.
-      _winners[_winKey(zmEpisodeUrl, category)] =
-          (episodeUrl: attempt.episodeUrl, sourceId: attempt.match.sourceId);
-      // Per-title only — remembered for THIS show's own re-ranking (see
-      // `_orderedCandidates`). This must never write the kind-wide
-      // `ZSourcePrefs` default: that's an explicit, rare user choice (the
-      // "source went quiet" recovery picker), and a single successful
-      // Auto Resolve play silently promoting itself to play EVERY title of
-      // the kind is exactly the bug this design fixes.
-      if (!attempt.match.pinned) {
-        await _store.rememberLastPlayed(p.show, attempt.match.sourceId);
-      }
-      debugPrint(
-        '[playback] $zmEpisodeUrl -> ${attempt.match.sourceId} '
-        '(${attempt.streams.length} streams)',
-      );
-      return ResolvedPlayback(
-        match: attempt.match,
-        episodeUrl: attempt.episodeUrl,
-        streams: attempt.streams,
-        show: p.show,
-        episode: p.episode,
-      );
     }
 
     final blocked = _matcher.cfBlockedUrl(p.show.kind);
@@ -609,8 +1048,10 @@ class PlaybackResolver {
       // cfBlockedUrl covers suppressed searches.
     }
 
-    _noSource[_winKey(zmEpisodeUrl, category)] =
-        (at: DateTime.now(), hadTitleMatch: hadTitleMatch);
+    _noSource[_winKey(zmEpisodeUrl, category)] = (
+      at: DateTime.now(),
+      hadTitleMatch: hadTitleMatch,
+    );
     if (hadTitleMatch) {
       debugPrint(
         '[playback] _resolve → EpisodeNotAvailable '
@@ -645,7 +1086,11 @@ class PlaybackResolver {
   }) async {
     final hit = _winners[_winKey(zmEpisodeUrl, category)];
     if (hit != null) {
-      return _sources.sources(hit.episodeUrl, sourceId: hit.sourceId, fast: fast);
+      return _sources.sources(
+        hit.episodeUrl,
+        sourceId: hit.sourceId,
+        fast: fast,
+      );
     }
     return (await resolveForPlayback(
       zmEpisodeUrl,
@@ -687,8 +1132,7 @@ class PlaybackResolver {
     //
     // EVERY category: the keys carry one now, and a caller retrying an episode
     // means "forget what you know about it", not "forget the sub cut".
-    bool mine(String k) =>
-        k == zmEpisodeUrl || k.startsWith('$zmEpisodeUrl|');
+    bool mine(String k) => k == zmEpisodeUrl || k.startsWith('$zmEpisodeUrl|');
     // BOTH maps, independently. A sweep that found nothing leaves a _noSource
     // entry and no winner at all, so walking _winners alone would clear
     // nothing and Retry would keep answering from the remembered no.
@@ -816,8 +1260,7 @@ class PlaybackResolver {
     final out = StreamController<SourceProbe>();
     final clock = Stopwatch()..start();
     var stopped = false;
-    bool full() =>
-        stopped || out.isClosed || clock.elapsed > wallClock;
+    bool full() => stopped || out.isClosed || clock.elapsed > wallClock;
 
     Future<void> run() async {
       final p = ZmodeIds.parseEpisode(zmEpisodeUrl);
@@ -873,17 +1316,17 @@ class PlaybackResolver {
         } catch (e) {
           how = 'error: $e';
         }
-        debugPrint(
-          '[probe] $sourceId → $how (${sw.elapsedMilliseconds}ms)',
-        );
+        debugPrint('[probe] $sourceId → $how (${sw.elapsedMilliseconds}ms)');
         final timedOut = how == 'timeout';
         if (!out.isClosed) {
-          out.add(SourceProbe(
-            sourceId: sourceId,
-            name: name,
-            episodeUrl: srcEp?.url,
-            match: match,
-          ));
+          out.add(
+            SourceProbe(
+              sourceId: sourceId,
+              name: name,
+              episodeUrl: srcEp?.url,
+              match: match,
+            ),
+          );
         }
         return timedOut;
       }
@@ -989,6 +1432,26 @@ class PlaybackResolver {
     return _sources.sources(ep.url, sourceId: match.sourceId, fast: fast);
   }
 
+  /// Warms Continue Watching from the source already remembered for this
+  /// title, without starting an Auto Resolve sweep.
+  ///
+  /// A background prewarm is speculative work: if the remembered source no
+  /// longer has the episode, leave playback to handle that after a real tap.
+  /// Contacting fallback sources here makes merely opening Home run provider
+  /// searches the viewer never requested.
+  Future<List<VideoSource>> prewarmRememberedSource(
+    String zmEpisodeUrl, {
+    String category = 'sub',
+  }) async {
+    final parsed = ZmodeIds.parseEpisode(zmEpisodeUrl);
+    if (parsed == null) return const [];
+    final remembered = _store.bestFor(parsed.show);
+    if (remembered == null) return const [];
+    final title = await _titleLookup(parsed.show);
+    await _hasEpisode(parsed, remembered.sourceId, title, category: category);
+    return const [];
+  }
+
   /// [body] with the blocking Cloudflare solver disabled, when the JS provider
   /// manager is available to disable it. A no-op otherwise (tests, TV boot)
   /// rather than a hard dependency — suppression is an optimisation, never a
@@ -1042,10 +1505,11 @@ class PlaybackResolver {
     final m = probe.match;
     if (url == null || m == null) return;
     _noSource.remove(zmEpisodeUrl);
-    _winners[zmEpisodeUrl] = (episodeUrl: url, sourceId: m.sourceId);
+    _winners[zmEpisodeUrl] = (episodeUrl: url, sourceId: m.sourceId, match: m);
     final p = ZmodeIds.parseEpisode(zmEpisodeUrl);
     if (p != null && !m.pinned) {
       await _store.rememberLastPlayed(p.show, m.sourceId);
+      await _scores?.bump(m.sourceId);
     }
   }
 
@@ -1134,8 +1598,28 @@ class PlaybackResolver {
         final byRank = rank(a).compareTo(rank(b));
         return byRank != 0 ? byRank : position[a]!.compareTo(position[b]!);
       });
-    return sorted;
+    // Bounded by the SAME number the Source Priority screen shows. It used to
+    // cap only the title-match sweep, so "Try the top 3 sources" still asked
+    // all 32 here — the setting meant one thing on that screen and another in
+    // the player, which makes it not a setting.
+    //
+    // A pinned source and the last one that played rank 0 and 1 above, so the
+    // sources most likely to work are inside any cap, however small.
+    //
+    // The cost, deliberately taken: set it low and if those few serve dead
+    // links the episode does not play, even though a source further down
+    // would have. The failure sheet says only the top sources were checked,
+    // and the slider is the fix. A hidden floor here would put the lie back.
+    return sorted.take(_sweepCap(c.kind)).toList();
   }
+
+  /// How many sources a sweep may walk, from the user's Source Priority
+  /// setting. Falls back to the whole list where that store is not registered
+  /// — several tests build this resolver without DI, and bounding them to a
+  /// number they never set would change what they are testing.
+  int _sweepCap(ZKind kind) => sl.isRegistered<SourceOrderPrefs>()
+      ? sl<SourceOrderPrefs>().cap(kind)
+      : 1 << 30;
 
   int _healthRank(String id) => switch (_health.statusOf(id)) {
     SourceHealth.ok => 0,

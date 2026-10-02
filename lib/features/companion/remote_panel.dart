@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 
+/// Responsive presentation of receiver capabilities; transport decisions belong to RemoteSession.
 class RemotePanel extends StatelessWidget {
   const RemotePanel({
     super.key,
@@ -84,7 +85,12 @@ class RemotePanel extends StatelessWidget {
       onPress: () => command(action, {'phase': 'press'}),
       onRelease: () => command('release', {}),
       onTap: () => command(action, {}),
-      child: icon(symbol, label, () => command(action, {}), enabled: state['volumeAvailable'] != false),
+      child: icon(
+        symbol,
+        label,
+        () => command(action, {}),
+        enabled: state['volumeAvailable'] != false,
+      ),
     );
     final playback = Container(
       padding: const EdgeInsets.fromLTRB(12, 6, 12, 2),
@@ -497,11 +503,13 @@ class RemotePanel extends StatelessWidget {
   }
 }
 
+/// Keeps a common D-pad budget while anchoring playback above the mobile navigation dock.
 class _RemotePortraitLayout extends MultiChildLayoutDelegate {
   _RemotePortraitLayout(this.sharedHeight, this.anchorPlayback);
   final double sharedHeight;
   final bool anchorPlayback;
   @override
+  /// Measures content first, then allocates remaining height without introducing remote scrolling.
   void performLayout(Size size) {
     final loose = BoxConstraints(maxWidth: size.width, maxHeight: size.height);
     final header = layoutChild(0, loose);
@@ -541,6 +549,7 @@ class _RemotePortraitLayout extends MultiChildLayoutDelegate {
       sharedHeight != old.sharedHeight || anchorPlayback != old.anchorPlayback;
 }
 
+/// A single-pointer control that always pairs a press with release/cancel.
 class _HeldControl extends StatefulWidget {
   const _HeldControl({
     required this.enabled,
@@ -558,6 +567,7 @@ class _HeldControl extends StatefulWidget {
   State<_HeldControl> createState() => _HeldControlState();
 }
 
+/// Tracks pointer ownership so overlapping touches do not duplicate held commands.
 class _HeldControlState extends State<_HeldControl> {
   int? pointer;
   void release() {
@@ -598,6 +608,7 @@ class _HeldControlState extends State<_HeldControl> {
   );
 }
 
+/// Accessible directional pad whose visual regions share the same command dispatch.
 class CircularRemotePad extends StatefulWidget {
   const CircularRemotePad({
     super.key,
@@ -612,6 +623,7 @@ class CircularRemotePad extends StatefulWidget {
   State<CircularRemotePad> createState() => _CircularRemotePadState();
 }
 
+/// Owns touch/release state; hold timing and transport routing remain outside the painter.
 class _CircularRemotePadState extends State<CircularRemotePad> {
   String? _pressed;
   int? _pointer;
@@ -623,6 +635,7 @@ class _CircularRemotePadState extends State<CircularRemotePad> {
     }
   }
 
+  /// Emits a complete tap for semantic activation, including the release event.
   void _accessibleTap(String key) {
     _send(key);
     widget.onRelease?.call();
@@ -642,6 +655,7 @@ class _CircularRemotePadState extends State<CircularRemotePad> {
         : (d.dy < 0 ? 'up' : 'down');
   }
 
+  /// Dispatches only the current pad direction while enforcing one active touch.
   void _send(String key) {
     if (widget.enabled) {
       HapticFeedback.selectionClick();
@@ -752,6 +766,7 @@ class _CircularRemotePadState extends State<CircularRemotePad> {
   );
 }
 
+/// Draws the circular control; contains no input or transport logic.
 class _PadPainter extends CustomPainter {
   _PadPainter(this.surface, this.accent, this.pressed, this.enabled);
   final Color surface, accent;
@@ -805,6 +820,7 @@ class _PadPainter extends CustomPainter {
       old.enabled != enabled;
 }
 
+/// Keeps drag feedback local while publishing the final seek or volume change.
 class _ControlSlider extends StatefulWidget {
   const _ControlSlider({
     required this.value,
@@ -819,6 +835,7 @@ class _ControlSlider extends StatefulWidget {
   State<_ControlSlider> createState() => _ControlSliderState();
 }
 
+/// Separates the in-progress drag value from receiver snapshots.
 class _ControlSliderState extends State<_ControlSlider> {
   double? drag;
   @override

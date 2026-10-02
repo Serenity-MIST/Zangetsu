@@ -45,6 +45,63 @@ class MihonExtensionService {
   /// (`'aniyomi_installed'`) so the two extension families never collide.
   static const String installedBoxName = 'mihon_installed';
 
+  /// Uninstalls [pkg]: drops its installed-box entry, then deletes the APK
+  /// from disk.
+  ///
+  /// Order matters. The native `loadInstalled` walks the mihon directory and
+  /// loads *every* `*.apk` it finds — it never consults the box — so an APK
+  /// left on disk comes back on the next cold start and the source reappears
+  /// as if the uninstall had failed. Deleting the box entry first means a
+  /// process death between the two steps leaves an orphaned APK (reloadable,
+  /// visible, retryable) rather than an entry pointing at a missing file
+  /// (invisible in the list, with no tile left to uninstall from).
+  ///
+  /// Returns null on success, or a short human-readable reason on failure.
+  /// Never throws: a failed uninstall must still leave the source list
+  /// consistent, and the caller reports the reason to the user.
+  static Future<String?> uninstall(String pkg, {Directory? mihonDir}) async {
+    String? apkPath;
+    if (Hive.isBoxOpen(installedBoxName)) {
+      final box = Hive.box<dynamic>(installedBoxName);
+      apkPath = box.get(pkg) as String?;
+      await box.delete(pkg);
+    }
+    // The box is only a convenience cache of the path, and it has been seen
+    // empty for extensions that are demonstrably still installed and loading
+    // (Hive boxes here get quarantined and reset on read errors). The APK name
+    // is derived from the pkg at install time, so fall back to it rather than
+    // reporting failure and leaving the file to resurrect the source.
+    apkPath ??= await _conventionalApkPath(pkg, mihonDir);
+    if (apkPath == null) {
+      debugPrint('[mihon] uninstall $pkg: no apk found for pkg');
+      return 'apk not found';
+    }
+    try {
+      final f = File(apkPath);
+      if (await f.exists()) await f.delete();
+    } catch (e) {
+      debugPrint('[mihon] uninstall $pkg: deleting $apkPath failed: $e');
+      return '$e';
+    }
+    return null;
+  }
+
+  /// `<appSupport>/mihon/<pkg>.apk` — the same path [installFromRepo] writes,
+  /// or null when no such file exists.
+  static Future<String?> _conventionalApkPath(
+    String pkg,
+    Directory? mihonDir,
+  ) async {
+    try {
+      final dir = mihonDir ??
+          Directory('${(await getApplicationSupportDirectory()).path}/mihon');
+      final f = File('${dir.path}/$pkg.apk');
+      return await f.exists() ? f.path : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Loads and registers a single extension APK located at [apkPath].
   ///
   /// Throws a [PlatformException] with code `"LOAD"` when the APK is not a
@@ -79,10 +136,48 @@ class MihonExtensionService {
   /// null when the source has no filters or any channel error occurs.
   Future<String?> getFilterList(int sourceId) async {
     try {
-      return await _channel.invokeMethod<String>(
-        'getFilterList',
-        {'sourceId': sourceId},
-      );
+      return await _channel.invokeMethod<String>('getFilterList', {
+        'sourceId': sourceId,
+      });
+    } on PlatformException {
+      return null;
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
+  /// The source's own web page for a chapter (or the manga, when
+  /// [chapterUrl] is null) — asked of the extension instead of derived.
+  ///
+  /// Null when the source can't answer, so callers keep their existing
+  /// baseUrl + url join as the fallback and nothing regresses if this fails.
+  ///
+  /// Worth the round trip because the stored url is not always the page: a
+  /// source whose real slugs carry a rotating hash keeps a stable key instead
+  /// and overrides the URL methods to build the real one. Joining by hand
+  /// gives a 404 there.
+  Future<String?> webUrl(
+    int sourceId, {
+    String? mangaUrl,
+    String? chapterUrl,
+  }) async {
+    if ((mangaUrl == null || mangaUrl.isEmpty) &&
+        (chapterUrl == null || chapterUrl.isEmpty)) {
+      return null;
+    }
+    try {
+      final result = await _channel.invokeMethod<String>('webUrl', {
+        'sourceId': sourceId,
+        'mangaUrl': mangaUrl,
+        'chapterUrl': chapterUrl,
+      });
+      final u = result?.trim();
+      // Only an http(s) page is useful to a browser, and this string comes
+      // from a third-party extension — the same rule joinChapterUrl applies.
+      if (u == null || !(u.startsWith('http://') || u.startsWith('https://'))) {
+        return null;
+      }
+      return u;
     } on PlatformException {
       return null;
     } on MissingPluginException {
@@ -96,10 +191,9 @@ class MihonExtensionService {
   /// Returns false on any channel error (source not found, not configurable).
   Future<bool> hasSourceSettings(int sourceId) async {
     try {
-      final result = await _channel.invokeMethod<bool>(
-        'hasSourceSettings',
-        {'sourceId': sourceId},
-      );
+      final result = await _channel.invokeMethod<bool>('hasSourceSettings', {
+        'sourceId': sourceId,
+      });
       return result ?? false;
     } on PlatformException {
       return false;
@@ -111,7 +205,9 @@ class MihonExtensionService {
   /// No-op (returns without error) when the source has no settings.
   Future<void> openSourceSettings(int sourceId) async {
     try {
-      await _channel.invokeMethod<void>('openSourceSettings', {'sourceId': sourceId});
+      await _channel.invokeMethod<void>('openSourceSettings', {
+        'sourceId': sourceId,
+      });
     } on PlatformException catch (e) {
       debugPrint('[mihon] openSourceSettings($sourceId) failed: $e');
     }
@@ -273,7 +369,8 @@ class MihonExtensionService {
       }
 
       // 5. Register in the MihonManager.
-      final effectiveManager = manager ??
+      final effectiveManager =
+          manager ??
           (GetIt.instance.isRegistered<MihonManager>()
               ? GetIt.instance.get<MihonManager>()
               : null);

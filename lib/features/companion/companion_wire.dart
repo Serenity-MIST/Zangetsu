@@ -4,12 +4,17 @@ import 'dart:io';
 import 'dart:math';
 import 'package:crypto/crypto.dart';
 
+/// Creates a 256-bit random pairing credential encoded as hexadecimal.
 String companionSecret() => List.generate(
   32,
   (_) => Random.secure().nextInt(256),
 ).map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+/// Computes the protocol HMAC proof over the receiver nonce using the shared credential.
 String companionProof(String secret, String nonce) =>
     Hmac(sha256, utf8.encode(secret)).convert(utf8.encode(nonce)).toString();
+
+/// Compares complete proofs without returning early on a differing character.
 bool companionProofMatches(String a, String b) {
   var difference = a.length ^ b.length;
   for (var i = 0; i < a.length; i++) {
@@ -21,6 +26,7 @@ bool companionProofMatches(String a, String b) {
 /// The same bounded, ordered JSON-line protocol used by the Android receiver.
 /// Closing a failed exchange is intentional: uncertain commands are not replayed.
 class CompanionWire {
+  /// Frames UTF-8 JSON by newline, caps frame size, and propagates stream backpressure.
   CompanionWire(this.socket) {
     socket.setOption(SocketOption.tcpNoDelay, true);
     final subscription = socket.listen(
@@ -71,6 +77,7 @@ class CompanionWire {
   int _sequence = 0;
   Future<void> _tail = Future.value();
 
+  /// Reads one frame within the deadline; a timeout closes the uncertain connection.
   Future<Map<String, dynamic>> read({
     Duration timeout = const Duration(seconds: 95),
   }) async {
@@ -84,6 +91,7 @@ class CompanionWire {
     }
   }
 
+  /// Writes one bounded frame; callers must authenticate before sending commands.
   void send(Map<String, dynamic> frame) {
     if (!alive) throw StateError('TV disconnected');
     final data = utf8.encode(jsonEncode(frame));
@@ -91,6 +99,7 @@ class CompanionWire {
     socket.add([...data, 10]);
   }
 
+  /// Queues a command with a monotonic ID; mismatched replies terminate this transport.
   Future<Map<String, dynamic>> exchange(Map<String, dynamic> command) {
     final result = Completer<Map<String, dynamic>>();
     _tail = _tail.then((_) async {
@@ -110,6 +119,7 @@ class CompanionWire {
     return result.future;
   }
 
+  /// Idempotently closes the socket and stops delivering frames.
   void close() {
     if (!alive) return;
     alive = false;

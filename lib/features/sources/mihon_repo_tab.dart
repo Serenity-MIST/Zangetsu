@@ -3,6 +3,7 @@ import 'package:get_it/get_it.dart';
 import 'package:hive/hive.dart';
 
 import '../../core/aniyomi/aniyomi_repo.dart';
+import '../../core/ui/source_icon_tile.dart';
 import '../../core/di/injector.dart';
 import '../../core/i18n/source_languages.dart';
 import '../../core/mihon/mihon_extension_service.dart';
@@ -12,6 +13,7 @@ import '../../core/mihon/mihon_update.dart';
 import '../../core/prefs/source_lang_prefs.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
+import '../../core/ui/app_dialog.dart';
 import '../../core/ui/states.dart';
 import 'sources_search_field.dart';
 import '../../l10n/l10n.dart';
@@ -315,33 +317,13 @@ class _MihonRepoSectionState extends State<_MihonRepoSection> {
   }
 
   Future<void> _confirmRemove(BuildContext context) async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppColors.surface,
-        title: Text(context.l10n.removeRepo, style: AppText.headline),
-        content: Text(
-          context.l10n.alreadyInstalledExtensionsStay +
-              context.l10n.youCanAddRepoBackLater,
-          style: AppText.body,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: Text(
-              context.l10n.cancel,
-              style: AppText.body.copyWith(color: AppColors.textSecondary),
-            ),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: Text(
-              context.l10n.removeDownloadTooltip,
-              style: AppText.body.copyWith(color: AppColors.accent),
-            ),
-          ),
-        ],
-      ),
+    final ok = await AppDialog.confirm(
+      context,
+      title: context.l10n.removeRepo,
+      message: context.l10n.alreadyInstalledExtensionsStay +
+          context.l10n.youCanAddRepoBackLater,
+      confirmLabel: context.l10n.removeDownloadTooltip,
+      destructive: true,
     );
     if (ok == true) widget.onRemove();
   }
@@ -512,7 +494,7 @@ class _MihonRepoSectionState extends State<_MihonRepoSection> {
                         final n = mgr.updatesFor(widget.url).length;
                         if (n == 0) return const SizedBox.shrink();
                         return Padding(
-                          padding: const EdgeInsets.only(right: 2),
+                          padding: const EdgeInsetsDirectional.only(end: 2),
                           child: GestureDetector(
                             behavior: HitTestBehavior.opaque,
                             onTap: _updateAll,
@@ -754,6 +736,13 @@ class _MihonExtensionRowState extends State<_MihonExtensionRow> {
 
   Future<void> _install() async {
     final messenger = ScaffoldMessenger.of(context);
+    // Captured BEFORE the download, alongside the messenger and for the same
+    // reason: the row can be gone by the time it finishes — the user leaves,
+    // or the list rebuilds — and [State.context] is `_element!`, which throws
+    // once it is. Reading `context.l10n` afterwards took out the catch block
+    // too, so a failed install said nothing at all instead of saying why.
+    // The messenger is the app-level one, so it still shows the snackbar.
+    final l10n = context.l10n;
     setState(() => _busy = true);
     try {
       if (widget.installFn != null) {
@@ -769,49 +758,29 @@ class _MihonExtensionRowState extends State<_MihonExtensionRow> {
         // installFromRepo never throws — it returns an empty list on failure.
         // Treat "no source loaded" as a failure so we don't mislabel context.l10n.installed.
         if (providers.isEmpty) {
-          throw Exception(context.l10n.noSourceLoaded);
+          throw Exception(l10n.noSourceLoaded);
         }
       }
       widget.onInstalled();
       messenger
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(content: Text(context.l10n.installedName(_entry.name))));
+        ..showSnackBar(SnackBar(content: Text(l10n.installedName(_entry.name))));
     } catch (e) {
       messenger
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(content: Text(context.l10n.installFailed('$e'))));
+        ..showSnackBar(SnackBar(content: Text(l10n.installFailed('$e'))));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
   Future<void> _uninstall() async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppColors.surface,
-        title: Text(ctx.l10n.uninstallNameQuestion(_entry.name), style: AppText.headline),
-        content: Text(
-          context.l10n.thisRemovesTheExtensionFromYourInstalledSources,
-          style: AppText.body,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: Text(
-              context.l10n.cancel,
-              style: AppText.body.copyWith(color: AppColors.textSecondary),
-            ),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: Text(
-              context.l10n.uninstall,
-              style: AppText.body.copyWith(color: AppColors.accent),
-            ),
-          ),
-        ],
-      ),
+    final ok = await AppDialog.confirm(
+      context,
+      title: context.l10n.uninstallNameQuestion(_entry.name),
+      message: context.l10n.thisRemovesTheExtensionFromYourInstalledSources,
+      confirmLabel: context.l10n.uninstall,
+      destructive: true,
     );
     if (ok != true) return;
     if (!mounted) return;
@@ -837,14 +806,11 @@ class _MihonExtensionRowState extends State<_MihonExtensionRow> {
   }
 
   Future<void> _defaultUninstall() async {
-    // Remove from installed box.
-    try {
-      if (Hive.isBoxOpen(MihonExtensionService.installedBoxName)) {
-        await Hive.box<dynamic>(
-          MihonExtensionService.installedBoxName,
-        ).delete(_entry.pkg);
-      }
-    } catch (_) {}
+    // Same helper as the source tile: box entry AND the APK. The APK is what
+    // actually resurrects the source — `loadInstalled` re-reads the directory
+    // on every cold start — so deleting only the box entry left the extension
+    // to come back on the next launch.
+    final failure = await MihonExtensionService.uninstall(_entry.pkg);
     // Remove from the manager so the source disappears from the picker.
     // Unlike AniyomiManager (whose store is Map<String, BaseProvider> and so
     // needs an `is AniyomiProvider` narrowing check), MihonManager._sources is
@@ -855,6 +821,9 @@ class _MihonExtensionRowState extends State<_MihonExtensionRow> {
         (p) => p.pkg == _entry.pkg,
       );
     }
+    if (failure != null) {
+      debugPrint('[mihon] repo-tab uninstall ${_entry.pkg}: $failure');
+    }
   }
 
   @override
@@ -864,6 +833,12 @@ class _MihonExtensionRowState extends State<_MihonExtensionRow> {
       padding: const EdgeInsets.fromLTRB(16, 10, 12, 10),
       child: Row(
         children: [
+          // The index names the icon, so a browse row can show the real logo
+          // before anything is installed.
+          Padding(
+            padding: const EdgeInsetsDirectional.only(end: 12),
+            child: SourceIconTile(name: _entry.name, icon: _entry.iconUrl),
+          ),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,

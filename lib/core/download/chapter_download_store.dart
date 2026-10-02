@@ -127,12 +127,36 @@ class ChapterDownloadStore {
           // record still goes.
         }
       }
+      final owned = ownedFolder(d);
+      if (owned != null) {
+        try {
+          await deleteDir(owned);
+        } catch (_) {
+          // Best-effort, like the file deletes above.
+        }
+      }
+
       final dir = await dirFor(d);
       await deleteDir(dir);
       await deleteDir(Directory('${dir.path}$partSuffix'));
     }
     await _box.delete(id);
   }
+
+  /// The published folder that belongs to this chapter ALONE, or null when it
+  /// shares one with other chapters.
+  ///
+  /// A novel is published to `<Show>/<Chapter>/` and owns it — the html plus
+  /// any images saved beside it — so deleting the chapter has to take the
+  /// folder, or the pictures are orphaned in the user's Downloads with nothing
+  /// left pointing at them. A manga is published as `<Show>/Chapter N.cbz`,
+  /// whose parent is the SHOW folder shared with every other chapter; deleting
+  /// that would take the whole series with it.
+  @visibleForTesting
+  static Directory? ownedFolder(ChapterDownload d) =>
+      d.mode == ContentMode.novel && d.textPath != null
+      ? File(d.textPath!).parent
+      : null;
 
   Future<Directory> dirFor(ChapterDownload d) async {
     final root = await _root();
@@ -229,9 +253,17 @@ class ChapterDownloadStore {
     }
 
     await deleteDir(staged);
-    return d.mode == ContentMode.novel
-        ? d.copyWith(textPath: moved.first)
-        : d.copyWith(archivePath: moved.first, pageCount: files.length);
+    if (d.mode != ContentMode.novel) {
+      return d.copyWith(archivePath: moved.first, pageCount: files.length);
+    }
+    // A novel's chapter images (img_0.jpg, ...) sort before text.html
+    // alphabetically, so `moved.first` is no longer safe once a chapter has
+    // pictures — pick the actual HTML file by name instead.
+    final text = moved.firstWhere(
+      (p) => p.endsWith('/$textFile'),
+      orElse: () => moved.first,
+    );
+    return d.copyWith(textPath: text);
   }
 
   /// Pack a chapter's pages into a `.cbz` beside the staging folder.

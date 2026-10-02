@@ -38,30 +38,68 @@ globalThis.__console = function (src, level, args) {
   console.log('[' + src + '/js ' + level + ']', parts.join(' '));
 };
 
-globalThis.htmlText = (s) => String(s || '')
-  .replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
-  .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
-  .replace(/&#39;/g, "'").trim();
+// Mirrors globalThis.htmlText in js_bootstrap.dart: strips tags, decodes the
+// numeric/hex character references providers actually hit (&#8212; &#x2014;)
+// and the named ones, then collapses runs of whitespace.
+globalThis.htmlText = function (html) {
+  if (!html) return '';
+  return String(html)
+    .replace(/<[^>]*>/g, '')
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+};
 
-globalThis.absUrl = (h, b) => /^https?:\/\//i.test(h) ? h
-  : h.startsWith('//') ? 'https:' + h
-  : b ? (h.startsWith('/') ? b.match(/^(https?:\/\/[^/]+)/)[1] + h : b.replace(/\/$/, '') + '/' + h)
-  : h;
+// Mirrors globalThis.absUrl in js_bootstrap.dart. A base the host regex can't
+// match (protocol-relative, scheme-less) yields the href unchanged there, so it
+// must not throw here either.
+globalThis.absUrl = function (href, base) {
+  if (!href) return '';
+  if (/^https?:\/\//i.test(href)) return href;
+  if (href.startsWith('//')) return 'https:' + href;
+  if (!base) return href;
+  if (href.startsWith('/')) {
+    const m = base.match(/^(https?:\/\/[^/]+)/i);
+    return m ? m[1] + href : href;
+  }
+  return base.replace(/\/$/, '') + '/' + href;
+};
 
-// Dean-Edwards p,a,c,k,e,d unpacker (base-62), no eval. Returns input unchanged
-// if not packed. Mirrors globalThis.unpackJs in js_bootstrap.dart.
+// Dean-Edwards p,a,c,k,e,d unpacker (in the packer's own base, up to 62), no
+// eval. Returns input unchanged if not packed. Mirrors globalThis.unpackJs in
+// js_bootstrap.dart.
 globalThis.unpackJs = function (source) {
   const s = String(source);
-  if (s.indexOf('}(') === -1 || s.indexOf(".split('|')") === -1) return s;
-  let body = s.slice(s.indexOf("}('") + 3, s.indexOf(".split('|'),0,{}))"));
+  // Same marker checks as kJsBootstrap — see the comment there.
+  const open = s.indexOf("}('");
+  const close = s.indexOf(".split('|'),0,{}))");
+  if (open === -1 || close <= open) return s;
+  let body = s.slice(open + 3, close);
   body = body.replace(/\\'/g, "'");
-  const payload = body.slice(0, body.indexOf("',"));
-  const dict = body.slice(body.indexOf("'", body.indexOf("',") + 2) + 1, body.lastIndexOf("'")).split('|');
-  const r62 = (t) => [...t].reduce((a, c) => a * 62 +
-    (c <= '9' ? c.charCodeAt(0) - 48 : c >= 'a' ? c.charCodeAt(0) - 87 : c.charCodeAt(0) - 29), 0);
+  const comma = body.indexOf("',");
+  if (comma === -1) return s;
+  const payload = body.slice(0, comma);
+  let radix = parseInt(body.slice(comma + 2), 10);
+  if (!(radix >= 2 && radix <= 62)) radix = 62;
+  const dictStart = body.indexOf("'", comma + 2);
+  const dictEnd = body.lastIndexOf("'");
+  if (dictStart === -1 || dictEnd <= dictStart) return s;
+  const dict = body.slice(dictStart + 1, dictEnd).split('|');
+  const unbase = (t) => {
+    let a = 0;
+    for (const c of t) {
+      const d = c <= '9' ? c.charCodeAt(0) - 48 : c >= 'a' ? c.charCodeAt(0) - 87 : c.charCodeAt(0) - 29;
+      if (d >= radix) return -1;
+      a = a * radix + d;
+    }
+    return a;
+  };
   return payload.replace(/[0-9A-Za-z]+/g, (k) => {
-    const i = r62(k);
-    return i < dict.length && dict[i] !== '' ? dict[i] : k;
+    const i = unbase(k);
+    return i >= 0 && i < dict.length && dict[i] !== '' ? dict[i] : k;
   });
 };
 

@@ -1,12 +1,12 @@
+import 'dart:async';
 import 'dart:ui' show ImageFilter;
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
+import '../../core/tracker/tracker_item_url.dart';
 import '../../core/zmode/metadata_provider_prefs.dart';
-import '../../core/zmode/zmode_ids.dart';
-import '../../core/models/provider_info.dart';
 import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
 import '../../core/mode/content_mode.dart';
@@ -36,8 +36,9 @@ import '../auth/auth_cubit.dart';
 import '../auth/auth_screens.dart';
 import '../detail/detail_screen.dart';
 import 'cubit/my_list_cubit.dart';
-import 'library_tabs.dart';
 import 'cubit/tracker_list_cubit.dart';
+import 'library_filter.dart';
+import 'library_tabs.dart';
 import 'my_list_screen_tv.dart';
 import 'search_screen.dart';
 
@@ -116,7 +117,7 @@ class _MyListView extends StatefulWidget {
   State<_MyListView> createState() => _MyListViewState();
 }
 
-class _MyListViewState extends State<_MyListView> {
+class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
   late WatchStatus? _statusFilter = widget.initialStatus; // null = All
 
   /// Selected AniList custom list, or null. Separate from [_categoryFilter]:
@@ -146,6 +147,7 @@ class _MyListViewState extends State<_MyListView> {
   /// answers for one kind already.
   ContentMode _kind = sl<ContentModeCubit>().state;
   bool _sortDesc = ListSortPrefs.descending;
+  VoidCallback? _shuffleAction;
 
   ListSort _sortFor({required bool isMyList}) {
     final chosen = _sort;
@@ -177,9 +179,45 @@ class _MyListViewState extends State<_MyListView> {
     _ => null,
   };
 
+  Timer? _liveSync;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // Own My List is Hive; tracker chips cache a fetch. While this screen is
+    // mounted, keep both aligned with other devices — TV never backgrounds.
+    _liveSync = Timer.periodic(const Duration(seconds: 15), (_) {
+      _refreshLibrary();
+    });
+  }
+
+  @override
+  void dispose() {
+    _liveSync?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _refreshLibrary();
+  }
+
+  void _refreshLibrary() {
+    if (!mounted) return;
+    if (sl.isRegistered<MyListStore>()) {
+      unawaited(sl<MyListStore>().pullFromCloud());
+    }
+    unawaited(context.read<TrackerListCubit>().refresh());
+  }
+
   @override
   Widget build(BuildContext context) {
-    if (sl<AppMode>().isTv) return const MyListScreenTv();
+    if (sl<AppMode>().isTv) {
+      return MyListScreenTv(initialStatus: widget.initialStatus);
+    }
     return Scaffold(
       backgroundColor: AppColors.bg,
       // bottom: false — the shell's floating dock overlays the content
@@ -217,12 +255,6 @@ class _MyListViewState extends State<_MyListView> {
   bool _searching = false;
   String _query = '';
   final _searchController = TextEditingController();
-
-  @override
-  void dispose() {
-    _searchController.dispose();
-    super.dispose();
-  }
 
   void _toggleSearch() {
     setState(() {
@@ -383,12 +415,7 @@ class _MyListViewState extends State<_MyListView> {
                       ),
 
                       const SizedBox(width: 8),
-                      _pillIcon(
-                        Icons.sort_rounded,
-                        context.l10n.sort,
-                        () => _openSortSheet(context),
-                        active: _sort != null,
-                      ),
+                      _libraryOptionsButton(context),
                       const SizedBox(width: 8),
                     ],
                   ),
@@ -401,74 +428,133 @@ class _MyListViewState extends State<_MyListView> {
     );
   }
 
-  /// Sort options for whichever list is showing. Tapping the active one flips
-  /// its direction, which is how the reference apps do it and saves a second
-  /// control.
-  void _openSortSheet(BuildContext context) {
+  /// Search stays separate; this menu gathers random selection and sorting in
+  /// one compact control at the end of the header.
+  Widget _libraryOptionsButton(BuildContext context) {
     final isMyList = context.read<TrackerListCubit>().state.isMyList;
-    final options = optionsFor(isMyList: isMyList);
     final active = _sortFor(isMyList: isMyList);
-    showModalBottomSheet<void>(
-      context: context,
-      backgroundColor: AppColors.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (sheetContext) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 18, 20, 8),
-              child: Text(context.l10n.sortBy, style: AppText.title),
-            ),
-            for (final o in options)
-              ListTile(
-                title: Text(
-                  listSortLabel(o),
-                  style: AppText.body.copyWith(
-                    color: o == active
-                        ? AppColors.accent
-                        : AppColors.textPrimary,
-                    fontWeight: o == active ? FontWeight.w700 : null,
-                  ),
-                ),
-                subtitle: o == active
-                    ? Text(
-                        listSortDirectionLabel(o, _sortDesc),
-                        style: AppText.caption,
-                      )
-                    : null,
-                trailing: o == active
-                    ? Icon(
-                        _sortDesc
-                            ? Icons.arrow_downward_rounded
-                            : Icons.arrow_upward_rounded,
-                        color: AppColors.accent,
-                        size: 18,
-                      )
-                    : null,
-                onTap: () {
-                  Navigator.pop(sheetContext);
-                  setState(() {
-                    // Same option again → flip direction; a new one starts in
-                    // the direction people expect (best/newest/A-Z first).
-                    if (o == active) {
-                      _sortDesc = !_sortDesc;
-                    } else {
-                      _sort = o;
-                      _sortDesc = o != ListSort.title;
-                    }
-                  });
-                  ListSortPrefs.save(_sortFor(isMyList: isMyList), _sortDesc);
-                },
-              ),
-            const SizedBox(height: 8),
-          ],
+
+    return MenuAnchor(
+      animated: true,
+      alignmentOffset: const Offset(0, 6),
+      style: MenuStyle(
+        alignment: AlignmentDirectional.topEnd,
+        backgroundColor: WidgetStatePropertyAll(AppColors.surface2),
+        surfaceTintColor: const WidgetStatePropertyAll(Colors.transparent),
+        shadowColor: WidgetStatePropertyAll(
+          Colors.black.withValues(alpha: 0.4),
+        ),
+        elevation: const WidgetStatePropertyAll(4),
+        padding: const WidgetStatePropertyAll(
+          EdgeInsets.symmetric(vertical: 8),
+        ),
+        minimumSize: const WidgetStatePropertyAll(Size(220, 0)),
+        side: const WidgetStatePropertyAll(
+          BorderSide(color: AppColors.hairline),
+        ),
+        shape: WidgetStatePropertyAll(
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         ),
       ),
+      menuChildren: [
+        Builder(
+          builder: (menuContext) {
+            final shuffleAction = _shuffleAction;
+            return MenuItemButton(
+              onPressed: shuffleAction,
+              style: _libraryMenuItemStyle(enabled: shuffleAction != null),
+              leadingIcon: Icon(
+                Icons.shuffle_rounded,
+                size: 18,
+                color: shuffleAction == null
+                    ? AppColors.textTertiary
+                    : AppColors.textSecondary,
+              ),
+              child: Text(menuContext.l10n.shuffle),
+            );
+          },
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: Divider(color: AppColors.hairline, height: 1),
+        ),
+        Padding(
+          padding: const EdgeInsetsDirectional.fromSTEB(16, 8, 16, 4),
+          child: Text(
+            context.l10n.sortBy,
+            style: AppText.caption.copyWith(
+              color: AppColors.textTertiary,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+        for (final option in optionsFor(isMyList: isMyList))
+          MenuItemButton(
+            onPressed: () => _onLibraryMenuSelected(context, option),
+            style: _libraryMenuItemStyle(selected: option == active),
+            leadingIcon: option == active
+                ? Icon(Icons.check_rounded, color: AppColors.accent, size: 18)
+                : const SizedBox(width: 18),
+            trailingIcon: option == active
+                ? Icon(
+                    _sortDesc
+                        ? Icons.arrow_downward_rounded
+                        : Icons.arrow_upward_rounded,
+                    color: AppColors.accent,
+                    size: 18,
+                  )
+                : null,
+            child: Text(listSortLabel(option)),
+          ),
+      ],
+      builder: (context, controller, _) => IconButton(
+        tooltip: context.l10n.more,
+        constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+        padding: EdgeInsets.zero,
+        style: IconButton.styleFrom(
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          backgroundColor: controller.isOpen
+              ? AppColors.accentSoft
+              : AppColors.surface2,
+          foregroundColor: AppColors.accent,
+          shape: const CircleBorder(),
+        ),
+        onPressed: controller.isOpen ? controller.close : controller.open,
+        icon: const Icon(Icons.more_vert_rounded, size: 18),
+      ),
     );
+  }
+
+  ButtonStyle _libraryMenuItemStyle({
+    bool selected = false,
+    bool enabled = true,
+  }) => ButtonStyle(
+    foregroundColor: WidgetStatePropertyAll(
+      !enabled
+          ? AppColors.textTertiary
+          : selected
+          ? AppColors.accent
+          : AppColors.textPrimary,
+    ),
+    textStyle: WidgetStatePropertyAll(
+      AppText.body.copyWith(fontWeight: selected ? FontWeight.w700 : null),
+    ),
+  );
+
+  void _onLibraryMenuSelected(BuildContext context, ListSort action) {
+    final isMyList = context.read<TrackerListCubit>().state.isMyList;
+    final active = _sortFor(isMyList: isMyList);
+    setState(() {
+      // Same option again flips direction; a new one starts in the familiar
+      // direction (newest/highest first, or A-Z).
+      if (action == active) {
+        _sortDesc = !_sortDesc;
+      } else {
+        _sort = action;
+        _sortDesc = action != ListSort.title;
+      }
+    });
+    ListSortPrefs.save(_sortFor(isMyList: isMyList), _sortDesc);
   }
 
   /// Create a list on the user's AniList account from the tab row, then
@@ -553,7 +639,7 @@ class _MyListViewState extends State<_MyListView> {
             Padding(
               padding: const EdgeInsets.fromLTRB(20, 18, 20, 6),
               child: Align(
-                alignment: Alignment.centerLeft,
+                alignment: AlignmentDirectional.centerStart,
                 child: Text(c.name, style: AppText.title),
               ),
             ),
@@ -781,12 +867,31 @@ class _MyListViewState extends State<_MyListView> {
   Widget _myListBody(BuildContext context) {
     return BlocBuilder<MyListCubit, List<MyListEntry>>(
       builder: (context, entries) {
-        if (entries.isEmpty) return _empty(context);
-        return _grid(
-          context,
-          entries,
-          onTap: (item) => _openItem(context, item),
-          onMore: (entry) => showListStatusSheet(context, item: entry.item),
+        if (entries.isEmpty) _shuffleAction = null;
+        final child = entries.isEmpty
+            ? _empty(context)
+            : _grid(
+                context,
+                entries,
+                onTap: (item) => _openItem(context, item),
+                onMore: (entry) =>
+                    showListStatusSheet(context, item: entry.item),
+              );
+        return RefreshIndicator(
+          color: AppColors.accent,
+          backgroundColor: AppColors.surface,
+          onRefresh: () => sl<MyListStore>().pullFromCloud(),
+          child: entries.isEmpty
+              ? ListView(
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  children: [
+                    SizedBox(
+                      height: MediaQuery.of(context).size.height * 0.6,
+                      child: child,
+                    ),
+                  ],
+                )
+              : child,
         );
       },
     );
@@ -798,16 +903,19 @@ class _MyListViewState extends State<_MyListView> {
     final Widget content;
     switch (tlState.status) {
       case TrackerListStatus.loading:
+        _shuffleAction = null;
         content = Center(
           child: CircularProgressIndicator(color: AppColors.accent),
         );
       case TrackerListStatus.error:
+        _shuffleAction = null;
         content = EmptyState(
           icon: Icons.cloud_off_rounded,
           message: context.l10n.couldnTLoadPullToRefresh,
         );
       case TrackerListStatus.idle:
       case TrackerListStatus.ready:
+        if (tlState.entries.isEmpty) _shuffleAction = null;
         content = tlState.entries.isEmpty
             ? EmptyState(
                 icon: Icons.bookmark_outline,
@@ -967,6 +1075,24 @@ class _MyListViewState extends State<_MyListView> {
         : (tracker is AniListService
               ? () => _createAniListList(context, tracker)
               : null);
+    final selectedView = views.firstWhere(
+      (view) => view.id == _selectedTabId,
+      orElse: () => views.first,
+    );
+    final shuffleCandidates = modeEntries
+        .where(
+          (entry) =>
+              selectedView.test(entry) &&
+              _matchesQuery(entry) &&
+              (isMyList || playableTrackerItem(entry.item) != null),
+        )
+        .toList();
+    _shuffleAction = shuffleCandidates.isEmpty
+        ? null
+        : () {
+            final entry = pickRandomLibraryEntry(shuffleCandidates);
+            if (entry != null) onTap(entry.item);
+          };
 
     return LibraryTabs(
       tabs: views,
@@ -1063,31 +1189,23 @@ class _MyListViewState extends State<_MyListView> {
   /// Open a tracker entry.
   ///
   /// The stub carries no provider, but it does carry the id the metadata
-  /// catalogue is keyed by — a MAL id from AniList/MAL, a TMDB one from Simkl
-  /// — which is the same identity a `zm://` title uses. So the title can be
-  /// opened directly instead of dumping you into a search for its own name.
-  /// Search stays the fallback for an entry with no id to go on.
+  /// catalogue is keyed by, which is the same identity a `zm://` title uses.
+  /// So the title opens directly instead of dumping you into a search for its
+  /// own name. Search stays the fallback for an entry with no id to go on.
+  ///
+  /// This goes through the shared [playableTrackerItem] on purpose. A local
+  /// copy of that logic used to live here and fell behind it: the copy knew
+  /// only MAL and TMDB ids, so every AniList manga without a MAL id — which is
+  /// a lot of them — took the search fallback despite having an `al:` id the
+  /// catalogue resolves perfectly well.
   void _openTrackerItem(BuildContext context, MediaItem stub) {
-    final c = _canonicalOf(stub);
-    if (c != null) {
-      _openItem(
-        context,
-        prefer: _providerOf(widget.pinnedTracker),
-        MediaItem(
-          id: c.id,
-          title: stub.title,
-          englishTitle: stub.englishTitle,
-          cover: stub.cover,
-          url: ZmodeIds.showUrl(c),
-          type: stub.type,
-          sourceId: ZmodeIds.sourceId,
-          malId: stub.malId,
-          tmdbId: stub.tmdbId,
-          tmdbIsTv: stub.tmdbIsTv,
-          // Saved from here, it stays this tracker's title.
-          savedFrom: widget.pinnedTracker?.displayName,
-        ),
-      );
+    final item = playableTrackerItem(
+      stub,
+      // Saved from here, it stays this tracker's title.
+      savedFrom: widget.pinnedTracker?.displayName,
+    );
+    if (item != null) {
+      _openItem(context, prefer: _providerOf(widget.pinnedTracker), item);
       return;
     }
     Navigator.of(context).push(
@@ -1095,23 +1213,6 @@ class _MyListViewState extends State<_MyListView> {
         builder: (_) => SearchScreen(initialQuery: stub.title),
       ),
     );
-  }
-
-  /// The metadata identity of a tracker stub, or null when it has none.
-  ZCanonical? _canonicalOf(MediaItem stub) {
-    final mal = stub.malId;
-    if (mal != null) {
-      return ZCanonical(switch (stub.type) {
-        ProviderType.manga => ZKind.manga,
-        ProviderType.novel => ZKind.novel,
-        _ => ZKind.anime,
-      }, 'mal:$mal');
-    }
-    final tmdb = stub.tmdbId;
-    if (tmdb != null) {
-      return ZCanonical(stub.tmdbIsTv ? ZKind.tv : ZKind.movie, 'tmdb:$tmdb');
-    }
-    return null;
   }
 
   /// How many of [entries] — already narrowed to the kind on screen — are in

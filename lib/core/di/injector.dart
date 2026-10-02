@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:watch_app/core/hive/safe_box.dart';
+import 'package:watch_app/core/hive/source_icon_store.dart';
 import 'package:watch_app/core/lnreader/novel_cloudflare.dart';
 
 import 'package:dio/dio.dart';
@@ -23,6 +24,7 @@ import '../playback/pinned_sources.dart';
 import '../playback/search_history.dart';
 import '../playback/search_prefs.dart';
 import '../ui/home_rows_prefs.dart';
+import '../ui/streaming_prefs.dart';
 import '../ui/nav_prefs.dart';
 import '../playback/search_source_prefs.dart';
 import '../playback/source_health_store.dart';
@@ -54,6 +56,7 @@ import '../state/active_source_cubit.dart';
 import '../locale/locale_controller.dart';
 import '../zmode/genre_catalog.dart';
 import '../zmode/metadata_repository.dart';
+import '../zmode/source_score_store.dart';
 import '../zmode/zmode_module.dart';
 import '../zmode/zmode_ids.dart';
 import '../zmode/zmode_prefs.dart';
@@ -65,6 +68,7 @@ import '../metadata/people_service.dart';
 import '../app_config.dart';
 import '../environment.dart';
 import '../metadata/tmdb.dart';
+import 'package:watch_app/core/metadata/tmdb_fallback.dart';
 import '../metadata/title_logo_service.dart';
 import '../mode/content_mode_cubit.dart';
 import '../trailer/trailer_service.dart';
@@ -73,6 +77,7 @@ import '../anilist/anilist_network_policy.dart';
 import '../anilist/anilist_service.dart';
 import '../anilist/anilist_store.dart';
 import '../tracker/mal_service.dart';
+import '../tracker/mangabaka_service.dart';
 import '../tracker/simkl_service.dart';
 import '../tracker/tracker_binding_store.dart';
 import '../tracker/tracker_hub.dart';
@@ -104,9 +109,11 @@ import '../lnreader/lnreader_runtime.dart' show LnReaderHttpResponse;
 import '../mihon/mihon_extension_service.dart';
 import '../mihon/mihon_manager.dart';
 import '../mihon/mihon_provider.dart';
+import '../mihon/mihon_repo.dart';
 import '../../features/auth/auth_cubit.dart';
 import '../../features/auth/migration_bridge.dart';
 import '../../features/auth/tv_pairing_service.dart';
+import '../../features/home/cubit/home_cache.dart';
 import '../../features/home/cubit/home_cubit.dart';
 import '../../features/watch_together/watch_room_service.dart';
 import '../../features/watch_together/watch_together_controller.dart';
@@ -318,6 +325,7 @@ Future<void> initDependencies() async {
   );
   await TitlePrefsStore.init();
   sl.registerSingleton<TitlePrefsStore>(TitlePrefsStore());
+  await HomeCache.init();
   await PlaybackPrefs.init();
   sl.registerSingleton<PlaybackPrefs>(PlaybackPrefs());
   await ReaderPrefs.init();
@@ -332,6 +340,7 @@ Future<void> initDependencies() async {
   await ZModePrefs.init();
   await GenreCatalog.init();
   await HomeRowsPrefs.init();
+  await StreamingPrefs.init();
   await DownloadPrefs.init();
   sl.registerSingleton<DownloadPrefs>(DownloadPrefs());
   await TorrentPrefs.init();
@@ -362,6 +371,8 @@ Future<void> initDependencies() async {
   // sources, and backs the "Source health" test screen.
   await SourceHealthStore.init();
   sl.registerSingleton<SourceHealthStore>(SourceHealthStore());
+  final sourceScores = await SourceScoreStore.open();
+  sl.registerSingleton<SourceScoreStore>(sourceScores);
 
   // Read by SourceRepository.baseUrlFor / cfSolveTargetFor, so it has to be
   // registered before that repository is used, not just before it is built.
@@ -389,7 +400,8 @@ Future<void> initDependencies() async {
         if (options.uri.host == AniListGraphql.host) {
           options.headers.addAll(AniListGraphql.headers);
         }
-        if (options.uri.host == Tmdb.host) {
+        if (options.uri.host == Tmdb.host ||
+            options.uri.host == Tmdb.fallbackHost) {
           options.queryParameters = {
             ...options.queryParameters,
             'api_key': Tmdb.apiKey,
@@ -400,6 +412,8 @@ Future<void> initDependencies() async {
       },
     ),
   );
+  // One retry on TMDB's other host when a network blocks the usual one.
+  dio.interceptors.add(TmdbFallbackInterceptor(dio));
   // AniList gets a longer read than the 8s above and honours 429 — see
   // AniListNetworkPolicy. Registered so the UI can ask how long the wait is.
   final aniListPolicy = AniListNetworkPolicy();
@@ -464,8 +478,18 @@ Future<void> initDependencies() async {
   sl.registerSingleton<MalService>(MalService(dio));
   await SimklService.init();
   sl.registerSingleton<SimklService>(SimklService(dio));
+  await MangaBakaService.init();
+  sl.registerSingleton<MangaBakaService>(MangaBakaService(dio));
   sl.registerSingleton<TrackerHub>(
-    TrackerHub([sl<AniListService>(), sl<MalService>(), sl<SimklService>()]),
+    TrackerHub([
+      sl<AniListService>(),
+      sl<MalService>(),
+      sl<SimklService>(),
+      // Reading-only: MangaBaka has no anime library, so TrackerHub.forMode
+      // keeps it out of anime contexts the way it already keeps Simkl out of
+      // reading ones.
+      sl<MangaBakaService>(),
+    ]),
   );
   // Manual match corrections (the sync sheet's "Change match"): show → chosen
   // tracker entry id, persisted so a fixed match sticks.
@@ -476,6 +500,7 @@ Future<void> initDependencies() async {
         'anilist': sl<AniListService>(),
         'mal': sl<MalService>(),
         'simkl': sl<SimklService>(),
+        'mangabaka': sl<MangaBakaService>(),
       }));
 
   // Share deep links (zangetsu://open?…): opens a shared title's Detail, or
@@ -765,6 +790,11 @@ Future<void> initDependencies() async {
       if (!Hive.isBoxOpen('aniyomi_repos')) {
         await openBoxSafely<String>('aniyomi_repos');
       }
+      // Icon URLs picked up from repo indexes, read synchronously by the
+      // source picker. Shared with Mihon.
+      if (!Hive.isBoxOpen(SourceIconStore.boxName)) {
+        await openBoxSafely<String>(SourceIconStore.boxName);
+      }
       final box = Hive.box<dynamic>(AniyomiExtensionService.installedBoxName);
       if (box.isEmpty) {
         return; // nothing installed yet
@@ -826,6 +856,9 @@ Future<void> initDependencies() async {
       if (!Hive.isBoxOpen('mihon_repos')) {
         await openBoxSafely<String>('mihon_repos');
       }
+      if (!Hive.isBoxOpen(SourceIconStore.boxName)) {
+        await openBoxSafely<String>(SourceIconStore.boxName);
+      }
       final box = Hive.box<dynamic>(MihonExtensionService.installedBoxName);
       if (box.isEmpty) {
         return; // nothing installed yet
@@ -837,6 +870,27 @@ Future<void> initDependencies() async {
       final sources = await service.listSources();
       final providers = sources.map((s) => MihonProvider(info: s)).toList();
       mihonManager.registerAll(providers);
+      // Nothing else reads a Mihon repo index at launch — Aniyomi gets its
+      // icons for free off the update check, Mihon would show letters until
+      // the user next opened its Sources screen. So read each index once, and
+      // only while we have no icon at all for what's installed.
+      if (providers.isNotEmpty &&
+          providers.every((p) => SourceIconStore.urlFor(p.pkg) == null)) {
+        final repoUrls = Hive.isBoxOpen('mihon_repos')
+            ? Hive.box<String>('mihon_repos').values.toList()
+            : const <String>[];
+        unawaited(() async {
+          for (final url in repoUrls) {
+            // fetchIndex records the icons on its way past; the entries
+            // themselves are of no use here.
+            try {
+              await MihonRepo.fetchIndex(url);
+            } catch (_) {
+              /* an icon is never worth a boot failure */
+            }
+          }
+        }());
+      }
       // Honor a saved `mihon:` active source (the user quit while in manga
       // mode) that wasn't loaded yet at boot. reapplySaved only swaps when the
       // saved id is now valid and never resets an already-restored source, so

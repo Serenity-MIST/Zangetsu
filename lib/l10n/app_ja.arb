@@ -912,6 +912,7 @@
 	"builtInPlayer": "内蔵プレーヤー",
 	"otherApps": "ほかのアプリ",
 	"seeAll2": "すべて見る",
+	"webView": "WebView",
 	"openInBrowser": "ブラウザで開く",
 	"copyLink": "リンクをコピー",
 	"removeTracking": "トラッキングを解除",
@@ -1025,6 +1026,7 @@
 		}
 	},
 	"sort": "選別",
+	"shuffle": "ランダムに選ぶ",
 	"giveItAName": "名前を付けて",
 	"youAlreadyHaveThatOne": "あなたは既にそれを持っています",
 	"thatNameIsTaken": "その名前は既に使われています",

@@ -24,6 +24,7 @@ import 'cf_clearance_store.dart';
 import 'cf_solve_needed.dart';
 import 'crypto_ops.dart';
 import 'js_bootstrap.dart';
+import 'js_call_scheduler.dart';
 import 'js_engine.dart';
 import 'reading_provider.dart';
 
@@ -93,7 +94,27 @@ bool looksLikeCfChallenge({
       b.contains('enable javascript and cookies');
 }
 
+/// Thrown instead of running a queued provider call whose caller has gone.
+///
+/// Its own type so a caller can tell "you left" apart from a real failure: a
+/// screen that has closed must not record this against the source's health,
+/// and must not show an error nobody is there to read.
+class ProviderCallAbandoned implements Exception {
+  const ProviderCallAbandoned();
+  @override
+  String toString() => 'Provider call abandoned — the caller had gone';
+}
+
 class _JsHost {
+  /// Hard ceiling on any single provider fetch, whatever the source asked for.
+  /// A source's patience must not become everyone else's stall.
+  static const int maxProviderFetchTimeoutMs = 25000;
+
+  /// Hard ceiling on a whole `call`, across every fetch it chains. The engine
+  /// runs one call at a time, so this is what stops one slow source freezing
+  /// the app instead of just its own screen.
+  static const Duration maxProviderCallTimeout = Duration(seconds: 25);
+
   _JsHost({required this.dio}) {
     _engine = JsEngine(onChannel: _onChannel, polling: isAppleTv);
   }
@@ -128,7 +149,6 @@ class _JsHost {
   // OWN re-entrant resolves (__resolveFetch/__fireTimer/__resolveCrypto) do NOT
   // take this lock, so an in-flight call can still be fed while it pumps the JS
   // event loop — i.e. this can't deadlock.
-  Future<void> _callQueue = Future<void>.value();
 
   // Cloudflare bridge: JS providers opt into a CF-cleared request via
   // fetch(url, { browser: true }). We reuse the native WebView solver (the same
@@ -246,31 +266,46 @@ class _JsHost {
         });
   }
 
-  // Chains [action] after the current queue tail so calls run strictly one at a
-  // time; a failing call still releases the queue (errors are swallowed on the
-  // chaining future, propagated only to the caller). See [_callQueue].
-  Future<T> _serialized<T>(Future<T> Function() action) {
-    final done = Completer<T>();
-    final prev = _callQueue;
-    _callQueue = done.future.then<void>((_) {}, onError: (_) {});
-    prev.whenComplete(
-      () => action().then(done.complete, onError: done.completeError),
-    );
-    return done.future;
-  }
+  final _scheduler = JsCallScheduler();
+
+  /// Reads the zone the call was scheduled in. A zone rather than a parameter
+  /// because the call chain is six layers deep and threading a lane flag
+  /// through all of them is a diff nobody can review — so only the few
+  /// fire-and-forget origins set it, and everything else stays interactive.
+  CallLane _laneNow() => Zone.current[ProviderManager.backgroundKey] == true
+      ? CallLane.background
+      : CallLane.interactive;
 
   Future<String> call(
     String sourceId,
     String method,
     List<Object?> args, {
     Duration timeout = const Duration(seconds: 15),
+    bool Function()? abandoned,
   }) async {
     try {
-      final v = await _serialized(
-        () => _runCall(sourceId, method, args, timeout),
-      );
+        final v = await _scheduler
+            .enqueue<String>(
+              sourceId,
+              method,
+              () => _runCall(sourceId, method, args, timeout),
+              lane: _laneNow(),
+              abandoned: abandoned,
+            )
+            // One call owns the shared engine, so a call that overruns holds
+            // every other source hostage. `maxProviderFetchTimeoutMs` bounds a
+            // single fetch, but a call is several fetches chained inside the
+            // provider, so the total could still reach ~30s (measured: a
+            // `fuckingfast.net` download ran 30306ms and 82 calls queued behind
+            // it, each then burning the full queue wait). Bound the whole call
+            // so one slow site costs its own search and nothing else.
+            .timeout(maxProviderCallTimeout);
       _health.remove(sourceId);
       return v;
+    } on ProviderCallAbandoned {
+      // The viewer left. That says nothing about the source, so it must not
+      // count towards the failure tally that marks one degraded or broken.
+      rethrow;
     } catch (e) {
       final failures = (_health[sourceId]?.failures ?? 0) + 1;
       _health[sourceId] = _ProviderHealth(
@@ -554,6 +589,24 @@ class _JsHost {
     }
   }
 
+  /// In-flight provider fetches, keyed by method + url + body. A second
+  /// request for a URL already being fetched waits for that one instead of
+  /// issuing a duplicate.
+  ///
+  /// Measured over one browsing session: 873 requests, 206 unique. The same
+  /// domains.json 19 times, the same TMDB title search 16 times, individual
+  /// hubcloud links 12 times each. Those duplicates saturate a phone's
+  /// connection, so every real request queues behind copies of itself — which is
+  /// what "stuck" looks like, and it was self-inflicted rather than slow
+  /// sources.
+  ///
+  /// In-flight only, deliberately: this is not a cache. Sharing a future is
+  /// free and obviously correct, whereas caching would change what a viewer
+  /// sees when a source changes under a pinned link, and would need an
+  /// invalidation story nobody asked for. The same pattern is already used for
+  /// source sweeps in `SourceMatcher._inFlight`.
+  final Map<String, Future<Response<dynamic>>> _inFlightFetches = {};
+
   Future<Response<dynamic>> _request(
     String url,
     String method,
@@ -562,9 +615,59 @@ class _JsHost {
     bool follow,
     int tMs,
   ) {
+    final key = '$method\u0000$url\u0000${body ?? ''}';
+    final running = _inFlightFetches[key];
+    if (running != null) return running;
+    final started = _requestUnshared(url, method, headers, body, follow, tMs);
+    _inFlightFetches[key] = started;
+    // Braces, NOT an arrow: Map.remove hands back the removed value, and
+    // whenComplete awaits a returned Future — an arrow would await the very
+    // future being completed and never finish.
+    unawaited(
+      started.whenComplete(() {
+        _inFlightFetches.remove(key);
+      }).then<void>((_) {}, onError: (Object _) {}),
+    );
+    return started;
+  }
+
+  Future<Response<dynamic>> _requestUnshared(
+    String url,
+    String method,
+    Map<String, String> headers,
+    dynamic body,
+    bool follow,
+    int tMs,
+  ) {
+    // `null` in Dio means "wait forever", which is what a provider fetch got
+    // whenever the source didn't ask for a timeout — and WCCCNF shows the cost:
+    // one title took 71.8s while every other request queued behind it. A
+    // source's requested timeout is a FLOOR, not a ceiling: these sources ask
+    // for 30s, and those 30s are spent inside one call that OWNS the shared JS
+    // bridge, so a hostile host stalls every source in the app (5YD3QD:
+    // `vegamovies.getDetail waited 20s in the queue`).
+    //
+    // 25s matches the hand-picked source's existing budget, so this changes
+    // nothing about how long a source the viewer chose gets. It only stops
+    // unbounded and 30s requests holding everyone else hostage. A request
+    // asking for less still gets less.
+    final ms =
+        tMs > 0 && tMs < maxProviderFetchTimeoutMs ? tMs : maxProviderFetchTimeoutMs;
     return dio.requestUri<dynamic>(
       Uri.parse(url),
       data: body,
+      // `null` here means "wait forever" in Dio, which is what a provider fetch
+      // got whenever the source didn't ask for a timeout — and WCCCNF shows what
+      // that costs: a title took 71.8s while every other request queued behind
+      // it. A source's requested timeout is a FLOOR, not a ceiling: these
+      // sources ask for 30s, and those 30s are spent inside one call that owns
+      // the shared JS bridge, so a hostile host stalls every source in the app
+      // (5YD3QD: `vegamovies.getDetail waited 20s in the queue`).
+      //
+      // 25s is the hand-picked source's existing budget, so this changes
+      // nothing about how long a source the viewer chose gets; it only stops
+      // unbounded and 30s requests from holding everyone else hostage. A
+      // request asking for less still gets less.
       options: Options(
         method: method,
         headers: headers,
@@ -572,8 +675,8 @@ class _JsHost {
         followRedirects: follow,
         maxRedirects: follow ? 5 : 0,
         validateStatus: (_) => true,
-        receiveTimeout: tMs > 0 ? Duration(milliseconds: tMs) : null,
-        sendTimeout: tMs > 0 ? Duration(milliseconds: tMs) : null,
+        receiveTimeout: Duration(milliseconds: ms),
+        sendTimeout: Duration(milliseconds: ms),
       ),
     );
   }
@@ -813,7 +916,14 @@ class JsProvider implements BaseProvider, ReadingProvider {
     String method,
     List<Object?> args, {
     Duration timeout = const Duration(seconds: 15),
-  }) => _host.call(sourceId, method, args, timeout: timeout);
+    bool Function()? abandoned,
+  }) => _host.call(
+    sourceId,
+    method,
+    args,
+    timeout: timeout,
+    abandoned: abandoned,
+  );
 
   ProviderInfo? _infoCache;
 
@@ -917,13 +1027,19 @@ class JsProvider implements BaseProvider, ReadingProvider {
   }
 
   @override
-  Future<MediaDetail> getDetail(String url, {String category = 'sub'}) async {
+  Future<MediaDetail> getDetail(
+    String url, {
+    String category = 'sub',
+    // Adding an optional parameter is a valid override, so the interface and
+    // every other provider stay exactly as they are.
+    bool Function()? abandoned,
+  }) async {
     // 30s: some providers enrich detail with extra metadata round-trips
     // (e.g. TMDB episode names/stills) on top of the page fetch.
     final raw = await _call('getDetail', [
       url,
       {'category': category},
-    ], timeout: const Duration(seconds: 30));
+    ], timeout: const Duration(seconds: 30), abandoned: abandoned);
     final map = jsonDecode(raw) as Map<String, dynamic>;
     // Sozo Read manga/novel detail payloads carry the chapter list under
     // `chapters`; Zangetsu's MediaDetail reads `episodes` (Task E4 compat
@@ -969,12 +1085,14 @@ class JsProvider implements BaseProvider, ReadingProvider {
   @override
   Future<List<VideoSource>> getVideoSources(
     String episodeUrl, {
-    bool fast = false, // JS providers resolve in one call; no incremental mode.
+    bool fast = false,
   }) async {
     // Video source resolution makes several network hops (decrypt + multiple
     // embed/clock resolves), so it needs a longer ceiling than the 15s default.
+    // TorBox and similar debrid sources use [fast] to parallelize unlocks.
     final raw = await _call('getVideoSources', [
       episodeUrl,
+      fast,
     ], timeout: const Duration(seconds: 60));
     final list = (jsonDecode(raw) as List).cast<Map<String, dynamic>>();
     return list.map(VideoSource.fromJson).toList();
@@ -1058,6 +1176,14 @@ abstract class ProviderRuntimeLoader {
 /// Public manager. Owns the single shared QuickJS runtime + registered
 /// providers and extractors.
 class ProviderManager implements ProviderRuntimeLoader {
+  /// Zone key marking a provider call as housekeeping nobody is waiting on.
+  static final Object backgroundKey = Object();
+
+  /// Runs [body] with every provider call it makes tagged background, so it
+  /// queues behind the viewer's taps instead of competing with them.
+  static Future<T> inBackground<T>(Future<T> Function() body) =>
+      runZoned(body, zoneValues: {backgroundKey: true});
+
   ProviderManager({required Dio dio}) : _host = _JsHost(dio: dio);
 
   final _JsHost _host;

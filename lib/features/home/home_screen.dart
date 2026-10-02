@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -8,6 +9,8 @@ import 'package:hive_flutter/hive_flutter.dart';
 import '../../core/app_mode.dart';
 import '../../core/aniyomi/aniyomi_image_provider.dart';
 import '../../core/di/injector.dart';
+import '../../core/metadata/streaming_service.dart';
+import '../../core/zmode/tmdb_catalogue.dart';
 import '../../core/platform/apple_tv.dart';
 import '../../core/mihon/mihon_extension_service.dart';
 import '../../core/mihon/mihon_image_provider.dart';
@@ -25,6 +28,7 @@ import '../../core/models/home_row.dart';
 import '../../core/models/home_section.dart';
 import '../../core/models/media_detail.dart';
 import '../../core/models/media_item.dart';
+import '../../core/models/video_source.dart';
 import '../../core/models/provider_info.dart';
 import '../../core/playback/my_list.dart';
 import '../../core/playback/playback_prefs.dart';
@@ -49,6 +53,7 @@ import '../downloads/downloads_screen.dart';
 import '../notify/subscriptions_screen.dart';
 import '../reader/manga_reader_screen.dart';
 import '../reader/novel_reader_screen.dart';
+import '../settings/streaming_services_screen.dart';
 import '../sources/aniyomi_repo_tab.dart' show kAniyomiReposBoxName;
 import '../sources/providers_hub_screen.dart';
 import '../sources/zangetsu_sources_screen.dart';
@@ -57,6 +62,8 @@ import 'continue_section.dart';
 import 'my_list_screen.dart';
 import 'tracker_continue_section.dart';
 import '../../core/ui/content_row.dart';
+import '../../core/ui/banner_style.dart';
+import '../../core/ui/featured_banner_panels.dart';
 import '../../core/ui/featured_carousel.dart';
 import '../../core/ui/featured_hero.dart';
 import '../../core/metadata/title_logo_service.dart';
@@ -76,7 +83,9 @@ import '../schedule/schedule_screen.dart';
 import '../shell/dock_icons.dart';
 import '../../core/zmode/source_matcher.dart';
 import '../../core/zmode/metadata_repository.dart';
+import '../../core/zmode/playback_resolver.dart';
 import '../../core/zmode/zmode_ids.dart';
+import 'streaming_services_row.dart';
 import 'cubit/home_cubit.dart';
 import 'home_screen_tv.dart';
 import 'lists_hub_screen.dart';
@@ -115,6 +124,7 @@ class _HomeViewState extends State<_HomeView>
   /// never re-fetched on carousel rotation; pre-warmed when hero items load.
   final Map<String, Future<HeroMeta?>> _metaCache = {};
   bool _heroPrewarmed = false;
+  bool _resumePrewarmed = false;
 
   // ── Logo-strike mode transition ──────────────────────────────────────────
   // Tapping a mode card runs a full-screen overlay: the Zangetsu mark springs
@@ -250,9 +260,38 @@ class _HomeViewState extends State<_HomeView>
   }
 
   /// Genres + episode count for the hero banner (lazily fetched, cached).
+  ///
+  /// Settles on the FIRST of two answers: the partial a metadata title hands
+  /// over once its catalogue has replied, or the finished detail. A metadata
+  /// title's `detail()` also pairs the title with an installed source before
+  /// it returns, and that pairing searches every installed source in turn —
+  /// one report spent 18 seconds on a title no source carried, with the
+  /// banner's caption blank the whole time and the carousel rotating on. The
+  /// caption is genres, a count and a year; the catalogue supplies all three
+  /// up front, and the source is only needed for episode *urls*, which the
+  /// banner never reads. Once that partial result arrives, the unused source
+  /// match is abandoned so Home cannot keep provider work running underneath
+  /// a detail screen.
+  ///
+  /// A source-backed title never calls `onPartial` — it has nothing to search
+  /// for — and completes on the second branch exactly as it always did.
   Future<HeroMeta?> _heroMeta(MediaItem m) =>
       _metaCache.putIfAbsent('${m.sourceId}:${m.id}', () async {
-        final d = await _detailOf(m.url, m.sourceId);
+        final first = Completer<MediaDetail?>();
+        void settle(MediaDetail? d) {
+          if (!first.isCompleted) first.complete(d);
+        }
+
+        // _detailOf swallows its errors, so this always settles.
+        unawaited(
+          _detailOf(
+            m.url,
+            m.sourceId,
+            onPartial: settle,
+            abandoned: () => first.isCompleted,
+          ).then(settle),
+        );
+        final d = await first.future;
         if (d == null) return null;
         return HeroMeta(
           genres: d.genres,
@@ -267,9 +306,48 @@ class _HomeViewState extends State<_HomeView>
   /// one `detail()` per hero AT ONCE; for a heavy CloudStream source (e.g.
   /// MovieBox) those N concurrent `load()`s saturated the read pool and froze
   /// the UI thread → ANR. One-at-a-time on rotation is fine even for MovieBox.
+  /// Resolve the stream for the top Continue Watching row before it is tapped.
+  ///
+  /// It is the most-tapped thing on Home, and the caches that make a resolve
+  /// instant live in memory only — so the first play after opening the app
+  /// always paid full price (7.3s median across 139 plays on 2.2.0, 20s at
+  /// p90). The episode url is already on the history row, so this costs one
+  /// resolve and no source search.
+  ///
+  /// Only the first row: warming the whole rail would fire a resolve per show
+  /// for shows nobody asked for. Fire-and-forget, after the frame, so it never
+  /// competes with Home rendering — and a failure just means Play does the
+  /// work itself, as before.
+  void _prewarmResume() {
+    if (_resumePrewarmed) return;
+    _resumePrewarmed = true;
+    final rows = sl<WatchHistory>().all();
+    if (rows.isEmpty) return;
+    final e = rows.first;
+    if (e.episodeUrl.isEmpty) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      ProviderManager.inBackground(
+        () {
+          // Z Mode's source id is only a catalogue pseudo-id. Use the actual
+          // source remembered for this title and stop there: a speculative
+          // startup warm must never turn into an Auto Resolve sweep.
+          if (e.sourceId == ZmodeIds.sourceId) {
+            if (!sl.isRegistered<PlaybackResolver>()) {
+              return Future.value(<VideoSource>[]);
+            }
+            return sl<PlaybackResolver>().prewarmRememberedSource(e.episodeUrl);
+          }
+          return _repo.sources(e.episodeUrl, sourceId: e.sourceId, fast: true);
+        },
+      ).catchError((_) => <VideoSource>[]);
+    });
+  }
+
   void _prewarmHeroMeta(List<MediaItem> items) {
     if (_heroPrewarmed || items.isEmpty) return;
     _heroPrewarmed = true;
+    _prewarmResume();
     _heroMeta(items.first);
     // Warm the TMDB title logos for the whole carousel up front. The service
     // resolves them SEQUENTIALLY (so no request burst at TMDB) and caches both
@@ -288,9 +366,19 @@ class _HomeViewState extends State<_HomeView>
   String _typeLabel(ProviderType t) =>
       t == ProviderType.movie ? 'Movie' : 'Anime';
 
-  Future<MediaDetail?> _detailOf(String url, String sourceId) async {
+  Future<MediaDetail?> _detailOf(
+    String url,
+    String sourceId, {
+    void Function(MediaDetail partial)? onPartial,
+    bool Function()? abandoned,
+  }) async {
     try {
-      return await _repo.detail(url, sourceId: sourceId);
+      return await _repo.detail(
+        url,
+        sourceId: sourceId,
+        onPartial: onPartial,
+        abandoned: abandoned,
+      );
     } catch (_) {
       return null;
     }
@@ -377,11 +465,12 @@ class _HomeViewState extends State<_HomeView>
   /// Long-press info card for a Continue Reading item — the manga/novel twin of
   /// [_showContinueInfo]: Read + Remove + My List, backed by [ReadHistory].
   void _showContinueReadingInfo(ReadEntry e) {
+    final showUrl = e.detailUrl;
     final stub = MediaItem(
       id: e.showId,
       title: e.title,
       cover: e.cover,
-      url: e.showId,
+      url: showUrl,
       type: e.type,
       sourceId: e.sourceId,
     );
@@ -391,7 +480,7 @@ class _HomeViewState extends State<_HomeView>
       context,
       title: e.title,
       cover: e.cover,
-      detail: _detailOf(e.showId, e.sourceId),
+      detail: _detailOf(showUrl, e.sourceId),
       inMyList: _myList.contains(stub),
       playLabel: 'Read',
       progress: progress,
@@ -568,7 +657,7 @@ class _HomeViewState extends State<_HomeView>
             // is untouched.
             Expanded(
               child: Align(
-                alignment: Alignment.centerLeft,
+                alignment: AlignmentDirectional.centerStart,
                 child: GestureDetector(
                   behavior: HitTestBehavior.opaque,
                   onTap: () => showMetadataSwitchSheet(context),
@@ -595,6 +684,49 @@ class _HomeViewState extends State<_HomeView>
         ),
       ),
     );
+  }
+
+  /// The banner for [bannerId], with the same items and the same callbacks
+  /// whichever one is showing.
+  ///
+  /// [BannerStyle.defaultId] returns the carousel exactly as it was written —
+  /// this switch is the only thing standing between Home and the banner every
+  /// install already has, and the other branch is a separate widget that never
+  /// runs unless someone opts in.
+  Widget _featuredBanner(String bannerId, List<MediaItem> heroItems) {
+    final reading = sl<ContentModeCubit>().state.isReading;
+    void toggleList(MediaItem m) => showListStatusSheet(
+      context,
+      item: m,
+      onChanged: () {
+        if (mounted) setState(() {});
+      },
+    );
+
+    switch (bannerId) {
+      case BannerStyle.panelsId:
+        return FeaturedBannerPanels(
+          items: heroItems,
+          reading: reading,
+          inList: (m) => _myList.contains(m),
+          onPlay: _playFeatured,
+          onInfo: _openDetail,
+          onToggleList: toggleList,
+          meta: _heroMeta,
+        );
+      default:
+        // Auto-rotating carousel (up to 6 trending items)
+        return FeaturedCarousel(
+          items: heroItems,
+          reading: reading,
+          inList: (m) => _myList.contains(m),
+          onPlay: _playFeatured,
+          onInfo: _openDetail,
+          onToggleList: toggleList,
+          meta: _heroMeta,
+          style: HeroTransition.cinematic,
+        );
+    }
   }
 
   /// Header download shortcut → [DownloadsScreen]. Same shape as
@@ -689,6 +821,37 @@ class _HomeViewState extends State<_HomeView>
     );
   }
 
+  /// Open one streaming service's catalogue from the rail.
+  ///
+  /// Goes straight to the paginated grid rather than via the services screen —
+  /// the rail already IS the service picker, so a stop in between would be a
+  /// screen you pass through.
+  Future<void> _openStreamingService(StreamingService s) async {
+    final repo = sl<MetadataRepository>();
+    final more = BrowseMore(
+      sourceId: ZmodeIds.sourceId,
+      kind: 'zm_video',
+      categoryId: TmdbCatalogue.wpRowId(s.id),
+    );
+    List<MediaItem> first;
+    try {
+      first = await repo.browseMore(more, 1);
+    } catch (_) {
+      first = const [];
+    }
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SeeAllScreen(
+          title: s.name,
+          items: first,
+          onTap: (m) => Navigator.push(context, DetailScreen.route(m)),
+          onLoadMore: (page) => repo.browseMore(more, page),
+        ),
+      ),
+    );
+  }
+
   /// One row of the merged home arrangement, as a sliver. Every [HomeRow]
   /// type maps to the widget that already renders that shape — the sealed
   /// switch makes a future row type a compile error here instead of a silent
@@ -702,6 +865,16 @@ class _HomeViewState extends State<_HomeView>
       onSeeAll: _openHistory,
       onResumeReading: _resumeReading,
       onLongPressReading: _showContinueReadingInfo,
+    ),
+    StreamingServicesHomeRow() => SliverToBoxAdapter(
+      child: StreamingServicesRow(
+        onOpen: _openStreamingService,
+        onSeeAll: () => Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => const StreamingServicesScreen(),
+          ),
+        ),
+      ),
     ),
     ProviderHomeRow(:final section) => SliverToBoxAdapter(
       child: _sectionRow(section),
@@ -1492,7 +1665,16 @@ class _HomeViewState extends State<_HomeView>
           children: [
             RefreshIndicator(
               color: AppColors.accent,
-              onRefresh: () => context.read<HomeCubit>().load(),
+              onRefresh: () {
+                // Pull-to-refresh is the user saying "try again", so it also
+                // re-tests a session the startup check only assumed was dead
+                // (the "Reconnect to sync" banner). force: it must not sit out
+                // the cool-off when someone deliberately pulled.
+                if (sl.isRegistered<AuthCubit>()) {
+                  unawaited(sl<AuthCubit>().revalidateIfFlagged(force: true));
+                }
+                return context.read<HomeCubit>().load();
+              },
               child: BlocBuilder<HomeCubit, HomeState>(
                 builder: (context, state) {
                   final sections = state.sections ?? const <HomeSection>[];
@@ -1540,34 +1722,23 @@ class _HomeViewState extends State<_HomeView>
                             if (hasHero) _prewarmHeroMeta(heroItems);
 
                             if (hasHero && !noSourceForMode) {
-                              return Stack(
-                                children: [
-                                  // Auto-rotating carousel (up to 6 trending items)
-                                  FeaturedCarousel(
-                                    items: heroItems,
-                                    reading:
-                                        sl<ContentModeCubit>().state.isReading,
-                                    inList: (m) => _myList.contains(m),
-                                    onPlay: _playFeatured,
-                                    onInfo: _openDetail,
-                                    onToggleList: (m) => showListStatusSheet(
-                                      context,
-                                      item: m,
-                                      onChanged: () {
-                                        if (mounted) setState(() {});
-                                      },
+                              // Which banner is drawn is a Settings choice, and
+                              // it can change while Home is already built — so
+                              // listen rather than read once.
+                              return ValueListenableBuilder<String>(
+                                valueListenable: BannerStyle.current,
+                                builder: (context, bannerId, _) => Stack(
+                                  children: [
+                                    _featuredBanner(bannerId, heroItems),
+                                    // Floating header sits on top
+                                    Positioned(
+                                      top: 0,
+                                      left: 0,
+                                      right: 0,
+                                      child: _buildHeader(),
                                     ),
-                                    meta: _heroMeta,
-                                    style: HeroTransition.cinematic,
-                                  ),
-                                  // Floating header sits on top
-                                  Positioned(
-                                    top: 0,
-                                    left: 0,
-                                    right: 0,
-                                    child: _buildHeader(),
-                                  ),
-                                ],
+                                  ],
+                                ),
                               );
                             }
 
@@ -2076,6 +2247,7 @@ Widget readerFor(ReadEntry e, Episode chapter) {
     return MangaReaderScreen(
       sourceId: e.sourceId,
       showId: e.showId,
+      showUrl: e.detailUrl,
       showTitle: e.title,
       cover: e.cover,
       chapters: [chapter],
@@ -2086,6 +2258,7 @@ Widget readerFor(ReadEntry e, Episode chapter) {
   return NovelReaderScreen(
     sourceId: e.sourceId,
     showId: e.showId,
+    showUrl: e.detailUrl,
     showTitle: e.title,
     cover: e.cover,
     chapters: [chapter],
@@ -2114,7 +2287,7 @@ class _IncognitoChip extends StatelessWidget {
       return Padding(
         // Its own breathing room. The old chip carried a right margin only, so
         // it sat flush against the wordmark.
-        padding: const EdgeInsets.only(left: 10, right: 6),
+        padding: const EdgeInsetsDirectional.only(start: 10, end: 6),
         child: Tooltip(
           message: l10n.incognitoMode,
           child: GestureDetector(

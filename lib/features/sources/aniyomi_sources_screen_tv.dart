@@ -399,22 +399,43 @@ class _AniScreenTvSourceRowState extends State<_AniScreenTvSourceRow> {
                     vertical: 12,
                   ),
                   child: ExcludeSemantics(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+                    child: Row(
                       children: [
-                        Text(
-                          source.displayName,
-                          style: AppText.headline.copyWith(
-                            color: active
-                                ? AppColors.accent
-                                : AppColors.textPrimary,
-                            fontWeight: active ? FontWeight.w600 : null,
+                        Padding(
+                          padding: const EdgeInsetsDirectional.only(end: 14),
+                          // Bigger than the phone tile — this is read from
+                          // across a room.
+                          child: SourceIconTile(
+                            size: 38,
+                            name: source.displayName,
+                            icon: source is AniyomiProvider
+                                ? SourceIconStore.urlFor(source.info.pkg)
+                                : null,
                           ),
                         ),
-                        if (lang.isNotEmpty) ...[
-                          const SizedBox(height: 2),
-                          Text('aniyomi • $lang', style: AppText.caption),
-                        ],
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                source.displayName,
+                                style: AppText.headline.copyWith(
+                                  color: active
+                                      ? AppColors.accent
+                                      : AppColors.textPrimary,
+                                  fontWeight: active ? FontWeight.w600 : null,
+                                ),
+                              ),
+                              if (lang.isNotEmpty) ...[
+                                const SizedBox(height: 2),
+                                Text(
+                                  'aniyomi • $lang',
+                                  style: AppText.caption,
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
                       ],
                     ),
                   ),
@@ -809,6 +830,14 @@ class _AniScreenTvExtensionRowState extends State<_AniScreenTvExtensionRow> {
             ),
             child: Row(
               children: [
+                Padding(
+                  padding: const EdgeInsetsDirectional.only(end: 14),
+                  child: SourceIconTile(
+                    size: 38,
+                    name: entry.name,
+                    icon: entry.iconUrl,
+                  ),
+                ),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -905,84 +934,14 @@ Future<bool> _aniScreenTvConfirm(
   required String title,
   required String body,
   required String confirmLabel,
-}) async {
-  final ok = await showDialog<bool>(
-    context: context,
-    barrierColor: Colors.black54,
-    builder: (ctx) => Dialog(
-      backgroundColor: AppColors.surface,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      insetPadding: const EdgeInsets.symmetric(horizontal: 80, vertical: 48),
-      child: SizedBox(
-        width: 440,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
-              child: Text(title, style: AppText.headline),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(24, 0, 24, 16),
-              child: Text(
-                body,
-                style: AppText.body.copyWith(color: AppColors.textSecondary),
-              ),
-            ),
-            const Divider(height: 1, color: AppColors.hairline),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  // Cancel — autofocused so D-pad lands here first.
-                  TvListFocusable(
-                    autofocus: true,
-                    onTap: () => Navigator.pop(ctx, false),
-                    semanticLabel: context.l10n.cancel,
-                    child: ExcludeSemantics(
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 20,
-                          vertical: 12,
-                        ),
-                        child: Text(
-                          context.l10n.cancel,
-                          style: AppText.body.copyWith(
-                            color: AppColors.textSecondary,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 4),
-                  // Confirm action.
-                  TvListFocusable(
-                    onTap: () => Navigator.pop(ctx, true),
-                    semanticLabel: confirmLabel,
-                    child: ExcludeSemantics(
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 20,
-                          vertical: 12,
-                        ),
-                        child: Text(
-                          confirmLabel,
-                          style: AppText.body.copyWith(color: AppColors.accent),
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    ),
+}) {
+  return AppDialog.confirm(
+    context,
+    title: title,
+    message: body,
+    confirmLabel: confirmLabel,
+    destructive: true,
   );
-  return ok == true;
 }
 
 // ---------------------------------------------------------------------------

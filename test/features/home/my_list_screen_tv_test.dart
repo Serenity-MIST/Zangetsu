@@ -119,14 +119,27 @@ MyListCubit _makeCubit(List<MediaItem> items) =>
 Widget _pumpTree({
   required MyListCubit myList,
   required TrackerListCubit trackerList,
+  List<NavigatorObserver> navigatorObservers = const [],
 }) {
   return MultiBlocProvider(
     providers: [
       BlocProvider<MyListCubit>.value(value: myList),
       BlocProvider<TrackerListCubit>.value(value: trackerList),
     ],
-    child: const MaterialApp(home: MyListScreenTv()),
+    child: MaterialApp(
+      navigatorObservers: navigatorObservers,
+      home: const MyListScreenTv(),
+    ),
   );
+}
+
+class _RecordingNavigatorObserver extends NavigatorObserver {
+  final List<Route<dynamic>> pushed = [];
+
+  @override
+  void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    pushed.add(route);
+  }
 }
 
 Future<void> _registerHub(List<Tracker> trackers) async {
@@ -163,6 +176,7 @@ void main() {
     url: '',
     type: ProviderType.anime,
     sourceId: '',
+    anilistId: 99,
   );
 
   setUp(() async {
@@ -191,32 +205,33 @@ void main() {
       expect(find.text('Demon Slayer'), findsOneWidget);
       // No tracker chips when nothing is connected.
       expect(find.text('AniList'), findsNothing);
+      expect(find.text('All'), findsOneWidget);
 
-      final focusables =
-          tester.widgetList<TvFocusable>(find.byType(TvFocusable)).toList();
+      final focusables = tester
+          .widgetList<TvFocusable>(find.byType(TvFocusable))
+          .toList();
       expect(focusables.length, greaterThanOrEqualTo(2));
       expect(focusables.first.autofocus, isTrue);
-      expect(focusables.first.onLongPress, isNotNull);
+      expect(focusables.any((f) => f.onLongPress != null), isTrue);
     },
   );
 
-  testWidgets(
-    'MyListScreenTv shows empty state when cubit emits no entries',
-    (tester) async {
-      await _registerHub(const []);
+  testWidgets('MyListScreenTv shows empty state when cubit emits no entries', (
+    tester,
+  ) async {
+    await _registerHub(const []);
 
-      final cubit = _makeCubit([]);
-      final tlCubit = TrackerListCubit();
-      addTearDown(cubit.close);
-      addTearDown(tlCubit.close);
+    final cubit = _makeCubit([]);
+    final tlCubit = TrackerListCubit();
+    addTearDown(cubit.close);
+    addTearDown(tlCubit.close);
 
-      await tester.pumpWidget(_pumpTree(myList: cubit, trackerList: tlCubit));
-      await tester.pumpAndSettle();
+    await tester.pumpWidget(_pumpTree(myList: cubit, trackerList: tlCubit));
+    await tester.pumpAndSettle();
 
-      expect(find.text('Titles you add appear here'), findsOneWidget);
-      expect(find.byType(TvFocusable), findsNothing);
-    },
-  );
+    expect(find.text('Titles you add appear here'), findsOneWidget);
+    expect(find.byType(TvFocusable), findsNothing);
+  });
 
   testWidgets(
     'connected tracker shows a source chip; selecting it shows tracker titles',
@@ -248,8 +263,9 @@ void main() {
       expect(find.text('Jujutsu Kaisen'), findsNothing);
 
       // First focusable is the My List chip (autofocus when chips exist).
-      final focusables =
-          tester.widgetList<TvFocusable>(find.byType(TvFocusable)).toList();
+      final focusables = tester
+          .widgetList<TvFocusable>(find.byType(TvFocusable))
+          .toList();
       expect(focusables.first.autofocus, isTrue);
 
       await tester.tap(find.text('AniList'));
@@ -260,78 +276,176 @@ void main() {
     },
   );
 
-  testWidgets(
-    'tracker loading state shows a progress indicator',
-    (tester) async {
-      final anilist = _FakeTracker(name: 'AniList', connected: true);
-      await _registerHub([anilist]);
+  testWidgets('Shuffle on a tracker list opens its title details', (
+    tester,
+  ) async {
+    final anilist = _FakeTracker(name: 'AniList', connected: true);
+    await _registerHub([anilist]);
 
-      final cubit = _makeCubit([item1]);
-      final tlCubit = _SeededTrackerListCubit()
-        ..seed(TrackerListState(
+    final cubit = _makeCubit([item1]);
+    final tlCubit = _SeededTrackerListCubit()
+      ..seed(
+        TrackerListState(
+          source: TrackerSource(anilist),
+          status: TrackerListStatus.ready,
+          entries: [const MyListEntry(trackerItem, WatchStatus.planning)],
+        ),
+      );
+    final observer = _RecordingNavigatorObserver();
+    addTearDown(cubit.close);
+    addTearDown(tlCubit.close);
+
+    await tester.pumpWidget(
+      _pumpTree(
+        myList: cubit,
+        trackerList: tlCubit,
+        navigatorObservers: [observer],
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Jujutsu Kaisen'), findsOneWidget);
+    final before = observer.pushed.length;
+    await tester.tap(find.text('Shuffle'));
+
+    expect(observer.pushed.length, before + 1);
+    expect(observer.pushed.last, isA<PageRouteBuilder<void>>());
+  });
+
+  testWidgets('tracker loading state shows a progress indicator', (
+    tester,
+  ) async {
+    final anilist = _FakeTracker(name: 'AniList', connected: true);
+    await _registerHub([anilist]);
+
+    final cubit = _makeCubit([item1]);
+    final tlCubit = _SeededTrackerListCubit()
+      ..seed(
+        TrackerListState(
           source: TrackerSource(anilist),
           status: TrackerListStatus.loading,
-        ));
-      addTearDown(cubit.close);
-      addTearDown(tlCubit.close);
+        ),
+      );
+    addTearDown(cubit.close);
+    addTearDown(tlCubit.close);
 
-      await tester.pumpWidget(_pumpTree(myList: cubit, trackerList: tlCubit));
-      // One frame only — pumpAndSettle never completes on an indeterminate
-      // CircularProgressIndicator.
-      await tester.pump();
-      expect(find.byType(CircularProgressIndicator), findsOneWidget);
-    },
-  );
+    await tester.pumpWidget(_pumpTree(myList: cubit, trackerList: tlCubit));
+    // One frame only — pumpAndSettle never completes on an indeterminate
+    // CircularProgressIndicator.
+    await tester.pump();
+    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+  });
 
-  testWidgets(
-    'tracker empty and error states show dedicated copy',
-    (tester) async {
-      final anilist = _FakeTracker(name: 'AniList', connected: true);
-      await _registerHub([anilist]);
+  testWidgets('tracker empty and error states show dedicated copy', (
+    tester,
+  ) async {
+    final anilist = _FakeTracker(name: 'AniList', connected: true);
+    await _registerHub([anilist]);
 
-      final cubit = _makeCubit([item1]);
-      final tlCubit = _SeededTrackerListCubit()
-        ..seed(TrackerListState(
+    final cubit = _makeCubit([item1]);
+    final tlCubit = _SeededTrackerListCubit()
+      ..seed(
+        TrackerListState(
           source: TrackerSource(anilist),
           status: TrackerListStatus.ready,
           entries: const [],
-        ));
-      addTearDown(cubit.close);
-      addTearDown(tlCubit.close);
+        ),
+      );
+    addTearDown(cubit.close);
+    addTearDown(tlCubit.close);
 
-      await tester.pumpWidget(_pumpTree(myList: cubit, trackerList: tlCubit));
-      await tester.pumpAndSettle();
-      expect(find.text('No titles in this list'), findsOneWidget);
+    await tester.pumpWidget(_pumpTree(myList: cubit, trackerList: tlCubit));
+    await tester.pumpAndSettle();
+    expect(find.text('No titles in this list'), findsOneWidget);
 
-      tlCubit.seed(TrackerListState(
+    tlCubit.seed(
+      TrackerListState(
         source: TrackerSource(anilist),
         status: TrackerListStatus.error,
-      ));
-      await tester.pumpAndSettle();
-      expect(
-        find.text('Couldn’t load — try again from Settings'),
-        findsOneWidget,
-      );
-    },
-  );
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Couldn’t load — try again from Settings'),
+      findsOneWidget,
+    );
+  });
 
-  testWidgets(
-    'MAL chip uses short label',
-    (tester) async {
-      await _registerHub([
-        _FakeTracker(name: 'MyAnimeList', connected: true),
-      ]);
+  testWidgets('MAL chip uses short label', (tester) async {
+    await _registerHub([_FakeTracker(name: 'MyAnimeList', connected: true)]);
 
-      final cubit = _makeCubit([item1]);
-      final tlCubit = TrackerListCubit();
-      addTearDown(cubit.close);
-      addTearDown(tlCubit.close);
+    final cubit = _makeCubit([item1]);
+    final tlCubit = TrackerListCubit();
+    addTearDown(cubit.close);
+    addTearDown(tlCubit.close);
 
-      await tester.pumpWidget(_pumpTree(myList: cubit, trackerList: tlCubit));
-      await tester.pumpAndSettle();
+    await tester.pumpWidget(_pumpTree(myList: cubit, trackerList: tlCubit));
+    await tester.pumpAndSettle();
 
-      expect(find.text('MAL'), findsOneWidget);
-      expect(find.text('MyAnimeList'), findsNothing);
-    },
-  );
+    expect(find.text('MAL'), findsOneWidget);
+    expect(find.text('MyAnimeList'), findsNothing);
+  });
+
+  testWidgets('AniList chips filter by status and sort highest score first', (
+    tester,
+  ) async {
+    const low = MediaItem(
+      id: 'low',
+      title: 'Low Score',
+      url: '/low',
+      type: ProviderType.anime,
+      sourceId: 'test',
+    );
+    const high = MediaItem(
+      id: 'high',
+      title: 'High Score',
+      url: '/high',
+      type: ProviderType.anime,
+      sourceId: 'test',
+    );
+    final anilist = _FakeTracker(
+      name: 'AniList',
+      connected: true,
+      list: [
+        const TrackerListItem(
+          item: low,
+          status: WatchStatus.watching,
+          score: 4,
+        ),
+        const TrackerListItem(
+          item: high,
+          status: WatchStatus.completed,
+          score: 9,
+        ),
+      ],
+    );
+    await _registerHub([anilist]);
+
+    final cubit = _makeCubit([]);
+    final tlCubit = TrackerListCubit();
+    addTearDown(cubit.close);
+    addTearDown(tlCubit.close);
+
+    await tester.pumpWidget(_pumpTree(myList: cubit, trackerList: tlCubit));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('AniList'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Watching'), findsOneWidget);
+    expect(find.text('Completed'), findsOneWidget);
+    expect(find.text('Score · High → Low'), findsOneWidget);
+
+    // Score desc: completed (9) before watching (4).
+    final titles = tester
+        .widgetList<Text>(find.byType(Text))
+        .map((t) => t.data)
+        .whereType<String>()
+        .toList();
+    expect(titles.indexOf('High Score'), lessThan(titles.indexOf('Low Score')));
+
+    await tester.tap(find.text('Completed'));
+    await tester.pumpAndSettle();
+    expect(find.text('High Score'), findsOneWidget);
+    expect(find.text('Low Score'), findsNothing);
+  });
 }

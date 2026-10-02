@@ -12,12 +12,15 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../core/anilist/anilist_service.dart';
 import '../../core/app_config.dart';
 import '../../core/app_mode.dart';
+import '../../core/metadata/streaming_providers.dart';
 import '../../core/tracker/tracker_hub.dart';
+import '../../core/ui/streaming_prefs.dart';
 import '../../core/zmode/metadata_provider_prefs.dart';
 import '../../core/cache/media_cache.dart';
 import '../../core/logging/app_logger.dart';
 import '../../core/logging/log_report_service.dart';
 import '../../core/tracker/mal_service.dart';
+import '../../core/tracker/mangabaka_service.dart';
 import '../../core/tracker/simkl_service.dart';
 import '../../core/tracker/tracker.dart';
 import '../player/player_screen.dart' show openSubtitleStyleSheet;
@@ -39,8 +42,10 @@ import '../../core/provider/cs_dns.dart';
 import '../../core/provider/provider_manager.dart';
 import '../downloads/downloads_screen.dart';
 import '../history/history_screen.dart';
+import 'app_face_screen.dart';
 import 'appearance_screen.dart';
 import '../companion/companion_settings_screen.dart';
+import 'home_rows_screen.dart';
 import 'nav_tabs_screen.dart';
 import 'reader_settings_screen.dart';
 import 'discord_settings_screen.dart';
@@ -57,6 +62,7 @@ import '../../core/ui/subtitle_language_picker.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/update/update_service.dart';
 import '../update/update_dialog.dart';
+import '../../core/ui/app_dialog.dart';
 import '../../core/ui/settings_widgets.dart';
 import '../../core/tv/tv_list_focusable.dart';
 import '../../core/ui/dock_visibility.dart';
@@ -146,8 +152,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   ProviderRegistry get _registry => sl<ProviderRegistry>();
-
-  CloudStreamManager get _csManager => sl<CloudStreamManager>();
 
   Future<void> _push(Widget screen) => _pushBuilder((_) => screen);
 
@@ -343,26 +347,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
     messenger.clearSnackBars();
     if (ref == null) return _shareLogs();
 
-    await showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppColors.surface,
-        title: Text(ctx.l10n.reportSent),
-        content: Text(ctx.l10n.reportSentBody(ref)),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Clipboard.setData(ClipboardData(text: ref));
-              Navigator.pop(ctx);
-            },
-            child: Text(ctx.l10n.copy),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: Text(ctx.l10n.ok),
-          ),
-        ],
-      ),
+    await AppDialog.show<void>(
+      context,
+      title: context.l10n.reportSent,
+      body: Text(context.l10n.reportSentBody(ref)),
+      actions: [
+        TvAlertAction(
+          label: context.l10n.copy,
+          onTap: () {
+            Clipboard.setData(ClipboardData(text: ref));
+            Navigator.of(context, rootNavigator: true).pop();
+          },
+        ),
+        TvAlertAction(
+          label: context.l10n.ok,
+          primary: true,
+          autofocus: true,
+          onTap: () => Navigator.of(context, rootNavigator: true).pop(),
+        ),
+      ],
     );
   }
 
@@ -419,14 +422,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Padding(
                   padding: const EdgeInsets.fromLTRB(20, 4, 20, 4),
                   child: Align(
-                    alignment: Alignment.centerLeft,
+                    alignment: AlignmentDirectional.centerStart,
                     child: Text(sheetL10n.dns, style: AppText.headline),
                   ),
                 ),
                 Padding(
                   padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
                   child: Align(
-                    alignment: Alignment.centerLeft,
+                    alignment: AlignmentDirectional.centerStart,
                     child: Text(sheetL10n.dnsBlurb, style: AppText.caption),
                   ),
                 ),
@@ -494,7 +497,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Padding(
                   padding: const EdgeInsets.fromLTRB(20, 4, 20, 4),
                   child: Align(
-                    alignment: Alignment.centerLeft,
+                    alignment: AlignmentDirectional.centerStart,
                     child: Text(
                       sheetL10n.searchLayout,
                       style: AppText.headline,
@@ -504,7 +507,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Padding(
                   padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
                   child: Align(
-                    alignment: Alignment.centerLeft,
+                    alignment: AlignmentDirectional.centerStart,
                     child: Text(
                       sheetL10n.searchLayoutBlurb,
                       style: AppText.caption,
@@ -587,7 +590,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Padding(
                   padding: const EdgeInsets.fromLTRB(20, 4, 20, 4),
                   child: Align(
-                    alignment: Alignment.centerLeft,
+                    alignment: AlignmentDirectional.centerStart,
                     child: Text(
                       sheetL10n.batchDownloadStyle,
                       style: AppText.headline,
@@ -597,7 +600,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Padding(
                   padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
                   child: Align(
-                    alignment: Alignment.centerLeft,
+                    alignment: AlignmentDirectional.centerStart,
                     child: Text(
                       sheetL10n.batchDownloadStyleBlurb,
                       style: AppText.caption,
@@ -626,66 +629,41 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (mounted) setState(() {});
   }
 
-  /// Prompts for a CloudStream repo URL, installs it via the native channel,
-  /// and reports how many sources are now available. Android-only.
-  Future<void> _addCloudStreamRepo() async {
-    final String? url;
-    if (_isTv) {
-      url = await showDialog<String>(
-        context: context,
-        builder: (_) => const _TvAddRepoDialog(),
-      );
-    } else {
-      final controller = TextEditingController();
-      url = await showDialog<String>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          backgroundColor: AppColors.surface,
-          title: Text(
-            ctx.l10n.addCloudStreamRepository,
-            style: AppText.headline,
-          ),
-          content: TextField(
-            controller: controller,
-            keyboardType: TextInputType.url,
-            cursorColor: AppColors.accent,
-            style: AppText.body.copyWith(color: AppColors.textPrimary),
-            decoration: InputDecoration(
-              labelText: ctx.l10n.repositoryUrlLabel,
-              hintText: 'https://.../repo.json',
-            ),
-            onSubmitted: (v) => Navigator.pop(ctx, v.trim()),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: Text(ctx.l10n.cancel),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-              child: Text(ctx.l10n.add),
-            ),
+  /// Which country's streaming catalogue to browse.
+  ///
+  /// A service's shelf differs per country, so the wrong region silently shows
+  /// titles the user cannot get — which is why this is a visible setting and
+  /// not only a locale guess.
+  Future<void> _pickStreamingRegion() async {
+    final current = StreamingPrefs.region;
+    final picked = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: AppColors.surface,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            for (final code in kStreamingRegions)
+              ListTile(
+                title: Text(code, style: AppText.body),
+                trailing: code == current
+                    ? Icon(Icons.check_rounded, color: AppColors.accent)
+                    : null,
+                onTap: () => Navigator.pop(ctx, code),
+              ),
           ],
         ),
-      );
-      controller.dispose();
+      ),
+    );
+    if (picked == null || picked == current) return;
+    await StreamingPrefs.setRegion(picked);
+    // The cached provider list is per region; leaving it would show the old
+    // country's services under the new country's name.
+    if (sl.isRegistered<StreamingProvidersService>()) {
+      sl<StreamingProvidersService>().clearCache();
     }
-    if (url == null || url.isEmpty || !mounted) return;
-    final messenger = ScaffoldMessenger.of(context);
-    final l10n = context.l10n;
-    try {
-      final count = await _csManager.addRepo(url);
-      if (!mounted) return;
-      messenger.showSnackBar(
-        SnackBar(content: Text(l10n.addedCloudStreamSourcesCount(count))),
-      );
-      setState(() {});
-    } catch (e) {
-      if (!mounted) return;
-      messenger.showSnackBar(
-        SnackBar(content: Text(l10n.failedToAddRepository('$e'))),
-      );
-    }
+    if (mounted) setState(() {});
   }
 
   /// Account header — a single profile card at the top of Settings. Signed in:
@@ -855,7 +833,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         color: AppColors.settingsCard,
         borderRadius: BorderRadius.circular(13),
       ),
-      padding: const EdgeInsets.only(left: 14, right: 4),
+      padding: const EdgeInsetsDirectional.only(start: 14, end: 4),
       child: Row(
         children: [
           const Icon(
@@ -1040,6 +1018,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
     ),
     _SettingsEntry(
       section: SettingsSection.sources,
+      icon: Icons.public_rounded,
+      title: l10n.streamingRegion,
+      subtitle: '${l10n.streamingRegionSubtitle} · ${StreamingPrefs.region}',
+      keywords: 'streaming region country provider watch service catalogue',
+      onTap: _pickStreamingRegion,
+    ),
+    _SettingsEntry(
+      section: SettingsSection.sources,
       icon: Icons.health_and_safety_outlined,
       title: l10n.sourceHealth,
       subtitle: l10n.sourceHealthSubtitle,
@@ -1047,14 +1033,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       onTap: () => _push(const SourceHealthScreen()),
     ),
     if (Platform.isAndroid) ...[
-      _SettingsEntry(
-        section: SettingsSection.sources,
-        icon: Icons.extension_outlined,
-        title: l10n.addCloudStreamRepository,
-        subtitle: l10n.installCloudStreamSources,
-        keywords: 'cloudstream repository repo install sources extensions',
-        onTap: _addCloudStreamRepo,
-      ),
       _SettingsEntry(
         section: SettingsSection.sources,
         icon: Icons.update_rounded,
@@ -1151,12 +1129,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _SettingsEntry(
       section: SettingsSection.interface,
       id: LeafParent.appearance,
+      group: 'Look',
       icon: Icons.palette_outlined,
-      title: l10n.appearance,
-      subtitle: l10n.appearanceSubtitle,
+      title: 'Theme & colour',
+      subtitle: 'Accent colour, dark mode and font',
       keywords:
           'appearance accent colour color theme highlight personalise '
-          'quality badge poster 4k hd cam',
+          'dark amoled black font type animation motion',
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -1175,8 +1154,68 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
       onTap: () => _push(const AppearanceScreen()),
     ),
+    if (!_isTv)
+      _SettingsEntry(
+        section: SettingsSection.interface,
+        group: 'Look',
+        icon: Icons.auto_awesome_outlined,
+        title: 'Icon, splash & banner',
+        subtitle: 'How the app looks before you open it',
+        keywords:
+            'app icon launcher splash startup animation bankai wordmark '
+            'home banner card panels face',
+        onTap: () => _push(const AppFaceScreen()),
+      ),
+    if (!_isTv)
+      _SettingsEntry(
+        section: SettingsSection.interface,
+        group: 'Layout',
+        icon: Icons.view_agenda_outlined,
+        title: l10n.homeRows,
+        subtitle: 'Which rows show on Home, and their order',
+        keywords: 'home rows order hide show continue watching trending',
+        onTap: () => _push(const HomeRowsScreen()),
+      ),
+    if (!_isTv)
+      _SettingsEntry(
+        section: SettingsSection.interface,
+        group: 'Layout',
+        icon: Icons.dashboard_customize_outlined,
+        title: l10n.navigationBar,
+        subtitle: l10n.navigationBarSubtitle,
+        keywords:
+            'navigation bar tabs dock bottom reorder hide downloads '
+            'history customise customize interface',
+        onTap: () => _push(const NavTabsScreen()),
+      ),
     _SettingsEntry(
       section: SettingsSection.interface,
+      group: 'Layout',
+      icon: Icons.grid_view_rounded,
+      title: l10n.searchLayout,
+      subtitle: 'How results from different sources line up',
+      keywords: 'search layout grid list results view interface',
+      trailing: _value(sl<SearchPrefs>().layout.localizedLabel(context)),
+      onTap: _pickSearchLayout,
+    ),
+    _SettingsEntry(
+      section: SettingsSection.interface,
+      group: 'Layout',
+      icon: Icons.download_rounded,
+      title: l10n.batchDownloadStyle,
+      subtitle: 'How the sheet looks when you grab a batch of episodes',
+      keywords:
+          'batch download style sheet minimal classic wheel episodes multi',
+      trailing: _value(
+        sl<PlaybackPrefs>().batchDownloadStyle == 'minimal'
+            ? l10n.batchDownloadMinimal
+            : l10n.batchDownloadClassic,
+      ),
+      onTap: _pickBatchDownloadStyle,
+    ),
+    _SettingsEntry(
+      section: SettingsSection.interface,
+      group: 'Language',
       icon: Icons.translate_rounded,
       title: l10n.titleLanguage,
       subtitle: l10n.titleLanguageSubtitle,
@@ -1192,6 +1231,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     // is what keeps the two entry points from drifting apart.
     _SettingsEntry(
       section: SettingsSection.interface,
+      group: 'Language',
       icon: Icons.hub_outlined,
       title: l10n.metadata,
       subtitle: _malNeedsLogin ? l10n.malLoginForLists : l10n.metadataSubtitle,
@@ -1205,6 +1245,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     ),
     _SettingsEntry(
       section: SettingsSection.interface,
+      group: 'Language',
       icon: Icons.language_rounded,
       title: l10n.appLanguage,
       subtitle: l10n.appLanguageSubtitle,
@@ -1218,40 +1259,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
         }
         if (mounted) setState(() {});
       },
-    ),
-    if (!_isTv)
-      _SettingsEntry(
-        section: SettingsSection.interface,
-        icon: Icons.dashboard_customize_outlined,
-        title: l10n.navigationBar,
-        subtitle: l10n.navigationBarSubtitle,
-        keywords:
-            'navigation bar tabs dock bottom reorder hide downloads '
-            'history customise customize interface',
-        onTap: () => _push(const NavTabsScreen()),
-      ),
-    _SettingsEntry(
-      section: SettingsSection.interface,
-      icon: Icons.grid_view_rounded,
-      title: l10n.searchLayout,
-      subtitle: l10n.searchLayoutSubtitle,
-      keywords: 'search layout grid list results view interface',
-      trailing: _value(sl<SearchPrefs>().layout.localizedLabel(context)),
-      onTap: _pickSearchLayout,
-    ),
-    _SettingsEntry(
-      section: SettingsSection.interface,
-      icon: Icons.download_rounded,
-      title: l10n.batchDownloadStyle,
-      subtitle: l10n.batchDownloadStyleSubtitle,
-      keywords:
-          'batch download style sheet minimal classic wheel episodes multi',
-      trailing: _value(
-        sl<PlaybackPrefs>().batchDownloadStyle == 'minimal'
-            ? l10n.batchDownloadMinimal
-            : l10n.batchDownloadClassic,
-      ),
-      onTap: _pickBatchDownloadStyle,
     ),
     if (Platform.isAndroid)
       _SettingsEntry(
@@ -1405,17 +1412,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               final items = entries.where((e) => e.section == section).toList();
               children
                 ..add(_sectionHeader(section))
-                ..add(
-                  SettingsCard(
-                    children: [
-                      for (var i = 0; i < items.length; i++)
-                        items[i].toTile(
-                          iconAccent: i == 0,
-                          autofocus: _isTv && i == 0,
-                        ),
-                    ],
-                  ),
-                );
+                ..addAll(_groupedRows(items));
             } else {
               children.add(
                 Padding(
@@ -1616,6 +1613,56 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return [SettingsCard(children: tiles)];
   }
 
+  /// A section's rows, split into cards under their [_SettingsEntry.group]
+  /// headings. A section whose rows carry no group renders as one card, which
+  /// is what every section did before groups existed.
+  List<Widget> _groupedRows(List<_SettingsEntry> items) {
+    if (items.every((e) => e.group == null)) {
+      return [
+        SettingsCard(
+          children: [
+            for (var i = 0; i < items.length; i++)
+              items[i].toTile(iconAccent: i == 0, autofocus: _isTv && i == 0),
+          ],
+        ),
+      ];
+    }
+    final out = <Widget>[];
+    String? current;
+    var block = <_SettingsEntry>[];
+    var first = true;
+
+    void flush() {
+      if (block.isEmpty) return;
+      if (current != null) {
+        out.add(SettingsSectionLabel(current, first: first));
+      }
+      out.add(
+        SettingsCard(
+          children: [
+            for (var i = 0; i < block.length; i++)
+              block[i].toTile(
+                iconAccent: first && i == 0,
+                autofocus: _isTv && first && i == 0,
+              ),
+          ],
+        ),
+      );
+      first = false;
+      block = <_SettingsEntry>[];
+    }
+
+    for (final e in items) {
+      if (e.group != current) {
+        flush();
+        current = e.group;
+      }
+      block.add(e);
+    }
+    flush();
+    return out;
+  }
+
   /// Compact app-bar-style header for a section sub-page: a small back chevron
   /// + an 18px title with a hairline underneath (replaces the oversized title).
   /// On TV, a D-pad Back control pops the section via [SettingsCubit.back].
@@ -1736,9 +1783,15 @@ class _SettingsEntry {
     this.keywords = '',
     this.trailing,
     this.onTap,
+    this.group,
   });
 
   final String section;
+
+  /// Optional heading this row sits under inside its section's page. Purely
+  /// presentational: rows with no group render exactly as they always have,
+  /// in one card, and nothing about what a row DOES depends on this.
+  final String? group;
 
   /// Stable [LeafParent] id, set only on rows whose sub-page holds settings
   /// listed in [settingsLeaves]. Titles are translated, so search results can't

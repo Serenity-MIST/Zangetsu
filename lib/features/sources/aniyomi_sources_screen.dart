@@ -6,6 +6,8 @@ import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:hive/hive.dart';
 
 import '../../core/aniyomi/aniyomi_extension_service.dart';
+import '../../core/hive/source_icon_store.dart';
+import '../../core/ui/source_icon_tile.dart';
 import '../../core/aniyomi/aniyomi_provider.dart';
 import '../../core/aniyomi/aniyomi_repo.dart';
 import '../../core/aniyomi/aniyomi_update.dart';
@@ -27,6 +29,7 @@ import '../../core/ui/states.dart';
 import 'aniyomi_repo_tab.dart' show kAniyomiReposBoxName, AniyomiAddRepoDialog, AniyomiRepoTab;
 import 'source_language_sheet.dart';
 import 'sources_search_field.dart';
+import '../../core/ui/app_dialog.dart';
 import '../../l10n/l10n.dart';
 
 part 'aniyomi_sources_screen_phone.dart';

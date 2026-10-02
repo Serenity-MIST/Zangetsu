@@ -9,7 +9,9 @@ import 'companion_wire.dart';
 
 /// Apple uses the same Wi-Fi protocol as Android. Bluetooth HID/RFCOMM stays
 /// in Android's platform bridge; it is not emulated with private Apple APIs.
+/// Routes the shared method-channel contract to Dart on Apple and native code on Android.
 class CompanionChannel extends MethodChannel {
+  // Keep the existing wire channel identifier compatible with paired installations.
   const CompanionChannel() : super('zangetsu/beta_companion');
   @override
   Future<T?> invokeMethod<T>(String method, [dynamic arguments]) async {
@@ -18,6 +20,7 @@ class CompanionChannel extends MethodChannel {
   }
 }
 
+/// Apple phone client and TV receiver sharing the Android-compatible authenticated protocol.
 class AppleCompanion {
   AppleCompanion({bool Function()? receiverDevice})
     : _receiverDevice = receiverDevice ?? (() => isAppleTv);
@@ -37,6 +40,8 @@ class AppleCompanion {
   String? _playbackError;
   String _snapshotKey = '';
   DateTime _snapshotAt = DateTime(0);
+
+  /// Throttles optional Live Activity snapshots; media UI failure must not interrupt control.
   Future<void> _snapshot(Map<String, dynamic> state) async {
     if (_receiverDevice()) return;
     final key = jsonEncode([
@@ -58,13 +63,18 @@ class AppleCompanion {
     }
   }
 
+  /// Loads saved receiver/client credentials once from the native Keychain bridge.
   Future<void> _load() => _loading ??= () async {
     final raw = await native.invokeMethod<String>('readStore');
     if (raw != null)
       _saved.addAll(Map<String, dynamic>.from(jsonDecode(raw) as Map));
   }();
+
+  /// Stores the current pairing state in Keychain rather than application preferences.
   Future<void> _persist() =>
       native.invokeMethod('writeStore', jsonEncode(_saved));
+
+  /// Implements the shared channel contract and rejects unsupported platform operations.
   Future<dynamic> invoke(String method, dynamic args) async {
     await _load();
     switch (method) {
@@ -174,6 +184,7 @@ class AppleCompanion {
     }
   }
 
+  /// Authenticates QR/PIN or remembered credentials before replacing the current client link.
   Future<void> _connect(Map<String, dynamic> args) async {
     if (_connecting) return;
     _connecting = true;
@@ -242,6 +253,7 @@ class AppleCompanion {
     }
   }
 
+  /// Sends on the current authenticated link and clears stale activity state on failure.
   Future<Map<String, dynamic>> _exchange(Map<String, dynamic> command) async {
     final client = _client;
     if (client == null || !client.alive)
@@ -259,12 +271,14 @@ class AppleCompanion {
     }
   }
 
+  /// Cancels deliberate-hold repetition without sending a second navigation event.
   void _release() {
     _hold++;
     _repeat?.cancel();
     _repeat = null;
   }
 
+  /// Maps remote input to app-scoped commands; Apple does not emulate system HID keys.
   Future<Map<String, dynamic>> _control(Map<String, dynamic> c) async {
     final action = c['action'];
     if (action == 'release') {
@@ -325,6 +339,7 @@ class AppleCompanion {
     return result;
   }
 
+  /// Binds the opted-in TV receiver and advertises it through the native Bonjour bridge.
   Future<void> _start() async {
     if (!_receiverDevice()) throw StateError('Receiver mode requires a TV.');
     if (_server != null) return;
@@ -355,6 +370,7 @@ class AppleCompanion {
     });
   }
 
+  /// Builds TV pairing metadata from the active listener and persisted credentials.
   Future<Map<String, dynamic>> _receiverState() async {
     final addresses = await NetworkInterface.list(
       type: InternetAddressType.IPv4,
@@ -371,6 +387,7 @@ class AppleCompanion {
     };
   }
 
+  /// Authenticates one bounded client connection before accepting ordered allowlisted requests.
   Future<void> _serve(Socket socket) async {
     if (_peers.length >= 4) {
       socket.destroy();
@@ -455,6 +472,7 @@ class AppleCompanion {
     }
   }
 
+  /// Checks foreground capabilities before routing catalogue, focus or native player actions.
   Future<Map<String, dynamic>> _dispatch(Map<String, dynamic> c) async {
     final action = c['action'];
     if (action == 'state')

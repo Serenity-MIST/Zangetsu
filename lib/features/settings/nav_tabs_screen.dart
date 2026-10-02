@@ -327,7 +327,7 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
             ),
           ),
           Padding(
-            padding: const EdgeInsets.only(right: 12),
+            padding: const EdgeInsetsDirectional.only(end: 12),
             child: Text(
               l10n.pinned,
               style: AppText.caption.copyWith(
@@ -403,7 +403,7 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
             ReorderableDragStartListener(
               index: index,
               child: const Padding(
-                padding: EdgeInsets.only(right: 10),
+                padding: EdgeInsetsDirectional.only(end: 10),
                 child: Icon(
                   Icons.drag_indicator_rounded,
                   size: 19,
@@ -432,7 +432,7 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
           ),
           if (t.isPinned)
             Padding(
-              padding: const EdgeInsets.only(right: 12),
+              padding: const EdgeInsetsDirectional.only(end: 12),
               child: Text(
                 l10n.pinned,
                 style: AppText.caption.copyWith(

@@ -19,7 +19,7 @@ class AppDelegate: FlutterAppDelegate {
         Self.registerDeviceChannel(with: flutterViewController.binaryMessenger)
         Self.registerNovelHttp(with: flutterViewController.binaryMessenger)
         registerTvPlayerChannel(with: flutterViewController)
-        BetaAppleServices.register(messenger: flutterViewController.binaryMessenger, presenter: flutterViewController) { method, args, result in
+        AppleCompanionServices.register(messenger: flutterViewController.binaryMessenger, presenter: flutterViewController) { method, args, result in
             if method == "stream" { result(TvSystemPlayerViewController.active?.companionStream() ?? [:]); return }
             if let player = TvSystemPlayerViewController.active { player.companionCommand(args, result: result) }
             else if args["action"] as? String == "state" {

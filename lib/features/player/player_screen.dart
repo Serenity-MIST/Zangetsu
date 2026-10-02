@@ -20,9 +20,12 @@ import '../../core/repository/source_repository.dart';
 import '../../core/zmode/playback_resolver.dart';
 import '../../core/tracker/tracker_hub.dart';
 import '../../core/playback/external_player.dart';
+import '../../core/logging/app_logger.dart';
+import 'phone_playback_launch.dart';
 import '../../core/playback/playback_prefs.dart';
 import 'subtitle_style.dart';
 import 'subtitle_font_service.dart';
+import 'player_lifecycle.dart';
 import '../../core/torrent/torrent_util.dart';
 import '../../core/models/episode.dart';
 import '../../core/models/episode_title.dart';
@@ -37,6 +40,7 @@ import '../../core/playback/subtitle_search_service.dart';
 import '../../core/playback/watch_history.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
+import '../../core/ui/app_dialog.dart';
 import '../../core/ui/episode_unavailable_dialog.dart';
 import '../../core/ui/badge.dart';
 import '../../core/ui/brand_loader.dart';
@@ -169,6 +173,7 @@ class PlayerScreen extends StatefulWidget {
   /// of the adaptive default. One-shot: the cubit clears it after the first
   /// episode so nothing later is affected.
   final VideoSource? initialSource;
+  /// Optional handoff callback; true means the TV accepted the episode and resume point.
   final Future<bool> Function(int index, Duration position)? onContinueOnTv;
 
   /// Set by the episode list's long-press sheet: play this one episode here,
@@ -392,6 +397,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   // ── Chromecast ────────────────────────────────────────────────────────────
   CastState _prevCastState = CastState.unavailable;
+  // Soft-sub the user picked for the receiver. Null = no captions on the TV.
+  Subtitle? _castSubtitle;
 
   // TV bar visibility — only used when [AppMode.isTv] is true.
   // Stored here so [PopScope] can gate it at the Scaffold level.
@@ -401,6 +408,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   bool _remotePlayback = false;
   bool _sendingToTv = false;
   String? _remoteError;
+  PlayerRouteTeardownLease? _routeTeardownLease;
   // Set when a Watch Together join can't resolve the room's source on this
   // device — show a clear message instead of silently bouncing to a portrait
   // home screen.
@@ -426,9 +434,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _handleDeadEnd(String message) async {
     if (_handlingDeadEnd || !mounted) return;
     _handlingDeadEnd = true;
+    AppLogger.instance.log(
+      '[player-route] dead-end dialog open loading=${_c.state.loadingSources} '
+      'error=${message.split('\n').first}',
+    );
     final again = await showPlaybackDeadEnd(context, message);
     if (!mounted) return;
     _handlingDeadEnd = false;
+    AppLogger.instance.log(
+      '[player-route] dead-end dialog closed retry=$again',
+    );
     if (again) {
       _c.openEpisode(_c.state.currentIndex);
       return;
@@ -459,6 +474,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
     // Default external player: hand the stream off to the chosen app and close
     // this screen instead of starting the in-app player. Falls back to in-app
     // if the launch can't be set up, so playback never silently dies.
+    if (Platform.isAndroid && _chosenPlayer == PlaybackPrefs.androidPlayerId) {
+      _launchExoThenPop();
+      return;
+    }
     if (Platform.isAndroid && _chosenPlayer.isNotEmpty) {
       _launchExternalThenPop();
       return;
@@ -466,6 +485,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _initInApp();
   }
 
+  /// Resolves phone selection metadata and asks the TV to play before opening remote controls.
   Future<void> _sendRemotePlayback() async {
     if (_sendingToTv || !mounted) return;
     setState(() {
@@ -608,6 +628,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   void _initInApp() {
+    _routeTeardownLease ??= playerRouteTeardownBarrier.acquire();
     _turnLandscapeWhenCovered();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     // Wake-lock is bound to playback in _startSession, once the player exists.
@@ -674,6 +695,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (resumePos > Duration.zero) _c.seekTo(resumePos);
       _c.player.play();
       if (mounted) setState(() {}); // restore the normal player UI
+      return;
+    }
+
+    // ProgressListener ticks ~1s while playing so resume keeps up.
+    if (newState == CastState.connected) {
+      _c.syncExternalProgress(castCtrl.position, castCtrl.duration);
     }
   }
 
@@ -685,32 +712,42 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _castHandoff(VideoSource active) async {
     final castCtrl = sl<CastController>();
     final proxy = sl<CastProxyServer>();
-    final startAt = _c.currentPosition;
+    // Prefer the TV's clock once a session is live (source/caption recast).
+    final startAt = castCtrl.position > Duration.zero
+        ? castCtrl.position
+        : _c.currentPosition;
+    final duration = castCtrl.duration > Duration.zero
+        ? castCtrl.duration
+        : _c.player.state.duration;
     // The proxy URL carries no extension, so send the real mime explicitly.
     final mime = castMimeFor(active.container, active.url);
 
     var url = active.url;
-    var subs = active.subtitles;
     try {
       final proxied = await proxy.serve(active.url, active.headers);
-      if (proxied != null) {
-        url = proxied;
-        // Header-locked subtitle tracks need proxying too.
-        subs = [
-          for (final s in active.subtitles)
-            Subtitle(
-              url: proxy.proxify(s.url) ?? s.url,
-              lang: s.lang,
-              label: s.label,
-              format: s.format,
-              isDefault: s.isDefault,
-            ),
-        ];
-      }
+      if (proxied != null) url = proxied;
     } catch (_) {
       // Proxy failed to start — fall through with the direct URL.
     }
     if (!mounted) return;
+
+    // One VTT track, or none. DMR rejects SRT/ASS/untyped tracks with
+    // Invalid Request / 2001; the proxy converts SRT → VTT.
+    final chosen = _matchCastSub(active.subtitles);
+    _castSubtitle = chosen;
+    final tracks = <Subtitle>[];
+    if (chosen != null && canCastSubtitle(chosen)) {
+      final proxiedSub = proxy.proxify(chosen.url);
+      tracks.add(
+        Subtitle(
+          url: proxiedSub ?? chosen.url,
+          lang: chosen.lang,
+          label: chosen.label,
+          format: 'vtt',
+        ),
+      );
+    }
+
     castCtrl.loadCurrent(
       url: url,
       container: active.container,
@@ -718,9 +755,35 @@ class _PlayerScreenState extends State<PlayerScreen> {
       // Headers are injected by the proxy now (the native side ignores them).
       title: widget.showTitle,
       poster: widget.cover,
-      subtitles: subs,
+      subtitles: tracks,
       startAt: startAt,
+      duration: duration,
+      hlsSegmentFormat: proxy.lastHlsSegmentFormat,
+      hlsVideoSegmentFormat: proxy.lastHlsVideoSegmentFormat,
     );
+  }
+
+  /// Soft-sub intended for the receiver, rematched after a source change.
+  Subtitle? _matchCastSub(List<Subtitle> list) {
+    final want = _castSubtitle;
+    if (want == null) return null;
+    for (final s in list) {
+      if (s.url == want.url) return s;
+    }
+    for (final s in list) {
+      if (s.lang == want.lang) return s;
+    }
+    return want;
+  }
+
+  /// Re-send the active stream after the user picks a source or caption.
+  Future<void> _maybeRecast() async {
+    final castCtrl = sl<CastController>();
+    if (castCtrl.state != CastState.connected) return;
+    final active = _c.state.active;
+    if (active == null) return;
+    if (_c.player.state.playing) _c.player.pause();
+    await _castHandoff(active);
   }
 
   // ── Picture-in-Picture ────────────────────────────────────────────────────
@@ -825,6 +888,77 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// Resolve the start episode + its best source and open it in the user's
   /// chosen external player, then pop. The branded loader shows briefly while
   /// resolving. Any failure falls back to the in-app player.
+  /// Play through the native ExoPlayer activity instead of mpv, then leave
+  /// this screen — the same shape as [_launchExternalThenPop].
+  ///
+  /// Uses the very player the TV build ships ([launchTvPlayback] →
+  /// TvPlayerActivity): a separate Activity with its own SurfaceView, so there
+  /// is no media_kit, no libmpv and no Flutter platform view involved. It
+  /// carries resume, history, the episode list, the server picker and
+  /// subtitles, so switching to it gives up far less than embedding a view
+  /// here would.
+  ///
+  /// Runs INSTEAD of [_initInApp], never after it: that builds a [PlayerCubit]
+  /// whose constructor makes a media_kit `Player`, which is exactly what throws
+  /// on a device where libmpv never loaded.
+  ///
+  /// Falls back to the in-app player on any failure, so turning this on can
+  /// never leave someone worse off than before.
+  Future<void> _launchExoThenPop() async {
+    try {
+      var eps = widget.episodes;
+      if (eps.isEmpty && widget.episodesResolver != null) {
+        eps = await widget.episodesResolver!();
+      }
+      if (eps.isEmpty) throw StateError('no episodes');
+      var idx = widget.startIndex;
+      if (widget.resumeEpisodeId != null) {
+        var i = eps.indexWhere((e) => e.id == widget.resumeEpisodeId);
+        if (i < 0 && widget.resumeEpisodeNumber != null) {
+          i = eps.indexWhere((e) => e.number == widget.resumeEpisodeNumber);
+        }
+        if (i >= 0) idx = i;
+      }
+      if (!mounted) return;
+      final opened = await launchPhonePlayback(
+        context: context,
+        sourceId: widget.sourceId,
+        episodes: eps,
+        startIndex: idx.clamp(0, eps.length - 1),
+        resume: widget.resume,
+        resolveSources: widget.resolveSources,
+        pollSources: widget.pollSources,
+        resumePosition: widget.resumePosition.inMilliseconds,
+        peek: widget.peek,
+        showUrl: widget.showUrl,
+        showTitle: widget.showTitle,
+        cover: widget.cover,
+        coverHeaders: widget.coverHeaders,
+        category: widget.category ?? 'sub',
+        availableCategories: widget.availableCategories,
+        history: widget.history,
+        initialSource: widget.initialSource,
+        malId: widget.malId,
+        scrobbleTitle: widget.scrobbleTitle,
+        tmdbId: widget.tmdbId,
+        tmdbIsTv: widget.tmdbIsTv,
+        imdbId: widget.imdbId,
+      );
+      if (!opened) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(context.l10n.androidPlayerUnavailable)),
+        );
+        return;
+      }
+      _leavePlayer();
+    } catch (e, st) {
+      AppLogger.instance.logError(e, st);
+      if (!mounted) return;
+      Navigator.of(context).maybePop();
+    }
+  }
+
   Future<void> _launchExternalThenPop() async {
     try {
       var eps = widget.episodes;
@@ -1172,24 +1306,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // here (PopScope lets it pop straight through); 'confirm' asks first;
   // 'double_back' (default) needs a second back within 2s.
   Future<void> _handleCloseRequest() async {
+    // Nothing playing yet — the "Finding…" spinner has no close to confirm.
+    // Leaving must be instant, not gated behind double-back/confirm.
+    if (_c.state.loadingSources) {
+      _leavePlayer();
+      return;
+    }
     switch (sl<PlaybackPrefs>().closeConfirmation) {
       case 'confirm':
-        final ok = await showDialog<bool>(
-          context: context,
-          builder: (ctx) => AlertDialog(
-            title: Text(ctx.l10n.closeVideo),
-            content: Text(ctx.l10n.areYouSureYouWantToCloseTheVideo),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx, false),
-                child: Text(ctx.l10n.cancel),
-              ),
-              TextButton(
-                onPressed: () => Navigator.pop(ctx, true),
-                child: Text(ctx.l10n.close),
-              ),
-            ],
-          ),
+        final ok = await AppDialog.confirm(
+          context,
+          title: context.l10n.closeVideo,
+          message: context.l10n.areYouSureYouWantToCloseTheVideo,
+          confirmLabel: context.l10n.close,
         );
         if (ok == true) _leavePlayer();
       case 'direct':
@@ -1217,6 +1346,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
+    AppLogger.instance.log(
+      '[player-route] dispose ready=$_ready '
+      'loading=${_ready ? _c.state.loadingSources : 'uninitialized'} '
+      'active=${_ready ? _c.state.active?.label ?? _c.state.active?.url : 'none'} '
+      'deadEnd=$_handlingDeadEnd',
+    );
     // Leaving before a source answered: stop the sweep instead of letting it
     // ask the rest of the list. Those calls run on the UI isolate, so they
     // went on blocking a screen that no longer exists — see
@@ -1257,7 +1392,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
       FlutterVolumeController.updateShowSystemUI(true);
     }
     WakelockPlus.disable();
-    if (_ready) _c.close();
+    final routeLease = _routeTeardownLease;
+    if (_ready) {
+      _c.close();
+      unawaited(_c.nativeTeardown.whenComplete(() => routeLease?.release()));
+    } else {
+      routeLease?.release();
+    }
     // Detach from the app-level party controller (nulls out player hooks and,
     // if this client is host, marks the room lobby). Does NOT leave the party —
     // closing the player keeps the party alive in the background.
@@ -1812,7 +1953,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       barrierColor: Colors.black54,
       transitionDuration: const Duration(milliseconds: 240),
       pageBuilder: (ctx, _, _) => Align(
-        alignment: Alignment.centerRight,
+        alignment: AlignmentDirectional.centerEnd,
         child: _EpisodesPanel(
           episodes: _c.episodes,
           currentIndex: _c.state.currentIndex,
@@ -2085,7 +2226,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   void _openSpeedSheet() {
-    const rates = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+    const rates = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0];
     final current = _c.player.state.rate;
     // Chips, not a list. Six rows at 52px each came to 388 — on a 393px-tall
     // landscape phone that's the entire screen, so you were picking a speed
@@ -2167,7 +2308,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   /// Netflix-style combined Audio | Subtitles panel (two columns, live
   /// selection without closing).
-  void _openAudioSubsSheet() {
+  void _openAudioSubsSheet({bool castMode = false}) {
     showModalBottomSheet<void>(
       context: context,
       backgroundColor: Colors.transparent,
@@ -2181,6 +2322,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
           child: _AudioSubsSheet(
             controller: _c,
             onInteract: _bumpControls,
+            castMode: castMode,
+            onSoftSubPicked: (s) => _castSubtitle = s,
+            onSubtitlesOff: () => _castSubtitle = null,
+            onAfterChange: () {
+              unawaited(_maybeRecast());
+            },
             onLoadFile: () {
               Navigator.pop(context);
               _loadSubtitleFromFile();
@@ -2355,9 +2502,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     : '${k != AudioKind.unknown ? '${k.name.toUpperCase()} • ' : ''}'
                           '${s.quality?.isNotEmpty == true ? s.quality : s.container.name}',
                 active: s == _c.state.active,
-                onTap: () {
+                onTap: () async {
                   Navigator.pop(context);
-                  _c.selectSource(s); // remembers this source for the title
+                  await _c.selectSource(
+                    s,
+                  ); // remembers this source for the title
+                  await _maybeRecast();
                   _bumpControls();
                 },
               ),
@@ -3023,7 +3173,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       child: IgnorePointer(
                         ignoring: !_controlsVisible,
                         child: _ControlsOverlay(
-                          onContinueOnTv: !(Platform.isAndroid || Platform.isIOS)
+                          onContinueOnTv:
+                              !(Platform.isAndroid || Platform.isIOS)
                               ? null
                               : () async {
                                   final wasPlaying = _c.player.state.playing;
@@ -3294,6 +3445,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           loadError: castCtrl.loadError,
                           onBack: () => Navigator.of(context).maybePop(),
                           onStop: () => castCtrl.stop(),
+                          onSources: _openSourceSheet,
+                          onAudioSubs: () =>
+                              _openAudioSubsSheet(castMode: true),
                         ),
                       );
                     },
@@ -3323,6 +3477,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return PopScope(
       canPop: sl<PlaybackPrefs>().closeConfirmation == 'direct',
       onPopInvokedWithResult: (didPop, _) {
+        AppLogger.instance.log(
+          '[player-route] pop didPop=$didPop loading=${_c.state.loadingSources} '
+          'closeMode=${sl<PlaybackPrefs>().closeConfirmation} '
+          'deadEnd=$_handlingDeadEnd',
+        );
         if (didPop) return;
         _handleCloseRequest();
       },

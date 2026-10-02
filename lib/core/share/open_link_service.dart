@@ -39,7 +39,17 @@ class OpenLinkService {
   final AppLinks _appLinks = AppLinks();
   StreamSubscription<Uri>? _sub;
 
+  /// A link can arrive before the app is ready for it — see [appShellReady],
+  /// which explains both ways a cold launch used to lose the screen it opened.
+  ///
+  /// Holding every link there fixes all three handlers at once; the local
+  /// video one is simply the easiest to hit, since a file manager is usually
+  /// what cold-starts the app.
   void _onLink(Uri uri) {
+    appShellReady.then((_) => _route(uri));
+  }
+
+  void _route(Uri uri) {
     if (uri.scheme == 'zangetsu-beta' && uri.host == 'remote') {
       _openRemote(uri);
       return;

@@ -198,6 +198,9 @@ class _FakeProviderRegistry implements ProviderRegistry {
 
   @override
   Map<String, String> typeMapOf() => const {};
+  @override
+  ({Map<String, String> types, Map<String, String> logos})
+  manifestMapsOf() => (types: const {}, logos: const {});
 }
 
 /// Fake tracker — always disconnected, no Hive box.
@@ -274,6 +277,9 @@ class _FakeDownloadPrefs extends DownloadPrefs {
 
   @override
   String? get locationLabel => null;
+
+  @override
+  bool get keepPrivate => false;
 }
 
 /// [ScheduleScreen] (now a TV rail item — see root_shell_tv.dart) is built

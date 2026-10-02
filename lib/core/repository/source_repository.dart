@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/foundation.dart' show debugPrint;
 
 import '../aniyomi/aniyomi_filters.dart';
@@ -582,14 +584,35 @@ class SourceRepository implements CatalogueRepository {
     return p;
   }
 
+  /// [_providerFor], but gives a JS provider that is not in the runtime yet a
+  /// chance to load before we give up on it.
+  ///
+  /// On phone every provider is loaded at boot, so this costs nothing —
+  /// [ensureSourceLoaded] returns straight away for a provider already in the
+  /// runtime and for every non-JS ecosystem. On TV `loadAll` is skipped and
+  /// providers load on demand, so opening a title before anything else had
+  /// touched its source (straight into a show from Continue Watching, rather
+  /// than via the home rail) threw `Provider not loaded` for a source that was
+  /// installed the whole time.
+  ///
+  /// A source that still will not load falls through to [_providerFor] and
+  /// throws exactly as it did before.
+  Future<BaseProvider> _providerReady(String? id) async {
+    final resolved = id ?? _active.state;
+    await ensureSourceLoaded(resolved);
+    return _providerFor(resolved);
+  }
+
   Future<List<MediaItem>> popular({
     String category = 'sub',
     int dateRange = 7,
     int page = 1,
     String? sourceId,
-  }) => _providerFor(
-    sourceId,
-  ).popular(category: category, dateRange: dateRange, page: page);
+  }) async => (await _providerReady(sourceId)).popular(
+    category: category,
+    dateRange: dateRange,
+    page: page,
+  );
 
   /// CloudStream-style Home: the active provider's own named rows. When the
   /// provider defines `getHome` we render exactly what it returns (empty rows
@@ -601,7 +624,7 @@ class SourceRepository implements CatalogueRepository {
     String category = 'sub',
     String? sourceId,
   }) async {
-    final provider = _providerFor(sourceId);
+    final provider = await _providerReady(sourceId);
 
     final sections = await provider.getHome(category: category);
     if (sections != null) {
@@ -641,7 +664,7 @@ class SourceRepository implements CatalogueRepository {
   /// error) degrades to an empty list so the caller just stops the scroll.
   Future<List<MediaItem>> browseMore(BrowseMore more, int page) async {
     try {
-      final p = _providerFor(more.sourceId);
+      final p = await _providerReady(more.sourceId);
       switch (more.kind) {
         case 'ani_popular':
           return p.popular(page: page);
@@ -670,7 +693,8 @@ class SourceRepository implements CatalogueRepository {
     String query, {
     String category = 'sub',
     String? sourceId,
-  }) => _providerFor(sourceId).search(query, 1, category: category);
+  }) async =>
+      (await _providerReady(sourceId)).search(query, 1, category: category);
 
   /// Status-reporting search for the source-health feature (search ordering +
   /// the "Test sources" screen). Unlike [search] it surfaces whether a source
@@ -769,7 +793,7 @@ class SourceRepository implements CatalogueRepository {
           outcome: r.items.isEmpty ? SourceOutcome.empty : SourceOutcome.ok,
         );
       }
-      final provider = _providerFor(resolved);
+      final provider = await _providerReady(resolved);
       final items = (_isAniyomi(resolved) && provider is AniyomiProvider)
           ? await provider.search(
               query,
@@ -841,12 +865,19 @@ class SourceRepository implements CatalogueRepository {
     // A source detail arrives whole — there is no slow second half to skip
     // ahead of, so this is accepted for the interface and never called.
     void Function(MediaDetail partial)? onPartial,
+    bool Function()? abandoned,
   }) async {
     final sw = Stopwatch()..start();
     final sid = sourceId ?? _active.state;
     AppLogger.instance.log('[detail] source fetch start sourceId=$sid url=$url');
     try {
-      final d = await _providerFor(sourceId).getDetail(url, category: category);
+      final p = await _providerReady(sourceId);
+      // Only the JS providers share the serialized call queue this is meant to
+      // unblock; the native ecosystems each run their own calls, so there is
+      // nothing for them to wait behind and nothing to pass on.
+      final d = p is JsProvider
+          ? await p.getDetail(url, category: category, abandoned: abandoned)
+          : await p.getDetail(url, category: category);
       AppLogger.instance.log(
         '[detail] source fetch done title="${d.title}" eps=${d.episodes.length} '
         '${sw.elapsedMilliseconds}ms',
@@ -872,7 +903,8 @@ class SourceRepository implements CatalogueRepository {
     String url, {
     String category = 'sub',
     String? sourceId,
-  }) => _providerFor(sourceId).getEpisodes(url, category: category);
+  }) async =>
+      (await _providerReady(sourceId)).getEpisodes(url, category: category);
 
   /// The links resolved SO FAR for [episodeUrl], plus whether more may arrive.
   ///
@@ -930,15 +962,17 @@ class SourceRepository implements CatalogueRepository {
         return hit.sources;
       }
       // 3. Fresh resolve → cache it for the next re-open.
-      final fresh = await _providerFor(
-        sourceId,
-      ).getVideoSources(episodeUrl, fast: true);
+      final provider = await _providerReady(sourceId);
+      final fresh = await provider.getVideoSources(episodeUrl, fast: true);
       if (fresh.isNotEmpty) {
         _resolved[key] = (at: DateTime.now(), sources: fresh);
       }
       return fresh;
     }
-    return _providerFor(sourceId).getVideoSources(episodeUrl, fast: fast);
+    return (await _providerReady(sourceId)).getVideoSources(
+      episodeUrl,
+      fast: fast,
+    );
   }
 
   /// Manga leaf — ordered page images for [chapterUrl]. No expiry cache here:
@@ -953,13 +987,94 @@ class SourceRepository implements CatalogueRepository {
     final local = await _localPages(chapterUrl, sourceId);
     if (local != null) return local;
 
-    final p = _providerFor(sourceId);
+    final key = '${sourceId ?? _active.state}|$chapterUrl';
+    final hit = _pageListCache[key];
+    if (hit != null && !hit.stale) return hit.pages;
+
+    // Someone is already fetching this exact chapter — wait for THAT request
+    // instead of starting a second one.
+    //
+    // Measured on a real source: a page list took 8-14 SECONDS to come back,
+    // and warming the next chapter meant the reader then asked for the same
+    // chapter again while the first request was still in the air. Both waited
+    // the full time; one of them was pure waste. A finished-result cache can't
+    // help here, because neither request has finished yet.
+    // Resolved BEFORE the in-flight check on purpose: this can await (a TV
+    // loads a provider on demand), and an await between that check and the
+    // registration below would let a second caller slip past it and fetch the
+    // same chapter twice — the exact waste the check exists to stop.
+    final p = await _providerReady(sourceId);
+
+    final inFlight = _pageFetches[key];
+    if (inFlight != null) return inFlight;
+
     if (p is! ReadingProvider) {
       throw UnsupportedError('${p.sourceId} does not support reading content');
     }
     // ReadingProvider is deliberately unrelated to BaseProvider (Task 3), so
     // the `is!` check above doesn't statically promote — cast explicitly.
-    return (p as ReadingProvider).getPages(chapterUrl);
+    final future = _fetchPages(p as ReadingProvider, key, chapterUrl);
+    _pageFetches[key] = future;
+    try {
+      return await future;
+    } finally {
+      _pageFetches.remove(key);
+    }
+  }
+
+  Future<List<PageImage>> _fetchPages(
+    ReadingProvider p,
+    String key,
+    String chapterUrl,
+  ) async {
+    final started = DateTime.now();
+    final fetched = await p.getPages(chapterUrl);
+    final ms = DateTime.now().difference(started).inMilliseconds;
+    // The reader shows a spinner for exactly this long, and until now nothing
+    // recorded it — so "it was black for a few seconds" was unanswerable from
+    // a shared log. Cheap, and the number is the whole diagnosis.
+    debugPrint('[reader] ${fetched.length} pages in ${ms}ms · $chapterUrl');
+    if (fetched.isNotEmpty) _rememberPages(key, fetched);
+    return fetched;
+  }
+
+  /// Page fetches currently in the air, keyed like [_pageListCache]. Entries
+  /// live only for the length of the request.
+  final Map<String, Future<List<PageImage>>> _pageFetches = {};
+
+  /// Page lists the reader has already fetched, so reopening the chapter you
+  /// were just reading — or stepping back one — doesn't sit on a spinner
+  /// waiting for a request whose answer hasn't changed.
+  ///
+  /// Deliberately in memory and deliberately short-lived. Plenty of sources
+  /// hand back image URLs signed with a short-lived token; caching those to
+  /// disk, or for an hour, would trade a spinner for broken pages. Ten minutes
+  /// covers "flip forward, flip back" and nothing riskier, and the whole thing
+  /// dies with the process.
+  static const _pageCacheTtl = Duration(minutes: 10);
+  static const _pageCacheMax = 12;
+  final Map<String, _CachedPages> _pageListCache = {};
+
+  void _rememberPages(String key, List<PageImage> pages) {
+    _pageListCache.remove(key); // re-insert so the oldest key is first out
+    _pageListCache[key] = _CachedPages(pages, DateTime.now());
+    while (_pageListCache.length > _pageCacheMax) {
+      _pageListCache.remove(_pageListCache.keys.first);
+    }
+  }
+
+  /// Fetches a chapter's pages into the cache without returning them — the
+  /// reader calls this for the NEXT chapter once you're most of the way
+  /// through the current one, so tapping through lands on pages instead of a
+  /// spinner. Silent on failure: this is a guess about what you'll read next,
+  /// and a wrong guess must never surface as an error.
+  Future<void> warmPages(String chapterUrl, {String? sourceId}) async {
+    final key = '${sourceId ?? _active.state}|$chapterUrl';
+    final hit = _pageListCache[key];
+    if (hit != null && !hit.stale) return;
+    try {
+      await pages(chapterUrl, sourceId: sourceId);
+    } catch (_) {}
   }
 
   /// Pages of a downloaded chapter, or null when it isn't saved. Resolved
@@ -995,13 +1110,21 @@ class SourceRepository implements CatalogueRepository {
         );
         if (rec != null && rec.status == ChapterDownloadStatus.done) {
           final html = await store.localText(rec);
-          if (html != null && html.isNotEmpty) return ChapterText(html: html);
+          if (html != null && html.isNotEmpty) {
+            // The chapter's own folder on disk — a downloaded chapter's
+            // images (if it has any) sit right next to text.html, and the
+            // reader resolves their relative `src` against this.
+            final folder = rec.textPath != null
+                ? File(rec.textPath!).parent.path
+                : (await store.dirFor(rec)).path;
+            return ChapterText(html: html, folder: folder);
+          }
         }
       } catch (_) {
         // fall through to the network
       }
     }
-    final p = _providerFor(sourceId);
+    final p = await _providerReady(sourceId);
     if (p is! ReadingProvider) {
       throw UnsupportedError('${p.sourceId} does not support reading content');
     }
@@ -1082,4 +1205,16 @@ extension SourceNameTag on SourceRepository {
     final tag = SourceRepository.ecosystemTag(sourceId);
     return tag == null ? name : '$tag · $name';
   }
+}
+
+/// One chapter's page list plus when it was fetched — see
+/// `SourceRepository._pageListCache` for why it expires.
+class _CachedPages {
+  const _CachedPages(this.pages, this.at);
+
+  final List<PageImage> pages;
+  final DateTime at;
+
+  bool get stale =>
+      DateTime.now().difference(at) > SourceRepository._pageCacheTtl;
 }

@@ -52,19 +52,25 @@ void main() {
       final body = await playlist.transform(utf8.decoder).join();
       final segment = body
           .split('\n')
-          .firstWhere((line) => line.startsWith('/p/'));
-      final request = await client.getUrl(uri.resolve(segment));
+          .firstWhere((line) => line.startsWith('http://'));
+      // Upstream casting now emits absolute, path-encoded URLs. The companion
+      // must retain target registration and range forwarding with that format.
+      final request = await client.getUrl(
+        Uri.parse(segment).replace(host: '127.0.0.1'),
+      );
       request.headers.set('Range', 'bytes=2-4');
       final response = await request.close();
       expect(response.statusCode, 206);
       expect(response.headers.value('Content-Range'), 'bytes 2-4/6');
       expect(await response.transform(utf8.decoder).join(), 'cde');
       final unknown = uri.replace(
-        queryParameters: {
-          'u': base64Url.encode(
+        pathSegments: [
+          ...uri.pathSegments.take(2),
+          base64Url.encode(
             utf8.encode('http://127.0.0.1:${upstream.port}/private'),
           ),
-        },
+          'seg',
+        ],
       );
       final rejected = await (await client.getUrl(unknown)).close();
       expect(rejected.statusCode, 403);

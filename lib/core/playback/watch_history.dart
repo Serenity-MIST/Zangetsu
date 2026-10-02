@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:watch_app/core/hive/safe_box.dart';
+import 'package:watch_app/core/hive/hive_key.dart';
 
 import 'package:hive/hive.dart';
 
@@ -119,10 +120,17 @@ class WatchHistory {
     if (!Hive.isBoxOpen(syncMetaBox)) {
       await openBoxSafely(syncMetaBox);
     }
+    // Same reasoning as MyListStore.init: an unreadable history box reopens
+    // empty while the pull throttle in [syncMetaBox] survives, which would
+    // skip the very pull that puts the history back. Drop it.
+    if (quarantinedBoxes.contains(boxName) && Hive.isBoxOpen(syncMetaBox)) {
+      await Hive.box(syncMetaBox).delete(_syncMetaKey);
+    }
   }
 
   Box<Map> get _box => Hive.box<Map>(boxName);
-  String _key(String sourceId, String showId) => '$sourceId::$showId';
+  String _key(String sourceId, String showId) =>
+      hiveKey('$sourceId::$showId');
   final Map<String, int> _lastCloudPush = {};
 
   /// Persist progress. The local write is ALWAYS immediate (instant resume);
@@ -243,7 +251,7 @@ class WatchHistory {
     var readOk = true;
     try {
       for (final m in await _remote.listFor(uid)) {
-        cloudTimes['${m['source_id']}::${m['show_id']}'] =
+        cloudTimes[hiveKey('${m['source_id']}::${m['show_id']}')] =
             (m['updated_at'] as num?)?.toInt() ?? 0;
       }
     } catch (_) {
@@ -294,7 +302,7 @@ class WatchHistory {
     try {
       final rows = await _remote.listFor(uid);
       for (final m in rows) {
-        final key = '${m['source_id']}::${m['show_id']}';
+        final key = hiveKey('${m['source_id']}::${m['show_id']}');
         final cloudUpdated = (m['updated_at'] as num?)?.toInt() ?? 0;
         final localUpdated = (_box.get(key)?['updatedAt'] as num?)?.toInt() ?? -1;
         if (cloudUpdated <= localUpdated) continue; // local is same/newer — keep it

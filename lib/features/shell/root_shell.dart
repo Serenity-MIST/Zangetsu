@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' show ImageFilter;
 
@@ -11,6 +12,7 @@ import '../search/browse_sources_screen.dart';
 import '../companion/companion_settings_screen.dart';
 import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
+import '../../core/playback/my_list.dart';
 import '../../core/mode/content_mode.dart';
 import '../../core/mode/content_mode_cubit.dart';
 import '../../core/theme/app_colors.dart';
@@ -151,6 +153,9 @@ class _RootShellState extends State<RootShell>
     DockScrollCollapse.reset();
     setState(() => _tab = tab);
     _switchCtrl.forward(from: 0);
+    if (tab == DockTab.myList && sl.isRegistered<MyListStore>()) {
+      unawaited(sl<MyListStore>().pullFromCloud());
+    }
   }
 
   /// Root-level Back: the first press shows a toast, a second within 2s exits.
@@ -748,7 +753,7 @@ class _ProfileDockItem extends StatelessWidget {
     return Expanded(
       // See [_DockItem]: the name has to survive the label folding away.
       child: Semantics(
-        label: 'Profile',
+        label: context.l10n.profile,
         button: true,
         selected: selected,
         container: true,
@@ -844,7 +849,7 @@ class _ProfileDockItem extends StatelessWidget {
                             child: Opacity(
                               opacity: labelOpacity,
                               child: Text(
-                                'Profile',
+                                context.l10n.profile,
                                 maxLines: 1,
                                 overflow: TextOverflow.clip,
                                 softWrap: false,

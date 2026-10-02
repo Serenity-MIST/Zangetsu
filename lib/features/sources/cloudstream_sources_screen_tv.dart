@@ -434,21 +434,38 @@ class _CsScreenTvSourceRow extends StatelessWidget {
               child: ExcludeSemantics(
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(0, 4, 8, 4),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+                  child: Row(
                     children: [
-                      Text(
-                        source.displayName,
-                        style: AppText.headline.copyWith(
-                          fontSize: 15,
-                          color: nameColor,
-                          fontWeight: active ? FontWeight.w600 : null,
+                      Padding(
+                        padding: const EdgeInsetsDirectional.only(end: 14),
+                        child: SourceIconTile(
+                          size: 38,
+                          name: source.displayName,
+                          icon: cloudStreamIconUrls()[source.sourceId],
                         ),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
                       ),
-                      const SizedBox(height: 2),
-                      Text(context.l10n.cloudstream, style: AppText.caption),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              source.displayName,
+                              style: AppText.headline.copyWith(
+                                fontSize: 15,
+                                color: nameColor,
+                                fontWeight: active ? FontWeight.w600 : null,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              context.l10n.cloudstream,
+                              style: AppText.caption,
+                            ),
+                          ],
+                        ),
+                      ),
                     ],
                   ),
                 ),
@@ -1041,6 +1058,14 @@ class _CsScreenTvPluginRowState extends State<_CsScreenTvPluginRow> {
       padding: const EdgeInsets.fromLTRB(16, 8, 12, 8),
       child: Row(
         children: [
+          Padding(
+            padding: const EdgeInsetsDirectional.only(end: 14),
+            child: SourceIconTile(
+              size: 38,
+              name: widget.plugin.name,
+              icon: widget.plugin.iconUrl,
+            ),
+          ),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -1109,84 +1134,14 @@ Future<bool> _csScreenTvConfirm(
   required String title,
   required String body,
   required String confirmLabel,
-}) async {
-  final ok = await showDialog<bool>(
-    context: context,
-    barrierColor: Colors.black54,
-    builder: (ctx) => Dialog(
-      backgroundColor: AppColors.surface,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-      insetPadding: const EdgeInsets.symmetric(horizontal: 80, vertical: 48),
-      child: SizedBox(
-        width: 440,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
-              child: Text(title, style: AppText.headline),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(24, 0, 24, 16),
-              child: Text(
-                body,
-                style: AppText.body.copyWith(color: AppColors.textSecondary),
-              ),
-            ),
-            const Divider(height: 1, color: AppColors.hairline),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  // Cancel — autofocused so D-pad lands here first.
-                  TvListFocusable(
-                    autofocus: true,
-                    onTap: () => Navigator.pop(ctx, false),
-                    semanticLabel: context.l10n.cancel,
-                    child: ExcludeSemantics(
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 20,
-                          vertical: 12,
-                        ),
-                        child: Text(
-                          context.l10n.cancel,
-                          style: AppText.body.copyWith(
-                            color: AppColors.textSecondary,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 4),
-                  // Confirm action.
-                  TvListFocusable(
-                    onTap: () => Navigator.pop(ctx, true),
-                    semanticLabel: confirmLabel,
-                    child: ExcludeSemantics(
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 20,
-                          vertical: 12,
-                        ),
-                        child: Text(
-                          confirmLabel,
-                          style: AppText.body.copyWith(color: AppColors.accent),
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    ),
+}) {
+  return AppDialog.confirm(
+    context,
+    title: title,
+    message: body,
+    confirmLabel: confirmLabel,
+    destructive: true,
   );
-  return ok == true;
 }
 
 // ---------------------------------------------------------------------------

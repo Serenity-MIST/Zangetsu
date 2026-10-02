@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
 import '../../core/app_mode.dart';
+import '../../core/ui/source_icon_tile.dart';
 import '../../core/di/injector.dart';
 import '../../core/models/provider_info.dart';
 import '../../core/playback/playback_prefs.dart';
@@ -21,6 +22,7 @@ import 'bloc/sources_event.dart';
 import 'bloc/sources_state.dart';
 import 'source_settings_screen.dart';
 import 'sources_search_field.dart';
+import '../../core/ui/app_dialog.dart';
 import '../../l10n/l10n.dart';
 
 part 'zangetsu_sources_screen_phone.dart';

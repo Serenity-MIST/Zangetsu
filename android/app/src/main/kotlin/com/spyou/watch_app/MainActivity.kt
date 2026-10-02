@@ -26,6 +26,7 @@ import com.spyou.watch_app.cloudstream.PluginHost
 import com.spyou.watch_app.cloudstream.RepoManager
 import com.spyou.watch_app.cloudstream.SubscriptionWorker
 import com.spyou.watch_app.mihon.MihonBridge
+import com.spyou.watch_app.tiles.TileBridge
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -48,7 +49,7 @@ import java.util.concurrent.Executors
 /// native players (CloudStream etc.) use for seek-bar thumbnails. No second
 /// player, no video surface: just URL + time -> JPEG bytes.
 class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
-    private val betaRemote by lazy { BetaRemoteBridge.attach(this) }
+    private val companionRemote by lazy { RemoteCompanionBridge.attach(this) }
 
     // Flutter runs in a fragment rather than us extending FlutterActivity,
     // because this activity has to BE an androidx AppCompatActivity.
@@ -80,6 +81,10 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
     // a few extra workers let results come back without one slow source choking
     // the rest (each call is also time-capped in PluginHost).
     private val csReadPool = Executors.newFixedThreadPool(8)
+    // Playback's own lane: a stuck browse/search must never starve pressing
+    // play. Only the fast (first-link) resolve runs here — same call, same
+    // caps, just never queued behind the shared pool.
+    private val csPlayPool = Executors.newFixedThreadPool(2)
     private val repo: RepoManager by lazy { RepoManager(applicationContext) }
     private val host: PluginHost by lazy { PluginHost(applicationContext) }
 
@@ -87,13 +92,19 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
     /// Keys are persisted in prefs and the alias names appear on users' home
     /// screens, so neither side may be renamed once shipped.
     private val ICON_ALIASES = linkedMapOf(
+        "crescent" to "com.spyou.watch_app.MainActivityCrescent",
         "default" to "com.spyou.watch_app.MainActivityDefault",
         "classic" to "com.spyou.watch_app.MainActivityClassic",
     )
 
-    /// The enabled alias, or "classic" when nothing has been set. A component
+    /// The one alias carrying android:enabled="true". Named because two places
+    /// below have to reason about "enabled because the manifest says so"
+    /// separately from "enabled because the user chose it".
+    private val MANIFEST_ICON = "crescent"
+
+    /// The enabled alias, or "crescent" when nothing has been set. A component
     /// left at COMPONENT_ENABLED_STATE_DEFAULT takes the manifest's
-    /// android:enabled, which is true only for the Classic alias — so that is
+    /// android:enabled, which is true only for the Crescent alias — so that is
     /// what an untouched install is really showing. Must match
     /// `AppIconService.defaultId` and the manifest.
     private fun currentIconAlias(): String {
@@ -102,7 +113,7 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
             val state = pm.getComponentEnabledSetting(ComponentName(this, cls))
             if (state == PackageManager.COMPONENT_ENABLED_STATE_ENABLED) return id
         }
-        return "classic"
+        return "crescent"
     }
 
     /// Enables [id]'s alias and disables the others.
@@ -129,6 +140,43 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
                 PackageManager.DONT_KILL_APP,
             )
         }
+    }
+
+    /// Collapses the home screen back to ONE icon after an update that adds an
+    /// alias.
+    ///
+    /// An alias the user explicitly picked stays explicitly enabled across an
+    /// app update — that persistence is the entire reason the icon switcher
+    /// works at all. A newly shipped alias, though, arrives untouched, so it
+    /// takes the manifest's android:enabled, which is true for [MANIFEST_ICON].
+    /// Both carry a LAUNCHER intent-filter, so on the update that introduced
+    /// the crescent, everyone who had ever picked an icon got TWO Zangetsu
+    /// entries on their home screen. (Verified on device: component overrides
+    /// survive an upgrade, and an untouched alias is live from the manifest.)
+    ///
+    /// The one we keep is the one they just tapped. That is not only the least
+    /// surprising answer, it is the only one that cannot kill the app —
+    /// disabling the component a task was launched from tears that task down,
+    /// and DONT_KILL_APP is a request launchers are free to ignore.
+    ///
+    /// Nothing happens unless there really are two, so a fresh install and an
+    /// already-settled one both fall straight through. A launch that did not
+    /// come from an icon (a share, a notification) leaves it for next time
+    /// rather than guessing.
+    private fun reconcileIconAliases() {
+        val pm = packageManager
+        val live = ICON_ALIASES.filter { (id, cls) ->
+            when (pm.getComponentEnabledSetting(ComponentName(this, cls))) {
+                PackageManager.COMPONENT_ENABLED_STATE_ENABLED -> true
+                PackageManager.COMPONENT_ENABLED_STATE_DEFAULT -> id == MANIFEST_ICON
+                else -> false
+            }
+        }
+        if (live.size < 2) return
+        val launched = intent?.component?.className ?: return
+        val keep = live.entries.firstOrNull { it.value == launched } ?: return
+        Log.i(TAG, "Two launcher icons after update; keeping ${keep.key}")
+        applyIconAlias(keep.key)
     }
 
     companion object {
@@ -162,7 +210,8 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
         // The manifest meta-data is unchanged; we just have to read it ourselves.
         switchLaunchThemeForNormalTheme()
         super.onCreate(savedInstanceState)
-        BetaVisibility.install(application)
+        CompanionVisibility.install(application)
+        reconcileIconAliases()
         setContentView(R.layout.activity_main)
         // Survives configuration changes / process death: re-attaching a second
         // fragment would spin up a second FlutterEngine and run the app twice.
@@ -233,7 +282,7 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
     }
 
     override fun onPause() {
-        BetaRemoteBridge.shared?.releaseControl()
+        RemoteCompanionBridge.shared?.releaseControl()
         if (current?.get() === this) current = null
         // Fail safe: never leave the volume rocker hijacked for an app that
         // isn't in front. Dart re-enables it when the reader resumes.
@@ -251,7 +300,7 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
     private var volumeKeyChannel: MethodChannel? = null
 
     override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
-        if (BetaRemoteBridge.shared?.hardwareVolume(event) == true) return true
+        if (RemoteCompanionBridge.shared?.hardwareVolume(event) == true) return true
         if (volumeKeyPaging) {
             val code = event.keyCode
             if (code == android.view.KeyEvent.KEYCODE_VOLUME_UP ||
@@ -356,13 +405,13 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
         // own, so without this line NO plugin (shared_preferences, path_provider,
         // media_kit …) would be attached and the app would come up dead.
         GeneratedPluginRegister.registerGeneratedPlugins(flutterEngine)
-        BetaLink.activity = this
-        BetaLink.channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "zangetsu/beta_companion").also { channel ->
+        CompanionReceiver.activity = this
+        CompanionReceiver.channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "zangetsu/beta_companion").also { channel ->
             channel.setMethodCallHandler { call, result ->
                 if (call.method == "playbackError") {
-                    BetaLink.catalogueError = call.arguments as? String
+                    CompanionReceiver.catalogueError = call.arguments as? String
                     result.success(null)
-                } else betaRemote.handle(call, result)
+                } else companionRemote.handle(call, result)
             }
         }
 
@@ -535,6 +584,9 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
                     }
                 }
             }
+
+        // Native phone-player channel; the object owns everything else.
+        PhonePlayerBridge.register(flutterEngine, this)
 
         // Notifications channel: deliver the "new episode" notification a CS
         // worker posted (its launch intent carries notif_payload) to Dart so it
@@ -1028,10 +1080,28 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
                         val name = call.argument<String>("name")
                         val data = call.argument<String>("data")
                         val fast = call.argument<Boolean>("fast") ?: false
-                        csReadPool.execute {
+                        // Playback (fast) gets its own lane so a pool clogged
+                        // by dead servers can't starve pressing play.
+                        val lane = if (fast) csPlayPool else csReadPool
+                        lane.execute {
                             try {
                                 val res = host.loadLinks(name ?: "", data ?: "", fast)
                                 runOnUiThread { result.success(res) }
+                            } catch (e: Exception) {
+                                runOnUiThread { result.error("cs_error", e.message, null) }
+                            }
+                        }
+                    }
+                    // A hunt the viewer walked away from (back during "Finding…").
+                    // Stops it natively instead of letting dead servers hold a
+                    // pool thread to their cap.
+                    "cancelLinks" -> {
+                        val name = call.argument<String>("name")
+                        val data = call.argument<String>("data")
+                        csReadPool.execute {
+                            try {
+                                host.cancelSession(name ?: "", data ?: "")
+                                runOnUiThread { result.success(null) }
                             } catch (e: Exception) {
                                 runOnUiThread { result.error("cs_error", e.message, null) }
                             }
@@ -1121,6 +1191,12 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
         // bridge and separate source registry from Aniyomi's; nothing shared.
         val mihonChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "zangetsu/mihon")
         MihonBridge(applicationContext, extensionScope("mihon")).attach(mihonChannel)
+
+        // Tile channel: decodes just the visible region of a tall manga/manhwa
+        // page (BitmapRegionDecoder) instead of the whole page, for the reader's
+        // tiled-page path. Same registration shape as the two bridges above.
+        val tileChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "zangetsu/tiles")
+        TileBridge(extensionScope("tiles")).attach(tileChannel)
 
         // Novel-fetch channel: routes the LNReader plugin's HTTP requests
         // through native OkHttp (see NovelHttp.kt) instead of Dio/dart:io.
@@ -1393,6 +1469,23 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
         return out
     }
 
+    /// A content:// URI another app may read for [path], or null when the
+    /// file is outside the dirs res/xml/video_paths.xml covers (or is gone).
+    ///
+    /// Android 7+ throws FileUriExposedException for a file:// handed to
+    /// another app, so a FileProvider is the only way to pass a downloaded
+    /// episode to an external player.
+    private fun sharableUri(path: String): android.net.Uri? = try {
+        androidx.core.content.FileProvider.getUriForFile(
+            this,
+            "$packageName.videoprovider",
+            java.io.File(path),
+        )
+    } catch (e: Exception) {
+        Log.w(TAG, "no content uri for a downloaded file: ${e.message}")
+        null
+    }
+
     @Suppress("UNCHECKED_CAST")
     private fun launchExternal(call: MethodCall, result: MethodChannel.Result) {
         try {
@@ -1446,6 +1539,26 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
             try {
                 startActivityForResult(intent, EXT_PLAYER_REQUEST)
             } catch (e: android.content.ActivityNotFoundException) {
+                // A DOWNLOADED episode arrives as a bare filesystem path, which
+                // is a URI with no scheme at all. Most players guess it is a
+                // file; a strict one (com.ttee.leeplayer in the reports)
+                // resolves nothing and dies right here — every launched=false
+                // in the logs is a local .mp4, never a stream. Re-offer it as
+                // content://, the only form Android has let us hand another app
+                // since API 24. Streams are untouched: they already have a
+                // scheme, so this branch skips them.
+                val shared = if (Uri.parse(url).scheme == null) sharableUri(url) else null
+                if (shared != null) {
+                    Log.w(TAG, "no activity for a bare path in $pkg — retrying as content://")
+                    intent.setDataAndType(shared, mime)
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    try {
+                        startActivityForResult(intent, EXT_PLAYER_REQUEST)
+                        return
+                    } catch (_: android.content.ActivityNotFoundException) {
+                        // Still nothing — fall through to the mime retry.
+                    }
+                }
                 // The precise mime above is a hint, not a requirement: plenty of
                 // players advertise video/* and nothing else, so an HLS stream
                 // sent as application/x-mpegURL resolves to no activity and the
@@ -1501,7 +1614,10 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
             call.argument<String>("drmKey")?.let { intent.putExtra(TvPlayerActivity.EXTRA_DRM_KEY, it) }
             call.argument<Number>("accentColor")?.let { intent.putExtra(TvPlayerActivity.EXTRA_ACCENT, it.toInt()) }
             intent.putExtra(TvPlayerActivity.EXTRA_POSITION, (call.argument<Number>("positionMs") ?: 0).toLong())
-            intent.putExtra(TvPlayerActivity.EXTRA_SW_DECODE, call.argument<Boolean>("softwareDecoding") ?: false)
+            intent.putExtra(
+                TvPlayerActivity.EXTRA_DECODER_MODE,
+                (call.argument<Number>("decoderMode") ?: 0).toInt(),
+            )
             intent.putExtra(TvPlayerActivity.EXTRA_EP_COUNT, (call.argument<Number>("episodeCount") ?: 1).toInt())
             intent.putExtra(TvPlayerActivity.EXTRA_START_INDEX, (call.argument<Number>("startIndex") ?: 0).toInt())
             call.argument<String>("category")?.let { intent.putExtra(TvPlayerActivity.EXTRA_CATEGORY, it) }
@@ -1760,19 +1876,21 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
     }
 
     override fun onDestroy() {
-        betaRemote.detach(this)
-        if (BetaLink.activity === this) {
-            BetaLink.activity = null
-            BetaLink.channel = null
-            BetaLink.stop()
+        companionRemote.detach(this)
+        if (CompanionReceiver.activity === this) {
+            CompanionReceiver.activity = null
+            CompanionReceiver.channel = null
+            CompanionReceiver.stop()
         }
         pip.unregister()
         releaseRetriever()
         executor.shutdown()
         csExecutor.shutdown()
         csReadPool.shutdown()
+        csPlayPool.shutdown()
         castManager?.release()
         tvBridge = null
+        PhonePlayerBridge.dispose()
         if (com.lagradost.cloudstream3.CommonActivity.activity === this) {
             com.lagradost.cloudstream3.CommonActivity.setActivityInstance(null)
         }

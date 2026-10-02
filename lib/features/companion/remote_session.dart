@@ -8,6 +8,7 @@ import '../../core/di/injector.dart';
 
 /// A connection belongs to the app, not the remote page. Commands are ordered
 /// and never replayed when a connection is re-established.
+/// App-owned connection and playback state; survives disposal of individual remote pages.
 class RemoteSession extends ChangeNotifier with WidgetsBindingObserver {
   static final instance = RemoteSession();
   static const channel = CompanionChannel();
@@ -30,6 +31,7 @@ class RemoteSession extends ChangeNotifier with WidgetsBindingObserver {
   bool _started = false;
   DateTime _retryAfter = DateTime(0);
 
+  /// Starts one lifecycle observer and state poller; repeated calls reuse the session.
   Future<void> start() async {
     if (_started) return;
     _started = true;
@@ -58,11 +60,13 @@ class RemoteSession extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   @override
+  /// Refreshes receiver availability when the phone returns to the foreground.
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed && saved && !connected)
       unawaited(reconnect());
   }
 
+  /// Reads native transport status without treating a companion failure as HID disconnection.
   Future<void> refreshConnection() async {
     try {
       final result =
@@ -83,6 +87,7 @@ class RemoteSession extends ChangeNotifier with WidgetsBindingObserver {
     } catch (_) {}
   }
 
+  /// Pairs/connects a receiver and then refreshes capabilities before notifying the UI.
   Future<void> connect(Map<String, dynamic> arguments) async {
     reconnecting = true;
     error = null;
@@ -109,6 +114,7 @@ class RemoteSession extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
+  /// Forwards shared skip preferences; the remote does not maintain separate skip settings.
   void _skipChanged() {
     if (!sl.isRegistered<PlaybackPrefs>()) return;
     final p = sl<PlaybackPrefs>();
@@ -119,6 +125,7 @@ class RemoteSession extends ChangeNotifier with WidgetsBindingObserver {
     };
   }
 
+  /// Dispatches touch controls; releases bypass queued commands to avoid stuck held keys.
   Future<void> control(
     String action, [
     Map<String, dynamic> values = const {},
@@ -144,6 +151,7 @@ class RemoteSession extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
+  /// Retries saved credentials with a bounded retry interval and no automatic command replay.
   Future<void> reconnect() async {
     if (reconnecting || !saved) return;
     reconnecting = true;
@@ -166,6 +174,7 @@ class RemoteSession extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
+  /// Serializes request/reply traffic and publishes current playback state or a recoverable error.
   Future<Map<String, dynamic>> command(
     String action, [
     Map<String, dynamic> values = const {},
@@ -211,6 +220,7 @@ class RemoteSession extends ChangeNotifier with WidgetsBindingObserver {
     return result.future;
   }
 
+  /// Persists whether normal phone browsing should launch playback on the connected TV.
   Future<void> setRemoteMode(bool enabled) async {
     remoteMode = enabled;
     await channel.invokeMethod<void>('remoteMode', enabled);
@@ -221,6 +231,7 @@ class RemoteSession extends ChangeNotifier with WidgetsBindingObserver {
       });
   }
 
+  /// Stops reconnection and optionally removes the saved receiver credentials.
   Future<void> disconnect({bool forget = false}) async {
     await channel.invokeMethod<void>(forget ? 'forget' : 'disconnect');
     connected = false;
@@ -231,6 +242,7 @@ class RemoteSession extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
+  /// Validates the companion QR scheme and required fields before connecting.
   Future<void> connectQr(String raw) async {
     final uri = Uri.tryParse(raw);
     if (uri == null ||
@@ -252,11 +264,13 @@ class RemoteSession extends ChangeNotifier with WidgetsBindingObserver {
     await connect({'address': address, 'pin': pin, 'qr': qr});
   }
 
+  /// Extracts a user-facing platform failure without exposing a stack trace.
   String _message(Object e) => e is PlatformException
       ? e.message ?? 'Connection lost'
       : e.toString().replaceFirst('Bad state: ', '');
 
   @override
+  /// Cancels polling and preference/lifecycle listeners owned by this session.
   void dispose() {
     _timer?.cancel();
     WidgetsBinding.instance.removeObserver(this);

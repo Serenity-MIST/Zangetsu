@@ -912,6 +912,7 @@
 	"builtInPlayer": "内置播放器",
 	"otherApps": "其他应用",
 	"seeAll2": "查看全部",
+	"webView": "WebView",
 	"openInBrowser": "在浏览器中打开",
 	"copyLink": "复制链接",
 	"removeTracking": "取消追番",
@@ -1025,6 +1026,7 @@
 		}
 	},
 	"sort": "种类",
+	"shuffle": "随机选择",
 	"giveItAName": "给它起个名字",
 	"youAlreadyHaveThatOne": "你已经有那个了。",
 	"thatNameIsTaken": "这个名字已被占用",

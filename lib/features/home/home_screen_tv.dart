@@ -1,3 +1,8 @@
+import '../../core/metadata/streaming_service.dart';
+import '../../core/zmode/metadata_provider_prefs.dart';
+import '../../core/zmode/tmdb_catalogue.dart';
+import '../settings/streaming_services_screen_tv.dart';
+import 'cubit/home_rows_composer.dart';
 import 'dart:async';
 
 import 'package:cached_network_image/cached_network_image.dart';
@@ -19,6 +24,7 @@ import '../../core/models/home_section.dart';
 import '../../core/models/media_detail.dart';
 import '../../core/models/media_item.dart';
 import '../../core/models/provider_info.dart';
+import '../../core/playback/tv_playback_helpers.dart';
 import '../../core/playback/my_list.dart';
 import '../../core/playback/playback_prefs.dart';
 import '../../core/playback/resume_store.dart';
@@ -52,6 +58,8 @@ import '../sources/providers_hub_screen.dart';
 import 'home_screen.dart' show HomeLoadedEmptyView;
 import 'see_all_screen.dart';
 import 'cubit/home_cubit.dart';
+import 'see_all_screen_tv.dart';
+import 'streaming_services_row.dart';
 
 part 'home_screen_tv_rail.dart';
 part 'home_screen_tv_continue.dart';
@@ -204,6 +212,8 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
       scrobbleTitle: item.type == ProviderType.anime ? item.title : null,
       tmdbId: item.tmdbId,
       tmdbIsTv: item.tmdbIsTv,
+      imdbId: item.imdbId,
+      listItem: item,
     );
     if (mounted) setState(() {});
   }
@@ -289,6 +299,14 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
       malId: e.malId,
       scrobbleTitle: e.malId != null ? e.showTitle : null,
       skipOverlay: true, // source already worked — skip the "Finding…" cover
+      listItem: mediaItemForPlayback(
+        sourceId: e.sourceId,
+        showUrl: e.showUrl,
+        showTitle: e.showTitle,
+        cover: e.cover,
+        coverHeaders: e.coverHeaders,
+        malId: e.malId,
+      ),
     );
     debugPrint('[tv-home] _resume · launch complete');
     if (mounted) setState(() {});
@@ -611,6 +629,7 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
                 loading: state.loading,
                 autofocus: true,
                 active: true,
+                kind: kind,
               );
             },
           );
@@ -629,12 +648,64 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
     return Scaffold(backgroundColor: AppColors.bg, body: body);
   }
 
+  /// Whether the streaming rail belongs on this TV home.
+  ///
+  /// TMDB only — the rail's cards page through the ACTIVE video catalogue, and
+  /// Simkl cannot answer a `wp:` row, so on a Simkl layout every logo would
+  /// open an empty grid. Same rule the phone uses, read from the same prefs.
+  bool get _streamingRailApplies {
+    final prefs = sl.isRegistered<MetadataProviderPrefs>()
+        ? sl<MetadataProviderPrefs>()
+        : null;
+    return streamingRailForLayout(
+      layoutKeyFor(
+        sourceId: '',
+        zModeOn: true,
+        browseKind: ZKind.movie,
+        simklPreferred: prefs?.video == VideoProvider.simkl,
+      ),
+    );
+  }
+
+  /// Open one service's catalogue, straight to the paginated grid — the rail
+  /// already IS the service picker.
+  Future<void> _openStreamingService(StreamingService s) async {
+    final repo = sl<MetadataRepository>();
+    final more = BrowseMore(
+      sourceId: ZmodeIds.sourceId,
+      kind: 'zm_video',
+      categoryId: TmdbCatalogue.wpRowId(s.id),
+    );
+    List<MediaItem> first;
+    try {
+      first = await repo.browseMore(more, 1);
+    } catch (_) {
+      first = const [];
+    }
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SeeAllScreenTv(
+          title: s.name,
+          items: first,
+          onTap: (m) => Navigator.push(context, DetailScreen.route(m)),
+          onLoadMore: (page) => repo.browseMore(more, page),
+        ),
+      ),
+    );
+  }
+
+  void _openStreamingServices() => Navigator.of(context).push(
+    MaterialPageRoute<void>(builder: (_) => const StreamingServicesScreenTv()),
+  );
+
   Widget _catalogScroll(
     List<HomeSection> sections,
     List<HistoryEntry> history, {
     required bool loading,
     required bool autofocus,
     required bool active,
+    required StreamKind kind,
   }) {
     final heroItems = sections.isNotEmpty
         ? sections.first.items
@@ -671,6 +742,19 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
               firstAutofocus: autofocus && heroItem == null && !loading,
             ),
           ),
+        // The streaming-service rail, under Continue Watching exactly as on
+        // phone. Movie/TV pane only, and only on a TMDB layout: the cards
+        // page through the active video catalogue, and Simkl cannot answer a
+        // `wp:` row — on Simkl every logo would open an empty grid.
+        if (kind == StreamKind.movie && _streamingRailApplies)
+          SliverToBoxAdapter(
+            child: StreamingServicesRow(
+              onOpen: _openStreamingService,
+              onSeeAll: _openStreamingServices,
+              firstAutofocus:
+                  autofocus && heroItem == null && history.isEmpty && !loading,
+            ),
+          ),
         for (var i = 0; i < sections.length; i++)
           SliverToBoxAdapter(
             child: TvRail(
@@ -703,6 +787,7 @@ typedef _TvCatalogBuilder =
       required bool loading,
       required bool autofocus,
       required bool active,
+      required StreamKind kind,
     });
 
 /// Keeps both 10-foot catalogues mounted and swaps visibility without
@@ -784,6 +869,7 @@ class _TvDualCatalogHostState extends State<_TvDualCatalogHost> {
               loading: visible && widget.loading,
               autofocus: grantAutofocus,
               active: visible,
+              kind: kind,
             ),
           ),
         ),

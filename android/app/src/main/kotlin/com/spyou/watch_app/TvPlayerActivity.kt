@@ -78,7 +78,10 @@ class TvPlayerActivity : Activity() {
         const val EXTRA_SUB_URLS = "subUrls"
         const val EXTRA_SUB_LANGS = "subLangs"
         const val EXTRA_SUB_LABELS = "subLabels"
-        const val EXTRA_SW_DECODE = "softwareDecoding"
+        const val EXTRA_DECODER_MODE = "decoderMode"
+        const val DECODER_MODE_HARDWARE_ONLY = 0
+        const val DECODER_MODE_HARDWARE_FIRST = 1
+        const val DECODER_MODE_SOFTWARE_FIRST = 2
         const val EXTRA_ACCENT = "accentColor"
         // Buffer preset (Settings → Playback), resolved Dart-side. Absent/0 =
         // ExoPlayer defaults, which is what this activity used before.
@@ -146,14 +149,16 @@ class TvPlayerActivity : Activity() {
     private var lastVideoRatio: Float? = null
 
     private var player: ExoPlayer? = null
-    private fun betaOptionsVersion() = "${System.identityHashCode(this)}:$currentIndex:${currentUrl?.hashCode()}:${player?.currentTracks?.hashCode()}"
+    private fun companionOptionsVersion() = "${System.identityHashCode(this)}:$currentIndex:${currentUrl?.hashCode()}:${player?.currentTracks?.hashCode()}"
 
     /** Only called on the main thread by the authenticated companion receiver. */
-    fun betaStream(): Map<String, Any?> = mapOf("url" to currentUrl, "headers" to currentHeaders,
+    /** Exposes the active stream only to the authenticated companion handoff bridge. */
+    fun companionStream(): Map<String, Any?> = mapOf("url" to currentUrl, "headers" to currentHeaders,
         "index" to currentIndex, "drmKid" to currentDrmKid, "drmKey" to currentDrmKey,
         "subtitles" to currentSubs.map { mapOf("url" to it.uri.toString(), "lang" to (it.language ?: "und"), "label" to it.label) })
 
-    fun betaState(): org.json.JSONObject {
+    /** Snapshots player capabilities, options and progress for contextual remote controls. */
+    fun companionState(): org.json.JSONObject {
         val p = player
         val tracks = org.json.JSONArray()
         p?.currentTracks?.groups?.forEachIndexed { groupIndex, group ->
@@ -167,14 +172,14 @@ class TvPlayerActivity : Activity() {
             }
         }
         return org.json.JSONObject().put("active", p != null)
-            .put("appForeground", BetaVisibility.foreground).put("playerForeground", BetaVisibility.playerForeground)
+            .put("appForeground", CompanionVisibility.foreground).put("playerForeground", CompanionVisibility.playerForeground)
             .put("megaSkipEnabled", intent.getBooleanExtra(EXTRA_MEGASKIP, true)).put("megaSkipSeconds", megaSkipSecs)
             .put("canSkipIntro", skipIntroEnabled && skipIntervals.any { (p?.currentPosition ?: -1) >= it.start && (p?.currentPosition ?: -1) < it.end })
             .put("skipLabel", if (::skipButton.isInitialized) skipButton.text.toString() else "Skip Intro")
             .put("title", intent.getStringExtra(EXTRA_TITLE) ?: "Zangetsu")
             .put("episodeLabel", episodeLabels.getOrNull(currentIndex) ?: intent.getStringExtra(EXTRA_EP_LABEL) ?: "")
             .put("episodeIndex", currentIndex).put("episodes", org.json.JSONArray(episodeLabels.toList()))
-            .put("optionsVersion", betaOptionsVersion())
+            .put("optionsVersion", companionOptionsVersion())
             .put("positionMs", p?.currentPosition ?: 0).put("durationMs", (p?.duration ?: 0).coerceAtLeast(0))
             .put("playing", p?.playWhenReady == true).put("buffering", switching || p?.playbackState == Player.STATE_BUFFERING)
             .put("volume", ((p?.volume ?: 1f) * 100).toInt())
@@ -184,7 +189,8 @@ class TvPlayerActivity : Activity() {
             }))
     }
 
-    fun betaCommand(command: org.json.JSONObject) {
+    /** Applies allowlisted playback commands and rejects stale source/track selections. */
+    fun companionCommand(command: org.json.JSONObject) {
         val p = player ?: error("Player is not ready")
         when (command.getString("action")) {
             "toggle" -> { userPaused = p.playWhenReady; if (userPaused) p.pause() else p.play(); reportTiming(playing = !userPaused) }
@@ -224,14 +230,14 @@ class TvPlayerActivity : Activity() {
                 loadEpisode(index)
             }
             "source" -> {
-                check(command.optString("optionsVersion") == betaOptionsVersion()) { "Player options changed. Open the source list again." }
+                check(command.optString("optionsVersion") == companionOptionsVersion()) { "Player options changed. Open the source list again." }
                 check(command.getInt("episodeIndex") == currentIndex && !switching) { "Episode changed. Refresh and try again." }
                 val index = command.getInt("index")
                 require(index in episodeSources.indices) { "Source unavailable" }
                 loadSource(index)
             }
             "track" -> {
-                check(command.optString("optionsVersion") == betaOptionsVersion()) { "Player options changed. Open the track list again." }
+                check(command.optString("optionsVersion") == companionOptionsVersion()) { "Player options changed. Open the track list again." }
                 check(command.getInt("episodeIndex") == currentIndex && !switching) { "Episode changed. Refresh and try again." }
                 val type = command.getInt("type")
                 require(type in listOf(C.TRACK_TYPE_AUDIO, C.TRACK_TYPE_VIDEO, C.TRACK_TYPE_TEXT))
@@ -894,7 +900,8 @@ class TvPlayerActivity : Activity() {
         }
     }
 
-    fun betaSkipPrefs(settings: org.json.JSONObject) {
+    /** Applies the shared skip settings so player and remote buttons have one configuration. */
+    fun companionSkipPrefs(settings: org.json.JSONObject) {
         skipIntroEnabled = settings.optBoolean("skipIntro", true)
         megaSkipSecs = settings.optInt("megaSkipSeconds", 85).coerceIn(5, 180)
         intent.putExtra(EXTRA_MEGASKIP, settings.optBoolean("megaSkip", true))
@@ -1861,21 +1868,18 @@ class TvPlayerActivity : Activity() {
     }
 
     /**
-     * Force each cue onto the user's vertical preference (0=top … 100=bottom).
-     * Media3's [SubtitleView.setBottomPaddingFraction] only shifts cues that
-     * leave line unset — most VTT/SRT/ASS cues set their own line, so without
-     * this remapping Low/Middle/High look identical.
+     * Force each cue onto the user's vertical preference (0=top … 100=bottom),
+     * keeping simultaneous cues on separate rows. Media3's
+     * [SubtitleView.setBottomPaddingFraction] only shifts cues that leave line
+     * unset — most VTT/SRT/ASS cues set their own line, so without this remapping
+     * Low/Middle/High look identical. See [SubtitleCuePositioning].
      */
-    private fun repositionCues(cues: List<Cue>): List<Cue> {
-        if (cues.isEmpty()) return cues
-        val line = subPositionPref.coerceIn(0, 100) / 100f
-        return cues.map { cue ->
-            cue.buildUpon()
-                .setLine(line, Cue.LINE_TYPE_FRACTION)
-                .setLineAnchor(Cue.ANCHOR_TYPE_END)
-                .build()
-        }
-    }
+    private fun repositionCues(cues: List<Cue>): List<Cue> =
+        SubtitleCuePositioning.position(
+            cues,
+            positionPercent = subPositionPref,
+            textSizeFraction = SubtitleView.DEFAULT_TEXT_SIZE_FRACTION * subScale,
+        )
 
     private fun buildCaptionPos() {
         menuTitle("Position")
@@ -2669,21 +2673,23 @@ class TvPlayerActivity : Activity() {
     }
 
     /**
-     * OFF (default) → plain DefaultRenderersFactory (hardware only), identical to
-     * before. ON → NextRenderersFactory, which adds the hardware MediaCodec
-     * renderers first (via super) and appends FFmpeg audio/video only as a
-     * fallback. EXTENSION_RENDERER_MODE_ON keeps hardware preferred, so H.264/HEVC
-     * video + AAC audio are untouched — FFmpeg only decodes tracks the TV can't
-     * (Dolby AC3/E-AC3, DTS → were silent). Opt-in because software decoding can
-     * be unstable on some TVs (CloudStream disables it on TV by default too).
+     * The TV-only preference selects renderer priority. Hardware-only remains
+     * the default; extension decoders are available only when explicitly
+     * selected, with either hardware-first (ON) or software-first (PREFER)
+     * ordering. Decoder fallback allows ExoPlayer to try the other renderer if
+     * the preferred decoder cannot initialize.
      */
     private fun renderersFactory(): RenderersFactory =
-        if (intent.getBooleanExtra(EXTRA_SW_DECODE, false)) {
-            NextRenderersFactory(this)
+        when (intent.getIntExtra(EXTRA_DECODER_MODE, DECODER_MODE_HARDWARE_ONLY)) {
+            DECODER_MODE_HARDWARE_FIRST -> NextRenderersFactory(this)
                 .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
                 .setEnableDecoderFallback(true)
-        } else {
-            DefaultRenderersFactory(this)
+
+            DECODER_MODE_SOFTWARE_FIRST -> NextRenderersFactory(this)
+                .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+                .setEnableDecoderFallback(true)
+
+            else -> DefaultRenderersFactory(this)
         }
 
     private fun fmt(ms: Long): String {

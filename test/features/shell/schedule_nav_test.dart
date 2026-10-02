@@ -204,6 +204,9 @@ class _FakeProviderRegistry implements ProviderRegistry {
 
   @override
   Map<String, String> typeMapOf() => const {};
+  @override
+  ({Map<String, String> types, Map<String, String> logos})
+  manifestMapsOf() => (types: const {}, logos: const {});
 }
 
 class _FakeAniListService extends ChangeNotifier implements AniListService {
@@ -278,6 +281,9 @@ class _FakeDownloadPrefs extends DownloadPrefs {
 
   @override
   String? get locationLabel => null;
+
+  @override
+  bool get keepPrivate => false;
 }
 
 /// [ScheduleScreen] (built eagerly by both shells' IndexedStack) creates a

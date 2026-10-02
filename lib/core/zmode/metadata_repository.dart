@@ -25,6 +25,7 @@ import 'video_catalogue.dart';
 import 'match_store.dart';
 import 'playback_resolver.dart';
 import 'source_matcher.dart';
+import 'source_score_store.dart';
 import 'tmdb_catalogue.dart';
 import 'zmode_ids.dart';
 import 'zmode_source_prefs.dart';
@@ -61,26 +62,38 @@ class MetadataRepository implements CatalogueRepository {
          sources: sources,
          store: matchStore,
          prefs: sourcePrefs,
-         health: health ?? (sl.isRegistered<SourceHealthStore>() ? sl<SourceHealthStore>() : SourceHealthStore()),
+         health:
+             health ??
+             (sl.isRegistered<SourceHealthStore>()
+                 ? sl<SourceHealthStore>()
+                 : SourceHealthStore()),
          candidates: candidates ?? _defaultCandidates(sources),
+         scores: sl.isRegistered<SourceScoreStore>()
+             ? sl<SourceScoreStore>()
+             : null,
        ) {
     _bindPlayback();
   }
 
   static List<({String id, String name})> Function(ZKind) _defaultCandidates(
     SourceRepository sources,
-  ) =>
-      (kind) {
-        final all = sources.pickableSources;
-        return switch (kind) {
-          ZKind.manga => [for (final s in all) if (s.id.startsWith('mihon:')) s],
-          ZKind.novel => [for (final s in all) if (s.id.startsWith('lnr:')) s],
-          _ => [
-            for (final s in all)
-              if (!s.id.startsWith('mihon:') && !s.id.startsWith('lnr:')) s,
-          ],
-        };
-      };
+  ) => (kind) {
+    final all = sources.pickableSources;
+    return switch (kind) {
+      ZKind.manga => [
+        for (final s in all)
+          if (s.id.startsWith('mihon:')) s,
+      ],
+      ZKind.novel => [
+        for (final s in all)
+          if (s.id.startsWith('lnr:')) s,
+      ],
+      _ => [
+        for (final s in all)
+          if (!s.id.startsWith('mihon:') && !s.id.startsWith('lnr:')) s,
+      ],
+    };
+  };
 
   void _bindPlayback() {
     _playback.bindTitleLookup(titleFor);
@@ -109,6 +122,16 @@ class MetadataRepository implements CatalogueRepository {
   /// prefetched after each successful home fetch.
   final Map<ZKind, List<HomeSection>> _homeCache = {};
 
+  /// Home loads that are running RIGHT NOW, one per kind.
+  ///
+  /// [_homeCache] is only filled when a load finishes, so anything asking
+  /// during those seconds saw an empty cache and started its own copy — a
+  /// quarter of home loads in the field were duplicates of one already in
+  /// flight, and every slowest load had one. Twenty-one call sites reach this
+  /// (boot steps, refresh, retry buttons); only two of them check whether a
+  /// load is already running, so the guard belongs here, where they all meet.
+  final Map<ZKind, Future<List<HomeSection>>> _homeInFlight = {};
+
   /// Optional hook when anime/movie home rows land in [_homeCache] — wired in
   /// [initDependencies] so [HomeCubit] can mirror them for instant toggles.
   void Function(ZKind kind, List<HomeSection> rows)? onStreamHomeCached;
@@ -127,7 +150,7 @@ class MetadataRepository implements CatalogueRepository {
     final sw = Stopwatch()..start();
     debugPrint('[metadata] warm · kind=$kind · fetch');
     final rows = await _homeForKind(kind);
-    _homeCache[kind] = rows;
+    if (!_homeFailed(rows)) _homeCache[kind] = rows; // same rule as home()
     debugPrint(
       '[metadata] warm · kind=$kind · ${rows.length} rows · ${sw.elapsedMilliseconds}ms',
     );
@@ -229,9 +252,7 @@ class MetadataRepository implements CatalogueRepository {
   }) async {
     try {
       final result = await primary();
-      if (backup != null &&
-          treatAsFailure != null &&
-          treatAsFailure(result)) {
+      if (backup != null && treatAsFailure != null && treatAsFailure(result)) {
         try {
           final out = await backup();
           if (!treatAsFailure(out)) {
@@ -319,7 +340,7 @@ class MetadataRepository implements CatalogueRepository {
         ? 'MyAnimeList'
         : 'AniList';
   }
-  
+
   String nameForKind(ZKind kind) {
     if (_isTmdb(kind)) {
       return _providerPrefs?.video == VideoProvider.simkl ? 'Simkl' : 'TMDB';
@@ -328,7 +349,7 @@ class MetadataRepository implements CatalogueRepository {
         ? 'MyAnimeList'
         : 'AniList';
   }
-  
+
   Future<MediaItem?> canonicalFor(MediaItem sourceItem) async {
     if (ZmodeIds.isZ(sourceItem.url)) return sourceItem; // already canonical
     final title = sourceItem.title.trim();
@@ -376,6 +397,9 @@ class MetadataRepository implements CatalogueRepository {
   // ── browsing ─────────────────────────────────────────────────────────────
 
   @override
+  // Stays `async` on purpose. Dropping it would let a synchronous throw from
+  // [_browseKind] escape to the caller instead of arriving as a failed future,
+  // which is a different contract than every caller was written against.
   Future<List<HomeSection>> home({
     String category = 'sub',
     String? sourceId,
@@ -386,16 +410,39 @@ class MetadataRepository implements CatalogueRepository {
       debugPrint('[metadata] home · kind=$k · cache (${cached.length} rows)');
       return cached;
     }
+    final running = _homeInFlight[k];
+    if (running != null) {
+      debugPrint('[metadata] home · kind=$k · joined the load already running');
+      return running;
+    }
+    final started = _loadHome(k);
+    _homeInFlight[k] = started;
+    return started;
+  }
+
+  Future<List<HomeSection>> _loadHome(ZKind k) async {
     final sw = Stopwatch()..start();
     debugPrint('[metadata] home · kind=$k · fetch');
-    final rows = await _homeForKind(k);
-    _homeCache[k] = rows;
-    debugPrint(
-      '[metadata] home · kind=$k · ${rows.length} rows · ${sw.elapsedMilliseconds}ms',
-    );
-    _syncHomeCubitStreamCache(k, rows);
-    _prefetchStreamingCounterpart(k);
-    return rows;
+    try {
+      final rows = await _homeForKind(k);
+      // No rows is a FAILURE, not an answer — [_homeFailed] already says so,
+      // it just wasn't consulted here. Caching it stuck the user on an empty
+      // Home for the rest of the session: going back to Home re-read the
+      // cached emptiness instead of retrying, and a quarter of the cache hits
+      // in the field were serving zero rows. HomeCubit already refuses to
+      // remember empty rows for the same reason.
+      if (!_homeFailed(rows)) _homeCache[k] = rows;
+      debugPrint(
+        '[metadata] home · kind=$k · ${rows.length} rows · ${sw.elapsedMilliseconds}ms',
+      );
+      _syncHomeCubitStreamCache(k, rows);
+      _prefetchStreamingCounterpart(k);
+      return rows;
+    } finally {
+      // Always, including on a throw: the slot must not outlive the load, or
+      // every later caller joins a future that already failed.
+      _homeInFlight.remove(k);
+    }
   }
 
   static bool _homeFailed(List<HomeSection> rows) => rows.isEmpty;
@@ -421,7 +468,7 @@ class MetadataRepository implements CatalogueRepository {
       final sw = Stopwatch()..start();
       try {
         final rows = await _homeForKind(other);
-        _homeCache[other] = rows;
+        if (!_homeFailed(rows)) _homeCache[other] = rows; // same rule as home()
         _syncHomeCubitStreamCache(other, rows);
         debugPrint(
           '[metadata] prefetch · kind=$other · ${rows.length} rows · ${sw.elapsedMilliseconds}ms',
@@ -553,6 +600,7 @@ class MetadataRepository implements CatalogueRepository {
     /// resolver came from had dropped it, which would have quietly removed the
     /// metadata-provider switch.
     PreferredProvider? prefer,
+    bool Function()? abandoned,
   }) async {
     final c = ZmodeIds.parseShow(url);
     if (c == null) throw ArgumentError('not a metadata url: $url');
@@ -593,6 +641,11 @@ class MetadataRepository implements CatalogueRepository {
         title: d.title,
         altTitle: d.englishTitle,
         malId: d.malId,
+        // `detail` accepted `abandoned` but never consulted it, so a source
+        // sweep outlived the screen that asked for it. Fast back-and-tap
+        // through detail screens then stacked one live search per screen, and
+        // each new tap waited behind every abandoned one.
+        abandoned: abandoned,
       );
       if (m == null) {
         // A Cloudflare challenge on the source reading actually uses — surface
@@ -606,9 +659,7 @@ class MetadataRepository implements CatalogueRepository {
         // source the reader has never opened. Video never did this: it keeps
         // the page and raises Cloudflare at playback, where the user acted.
         final reading = _matcher.sourceForTitle(c);
-        final blocked = reading == null
-            ? null
-            : CfSolveNeeded.urlFor(reading);
+        final blocked = reading == null ? null : CfSolveNeeded.urlFor(reading);
         if (blocked != null) throw CloudflareRequiredException(blocked);
         AppLogger.instance.log(
           '[metadata] detail no source match ${sw.elapsedMilliseconds}ms',
@@ -633,11 +684,7 @@ class MetadataRepository implements CatalogueRepository {
       // resolver and was quietly losing 24 fields on every manga and novel:
       // score, tags, cast, relations, synonyms, dates, and coverHeaders, which
       // header-locked cover hosts need to render at all.
-      return d.copyWith(
-        id: m.showId,
-        episodes: chapters,
-        sourceId: m.sourceId,
-      );
+      return d.copyWith(id: m.showId, episodes: chapters, sourceId: m.sourceId);
     }
 
     // Video: the catalogue's list has already been painted (onPartial above),
@@ -660,6 +707,11 @@ class MetadataRepository implements CatalogueRepository {
       title: d.title,
       altTitle: d.englishTitle,
       malId: d.malId,
+      // `detail` accepted `abandoned` but never consulted it, so a source
+      // sweep outlived the screen that asked for it. Fast back-and-tap
+      // through detail screens then stacked one live search per screen, and
+      // each new tap waited behind every abandoned one.
+      abandoned: abandoned,
     );
     if (m == null) {
       // Keep the catalogue's list rather than blanking it. Playback sweeps
@@ -690,6 +742,9 @@ class MetadataRepository implements CatalogueRepository {
       m.showUrl,
       sourceId: m.sourceId,
       category: category,
+      // The slow half: the catalogue list is already on screen by now, and
+      // this is the call that sits in the provider queue.
+      abandoned: abandoned,
     );
     final srcEpisodes = srcDetail.episodes;
     AppLogger.instance.log(
@@ -767,15 +822,26 @@ class MetadataRepository implements CatalogueRepository {
     if (firstUnaired != null && n >= firstUnaired) {
       // An exact date only for the very next one — anything beyond it would be
       // us guessing at a schedule we were never told.
-      if (n == firstUnaired && airsAt != null) return 'Airs ${_shortDate(airsAt)}';
+      if (n == firstUnaired && airsAt != null)
+        return 'Airs ${_shortDate(airsAt)}';
       return 'Not out yet';
     }
     return checkedSource == null ? 'Not available' : 'Not on $checkedSource';
   }
 
   static const _months = [
-    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'May',
+    'Jun',
+    'Jul',
+    'Aug',
+    'Sep',
+    'Oct',
+    'Nov',
+    'Dec',
   ];
 
   static String _shortDate(DateTime d) {
@@ -841,8 +907,7 @@ class MetadataRepository implements CatalogueRepository {
   /// means "no preference" and takes the normal sweep.
   @override
   Future<List<VideoSource>> sources(
-    String episodeUrl,
-    {
+    String episodeUrl, {
     String? sourceId,
     bool fast = false,
   }) async {
@@ -856,10 +921,13 @@ class MetadataRepository implements CatalogueRepository {
         fast: fast,
         category: cut,
       );
-      if (named.isNotEmpty) return named;
+      final parsed = ZmodeIds.parseEpisode(episodeUrl);
+      final explicitlySelected =
+          parsed != null && _matcher.sourceForTitle(parsed.show) == sourceId;
+      if (named.isNotEmpty || explicitlySelected) return named;
       // That source doesn't have it. Sweeping is better than nothing here —
-      // the caller gets SOMETHING playable and the download code says which
-      // source it settled on — but the named one had to be asked first.
+      // except when the viewer selected it for this title. Ordinary named
+      // lookups retain their fallback, while an explicit choice stays local.
     }
     return _playback.sources(episodeUrl, fast: fast, category: cut);
   }

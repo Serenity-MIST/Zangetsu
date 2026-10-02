@@ -198,6 +198,9 @@ class AppLocalizationsFr extends AppLocalizations {
   String get custom => 'Perso';
 
   @override
+  String get customRange => 'Custom range';
+
+  @override
   String get defaultLabel => 'Par défaut';
 
   @override
@@ -220,6 +223,9 @@ class AppLocalizationsFr extends AppLocalizations {
 
   @override
   String get testing => 'Test…';
+
+  @override
+  String get searchOk => 'Search OK';
 
   @override
   String get working => 'En ligne';
@@ -388,6 +394,37 @@ class AppLocalizationsFr extends AppLocalizations {
 
   @override
   String get activeSource => 'Source active';
+
+  @override
+  String get streamingServices => 'Streaming Services';
+
+  @override
+  String get streamingServicesSubtitle =>
+      'Browse what each service carries where you are';
+
+  @override
+  String get streamingServicesEmpty => 'No services listed for this country';
+
+  @override
+  String get streamingServicesMetadataNote =>
+      'Browsing only — titles still play through your own sources';
+
+  @override
+  String get pinAsHomeRow => 'Pin as home row';
+
+  @override
+  String get unpinHomeRow => 'Unpin';
+
+  @override
+  String pinLimitReached(int count) {
+    return 'You can pin up to $count services';
+  }
+
+  @override
+  String get streamingRegion => 'Streaming region';
+
+  @override
+  String get streamingRegionSubtitle => 'Which country\'s catalogue to show';
 
   @override
   String get sourceHealth => 'État des sources';
@@ -1266,6 +1303,18 @@ class AppLocalizationsFr extends AppLocalizations {
   String get nativeTVPlayer => 'Lecteur TV natif';
 
   @override
+  String get tvDecoderMode => 'TV decoder priority';
+
+  @override
+  String get tvDecoderHardwareOnly => 'Hardware only';
+
+  @override
+  String get tvDecoderHardwareFirst => 'Hardware first (software fallback)';
+
+  @override
+  String get tvDecoderSoftwareFirst => 'Software first (hardware fallback)';
+
+  @override
   String get softwareAudioDolbyDTS => 'Audio logiciel (Dolby/DTS)';
 
   @override
@@ -1752,6 +1801,12 @@ class AppLocalizationsFr extends AppLocalizations {
   String get audioDelay => 'Délai audio';
 
   @override
+  String get androidPlayer => 'Android Player (Experimental)';
+
+  @override
+  String get androidPlayerUnavailable => 'Android Player could not start';
+
+  @override
   String get audioNormalization => 'Normalisation audio';
 
   @override
@@ -1906,6 +1961,9 @@ class AppLocalizationsFr extends AppLocalizations {
 
   @override
   String get findEpisode => 'Trouver un épisode';
+
+  @override
+  String get findChapter => 'Find chapter';
 
   @override
   String get refreshChapters => 'Actualiser les chapitres';
@@ -2668,7 +2726,13 @@ class AppLocalizationsFr extends AppLocalizations {
   String get seeAll2 => 'Tout voir';
 
   @override
+  String get webView => 'WebView';
+
+  @override
   String get openInBrowser => 'Ouvrir dans le navigateur';
+
+  @override
+  String get markAsRead => 'Mark as read';
 
   @override
   String get copyLink => 'Copier le lien';
@@ -2860,6 +2924,9 @@ class AppLocalizationsFr extends AppLocalizations {
   String get sort => 'Trier';
 
   @override
+  String get shuffle => 'Choisir au hasard';
+
+  @override
   String get giveItAName => 'Donnez-lui un nom';
 
   @override
@@ -2917,6 +2984,24 @@ class AppLocalizationsFr extends AppLocalizations {
   @override
   String markedEpisodesAsWatched(int count) {
     return 'Marked $count episodes as watched';
+  }
+
+  @override
+  String get openInBrowserSubtitle =>
+      'Read this chapter on the source\'s own site';
+
+  @override
+  String get readingSettings => 'Reading settings';
+
+  @override
+  String get markedAsRead => 'Marked as read';
+
+  @override
+  String get markedUnread => 'Marked unread';
+
+  @override
+  String markedChaptersAsRead(int count) {
+    return 'Marked $count chapters as read';
   }
 
   @override
@@ -3473,6 +3558,12 @@ class AppLocalizationsFr extends AppLocalizations {
 
   @override
   String get appIcon => 'Icône de l\'application';
+
+  @override
+  String get splashStyle => 'Splash';
+
+  @override
+  String get splashStyleBlurb => 'What plays while the app starts up.';
 
   @override
   String get currentLocation => 'Localisation actuelle';
@@ -5052,6 +5143,9 @@ class AppLocalizationsFr extends AppLocalizations {
   String get noSourceHasThisYet => 'No source has this yet';
 
   @override
+  String get checkedTopSources => 'Checked your top sources — none had this';
+
+  @override
   String get pickTheRightTitle => 'Pick the right title';
 
   @override
@@ -5183,4 +5277,64 @@ class AppLocalizationsFr extends AppLocalizations {
 
   @override
   String get yourSavedNovelList => 'Your saved novel list';
+
+  @override
+  String get epub => 'EPUB';
+
+  @override
+  String get exportAsEpub => 'Export as EPUB';
+
+  @override
+  String chaptersDownloadedCount(int done, int total) {
+    return '$done of $total chapters downloaded';
+  }
+
+  @override
+  String get noChaptersDownloadedToExport =>
+      'No chapters downloaded yet — download some first.';
+
+  @override
+  String get allChapters => 'All chapters';
+
+  @override
+  String get startChapter => 'Start';
+
+  @override
+  String get endChapter => 'End';
+
+  @override
+  String get includeChapterNumber => 'Include chapter number';
+
+  @override
+  String get includeChapterNumberSubtitle =>
+      '\"Chapter 5: Title\" instead of just \"Title\"';
+
+  @override
+  String get fileNameLabel => 'File name';
+
+  @override
+  String get folderLabel => 'Folder';
+
+  @override
+  String exportingChapterProgress(int done, int total) {
+    return 'Chapter $done of $total';
+  }
+
+  @override
+  String exportedToFolder(String folder) {
+    return 'Exported to $folder';
+  }
+
+  @override
+  String get epubExportFailed => 'Couldn\'t save the EPUB';
+
+  @override
+  String get export => 'Export';
+
+  @override
+  String get keepDownloadsPrivate => 'Keep downloads private';
+
+  @override
+  String get keepDownloadsPrivateSubtitle =>
+      'New video downloads stay inside Zangetsu instead of the Downloads folder. They are deleted when you uninstall Zangetsu. Chapters and exports are unaffected.';
 }

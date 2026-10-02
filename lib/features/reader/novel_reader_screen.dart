@@ -32,6 +32,7 @@ class NovelReaderScreen extends StatefulWidget {
     super.key,
     required this.sourceId,
     required this.showId,
+    this.showUrl,
     required this.showTitle,
     required this.cover,
     required this.chapters, // sorted ascending
@@ -43,6 +44,7 @@ class NovelReaderScreen extends StatefulWidget {
 
   final String sourceId;
   final String showId;
+  final String? showUrl;
   final String showTitle;
   final String? cover;
   final List<Episode> chapters;
@@ -349,6 +351,7 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
       ReadEntry(
         sourceId: widget.sourceId,
         showId: widget.showId,
+        showUrl: widget.showUrl,
         title: widget.showTitle,
         cover: widget.cover,
         chapterId: ep.id,
@@ -533,6 +536,13 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
               sliver: HtmlWidget(
                 cleanNovelHtml(text.html),
                 renderMode: RenderMode.sliverList,
+                // Only a downloaded chapter carries a folder — resolves an
+                // image's relative `src` (the download saves them bare, e.g.
+                // `img_0.jpg`) to the local file next to the saved HTML.
+                // Null for anything read live, same as before this existed.
+                baseUrl: text.folder == null
+                    ? null
+                    : Uri.file('${text.folder}/'),
                 textStyle: base,
                 // HtmlWidget caches its built tree and only re-renders when the
                 // HTML or one of these triggers changes — a changed `textStyle`

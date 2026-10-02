@@ -12,6 +12,7 @@ import 'package:watch_app/core/repository/source_repository.dart';
 import 'package:watch_app/core/zmode/match_store.dart';
 import 'package:watch_app/core/zmode/playback_resolver.dart';
 import 'package:watch_app/core/zmode/source_matcher.dart';
+import 'package:watch_app/core/zmode/source_score_store.dart';
 import 'package:watch_app/core/zmode/zmode_ids.dart';
 import 'package:watch_app/core/zmode/zmode_source_prefs.dart';
 
@@ -97,6 +98,7 @@ void main() {
   late MatchStore store;
   late ZSourcePrefs prefs;
   late SourceHealthStore health;
+  late SourceScoreStore scores;
 
   setUp(() async {
     dir = await Directory.systemTemp.createTemp('playback-resolver');
@@ -105,6 +107,7 @@ void main() {
     health = SourceHealthStore();
     store = await MatchStore.open();
     prefs = await ZSourcePrefs.open();
+    scores = await SourceScoreStore.open();
   });
 
   tearDown(() async {
@@ -127,6 +130,7 @@ void main() {
       health: health,
       candidates: (_) => [(id: 'src-a', name: 'A'), (id: 'src-b', name: 'B')],
       perSourceBudget: budget,
+      scores: scores,
     );
     r.bindTitleLookup((_) async => (title: 'FMA', alt: null, malId: 100));
     return r;
@@ -167,6 +171,32 @@ void main() {
     expect(r.resolvedSourceId(_ep2), isNull, reason: 'cached winner survived');
     final streams = await r.sources(_ep2);
     expect(streams.single.url, 'https://b/stream');
+  });
+
+  test('a resolved playback credits the source that served it', () async {
+    final src = _SweepSrc(
+      aEps: const [
+        Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://a/1'),
+        Episode(id: '2', title: 'Ep 2', number: 2, url: 'https://a/2'),
+      ],
+      bEps: const [
+        Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://b/1'),
+        Episode(id: '2', title: 'Ep 2', number: 2, url: 'https://b/2'),
+      ],
+    );
+    final matcher = SourceMatcher(
+      sources: src,
+      store: store,
+      prefs: prefs,
+      candidates: (_) => src.loadedSources,
+    );
+    final r = resolver(sources: src, matcher: matcher, preferred: 'src-a');
+
+    expect((await r.resolveForPlayback(_ep2)).match.sourceId, 'src-a');
+
+    expect(scores.plays('src-a'), 1);
+    expect(scores.plays('src-b'), 0,
+        reason: 'only the source that served the stream is credited');
   });
 
   test('a different show keeps its cached winner', () async {
@@ -246,6 +276,39 @@ void main() {
     final r = resolver(sources: src, matcher: matcher);
     final out = await r.resolveForPlayback(_ep2);
     expect(out.match.sourceId, 'src-a');
+  });
+
+  test('Continue Watching prewarm asks only the remembered source', () async {
+    await store.pin(_show, const SourceMatch(
+      sourceId: 'src-a',
+      showUrl: 'https://a/show',
+      showId: 'a',
+      showTitle: 'FMA',
+      pinned: true,
+    ));
+    final src = _SweepSrc(
+      aEps: const [
+        Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://a/1'),
+        Episode(id: '2', title: 'Ep 2', number: 2, url: 'https://a/2'),
+      ],
+      bEps: const [
+        Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://b/1'),
+        Episode(id: '2', title: 'Ep 2', number: 2, url: 'https://b/2'),
+      ],
+    );
+    final matcher = SourceMatcher(
+      sources: src,
+      store: store,
+      prefs: prefs,
+      candidates: (_) => src.loadedSources,
+    );
+    final r = resolver(sources: src, matcher: matcher);
+
+    final streams = await r.prewarmRememberedSource(_ep2);
+
+    expect(streams, isEmpty);
+    expect(src.log.where((call) => call.startsWith('sources:')), isEmpty);
+    expect(src.log.where((call) => call.endsWith(':src-b')), isEmpty);
   });
 
   test('throws EpisodeNotAvailable when episode missing everywhere', () async {

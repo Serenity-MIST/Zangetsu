@@ -198,6 +198,9 @@ class AppLocalizationsZh extends AppLocalizations {
   String get custom => '自定义';
 
   @override
+  String get customRange => 'Custom range';
+
+  @override
   String get defaultLabel => '默认';
 
   @override
@@ -220,6 +223,9 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get testing => '测试中…';
+
+  @override
+  String get searchOk => 'Search OK';
 
   @override
   String get working => '正常';
@@ -380,6 +386,37 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get activeSource => '当前来源';
+
+  @override
+  String get streamingServices => 'Streaming Services';
+
+  @override
+  String get streamingServicesSubtitle =>
+      'Browse what each service carries where you are';
+
+  @override
+  String get streamingServicesEmpty => 'No services listed for this country';
+
+  @override
+  String get streamingServicesMetadataNote =>
+      'Browsing only — titles still play through your own sources';
+
+  @override
+  String get pinAsHomeRow => 'Pin as home row';
+
+  @override
+  String get unpinHomeRow => 'Unpin';
+
+  @override
+  String pinLimitReached(int count) {
+    return 'You can pin up to $count services';
+  }
+
+  @override
+  String get streamingRegion => 'Streaming region';
+
+  @override
+  String get streamingRegionSubtitle => 'Which country\'s catalogue to show';
 
   @override
   String get sourceHealth => '来源状态';
@@ -1217,6 +1254,18 @@ class AppLocalizationsZh extends AppLocalizations {
   String get nativeTVPlayer => '系统电视播放器';
 
   @override
+  String get tvDecoderMode => 'TV decoder priority';
+
+  @override
+  String get tvDecoderHardwareOnly => 'Hardware only';
+
+  @override
+  String get tvDecoderHardwareFirst => 'Hardware first (software fallback)';
+
+  @override
+  String get tvDecoderSoftwareFirst => 'Software first (hardware fallback)';
+
+  @override
   String get softwareAudioDolbyDTS => '软件音频（Dolby/DTS）';
 
   @override
@@ -1682,6 +1731,12 @@ class AppLocalizationsZh extends AppLocalizations {
   String get audioDelay => '音频延迟';
 
   @override
+  String get androidPlayer => 'Android Player (Experimental)';
+
+  @override
+  String get androidPlayerUnavailable => 'Android Player could not start';
+
+  @override
   String get audioNormalization => '音频响度均衡';
 
   @override
@@ -1831,6 +1886,9 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get findEpisode => '查找剧集';
+
+  @override
+  String get findChapter => 'Find chapter';
 
   @override
   String get refreshChapters => '刷新章节';
@@ -2555,7 +2613,13 @@ class AppLocalizationsZh extends AppLocalizations {
   String get seeAll2 => '查看全部';
 
   @override
+  String get webView => 'WebView';
+
+  @override
   String get openInBrowser => '在浏览器中打开';
+
+  @override
+  String get markAsRead => 'Mark as read';
 
   @override
   String get copyLink => '复制链接';
@@ -2746,6 +2810,9 @@ class AppLocalizationsZh extends AppLocalizations {
   String get sort => '种类';
 
   @override
+  String get shuffle => '随机选择';
+
+  @override
   String get giveItAName => '给它起个名字';
 
   @override
@@ -2801,6 +2868,24 @@ class AppLocalizationsZh extends AppLocalizations {
   @override
   String markedEpisodesAsWatched(int count) {
     return '已观看 $count 集';
+  }
+
+  @override
+  String get openInBrowserSubtitle =>
+      'Read this chapter on the source\'s own site';
+
+  @override
+  String get readingSettings => 'Reading settings';
+
+  @override
+  String get markedAsRead => 'Marked as read';
+
+  @override
+  String get markedUnread => 'Marked unread';
+
+  @override
+  String markedChaptersAsRead(int count) {
+    return 'Marked $count chapters as read';
   }
 
   @override
@@ -3348,6 +3433,12 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get appIcon => '应用程序图标';
+
+  @override
+  String get splashStyle => 'Splash';
+
+  @override
+  String get splashStyleBlurb => 'What plays while the app starts up.';
 
   @override
   String get currentLocation => '当前位置';
@@ -4865,6 +4956,9 @@ class AppLocalizationsZh extends AppLocalizations {
   String get noSourceHasThisYet => 'No source has this yet';
 
   @override
+  String get checkedTopSources => 'Checked your top sources — none had this';
+
+  @override
   String get pickTheRightTitle => 'Pick the right title';
 
   @override
@@ -4996,6 +5090,66 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get yourSavedNovelList => 'Your saved novel list';
+
+  @override
+  String get epub => 'EPUB';
+
+  @override
+  String get exportAsEpub => 'Export as EPUB';
+
+  @override
+  String chaptersDownloadedCount(int done, int total) {
+    return '$done of $total chapters downloaded';
+  }
+
+  @override
+  String get noChaptersDownloadedToExport =>
+      'No chapters downloaded yet — download some first.';
+
+  @override
+  String get allChapters => 'All chapters';
+
+  @override
+  String get startChapter => 'Start';
+
+  @override
+  String get endChapter => 'End';
+
+  @override
+  String get includeChapterNumber => 'Include chapter number';
+
+  @override
+  String get includeChapterNumberSubtitle =>
+      '\"Chapter 5: Title\" instead of just \"Title\"';
+
+  @override
+  String get fileNameLabel => 'File name';
+
+  @override
+  String get folderLabel => 'Folder';
+
+  @override
+  String exportingChapterProgress(int done, int total) {
+    return 'Chapter $done of $total';
+  }
+
+  @override
+  String exportedToFolder(String folder) {
+    return 'Exported to $folder';
+  }
+
+  @override
+  String get epubExportFailed => 'Couldn\'t save the EPUB';
+
+  @override
+  String get export => 'Export';
+
+  @override
+  String get keepDownloadsPrivate => 'Keep downloads private';
+
+  @override
+  String get keepDownloadsPrivateSubtitle =>
+      'New video downloads stay inside Zangetsu instead of the Downloads folder. They are deleted when you uninstall Zangetsu. Chapters and exports are unaffected.';
 }
 
 /// The translations for Chinese, as used in Taiwan (`zh_TW`).
@@ -7526,6 +7680,9 @@ class AppLocalizationsZhTw extends AppLocalizationsZh {
   String get seeAll2 => '查看全部';
 
   @override
+  String get webView => 'WebView';
+
+  @override
   String get openInBrowser => '在瀏覽器開啟';
 
   @override
@@ -7659,6 +7816,9 @@ class AppLocalizationsZhTw extends AppLocalizationsZh {
 
   @override
   String get sort => '種類';
+
+  @override
+  String get shuffle => '隨機選擇';
 
   @override
   String get giveItAName => '給它取個名字';

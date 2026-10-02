@@ -87,7 +87,13 @@ class _Repo implements CatalogueRepository {
   @override
   Future<void> clearHttpCache() async {}
   @override
-  Future<MediaDetail> detail(String url, {String category = 'sub', String? sourceId, void Function(MediaDetail partial)? onPartial}) async {
+  Future<MediaDetail> detail(
+    String url, {
+    String category = 'sub',
+    String? sourceId,
+    void Function(MediaDetail partial)? onPartial,
+    bool Function()? abandoned,
+  }) async {
     detailCalls++;
     return const MediaDetail(
         id: 'x', title: 'x', url: 'zm://manga/mal:777', type: ProviderType.manga, sourceId: 'zm');
@@ -178,6 +184,33 @@ void main() {
     await t.pumpAndSettle();
     expect(find.textContaining('AllAnime'), findsOneWidget);
     expect(find.text('Wrong title?'), findsOneWidget);
+  });
+
+  // The row is 52 tall but its InkWell used to shrink to the text's own ~20px,
+  // so a tap 4px from the row's top edge — well inside what looks like a
+  // button — did nothing. Tapping the text always worked, which is why every
+  // other test here missed it.
+  testWidgets('the whole 52px row opens the picker, not just the text line',
+      (t) async {
+    await t.runAsync(
+      () => sl<SourceMatcher>().resolve(fma, title: 'Fullmetal Alchemist (2003)'),
+    );
+    await t.pumpWidget(harness(const MatchLine(
+        canonical: fma, title: 'Fullmetal Alchemist (2003)')));
+    await t.pumpAndSettle();
+
+    // The grey pill itself, not its label.
+    final row = find.ancestor(
+      of: find.textContaining('AllAnime'),
+      matching: find.byType(InkWell),
+    );
+    final box = t.getRect(row.first);
+    expect(box.height, 52, reason: 'the tap target must be the whole row');
+
+    // 4px in from the top edge — above the text, inside the pill.
+    await t.tapAt(Offset(box.left + 20, box.top + 4));
+    await t.pumpAndSettle();
+    expect(find.text('All'), findsOneWidget);
   });
 
   testWidgets('switching source in the picker updates the line', (t) async {

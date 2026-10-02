@@ -5,8 +5,7 @@ import 'package:dio/dio.dart';
 import 'package:equatable/equatable.dart';
 import 'package:gal/gal.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart'
-    show rootBundle, PlatformException;
+import 'package:flutter/services.dart' show rootBundle, PlatformException;
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
@@ -17,6 +16,7 @@ import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
 import '../../core/discord/discord_presence.dart';
 import '../../core/discord/discord_rpc.dart';
+import '../../core/logging/app_logger.dart';
 import '../../core/metadata/episode_metadata_service.dart';
 import '../../core/tracker/tracker_hub.dart';
 import '../../core/models/episode.dart';
@@ -24,6 +24,7 @@ import '../../core/models/provider_info.dart';
 import '../../core/models/video_source.dart';
 import '../../core/playback/hls.dart';
 import '../../core/playback/playback_prefs.dart';
+import '../../core/playback/source_health_store.dart';
 import '../../core/playback/filler_service.dart';
 import '../../core/playback/skip_service.dart';
 import '../../core/playback/subtitle_language.dart';
@@ -46,6 +47,8 @@ import 'color_profiles.dart';
 import 'shader_presets.dart';
 import 'subtitle_font_service.dart';
 import 'subtitle_style.dart' show libassOutline;
+import 'player_lifecycle.dart';
+import 'playback_failover.dart';
 
 /// The mpv video output (renderer) to create the player with, from the user's
 /// Video renderer setting.
@@ -62,6 +65,21 @@ String? _resolveVideoOutput() => resolveVideoOutput(
   choice: sl<PlaybackPrefs>().videoOutput,
   shaderStyle: sl<PlaybackPrefs>().videoShaderStyle,
 );
+
+/// The decoder to hand media_kit at VideoController creation — Apple only.
+///
+/// media_kit applies its OWN default when this is null, and on Apple that
+/// default lands AFTER [_configureMpv]'s write and replaces it, so the decoder
+/// the user picked never reaches mpv. Passing it here makes our value the one
+/// that gets applied.
+///
+/// Null everywhere else ON PURPOSE. Android's media_kit default is `auto-safe`
+/// — and `no` when it detects an emulator, which is what keeps video working on
+/// emulators. Overriding that would take the emulator fallback away, so Android
+/// keeps exactly the behaviour it ships with today.
+String? _configHwdec() => currentDecoderPlatform == DecoderPlatform.apple
+    ? sl<PlaybackPrefs>().hwdecValue
+    : null;
 
 /// Immutable view-state for the player screen: exactly the fields the UI
 /// rebuilds on. These used to drive `notifyListeners()` on the old
@@ -149,6 +167,71 @@ class PlayerState extends Equatable {
   ];
 }
 
+/// Pure merge core behind [PlayerCubit.mergeArrivedStreams], kept top-level
+/// so it is unit-testable without a media_kit player (a [PlayerCubit] cannot
+/// be constructed under `flutter test` — `Player()` needs native init).
+///
+/// [arrivals] is the cumulative known-streams list in final-list order (what
+/// `PlaybackResolver.resolveProgressive` yields per event), NOT just the
+/// delta: the merged list follows arrival order. Entries already open keep
+/// their SAME objects — the Sources sheet marks the playing row by value
+/// equality against `state.active`, and rebuilding those would drop the tick
+/// (same invariant as `PlayerCubit._pollForMoreSources`). Duplicate URLs
+/// collapse to their first arrival; open entries the arrivals omit are kept.
+List<VideoSource> mergeArrivedSourceLists(
+  List<VideoSource> current,
+  List<VideoSource> arrivals,
+) {
+  // Identity is the WHOLE entry, not the URL.
+  //
+  // Keying on url alone quietly threw away real choices: two sources can hand
+  // back one link under two different quality labels, and dropping the second
+  // removed a quality the viewer could otherwise have picked. Everything that
+  // makes an entry a distinct option is in the key, so a duplicate is only
+  // collapsed when it really is the same option offered twice.
+  String keyOf(VideoSource s) => [
+    s.url,
+    s.quality ?? '',
+    s.container.name,
+    s.kind.name,
+    s.audioLang ?? '',
+    s.subtitles.map((e) => '${e.lang}|${e.label}|${e.url}').join('\u0001'),
+    (s.headers ?? const <String, String>{}).entries
+        .map((e) => '${e.key}=${e.value}')
+        .join('\u0001'),
+  ].join('\u0000');
+
+  // Prefer the object already in the list, so the Sources sheet's tick on the
+  // playing row keeps matching by identity — that tick is why the
+  // substitution exists at all.
+  final existing = <String, VideoSource>{for (final s in current) keyOf(s): s};
+  final seen = <String>{};
+  final merged = <VideoSource>[];
+  for (final s in arrivals) {
+    final k = keyOf(s);
+    if (!seen.add(k)) continue;
+    merged.add(existing[k] ?? s);
+  }
+  // Anything already open that the newest list didn't repeat is KEPT, in the
+  // position it already held — not appended at the end, which is what the old
+  // url-keyed version did to every straggler.
+  for (final s in current) {
+    if (seen.add(keyOf(s))) merged.add(s);
+  }
+  return merged;
+}
+
+/// True when two source lists carry the same URLs in the same order — the
+/// no-change check that lets [PlayerCubit.mergeArrivedStreams] skip a
+/// pointless emit (and picker rebuild).
+bool _sameUrlOrder(List<VideoSource> a, List<VideoSource> b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i].url != b[i].url) return false;
+  }
+  return true;
+}
+
 /// Owns a media_kit [Player] for one watch session: opens a source with its
 /// headers + subtitles, persists resume position, advances on completion, and
 /// falls through to the next source if one fails to start (covers dead/DRM
@@ -160,7 +243,9 @@ class PlayerCubit extends Cubit<PlayerState> {
     required this.resume,
     required Future<List<VideoSource>> Function(String episodeUrl)
     resolveSources,
-    Future<({List<VideoSource> sources, bool done})> Function(String episodeUrl)?
+    Future<({List<VideoSource> sources, bool done})> Function(
+      String episodeUrl,
+    )?
     pollSources,
     required Dio dio,
     this.history,
@@ -299,6 +384,11 @@ class PlayerCubit extends Cubit<PlayerState> {
       libassAndroidFontName: 'Noto Sans',
     ),
   );
+  final PlayerLifecycleGate _lifecycle = PlayerLifecycleGate();
+  Future<void>? _nativeTeardown;
+
+  /// Completes after this cubit's native player has been disposed.
+  Future<void> get nativeTeardown => _nativeTeardown ?? Future<void>.value();
   late final VideoController videoController = VideoController(
     player,
     configuration: VideoControllerConfiguration(
@@ -306,6 +396,9 @@ class PlayerCubit extends Cubit<PlayerState> {
       // high-res playback + less battery/heat. media_kit auto-falls back to
       // software decode if the device can't hardware-decode a codec.
       enableHardwareAcceleration: true,
+      // Apple only — see [_configHwdec]. Null on Android, which keeps
+      // media_kit's own default (and its emulator fallback) exactly as before.
+      hwdec: _configHwdec(),
       // Attach the Android render surface only once the video's dimensions are
       // known, so it isn't created then resized on the first frame — kills the
       // black-frame/resize hitch at playback start.
@@ -378,6 +471,10 @@ class PlayerCubit extends Cubit<PlayerState> {
   int _lastResumeSeekMs = 0; // throttle for the resume re-seek (anti-thrash)
   int _lastHistoryMs = 0; // throttle: last wall-clock ms we wrote progress
   int _gen = 0; // bumped per open; async continuations bail if superseded
+  /// Live progressive subscription ([_openProgressive]), so leaving the player
+  /// or moving episodes drops late sweep events at the source. Null whenever
+  /// no progressive Play is in flight.
+  StreamIterator<ProgressiveResolve>? _progressive;
   final Set<String> _tried = {}; // source URLs already attempted this episode
 
   /// How many times this episode has given up on a SOURCE (not a mirror) and
@@ -386,7 +483,8 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// dead link at a time. Reset per episode.
   int _sourceHops = 0;
   static const int _maxSourceHops = 3;
-  bool _recovering = false; // debounce: one error-recovery at a time
+  bool _recovering = false;
+  bool _stallWatchdogArmed = false; // debounce: one error-recovery at a time
   // True once the current source has actually produced playback (position
   // advanced). libmpv emits transient "connection"/"failed to open" warnings
   // mid-stream (HLS segment blips, a failed subtitle track) even while video +
@@ -492,12 +590,19 @@ class PlayerCubit extends Cubit<PlayerState> {
   // "· proxy" version of the same quality. Aniyomi-only + direct-only, so
   // CloudStream / JS / torrent sources are completely unaffected.
   Timer? _startTimer;
+  // Never-started watchdog (all sources): same hole as the Aniyomi one above,
+  // but general — a dead playlist mpv retries without erroring and the stall
+  // watchdog needs a started source, so without this nothing ever fires and
+  // the spinner sits forever. 30s (generous: normal starts take seconds),
+  // cancelled by the first frame like every other watchdog here.
+  Timer? _neverStartedTimer;
   // Fired once per session: mark the anime CURRENT on AniList as soon as
   // playback starts (so "started watching" shows immediately, not only after
   // an episode crosses the 92% scrobble threshold).
   bool _markedWatching = false;
   bool _defaultRateApplied = false; // default speed applied once per session
-  bool _libassNoticeShown = false; // libass "disable if no subs" hint shown once
+  bool _libassNoticeShown =
+      false; // libass "disable if no subs" hint shown once
   Timer? _discordPauseTimer;
   bool _discordPaused = false;
 
@@ -542,6 +647,9 @@ class PlayerCubit extends Cubit<PlayerState> {
     // Re-resolve the current episode in the new language — like openEpisode but
     // keeping currentIndex and the live position.
     final gen = ++_gen;
+    // A different cut is a different resolve: late events from the old one
+    // must not merge into the new list.
+    await _cancelProgressive();
     final keepPos = _lastPos;
     _tried.clear();
     _sourceHops = 0; // a different cut is a fresh set of sources
@@ -562,17 +670,19 @@ class PlayerCubit extends Cubit<PlayerState> {
       // unchanged; for those, re-fetch the other category's episode list and use
       // the matching episode's data, otherwise dub would just replay the sub.
       var epUrl = _episodeUrl(currentEpisode);
-      if (epUrl == currentEpisode.url &&
-          (showUrl?.isNotEmpty ?? false)) {
-        final catEps = await sl<CatalogueRepository>()
-            .episodes(showUrl!, sourceId: sourceId, category: cat);
+      if (epUrl == currentEpisode.url && (showUrl?.isNotEmpty ?? false)) {
+        final catEps = await sl<CatalogueRepository>().episodes(
+          showUrl!,
+          sourceId: sourceId,
+          category: cat,
+        );
         if (gen != _gen) return;
         if (state.currentIndex < catEps.length) {
           episodes = catEps;
           epUrl = catEps[state.currentIndex].url;
         }
       }
-      final resolved = await _resolveSources(epUrl);
+      final resolved = await _resolveNoted(epUrl);
       if (gen != _gen) return;
       emit(state.copyWith(sources: resolved, loadingSources: false));
       _buildQualityMenu(gen);
@@ -624,14 +734,21 @@ class PlayerCubit extends Cubit<PlayerState> {
   Future<void> _pollForMoreSources(String epUrl) async {
     final poll = _pollSources;
     if (poll == null) return;
-    // Backs off: most providers are done within ~2s, so this is a handful of
-    // cheap reads, not a busy loop. Gives up after the last delay regardless.
+    // Back off quickly for the usual case, then keep checking CloudStream's
+    // bounded 60-second background link session for slow mirrors. These are
+    // reads of the existing session, not new source searches. Other providers
+    // report done on the first poll and stop here.
     const delays = [
       Duration(milliseconds: 900),
       Duration(seconds: 1),
       Duration(seconds: 2),
       Duration(seconds: 3),
       Duration(seconds: 5),
+      Duration(seconds: 8),
+      Duration(seconds: 10),
+      Duration(seconds: 10),
+      Duration(seconds: 10),
+      Duration(seconds: 10),
     ];
     for (final d in delays) {
       await Future<void>.delayed(d);
@@ -649,6 +766,26 @@ class PlayerCubit extends Cubit<PlayerState> {
       }
       if (result.done) return; // nothing more is coming
     }
+  }
+
+  /// Merges late-arriving streams for the CURRENT episode into the quality
+  /// list, by position, deduplicated by URL. Never touches the playing
+  /// stream. No-op when the arrivals belong to a departed episode (generation
+  /// guard, same `_gen` as the close path).
+  ///
+  /// Strictly additive like [_pollForMoreSources]: [state.active] is never
+  /// re-picked or reopened, so playback is uninterrupted; the emit only
+  /// rebuilds the Sources/quality picker. Staleness is judged by EPISODE
+  /// (not `_gen`, which legitimately advances mid-poll on re-opens — same
+  /// reason [_pollForMoreSources] keys on the URL), compared via
+  /// [_episodeUrl] so a Sub/Dub rewrite still matches the open episode.
+  void mergeArrivedStreams(String episodeUrl, List<VideoSource> streams) {
+    if (isClosed || episodes.isEmpty) return;
+    if (state.currentIndex >= episodes.length) return;
+    if (_episodeUrl(currentEpisode) != episodeUrl) return;
+    final merged = mergeArrivedSourceLists(state.sources, streams);
+    if (_sameUrlOrder(merged, state.sources)) return;
+    emit(state.copyWith(sources: merged));
   }
 
   /// mpv HTTP tuning so remote MP4s (e.g. 4khdhub file hosts) seek/resume
@@ -698,7 +835,10 @@ class PlayerCubit extends Cubit<PlayerState> {
         await p.setProperty('cache-secs', '${bufPrefs.bufferSecs}');
         await p.setProperty('demuxer-readahead-secs', '${bufPrefs.bufferSecs}');
         await p.setProperty('demuxer-max-bytes', bufPrefs.bufferMaxBytes);
-        await p.setProperty('demuxer-max-back-bytes', bufPrefs.bufferMaxBackBytes);
+        await p.setProperty(
+          'demuxer-max-back-bytes',
+          bufPrefs.bufferMaxBackBytes,
+        );
         // ── A/V stays in sync after a mid-stream stall. ───────────────────────
         // Symptom this fixes: a movie/episode freezes mid-playback (host throttle
         // or a brief dip — not a visible "buffering"), and on recovery the audio
@@ -735,7 +875,10 @@ class PlayerCubit extends Cubit<PlayerState> {
         // ffmpeg build lacks the `volume` libavfilter, so `af=lavfi=[volume=…]`
         // fails to init and KILLS all audio (the "no sound" bug). ────────────
         await p.setProperty('volume-max', '200');
-        await p.setProperty('volume', sl<PlaybackPrefs>().volumeBoost.toString());
+        await p.setProperty(
+          'volume',
+          sl<PlaybackPrefs>().volumeBoost.toString(),
+        );
         await p.setProperty('af', _audioFilterChain());
         // Keep voices natural (not chipmunk) when playing above 1× speed.
         await p.setProperty('audio-pitch-correction', 'yes');
@@ -858,8 +1001,7 @@ class PlayerCubit extends Cubit<PlayerState> {
   }
 
   /// Reset all colour values to neutral (0).
-  Future<void> resetColor() =>
-      applyColorPreset(ColorProfiles.byId('natural'));
+  Future<void> resetColor() => applyColorPreset(ColorProfiles.byId('natural'));
 
   // Extract-once guard (static: shared across player instances this session).
   static bool _subFontsExtracted = false;
@@ -979,9 +1121,14 @@ class PlayerCubit extends Cubit<PlayerState> {
 
         if (p > Duration.zero) {
           _startedThisSource = true; // source is playing
+          // Playing: the open-time watchdog has done its job. A later genuine stall
+          // re-arms it through the buffering event.
+          _disarmStallWatchdog();
           _everStarted = true; // ...and something has played at least once
           _startTimer?.cancel();
           _startTimer = null;
+          _neverStartedTimer?.cancel();
+          _neverStartedTimer = null;
           if (!_markedWatching) {
             _markedWatching = true;
             _markWatching(); // "started watching" → CURRENT on AniList now
@@ -1009,11 +1156,20 @@ class PlayerCubit extends Cubit<PlayerState> {
             _lastDur > Duration.zero &&
             p >= _lastDur * 0.85) {
           _prefetchedNextForIndex = idx;
-          // SourceRepository.prefetch has no metadata-catalogue equivalent and
-          // throws for the zm pseudo source, so skip it there.
-          if (sourceId != ZmodeIds.sourceId) {
-            sl<SourceRepository>()
-                .prefetch(_episodeUrl(episodes[idx + 1]), sourceId: sourceId);
+          final nextUrl = _episodeUrl(episodes[idx + 1]);
+          if (sourceId == ZmodeIds.sourceId) {
+            // Z Mode used to skip this entirely, because SourceRepository's
+            // own prefetch throws for the zm pseudo source — so every episode
+            // of a binge paid the full resolve again (7.3s median across 139
+            // plays, 20s at p90). The catalogue resolves it the same way Play
+            // will, and the winning source is already known here: we are
+            // playing from it. Fire-and-forget; a failure just means the next
+            // Play does the work itself, exactly as it did before.
+            sl<CatalogueRepository>()
+                .sources(nextUrl, sourceId: sourceId, fast: true)
+                .catchError((_) => <VideoSource>[]);
+          } else {
+            sl<SourceRepository>().prefetch(nextUrl, sourceId: sourceId);
           }
         }
       }),
@@ -1072,23 +1228,30 @@ class PlayerCubit extends Cubit<PlayerState> {
         // A torrent local stream buffers while pieces download — that's normal,
         // not a dead source. Arming the stall watchdog would restart the torrent
         // from scratch and churn native memory (force close). Skip it for torrents.
-        if (buffering &&
-            _startedThisSource &&
-            !_recovering &&
-            _activeTorrentId == null &&
-            !_isProxiedStream) {
-          // Started source stalled — arm a watchdog. If we're still stuck and the
-          // position hasn't advanced ~18s later, the stream is likely dead → fail
-          // over.
-          _stallAnchorPos = _lastPos;
-          _stallTimer?.cancel();
-          _stallTimer = Timer(const Duration(seconds: 18), _failoverFromStall);
-        } else {
-          _stallTimer?.cancel();
-          _stallTimer = null;
+        if (buffering && !_stallWatchdogArmed) {
+          if (_startedThisSource &&
+              !_recovering &&
+              _activeTorrentId == null &&
+              !_isProxiedStream) {
+            // Started source stalled — arm a watchdog. If we're still stuck and
+            // the position hasn't advanced ~18s later, the stream is likely dead
+            // → fail over.
+            _armStallWatchdog();
+          } else {
+            _disarmStallWatchdog();
+          }
         }
       }),
     );
+    // A stream that never starts never buffers, so the watchdog above — which
+    // only listens for `buffering` — is never armed for it. 1.9.8 had no such
+    // gap because links failed differently then: they hung mid-playback, so the
+    // stall detector caught them. Now the CDN answers 403 the instant the link
+    // is opened, no video ever starts, nothing ever buffers, and the screen sits
+    // there indefinitely. A source that has neither started nor buffered by the
+    // time this fires is as dead as one that started and froze — same 18s, same
+    // failover, so a blocked link cycles to the next source like 1.9.8 did.
+    _armStallWatchdog();
     openEpisode(index);
   }
 
@@ -1097,6 +1260,33 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// The latest position seen from the mpv stream. Used by the cast handoff to
   /// start the Cast receiver at the exact position local playback left off.
   Duration get currentPosition => _lastPos;
+
+  /// Chromecast (and similar) progress while local mpv is paused. Updates
+  /// resume / Continue Watching on the same path as the position stream.
+  void syncExternalProgress(Duration position, Duration duration) {
+    if (position <= Duration.zero) return;
+    if (duration > Duration.zero) _lastDur = duration;
+    final jumped = (position - _lastPos).abs() > const Duration(seconds: 3);
+    if (jumped) _markUserSeek(position);
+    _lastPos = position;
+    if (position > Duration.zero) {
+      _startedThisSource = true;
+      // Playing: the open-time watchdog has done its job. A later genuine stall
+      // re-arms it through the buffering event.
+      _disarmStallWatchdog();
+      _everStarted = true;
+      if (!_markedWatching) {
+        _markedWatching = true;
+        _markWatching();
+      }
+    }
+    if (jumped) _pushDiscordWatching();
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastHistoryMs >= 5000) {
+      _lastHistoryMs = now;
+      unawaited(_persist());
+    }
+  }
 
   void setRate(double r) => player.setRate(r);
 
@@ -1142,6 +1332,7 @@ class PlayerCubit extends Cubit<PlayerState> {
       onLocalPlayback?.call(willPlay ? 'play' : 'pause', _lastPos);
     }
   }
+
   void seekTo(Duration d) {
     if (_isRoomViewer) return;
     _pendingResume = Duration.zero; // user took control → drop the resume floor
@@ -1211,8 +1402,9 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// Embedded audio tracks for the open media (excludes the synthetic
   /// auto/no entries media_kit always reports).
   List<AudioTrack> get mediaAudioTracks {
-    final loaded =
-        state.tracks.audio.where((t) => t.id != 'auto' && t.id != 'no').toList();
+    final loaded = state.tracks.audio
+        .where((t) => t.id != 'auto' && t.id != 'no')
+        .toList();
     if (_audioRenditions.isEmpty) return loaded;
     // The languages we kept OUT of the master aren't tracks until they're
     // picked, so list them as uri tracks. Choosing one attaches that single
@@ -1353,11 +1545,13 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// which would duplicate the entry already listed under source subtitles
   /// (and pile up on every re-apply). Those are surfaced via [softSubs] instead.
   List<SubtitleTrack> get mediaSubtitleTracks => state.tracks.subtitle
-      .where((t) =>
-          t.id != 'auto' &&
-          t.id != 'no' &&
-          !t.id.startsWith('http') &&
-          !t.id.startsWith('/'))
+      .where(
+        (t) =>
+            t.id != 'auto' &&
+            t.id != 'no' &&
+            !t.id.startsWith('http') &&
+            !t.id.startsWith('/'),
+      )
       .toList();
 
   /// Currently-selected audio track (id == 'auto'/'no' for the synthetic ones).
@@ -1477,7 +1671,9 @@ class PlayerCubit extends Cubit<PlayerState> {
 
   /// Load one of the source's soft-subs by URL.
   Future<void> setSoftSub(Subtitle s) async {
+    final gen = _gen;
     await _setRemoteSub(s.url, title: s.label ?? s.lang, language: s.lang);
+    if (isClosed || gen != _gen) return;
     final lang = languageOfSource(s.lang) ?? languageOfSource(s.label ?? '');
     if (lang != null) sl<PlaybackPrefs>().setSubtitlePreference(lang.iso1);
   }
@@ -1492,13 +1688,23 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// sub (the tracks-stream re-arm) doesn't re-download it. Cleared per episode.
   final Map<String, String> _localSubCache = {};
 
-  /// Load an EXTERNAL subtitle [url]. With styled subtitles (libass) on, mpv
-  /// would fetch the URL itself and fail on Cloudflare-protected sub hosts (no
-  /// clearance cookie reaches mpv). So we download it in Dart WITH the source's
-  /// headers, write a temp file, and hand mpv the local path — libass then
-  /// renders it with no CF involvement. Off → the plain remote-uri path,
-  /// byte-identical to before. Best-effort: any download failure falls back to
-  /// the remote uri (no worse than today) and never throws.
+  /// Load an EXTERNAL subtitle [url], fetching it ourselves rather than letting
+  /// mpv do it.
+  ///
+  /// mpv's own fetch carries none of the source's headers — no Referer, no
+  /// User-Agent, no clearance cookie — so a sub host that checks any of them
+  /// answers 403/404 and the track never appears. That is the
+  /// `Can not open external file` in the reports, and it is silent: playback
+  /// carries on with no subtitles and nothing says why.
+  ///
+  /// So download it in Dart WITH [VideoSource.headers], write a temp file, and
+  /// hand mpv the local path. This used to happen only when styled subtitles
+  /// (libass) were on — but that setting is about RENDERING and is off by
+  /// default, so the common case was the broken one. Fetching and styling are
+  /// unrelated; the track is identical either way.
+  ///
+  /// Best-effort throughout: an empty body or any error falls back to the plain
+  /// remote uri, which is exactly what it did before, and never throws.
   ///
   /// Owns `_wantedSubId` (the LOCAL path when downloaded, else the url) so the
   /// sub-preference watcher matches the applied track's id and can't stomp it —
@@ -1508,17 +1714,17 @@ class PlayerCubit extends Cubit<PlayerState> {
     String? title,
     String? language,
   }) async {
+    final gen = _gen;
+    bool isCurrent() => !isClosed && gen == _gen;
+
     Future<void> loadRemote() async {
+      if (!isCurrent()) return;
       await player.setSubtitleTrack(
         SubtitleTrack.uri(url, title: title, language: language),
       );
-      _wantedSubId = url;
+      if (isCurrent()) _wantedSubId = url;
     }
 
-    if (!sl<PlaybackPrefs>().styledSubtitles) {
-      await loadRemote();
-      return;
-    }
     try {
       var local = _localSubCache[url];
       if (local == null || !File(local).existsSync()) {
@@ -1530,24 +1736,32 @@ class PlayerCubit extends Cubit<PlayerState> {
             validateStatus: (_) => true,
           ),
         );
+        if (!isCurrent()) return;
         final bytes = resp.data;
         if (bytes == null || bytes.isEmpty) {
           await loadRemote(); // fetch failed → best-effort remote
           return;
         }
         final dir = await getTemporaryDirectory();
+        if (!isCurrent()) return;
         // Keep the real extension so mpv picks the matching subtitle reader.
         final out = File('${dir.path}/softsub_${url.hashCode}${_subExt(url)}');
         await out.writeAsBytes(bytes, flush: true);
+        if (!isCurrent()) return;
         local = out.path;
         _localSubCache[url] = local;
       }
+      if (!isCurrent()) return;
       await player.setSubtitleTrack(
         SubtitleTrack.uri(local, title: title, language: language),
       );
-      _wantedSubId = local;
+      if (isCurrent()) _wantedSubId = local;
     } catch (_) {
-      await loadRemote(); // any error → best-effort remote, never disturb playback
+      // A request can complete after close() disposed the native player. Do
+      // not turn that cancellation into a second, late native call.
+      if (isCurrent()) {
+        await loadRemote(); // best-effort remote fallback while still active
+      }
     }
   }
 
@@ -1648,9 +1862,11 @@ class PlayerCubit extends Cubit<PlayerState> {
   }
 
   bool _subApplied = false; // remembered-subtitle restored for this episode
-  bool _autoSubDlTried = false; // keyless auto-download fired at most once/episode
+  bool _autoSubDlTried =
+      false; // keyless auto-download fired at most once/episode
   String? _wantedSubId; // id/url of the subtitle we intend to keep selected
-  bool _subReadyReapplied = false; // re-asserted the sub pref once at STATE_READY
+  bool _subReadyReapplied =
+      false; // re-asserted the sub pref once at STATE_READY
   bool _autoTranslateTried = false; // auto-translate fired at most once/episode
 
   /// If auto-translate is on and a target language is set, translate the current
@@ -1719,7 +1935,8 @@ class PlayerCubit extends Cubit<PlayerState> {
     for (final t in mediaSubtitleTracks) {
       final tLang = t.language ?? '';
       final tTitle = t.title ?? '';
-      if (matchesSourceLang(tLang, prefLang) || matchesSourceLang(tTitle, prefLang)) {
+      if (matchesSourceLang(tLang, prefLang) ||
+          matchesSourceLang(tTitle, prefLang)) {
         player.setSubtitleTrack(t);
         _wantedSubId = t.id;
         _subApplied = true;
@@ -1807,6 +2024,20 @@ class PlayerCubit extends Cubit<PlayerState> {
     return "Couldn't check every source\n$why";
   }
 
+  /// A selected source is intentionally the only one checked. Tell the viewer
+  /// whether it missed or could not be checked, and how to request a sweep.
+  static String _selectedSourceError(
+    String sourceName,
+    String settled,
+    List<SweepOutcome> outcomes,
+  ) {
+    final why = sweepFailureDetail(outcomes);
+    return [
+      if (why == null) settled else "Couldn't resolve from $sourceName\n$why",
+      'Choose Auto Resolve to check other sources.',
+    ].join('\n');
+  }
+
   /// Resolves sources for [index] and starts the best one.
   /// [fromRoom] bypasses the viewer lock so the room can move viewers to the
   /// host's episode; all other callers leave it false so viewer taps stay blocked.
@@ -1821,6 +2052,9 @@ class PlayerCubit extends Cubit<PlayerState> {
   }) async {
     if (_isRoomViewer && !fromRoom) return;
     final gen = ++_gen;
+    // A newer open supersedes any progressive Play still listening: drop its
+    // late events at the source (the episode guard below is the backstop).
+    await _cancelProgressive();
     await _persist(flush: true);
     // Only drop the pending resume when actually switching episodes — a
     // same-episode re-open (recovery/failover) must keep targeting it.
@@ -1854,58 +2088,14 @@ class PlayerCubit extends Cubit<PlayerState> {
       sl<PlaybackResolver>().invalidateWinner(_episodeUrl(currentEpisode));
     }
     try {
-      final resolved = await _resolveSources(_episodeUrl(currentEpisode));
-      if (gen != _gen) return; // superseded by a newer open
-      emit(state.copyWith(sources: resolved, loadingSources: false));
-      _buildQualityMenu(
-        gen,
-      ); // populate Auto/1080p/720p from the HLS master, if any
-      // A mirror picked on the episode list wins outright, and is consumed
-      // here so it only applies to the episode it was chosen for. Matched by
-      // url against this resolve, falling back to the picked source itself
-      // when the re-resolve hasn't produced it yet — the whole point is that
-      // the two lists don't always agree.
-      final chosen = initialSource;
-      initialSource = null;
-      final fromPick = chosen == null
-          ? null
-          : resolved.firstWhere(
-              (s) => s.url == chosen.url,
-              orElse: () => chosen,
-            );
-      // Otherwise the source remembered for this title (e.g. Hindi), else the
-      // adaptive default.
-      // Let the audio cut narrow the default ONLY when the title actually
-      // offers a choice between cuts. Aniyomi labels each video's cut but
-      // exposes no toggle — the counts that drive it are CloudStream-only — so
-      // narrowing to "sub" here quietly hid every dub server behind a switch
-      // that does not exist. AudioKind.unknown matches nothing in a labelled
-      // list, so pickDefault falls through to the whole pool: the best stream
-      // of every server, which is what a source with no cut choice always did.
-      final narrowTo = availableCategories.length > 1
-          ? (_activeCategory == 'dub' ? AudioKind.dub : AudioKind.sub)
-          : AudioKind.unknown;
-      final pick =
-          fromPick ??
-          _preferredSource(resolved) ??
-          pickDefault(
-            resolved,
-            prefer: narrowTo,
-            preferQuality: _preferredQuality(),
-          );
-      if (pick == null) {
-        emit(
-          state.copyWith(error: () => 'No playable sources for this episode.'),
-        );
-        return;
+      final epUrl = _episodeUrl(currentEpisode);
+      if (_useProgressive(epUrl)) {
+        await _openProgressive(epUrl, gen);
+      } else {
+        final resolved = await _resolveNoted(epUrl);
+        if (gen != _gen) return; // superseded by a newer open
+        await _openResolved(resolved, gen);
       }
-      await _open(pick, gen: gen);
-      _applyDefaultQuality();
-      // Playback is running — collect the mirrors that resolved after the fast
-      // return, so the Sources sheet ends up complete. Started here rather than
-      // alongside the open above so it can't compete with the stream starting.
-      unawaited(_pollForMoreSources(_episodeUrl(currentEpisode)));
-      if (roomRole == RoomRole.host) onLocalPlayback?.call('episode', Duration.zero);
     } on NoSourceMatch catch (e) {
       // No BuildContext down here to call context.l10n — this mirrors
       // AppLocalizationsEn.noSourceHasThisYet verbatim.
@@ -1913,7 +2103,13 @@ class PlayerCubit extends Cubit<PlayerState> {
       emit(
         state.copyWith(
           loadingSources: false,
-          error: () => _sweepError('No source has this yet', e.outcomes),
+          error: () => e.selectedSourceName == null
+              ? _sweepError('No source has this yet', e.outcomes)
+              : _selectedSourceError(
+                  e.selectedSourceName!,
+                  '${e.selectedSourceName} did not match this title.',
+                  e.outcomes,
+                ),
         ),
       );
     } on EpisodeNotAvailable catch (e) {
@@ -1925,12 +2121,21 @@ class PlayerCubit extends Cubit<PlayerState> {
       emit(
         state.copyWith(
           loadingSources: false,
-          error: () => _sweepError(
-            e.hadTitleMatch
-                ? "Episode ${e.episode} isn't available on any source yet"
-                : 'No source has this yet',
-            e.outcomes,
-          ),
+          error: () => e.selectedSourceName == null
+              ? _sweepError(
+                  e.hadTitleMatch
+                      ? "Episode ${e.episode} isn't available on any source yet"
+                      : 'No source has this yet',
+                  e.outcomes,
+                )
+              : _selectedSourceError(
+                  e.selectedSourceName!,
+                  e.hadTitleMatch
+                      ? "Episode ${e.episode} isn't available from "
+                            '${e.selectedSourceName}.'
+                      : '${e.selectedSourceName} did not match this title.',
+                  e.outcomes,
+                ),
         ),
       );
     } on EpisodeNotOnSource catch (e) {
@@ -1953,6 +2158,142 @@ class PlayerCubit extends Cubit<PlayerState> {
         ),
       );
     }
+  }
+
+  /// Progressive Play applies to metadata (`zm://`) episodes with a resolver
+  /// behind them. Anything else (single-source sessions, tests without DI)
+  /// keeps the one-shot [_resolveNoted] path exactly as before —
+  /// [PlaybackResolver.resolveProgressive] only answers metadata urls.
+  bool _useProgressive(String epUrl) =>
+      sl.isRegistered<PlaybackResolver>() && ZmodeIds.isZ(epUrl);
+
+  /// Drops the progressive subscription, if any. Late sweep events have no
+  /// listener afterwards, so nothing can merge into a departed episode. (The
+  /// sweep itself still ends via [PlaybackResolver.abortSweeps] from the
+  /// player screen's dispose; unsubscribing is what disconnects THIS cubit.)
+  Future<void> _cancelProgressive() async {
+    final it = _progressive;
+    _progressive = null;
+    if (it != null) await it.cancel();
+  }
+
+  /// Z-mode Play that paints the first hit instead of awaiting the sweep.
+  ///
+  /// The FIRST event opens playback through [_openResolved], exactly as the
+  /// one-shot resolve does; later events merge into the Sources sheet via
+  /// [mergeArrivedStreams] without touching the playing stream. The
+  /// pre-existing poll path still runs after open, untouched.
+  Future<void> _openProgressive(String epUrl, int gen) async {
+    await _cancelProgressive();
+    final it = StreamIterator(
+      sl<PlaybackResolver>().resolveProgressive(
+        epUrl,
+        category: _activeCategory,
+      ),
+    );
+    _progressive = it;
+    try {
+      var first = true;
+      while (await it.moveNext()) {
+        if (gen != _gen || isClosed) return;
+        final event = it.current;
+        if (episodes.isEmpty ||
+            state.currentIndex >= episodes.length ||
+            _episodeUrl(currentEpisode) != epUrl) {
+          return;
+        }
+        if (first) {
+          first = false;
+          if (!await _openResolved(
+            event.streams,
+            gen,
+            waitForQualityPreference: true,
+          )) {
+            return;
+          }
+          if (gen != _gen || isClosed) return;
+        } else {
+          mergeArrivedStreams(epUrl, event.streams);
+        }
+        if (event.done) return;
+      }
+    } finally {
+      if (identical(_progressive, it)) _progressive = null;
+      await it.cancel();
+    }
+  }
+
+  /// Opens playback on an already-resolved list — the tail of [openEpisode]
+  /// shared by the one-shot resolve and the progressive first event, so both
+  /// open identically. Returns false when nothing was pickable (error shown).
+  Future<bool> _openResolved(
+    List<VideoSource> resolved,
+    int gen, {
+    bool waitForQualityPreference = false,
+  }) async {
+    final poll = _pollSources;
+    if (waitForQualityPreference && poll != null) {
+      final preferredKind = availableCategories.length > 1
+          ? (_activeCategory == 'dub' ? AudioKind.dub : AudioKind.sub)
+          : AudioKind.unknown;
+      resolved = await waitForPreferredQuality(
+        initial: resolved,
+        preferredQuality: _preferredQuality(),
+        preferredKind: preferredKind,
+        poll: () => poll(_episodeUrl(currentEpisode)),
+        isStillCurrent: () => gen == _gen && !isClosed,
+      );
+      if (gen != _gen || isClosed) return false;
+    }
+    emit(state.copyWith(sources: resolved, loadingSources: false));
+    _buildQualityMenu(
+      gen,
+    ); // populate Auto/1080p/720p from the HLS master, if any
+    // A mirror picked on the episode list wins outright, and is consumed
+    // here so it only applies to the episode it was chosen for. Matched by
+    // url against this resolve, falling back to the picked source itself
+    // when the re-resolve hasn't produced it yet — the whole point is that
+    // the two lists don't always agree.
+    final chosen = initialSource;
+    initialSource = null;
+    final fromPick = chosen == null
+        ? null
+        : resolved.firstWhere((s) => s.url == chosen.url, orElse: () => chosen);
+    // Otherwise the source remembered for this title (e.g. Hindi), else the
+    // adaptive default.
+    // Let the audio cut narrow the default ONLY when the title actually
+    // offers a choice between cuts. Aniyomi labels each video's cut but
+    // exposes no toggle — the counts that drive it are CloudStream-only — so
+    // narrowing to "sub" here quietly hid every dub server behind a switch
+    // that does not exist. AudioKind.unknown matches nothing in a labelled
+    // list, so pickDefault falls through to the whole pool: the best stream
+    // of every server, which is what a source with no cut choice always did.
+    final narrowTo = availableCategories.length > 1
+        ? (_activeCategory == 'dub' ? AudioKind.dub : AudioKind.sub)
+        : AudioKind.unknown;
+    final pick =
+        fromPick ??
+        _preferredSource(resolved) ??
+        pickDefault(
+          resolved,
+          prefer: narrowTo,
+          preferQuality: _preferredQuality(),
+        );
+    if (pick == null) {
+      emit(
+        state.copyWith(error: () => 'No playable sources for this episode.'),
+      );
+      return false;
+    }
+    await _open(pick, gen: gen);
+    _applyDefaultQuality();
+    // Playback is running — collect the mirrors that resolved after the fast
+    // return, so the Sources sheet ends up complete. Started here rather than
+    // alongside the open above so it can't compete with the stream starting.
+    unawaited(_pollForMoreSources(_episodeUrl(currentEpisode)));
+    if (roomRole == RoomRole.host)
+      onLocalPlayback?.call('episode', Duration.zero);
+    return true;
   }
 
   /// Applies the user's [PlaybackPrefs.defaultQuality] over the adaptive default
@@ -2043,8 +2384,20 @@ class PlayerCubit extends Cubit<PlayerState> {
   // Language tokens used to re-match a remembered source across re-resolves
   // (URLs/sizes change, but the language usually persists in the label).
   static const List<String> _langTokens = [
-    'hindi', 'english', 'tamil', 'telugu', 'malayalam', 'kannada', 'bengali',
-    'marathi', 'punjabi', 'japanese', 'korean', 'dual', 'multi', 'org',
+    'hindi',
+    'english',
+    'tamil',
+    'telugu',
+    'malayalam',
+    'kannada',
+    'bengali',
+    'marathi',
+    'punjabi',
+    'japanese',
+    'korean',
+    'dual',
+    'multi',
+    'org',
   ];
 
   static String? _langOf(String label) {
@@ -2120,25 +2473,24 @@ class PlayerCubit extends Cubit<PlayerState> {
       '[quality] candidate=${candidate.label ?? candidate.url} '
       'container=${candidate.container.name} sniff=$sniff',
     );
-    fetchHlsVariants(
-      candidate.url,
-      candidate.headers,
-      _dio,
-      sniff: sniff,
-    ).then((vs) {
-      debugPrint('[quality] variants=${vs.length} '
-          '${vs.map((v) => v.quality).join(",")}');
-      if (gen == _gen && vs.length > 1) {
-        emit(state.copyWith(qualities: vs));
-        // Variants arrive async (after the initial open), so re-apply the
-        // default-quality pref now that the HLS ladder is known.
-        _applyDefaultQuality();
-      } else if (vs.length <= 1) {
-        // Not a ladder after all — don't leave a non-HLS source pinned as the
-        // master, or selectQuality would reopen the wrong thing.
-        if (gen == _gen && sniff) _hlsMaster = null;
-      }
-    });
+    fetchHlsVariants(candidate.url, candidate.headers, _dio, sniff: sniff).then(
+      (vs) {
+        debugPrint(
+          '[quality] variants=${vs.length} '
+          '${vs.map((v) => v.quality).join(",")}',
+        );
+        if (gen == _gen && vs.length > 1) {
+          emit(state.copyWith(qualities: vs));
+          // Variants arrive async (after the initial open), so re-apply the
+          // default-quality pref now that the HLS ladder is known.
+          _applyDefaultQuality();
+        } else if (vs.length <= 1) {
+          // Not a ladder after all — don't leave a non-HLS source pinned as the
+          // master, or selectQuality would reopen the wrong thing.
+          if (gen == _gen && sniff) _hlsMaster = null;
+        }
+      },
+    );
   }
 
   /// Switch the HLS resolution. [v] == null → Auto (highest); otherwise the
@@ -2207,7 +2559,9 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// couldn't (a clean error is emitted, no throw). Stops any previous torrent.
   Future<VideoSource?> _resolveTorrent(VideoSource s, int g) async {
     await _stopTorrent();
-    emit(state.copyWith(torrentPhase: () => 'Finding peers…', error: () => null));
+    emit(
+      state.copyWith(torrentPhase: () => 'Finding peers…', error: () => null),
+    );
     _torrentSub = sl<TorrentService>().events().listen((p) {
       if (g != _gen) return;
       final txt = switch (p.state) {
@@ -2250,14 +2604,16 @@ class PlayerCubit extends Cubit<PlayerState> {
       if (g != _gen) return null;
       final msg = (e is PlatformException && e.code == 'wifi_only')
           ? 'Torrents are set to Wi-Fi only. Turn on mobile data for torrents '
-              'in Settings › Torrents.'
+                'in Settings › Torrents.'
           : "Couldn't stream this torrent — no peers or it timed out. "
-              'Try another source.';
-      emit(state.copyWith(
-        torrentPhase: () => null,
-        loadingSources: false,
-        error: () => msg,
-      ));
+                'Try another source.';
+      emit(
+        state.copyWith(
+          torrentPhase: () => null,
+          loadingSources: false,
+          error: () => msg,
+        ),
+      );
       return null;
     }
   }
@@ -2285,6 +2641,8 @@ class PlayerCubit extends Cubit<PlayerState> {
     String? playUrlOverride,
   }) async {
     final g = gen ?? ++_gen;
+    final openToken = _lifecycle.beginOpen();
+    if (openToken < 0) return;
     // DRM (clearkey CENC/DASH) can't play in mpv — hand off to the native
     // ExoPlayer player, which does clearkey natively. The handoff launches that
     // player + closes this screen; if no handoff is wired, fall through (it'll
@@ -2298,32 +2656,56 @@ class PlayerCubit extends Cubit<PlayerState> {
     // ONLY torrent-specific code in the open path; direct urls skip it entirely.
     if (isTorrentUrl(s.url)) {
       final resolved = await _resolveTorrent(s, g);
-      if (g != _gen || resolved == null) return; // superseded or failed (error emitted)
+      if (g != _gen || resolved == null)
+        return; // superseded or failed (error emitted)
       s = resolved;
     }
     _startTimer?.cancel();
     _startedThisSource = false; // reset; set true once this source plays
+    // A source that never produces a frame and emits no error (a 403 HLS
+    // playlist mpv retries forever) used to spin forever: the error listener
+    // needs an error event and the stall watchdog needs a started source, so
+    // neither fired. Arm the same failover for the never-started case — a
+    // first frame within the window cancels it, exactly like the stall path.
+    // Torrents excluded (pieces take a while — same rule as the stall path).
+    _neverStartedTimer?.cancel();
+    final openGen = g;
+    _neverStartedTimer = Timer(const Duration(seconds: 30), () {
+      if (openGen != _gen ||
+          _startedThisSource ||
+          _recovering ||
+          _activeTorrentId != null) {
+        return;
+      }
+      _failoverFromStall();
+    });
     emit(state.copyWith(active: () => s, error: () => null));
     // When auto-resume is off, ignore the saved resume mark and start from the
     // explicit seek (a mid-session source/quality switch) or the very start.
     // In a Watch Together room the room position is authoritative, not the
     // user's personal mark.
-    final autoResume = sl<PlaybackPrefs>().autoResume && roomRole == RoomRole.none;
-    final mark =
-        autoResume ? resume.get(sourceId, _showKey, currentEpisode.id) : null;
-    var resumeAt =
-        (mark != null && !mark.finished) ? mark.position : Duration.zero;
+    final autoResume =
+        sl<PlaybackPrefs>().autoResume && roomRole == RoomRole.none;
+    final mark = autoResume
+        ? resume.get(sourceId, _showKey, currentEpisode.id)
+        : null;
+    var resumeAt = (mark != null && !mark.finished)
+        ? mark.position
+        : Duration.zero;
     // Fallback when the per-episode ResumeStore key didn't match (the provider
     // regenerated the episode's opaque data id between sessions): resume from
     // the position the Continue Watching entry itself recorded. First open only
     // — consume it so a later source/quality switch keeps the live position.
-    if (autoResume && resumeAt <= Duration.zero && initialResume > Duration.zero) {
+    if (autoResume &&
+        resumeAt <= Duration.zero &&
+        initialResume > Duration.zero) {
       resumeAt = initialResume;
     }
     initialResume = Duration.zero;
     // A fresh resume-open (no explicit seekTo) arms the pending-resume target so
     // a re-open that fires before we've reached it can't pull us back.
-    if ((seekTo == null || seekTo <= Duration.zero) && resumeAt > Duration.zero) {
+    if ((seekTo == null || seekTo <= Duration.zero) &&
+        resumeAt > Duration.zero) {
       _pendingResume = resumeAt;
     }
     // A source/quality switch passes seekTo: _lastPos to keep the position. But
@@ -2336,6 +2718,7 @@ class PlayerCubit extends Cubit<PlayerState> {
     // before opening — otherwise the first file opens without it (black screen
     // on AnimeSalt/AnimixStream-style streams).
     await _mpvConfigured;
+    if (g != _gen || isClosed || !_lifecycle.canContinue(openToken)) return;
     // HLS needs the fake-extension relaxation + per-segment reconnect
     // (http_persistent=0) for anti-leech CDNs. But forcing http_persistent=0 on
     // a progressive MP4 makes file-hosts throttle/drop it mid-stream (a fresh
@@ -2351,12 +2734,14 @@ class PlayerCubit extends Cubit<PlayerState> {
     var trimmedLocal = false;
     if (playUrlOverride == null && s.container == SourceContainer.hls) {
       final trimmed = await _trimMasterAudio(s);
+      if (g != _gen || isClosed || !_lifecycle.canContinue(openToken)) return;
       if (trimmed != null) {
         playUrl = trimmed;
         trimmedLocal = true;
       }
     }
     final plat = player.platform;
+    final setupSteps = <Future<void> Function()>[];
     if (plat is NativePlayer) {
       final isHls = s.container == SourceContainer.hls;
       // Opening a LOCAL playlist makes FFmpeg clamp nested protocols to
@@ -2366,24 +2751,28 @@ class PlayerCubit extends Cubit<PlayerState> {
       // to use its %n% length escape or the whole string is rejected (-4).
       const protos = 'file,crypto,data,http,https,tcp,tls';
       final whitelist = ',protocol_whitelist=%${protos.length}%$protos';
-      await plat.setProperty(
-        'demuxer-lavf-o',
-        (isHls
-                ? 'extension_picky=0,allowed_extensions=ALL,http_persistent=0,'
-                      'analyzeduration=2000000'
-                : 'extension_picky=0,allowed_extensions=ALL,'
-                      'analyzeduration=2000000') +
-            (trimmedLocal ? whitelist : ''),
+      setupSteps.add(
+        () => plat.setProperty(
+          'demuxer-lavf-o',
+          (isHls
+                  ? 'extension_picky=0,allowed_extensions=ALL,http_persistent=0,'
+                        'analyzeduration=2000000'
+                  : 'extension_picky=0,allowed_extensions=ALL,'
+                        'analyzeduration=2000000') +
+              (trimmedLocal ? whitelist : ''),
+        ),
       );
       // Progressive MP4 file hosts often drop the connection right after a
       // range-request seek (resume / scrub), which stalls playback at the seek
       // point. Let libavformat reconnect and continue — what ExoPlayer (and so
       // CloudStream) does natively. HLS reconnects per-segment already.
       if (!isHls) {
-        await plat.setProperty(
-          'stream-lavf-o',
-          'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,'
-              'reconnect_delay_max=30',
+        setupSteps.add(
+          () => plat.setProperty(
+            'stream-lavf-o',
+            'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,'
+                'reconnect_delay_max=30',
+          ),
         );
       }
       // Set mpv's `start` BEFORE loadfile so it opens AT the resume position (a
@@ -2393,11 +2782,13 @@ class PlayerCubit extends Cubit<PlayerState> {
       // 0 — so slow remote MP4s (file hosts) ignore it and land back at 0. We
       // set it ourselves before open, and to '0' otherwise (the property is
       // sticky across files, so it must be reset every open).
-      await plat.setProperty(
-        'start',
-        start > Duration.zero
-            ? (start.inMilliseconds / 1000).toStringAsFixed(3)
-            : '0',
+      setupSteps.add(
+        () => plat.setProperty(
+          'start',
+          start > Duration.zero
+              ? (start.inMilliseconds / 1000).toStringAsFixed(3)
+              : '0',
+        ),
       );
     }
     _isProxiedStream = playUrl.startsWith('http://127.0.0.1');
@@ -2410,15 +2801,18 @@ class PlayerCubit extends Cubit<PlayerState> {
         !_isProxiedStream &&
         s.proxyUrl != null) {
       _startTimer = Timer(const Duration(seconds: 10), () {
-        if (!_startedThisSource) {
-          _open(s, seekTo: _lastPos, playUrlOverride: s.proxyUrl);
+        if (g == _gen &&
+            !isClosed &&
+            _lifecycle.canContinue(openToken) &&
+            !_startedThisSource) {
+          _open(s, seekTo: _lastPos, gen: g, playUrlOverride: s.proxyUrl);
         }
       });
     }
-    await player.open(
-      Media(playUrl, httpHeaders: s.headers),
-    );
-    if (g != _gen) return; // superseded mid-open
+    setupSteps.add(() => player.open(Media(playUrl, httpHeaders: s.headers)));
+    if (g != _gen || isClosed || !_lifecycle.canContinue(openToken)) return;
+    final didOpen = await _lifecycle.runPlayerOpenSteps(openToken, setupSteps);
+    if (!didOpen || g != _gen || isClosed) return;
     // Discord Rich Presence: announce the episode now playing.
     _pushDiscordWatching();
     // Some streams ignore Media.start (the seek-on-open doesn't take), so the
@@ -2471,6 +2865,18 @@ class PlayerCubit extends Cubit<PlayerState> {
     _tryApplySubPref(); // apply the global subtitle preference (off / lang / auto)
   }
 
+  /// Stop playback, swallowing anything the platform throws.
+  ///
+  /// Only called on the paths that have already given up, where a failure to
+  /// stop must not replace the error the user is about to read.
+  Future<void> _stopQuietly() async {
+    try {
+      await player.stop();
+    } catch (_) {
+      /* already gone */
+    }
+  }
+
   /// Try the next source after the current one fails (dead/DRM/unsupported),
   /// preserving the live position and the audio kind.
   Future<void> _onPlaybackError(String e) async {
@@ -2514,7 +2920,9 @@ class PlayerCubit extends Cubit<PlayerState> {
     // A direct Aniyomi stream that failed on Cloudflare → swap to its hidden
     // proxy fallback (same quality) rather than cycling through other qualities.
     final act = state.active;
-    if (sourceId.startsWith('ani:') && !_isProxiedStream && act?.proxyUrl != null) {
+    if (sourceId.startsWith('ani:') &&
+        !_isProxiedStream &&
+        act?.proxyUrl != null) {
       await _open(act!, seekTo: _lastPos, playUrlOverride: act.proxyUrl);
       return;
     }
@@ -2529,14 +2937,40 @@ class PlayerCubit extends Cubit<PlayerState> {
     if (failed != null) _tried.add(failed.url);
     // Never re-try a source we've already attempted this episode (prevents the
     // A→B→A thrash cascade).
-    final remaining = state.sources
-        .where((s) => !_tried.contains(s.url))
-        .toList();
-    final next = pickDefault(
-      remaining,
-      prefer: failed?.kind ?? AudioKind.sub,
-      preferQuality: _preferredQuality(),
-    );
+    var availableSources = state.sources;
+    var next = failed == null
+        ? null
+        : pickPlaybackFallback(
+            failed: failed,
+            sources: availableSources,
+            triedUrls: _tried,
+            preferredQuality: _preferredQuality(),
+          );
+    // Providers may emit their first playable URL before sibling mirrors have
+    // finished resolving. Give that SAME provider session a short bounded
+    // window to publish another URL before escalating to another source.
+    final poll = _pollSources;
+    if (next == null && failed != null && poll != null) {
+      final episodeUrl = _episodeUrl(currentEpisode);
+      availableSources = await collectLatePlaybackMirrors(
+        initial: availableSources,
+        poll: () => poll(episodeUrl),
+        isStillCurrent: () => gen == _gen && !isClosed,
+      );
+      if (gen != _gen || isClosed) {
+        _recovering = false;
+        return;
+      }
+      if (!_sameUrlOrder(availableSources, state.sources)) {
+        emit(state.copyWith(sources: availableSources));
+      }
+      next = pickPlaybackFallback(
+        failed: failed,
+        sources: availableSources,
+        triedUrls: _tried,
+        preferredQuality: _preferredQuality(),
+      );
+    }
     if (next != null) {
       // Say so, the same way a stall failover already does. Silence here
       // looked identical to a frozen screen at the exact moment the player
@@ -2547,7 +2981,23 @@ class PlayerCubit extends Cubit<PlayerState> {
     } else if (!await _tryNextSource()) {
       // Guarded, not returned: _recovering still has to drop, or a player that
       // outlives this (a newer open on the same cubit) can never recover again.
-      if (gen == _gen) emit(state.copyWith(error: () => _deadEndMessage()));
+      if (gen == _gen) {
+        // Stop the player before saying so.
+        //
+        // Left running, it fetches the NEXT piece of the stream that just
+        // failed, fails on that too, and re-enters this whole path — about
+        // once a second, for as long as the screen is open. A device log of
+        // this shows 31 identical errors in 44 seconds behind a message that
+        // had already given up. From the outside that is a frozen app: the
+        // dialog is right there, and underneath the player is still grinding.
+        //
+        // Safe by construction: everything above has already established that
+        // this source never produced a frame, that there is nothing left to
+        // fail over to, and the user is about to be told so. "Try again"
+        // re-opens the episode from scratch, which works on a stopped player.
+        await _stopQuietly();
+        emit(state.copyWith(error: () => _deadEndMessage()));
+      }
     }
     _recovering = false;
   }
@@ -2603,19 +3053,21 @@ class PlayerCubit extends Cubit<PlayerState> {
     // drops the winner this reads.
     final winner = resolver.resolvedSourceId(epUrl, category: _activeCategory);
     if (winner == null) return false;
+    // Failover re-resolves and emits a fresh list: a progressive subscription
+    // still feeding the old sweep would merge its dead links straight back.
+    await _cancelProgressive();
     _sourceHops++;
     resolver.markSourceUnplayable(epUrl, winner, category: _activeCategory);
     _toast('That one didn\'t cut. Trying another source.');
     try {
-      final resolved = await _resolveSources(epUrl);
+      final resolved = await _resolveNoted(epUrl);
       if (gen != _gen) return true; // superseded; leaving is not a dead end
       final fresh = resolved.where((s) => !_tried.contains(s.url)).toList();
       if (fresh.isEmpty) return false;
       emit(state.copyWith(sources: resolved, error: () => null));
-      final pick = _preferredSource(fresh) ?? pickDefault(
-        fresh,
-        preferQuality: _preferredQuality(),
-      );
+      final pick =
+          _preferredSource(fresh) ??
+          pickDefault(fresh, preferQuality: _preferredQuality());
       if (pick == null) return false;
       await _open(pick, seekTo: _lastPos);
       if (gen != _gen) return true;
@@ -2630,20 +3082,56 @@ class PlayerCubit extends Cubit<PlayerState> {
     }
   }
 
+  /// [_resolveSources], plus a note on whether this source could produce any
+  /// playable link for this title.
+  ///
+  /// This is the ONLY signal that catches the common way a source rots: search
+  /// and the episode list keep working — the site is up, the pages parse — but
+  /// the embed host moved and nothing playable comes out. Health recorded from
+  /// search alone calls such a source perfectly healthy forever.
+  ///
+  /// Advisory only. It feeds the health screen; it never affects search order,
+  /// never skips a source, and never removes anything.
+  Future<List<VideoSource>> _resolveNoted(String epUrl) async {
+    try {
+      final out = await _resolveSources(epUrl);
+      _notePlayback(ok: out.isNotEmpty);
+      return out;
+    } catch (_) {
+      _notePlayback(ok: false);
+      rethrow;
+    }
+  }
+
+  void _notePlayback({required bool ok}) {
+    final url = showUrl;
+    // Z-Mode resolves across many sources behind one pseudo id, so an outcome
+    // there says nothing about any particular source — attributing it would
+    // convict whichever source happened to be asked last.
+    if (url == null || url.isEmpty || ZmodeIds.isZ(url)) return;
+    if (!sl.isRegistered<SourceHealthStore>()) return;
+    // Keyed by TITLE: retrying one broken title must count once, not once per
+    // attempt. Fire-and-forget — playback must never wait on bookkeeping.
+    unawaited(
+      sl<SourceHealthStore>()
+          .recordPlayback(sourceId, url, ok: ok)
+          .catchError((_) {}),
+    );
+  }
+
   /// Headline plus the plain fact, on the second line the error view styles
   /// separately. The joke never replaces the information: a viewer has to be
   /// able to tell a dead host from no connection.
   String _deadEndMessage() {
     final url = showUrl;
-    final sources = url != null &&
-            ZmodeIds.isZ(url) &&
-            sl.isRegistered<PlaybackResolver>()
+    final sources =
+        url != null && ZmodeIds.isZ(url) && sl.isRegistered<PlaybackResolver>()
         // The source playing now is not in the excluded set yet.
         ? sl<PlaybackResolver>().unplayableCount(
-              _episodeUrl(currentEpisode),
-              category: _activeCategory,
-            ) +
-            1
+                _episodeUrl(currentEpisode),
+                category: _activeCategory,
+              ) +
+              1
         : 1;
     final links = _tried.length;
     return 'Nothing left to cut.\n'
@@ -2654,7 +3142,25 @@ class PlayerCubit extends Cubit<PlayerState> {
 
   /// A started source stalled for too long (dead host / pulled segment).
   /// Switch to the next untried mirror at the same position, transparently.
+  /// Arm the stall detector. Shared by the two ways a stream turns out to be
+  /// dead: it started and then froze (the `buffering` event), or it never started
+  /// at all because the host refused the link on open. Reused rather than
+  /// duplicated so the 18s and the failover stay in one place.
+  void _armStallWatchdog() {
+    _stallAnchorPos = _lastPos;
+    _stallWatchdogArmed = true;
+    _stallTimer?.cancel();
+    _stallTimer = Timer(const Duration(seconds: 18), _failoverFromStall);
+  }
+
+  void _disarmStallWatchdog() {
+    _stallWatchdogArmed = false;
+    _stallTimer?.cancel();
+    _stallTimer = null;
+  }
+
   Future<void> _failoverFromStall() async {
+    _stallWatchdogArmed = false;
     // Bail if playback recovered (position moved past the stall anchor) or
     // we're no longer buffering — it was just a slow network dip, not a death.
     if (!player.state.buffering) return;
@@ -2686,6 +3192,9 @@ class PlayerCubit extends Cubit<PlayerState> {
       // A source whose every mirror stalls is as unplayable as one whose links
       // 404 — same fallthrough to the next source rather than ending here.
       if (!await _tryNextSource()) {
+        // Same reason as the dead end above: a stalled player left running
+        // keeps retrying behind the message.
+        await _stopQuietly();
         emit(
           state.copyWith(
             error: () =>
@@ -2863,8 +3372,11 @@ class PlayerCubit extends Cubit<PlayerState> {
     final title = showTitle;
     if (num == null || title == null || title.isEmpty) return;
     try {
-      final s = await sl<SkipService>()
-          .skipTimes(title: title, episode: num, duration: dur);
+      final s = await sl<SkipService>().skipTimes(
+        title: title,
+        episode: num,
+        duration: dur,
+      );
       if (index == state.currentIndex) _skips = s; // ignore if switched away
     } catch (_) {}
   }
@@ -2962,7 +3474,10 @@ class PlayerCubit extends Cubit<PlayerState> {
     final p = player.platform;
     if (p is NativePlayer) {
       try {
-        await p.setProperty('audio-delay', (d.inMilliseconds / 1000).toString());
+        await p.setProperty(
+          'audio-delay',
+          (d.inMilliseconds / 1000).toString(),
+        );
       } catch (_) {}
     }
   }
@@ -3123,13 +3638,20 @@ class PlayerCubit extends Cubit<PlayerState> {
     if (_goodPosMs > 0 && nowMs - _userSeekMs > 3000) {
       final elapsed = Duration(milliseconds: nowMs - _goodPosMs);
       final jump = _lastPos - _goodPos;
-      if (jump > elapsed * 4 + const Duration(seconds: 10)) return; // implausible
+      if (jump > elapsed * 4 + const Duration(seconds: 10))
+        return; // implausible
     }
     _goodPos = _lastPos;
     _goodPosMs = nowMs;
     // Save resume even when the duration is unknown (downloaded HLS files):
     // ResumeMark.finished is false at duration 0, so resume still seeks back.
-    await resume.save(sourceId, _showKey, currentEpisode.id, _lastPos, _lastDur);
+    await resume.save(
+      sourceId,
+      _showKey,
+      currentEpisode.id,
+      _lastPos,
+      _lastDur,
+    );
     final h = history;
     final title = showTitle;
     if (h != null && title != null) {
@@ -3253,13 +3775,18 @@ class PlayerCubit extends Cubit<PlayerState> {
       );
       if (isClosed || identical(next, episodes)) return;
       episodes = next;
-    } catch (_) {/* keep source titles */}
+    } catch (_) {
+      /* keep source titles */
+    }
   }
 
   /// Client-mode: apply the host's state without re-broadcasting. Seeks only on
   /// meaningful drift (the controller already gates with needsCorrection).
-  Future<void> applyRemote(
-      {required bool playing, required Duration position, double? rate}) async {
+  Future<void> applyRemote({
+    required bool playing,
+    required Duration position,
+    double? rate,
+  }) async {
     if ((_lastPos - position).abs() > const Duration(milliseconds: 2500)) {
       // Reuse the robust resume machinery so the seek lands on flaky hosts.
       _pendingResume = position;
@@ -3271,7 +3798,7 @@ class PlayerCubit extends Cubit<PlayerState> {
   }
 
   @override
-  Future<void> close() async {
+  Future<void> close() {
     // Leaving supersedes anything still in flight. Every delayed continuation
     // in here bails when _gen moves on, so bumping it once is what stops one
     // firing into a disposed player: the resume watchdog sleeps 15s, then 4s
@@ -3282,7 +3809,16 @@ class PlayerCubit extends Cubit<PlayerState> {
     // Before _persist, which doesn't consult _gen — the resume mark is still
     // written on the way out.
     _gen++;
-    await _persist(flush: true);
+    AppLogger.instance.log(
+      '[player-lifecycle] cubit close start gen=$_gen '
+      'active=${state.active?.label ?? state.active?.url ?? 'none'}',
+    );
+    // SILENCE FIRST, then detach the player. Exit must not wait for storage,
+    // network, torrent cleanup, or a provider callback; those finish after the
+    // route is gone. Native player teardown is coordinated separately below so
+    // it cannot race an in-flight player.open().
+    unawaited(player.pause().catchError((_) {}));
+    unawaited(_persist(flush: true).catchError((_) {}));
     // Leaving the player → drop Watching. Do not immediately restore a
     // "Playing" browse status; that is what kept the profile occupied after
     // the episode ended. Detail screens set browsing on their own init.
@@ -3292,15 +3828,50 @@ class PlayerCubit extends Cubit<PlayerState> {
     for (final s in _subs) {
       s.cancel();
     }
+    // Leaving drops the progressive subscription with it: late sweep events
+    // have no listener, so nothing merges into a closed player. (The sweep
+    // itself still ends via abortSweeps from the player screen's dispose.)
+    unawaited(_cancelProgressive().catchError((_) {}));
     _stallTimer?.cancel();
+    _startTimer?.cancel();
+    _neverStartedTimer?.cancel();
     _toastTimer?.cancel();
     _discordPauseTimer?.cancel();
     // Stop any active torrent stream + delete its buffered pieces.
-    await _stopTorrent();
+    unawaited(_stopTorrent().catchError((_) {}));
     toast.dispose();
     subtitleStyleRev.dispose();
     fillerEpisodes.dispose();
-    await player.dispose();
+    // Stop first, wait for any in-flight open to settle, then dispose. The
+    // route has already gone; this runs independently without allowing a late
+    // open callback to recreate the old native video surface.
+    _nativeTeardown ??= _lifecycle
+        .close(
+          stop: () async {
+            AppLogger.instance.log('[player-lifecycle] native stop start');
+            try {
+              await player.stop();
+              AppLogger.instance.log('[player-lifecycle] native stop done');
+            } catch (error) {
+              AppLogger.instance.log(
+                '[player-lifecycle] native stop error $error',
+              );
+            }
+          },
+          dispose: () async {
+            AppLogger.instance.log('[player-lifecycle] native dispose start');
+            try {
+              await player.dispose();
+              AppLogger.instance.log('[player-lifecycle] native dispose done');
+            } catch (error) {
+              AppLogger.instance.log(
+                '[player-lifecycle] native dispose error $error',
+              );
+            }
+          },
+        )
+        .catchError((_) {});
+    unawaited(_nativeTeardown!);
     return super.close();
   }
 }
