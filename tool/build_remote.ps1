@@ -2,9 +2,6 @@
 # Let Flutter refresh release plugin registration; --no-pub can leave test plugins registered.
 param([switch]$WithDeviceTests)
 $ErrorActionPreference = 'Stop'
-# Separate package for review installs; official release commands keep the upstream ID.
-$previousTryout = $env:ZANGETSU_REMOTE_TRYOUT
-$env:ZANGETSU_REMOTE_TRYOUT = '1'
 $remoteProject = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $remoteWork = Split-Path $remoteProject -Parent
 $remoteWorkspace = Split-Path $remoteWork -Parent
@@ -27,7 +24,4 @@ try {
             if ($LASTEXITCODE -ne 0) { throw 'Device test APK build failed.' }
         } finally { Pop-Location }
     }
-} finally {
-    Pop-Location
-    $env:ZANGETSU_REMOTE_TRYOUT = $previousTryout
-}
+} finally { Pop-Location }

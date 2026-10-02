@@ -21,9 +21,6 @@ plugins {
 val keystoreProperties = Properties()
 val keystorePropertiesFile = rootProject.file("key.properties")
 val hasReleaseKeystore = keystorePropertiesFile.exists()
-// Optional side-by-side review build. The default identity remains upstream's;
-// reviewers do not need its private signing key to keep their installed app.
-val remoteTryout = System.getenv("ZANGETSU_REMOTE_TRYOUT") == "1"
 if (hasReleaseKeystore) {
     keystoreProperties.load(FileInputStream(keystorePropertiesFile))
 }
@@ -50,8 +47,6 @@ android {
 
     defaultConfig {
         applicationId = "com.spyou.watch_app"
-        if (remoteTryout) applicationIdSuffix = ".remote"
-        manifestPlaceholders["appLabel"] = if (remoteTryout) "Zangetsu Remote Tryout" else "Zangetsu"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion

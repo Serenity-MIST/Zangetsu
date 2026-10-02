@@ -72,8 +72,6 @@ class UpdateService {
       final version = rawTag.startsWith('v') ? rawTag.substring(1) : rawTag;
 
       final pkg = await PackageInfo.fromPlatform();
-      // Side-by-side review APKs cannot update from officially signed releases.
-      if (pkg.packageName == 'com.spyou.watch_app.remote') return null;
       if (compareVersions(version, pkg.version) <= 0) return null;
       if (respectSkip && await _skippedVersion() == version) return null;
 
