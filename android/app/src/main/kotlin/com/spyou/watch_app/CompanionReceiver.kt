@@ -130,7 +130,7 @@ object CompanionReceiver {
         } catch (_: Exception) { /* Manual address remains available. */ }
     }
 
-    /** Keeps pairing credentials stable; explicit revocation is handled by forgetPhones. */
+    /** Rotates the manual pairing PIN and resets attempts; saved client tokens remain valid. */
     fun renewPin() {
         pin = (100000 + random.nextInt(900000)).toString()
         pairingPrefs?.edit()?.putString("pairPin", pin)?.apply()
