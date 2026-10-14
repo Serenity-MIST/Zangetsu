@@ -16,6 +16,15 @@ import UIKit
       AppleCompanionServices.register(messenger: registrar.messenger(), presenter: nil)
     }
 
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "MangaTranslationBridge") {
+      let channel = FlutterMethodChannel(
+        name: "zangetsu/manga_translation",
+        binaryMessenger: registrar.messenger()
+      )
+      let bridge = MangaTranslationBridge()
+      channel.setMethodCallHandler(bridge.handle)
+    }
+
     // Novel-fetch channel: the iOS twin of Android's NovelHttp. The LNReader
     // plugin's HTTP goes through URLSession here instead of Dart's HTTP client,
     // because URLSession rides the system TLS stack (a Safari-like fingerprint)

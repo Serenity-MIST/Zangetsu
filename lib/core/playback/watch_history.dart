@@ -5,6 +5,7 @@ import 'package:watch_app/core/hive/hive_key.dart';
 import 'package:hive/hive.dart';
 
 import '../privacy/incognito_mode.dart';
+import '../profiles/profile_scope.dart';
 import '../supabase/supabase_service.dart';
 
 class HistoryEntry {
@@ -61,31 +62,94 @@ class HistoryRemote {
   HistoryRemote(this._service);
 
   final SupabaseService _service;
+  static const int pageSize = 200;
+  static const int _seedPageSize = 1000;
+  static const String _historyColumns =
+      'source_id,show_id,show_title,cover,cover_headers,show_url,category,episode_id,episode_number,episode_url,position_ms,duration_ms,updated_at,mal_id';
 
   Future<void> upsert(Map<String, dynamic> row) async {
-    await _service.client
-        .from('history')
-        .upsert(row, onConflict: 'user_key,source_id,show_id');
+    final profileId = row['profile_id'] as String?;
+    final table = profileId == null ? 'history' : 'profile_history';
+    final conflict = profileId == null
+        ? 'user_key,source_id,show_id'
+        : 'user_key,profile_id,source_id,show_id';
+    await _service.client.from(table).upsert(row, onConflict: conflict);
   }
 
-  Future<void> deleteRow(String userKey, String sourceId, String showId) async {
-    await _service.client.from('history').delete().match({
+  Future<void> deleteRow(
+    String userKey,
+    String sourceId,
+    String showId, {
+    String? profileId,
+  }) async {
+    final table = profileId == null ? 'history' : 'profile_history';
+    await _service.client.from(table).delete().match({
       'user_key': userKey,
       'source_id': sourceId,
       'show_id': showId,
+      'profile_id': ?profileId,
     });
   }
 
   /// Delete EVERY history row for [userKey] — used by "Clear history" so it
   /// can't sync back on the next pull.
-  Future<void> deleteAllFor(String userKey) async {
-    await _service.client.from('history').delete().eq('user_key', userKey);
+  Future<void> deleteAllFor(String userKey, {String? profileId}) async {
+    final table = profileId == null ? 'history' : 'profile_history';
+    var query = _service.client.from(table).delete().eq('user_key', userKey);
+    if (profileId != null) query = query.eq('profile_id', profileId);
+    await query;
   }
 
-  Future<List<Map<String, dynamic>>> listFor(String userKey) async {
-    final res =
-        await _service.client.from('history').select().eq('user_key', userKey);
-    return (res as List).cast<Map<String, dynamic>>();
+  Future<List<Map<String, dynamic>>> listFor(
+    String userKey, {
+    String? profileId,
+  }) async {
+    final table = profileId == null ? 'history' : 'profile_history';
+    final rows = <Map<String, dynamic>>[];
+    var offset = 0;
+    while (true) {
+      var query = _service.client
+          .from(table)
+          .select('source_id,show_id,updated_at')
+          .eq('user_key', userKey);
+      if (profileId != null) query = query.eq('profile_id', profileId);
+      final page =
+          (await query
+                      .order('source_id')
+                      .order('show_id')
+                      .range(offset, offset + _seedPageSize - 1)
+                  as List)
+              .cast<Map<String, dynamic>>();
+      if (page.isEmpty) break;
+      rows.addAll(page);
+      offset += page.length;
+      if (page.length < _seedPageSize) break;
+    }
+    return rows;
+  }
+
+  /// shortcut: offset pages may drift during concurrent cloud edits; switch to
+  /// keyset cursors if users observe skipped rows while scrolling.
+  Future<List<Map<String, dynamic>>> pageFor(
+    String userKey, {
+    String? profileId,
+    required int offset,
+  }) async {
+    final table = profileId == null ? 'history' : 'profile_history';
+    var query = _service.client
+        .from(table)
+        .select(_historyColumns)
+        .eq('user_key', userKey);
+    if (profileId != null) query = query.eq('profile_id', profileId);
+    final page =
+        (await query
+                    .order('updated_at', ascending: false)
+                    .order('source_id')
+                    .order('show_id')
+                    .range(offset, offset + pageSize - 1)
+                as List)
+            .cast<Map<String, dynamic>>();
+    return page;
   }
 }
 
@@ -93,11 +157,19 @@ class HistoryRemote {
 /// Supabase when signed in. Cloud writes are throttled per show (the player
 /// persists every ~5s) so we don't hammer the backend.
 class WatchHistory {
-  WatchHistory(SupabaseService service, this._currentUserId, {HistoryRemote? remote})
-      : _remote = remote ?? HistoryRemote(service);
+  WatchHistory(
+    SupabaseService service,
+    this._currentUserId, {
+    HistoryRemote? remote,
+    String? Function()? currentProfileId,
+  }) : _remote = remote ?? HistoryRemote(service),
+       _currentProfileId = currentProfileId;
 
   final HistoryRemote _remote;
   final String? Function() _currentUserId;
+  final String? Function()? _currentProfileId;
+  String get _profileId => _currentProfileId?.call() ?? kDefaultProfileId;
+  String? _remoteProfileId(String id) => id == kDefaultProfileId ? null : id;
 
   static const String boxName = 'watch_history';
   // Cloud progress-sync throttle. The player calls [save] every ~1s during
@@ -112,6 +184,7 @@ class WatchHistory {
   /// [MyListStore.syncMetaBox]) so app-launch pulls can be throttled.
   static const String syncMetaBox = 'library_sync_meta';
   static const String _syncMetaKey = 'history_lastPullMs';
+  static const String _cloudPagePrefix = 'watch_history_page:';
 
   static Future<void> init() async {
     if (!Hive.isBoxOpen(boxName)) {
@@ -124,13 +197,47 @@ class WatchHistory {
     // empty while the pull throttle in [syncMetaBox] survives, which would
     // skip the very pull that puts the history back. Drop it.
     if (quarantinedBoxes.contains(boxName) && Hive.isBoxOpen(syncMetaBox)) {
-      await Hive.box(syncMetaBox).delete(_syncMetaKey);
+      final meta = Hive.box(syncMetaBox);
+      await meta.delete(_syncMetaKey);
+      for (final key in meta.keys.toList()) {
+        if ('$key'.contains(_cloudPagePrefix)) await meta.delete(key);
+      }
     }
   }
 
   Box<Map> get _box => Hive.box<Map>(boxName);
-  String _key(String sourceId, String showId) =>
-      hiveKey('$sourceId::$showId');
+  String _key(String sourceId, String showId, [String? profileId]) =>
+      profileScopedKey(profileId ?? _profileId, hiveKey('$sourceId::$showId'));
+
+  String _cloudPageKey(String userId, String profileId) =>
+      profileScopedKey(profileId, '$_cloudPagePrefix${hiveKey(userId)}');
+
+  Map _cloudPageState(String userId, String profileId) {
+    if (!Hive.isBoxOpen(syncMetaBox)) return const {};
+    final state = Hive.box(syncMetaBox).get(_cloudPageKey(userId, profileId));
+    return state is Map ? state : const {};
+  }
+
+  bool hasMoreCloudPages({String? forProfileId}) {
+    final uid = _currentUserId();
+    if (uid == null) return false;
+    final profileId = forProfileId ?? _profileId;
+    return _cloudPageState(uid, profileId)['hasMore'] as bool? ?? true;
+  }
+
+  Future<void> _saveCloudPageState(
+    String userId,
+    String profileId, {
+    required int offset,
+    required bool hasMore,
+  }) async {
+    if (!Hive.isBoxOpen(syncMetaBox)) return;
+    await Hive.box(syncMetaBox).put(_cloudPageKey(userId, profileId), {
+      'offset': offset,
+      'hasMore': hasMore,
+    });
+  }
+
   final Map<String, int> _lastCloudPush = {};
 
   /// Persist progress. The local write is ALWAYS immediate (instant resume);
@@ -139,7 +246,8 @@ class WatchHistory {
   /// episode change, and player close.
   Future<void> save(HistoryEntry e, {bool flush = false}) async {
     if (IncognitoMode.on) return; // incognito: don't record what's watched
-    final key = _key(e.sourceId, e.showId);
+    final profileId = _profileId;
+    final key = _key(e.sourceId, e.showId, profileId);
     await _box.put(key, {
       'sourceId': e.sourceId,
       'showId': e.showId,
@@ -158,33 +266,40 @@ class WatchHistory {
       'malId': e.malId,
     });
     if (flush) {
-      await _pushToCloud(key, e, force: true);
+      await _pushToCloud(key, e, profileId, force: true);
     } else {
-      _pushToCloud(key, e);
+      _pushToCloud(key, e, profileId);
     }
   }
 
   /// Throttled, best-effort cloud upsert. [force] bypasses the throttle for
   /// the flush moments (see [save]).
-  Map<String, dynamic> _rowFor(String uid, HistoryEntry e) => {
-    'user_key': uid,
-    'source_id': e.sourceId,
-    'show_id': e.showId,
-    'show_title': e.showTitle,
-    'cover': e.cover,
-    'cover_headers': e.coverHeaders,
-    'show_url': e.showUrl,
-    'category': e.category,
-    'episode_id': e.episodeId,
-    'episode_number': e.episodeNumber,
-    'episode_url': e.episodeUrl,
-    'position_ms': e.position.inMilliseconds,
-    'duration_ms': e.duration.inMilliseconds,
-    'updated_at': e.updatedAt,
-    'mal_id': e.malId?.toString(),
-  };
+  Map<String, dynamic> _rowFor(String uid, HistoryEntry e, String profileId) =>
+      {
+        'user_key': uid,
+        if (profileId != kDefaultProfileId) 'profile_id': profileId,
+        'source_id': e.sourceId,
+        'show_id': e.showId,
+        'show_title': e.showTitle,
+        'cover': e.cover,
+        'cover_headers': e.coverHeaders,
+        'show_url': e.showUrl,
+        'category': e.category,
+        'episode_id': e.episodeId,
+        'episode_number': e.episodeNumber,
+        'episode_url': e.episodeUrl,
+        'position_ms': e.position.inMilliseconds,
+        'duration_ms': e.duration.inMilliseconds,
+        'updated_at': e.updatedAt,
+        'mal_id': e.malId?.toString(),
+      };
 
-  Future<void> _pushToCloud(String key, HistoryEntry e, {bool force = false}) async {
+  Future<void> _pushToCloud(
+    String key,
+    HistoryEntry e,
+    String profileId, {
+    bool force = false,
+  }) async {
     final uid = _currentUserId();
     if (uid == null) return;
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -192,8 +307,10 @@ class WatchHistory {
     if (!force && now - last < _cloudThrottleMs) return;
     _lastCloudPush[key] = now;
     try {
-      await _remote.upsert(_rowFor(uid, e));
-    } catch (_) {/* best-effort */}
+      await _remote.upsert(_rowFor(uid, e, profileId));
+    } catch (_) {
+      /* best-effort */
+    }
   }
 
   HistoryEntry _fromMap(Map raw) {
@@ -221,7 +338,7 @@ class WatchHistory {
 
   /// Newest-first, excluding finished episodes (the Continue Watching feed).
   List<HistoryEntry> recent({int limit = 20}) {
-    final all = _box.values.map(_fromMap).where((e) => !e.finished).toList()
+    final all = _entriesFor(_profileId).where((e) => !e.finished).toList()
       ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     return all.take(limit).toList();
   }
@@ -229,9 +346,14 @@ class WatchHistory {
   /// Every watched show, newest-first, including finished ones — the full
   /// History screen (Continue Watching only surfaces the unfinished subset).
   List<HistoryEntry> all() {
-    return _box.values.map(_fromMap).toList()
+    return _entriesFor(_profileId)
       ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
   }
+
+  List<HistoryEntry> _entriesFor(String profileId) => [
+    for (final key in _box.keys)
+      if (profileOwnsKey(key, profileId)) _fromMap(_box.get(key)!),
+  ];
 
   static const String _seedFlagPrefix = 'history_seeded_';
 
@@ -246,24 +368,28 @@ class WatchHistory {
   Future<({int pushed, int failed})> pushAllLocalToCloud() async {
     final uid = _currentUserId();
     if (uid == null) return (pushed: 0, failed: 0);
+    final profileId = _profileId;
     // What the cloud already has, and how fresh — so we don't clobber newer.
     final cloudTimes = <String, int>{};
     var readOk = true;
     try {
-      for (final m in await _remote.listFor(uid)) {
-        cloudTimes[hiveKey('${m['source_id']}::${m['show_id']}')] =
+      for (final m in await _remote.listFor(
+        uid,
+        profileId: _remoteProfileId(profileId),
+      )) {
+        cloudTimes[_key('${m['source_id']}', '${m['show_id']}', profileId)] =
             (m['updated_at'] as num?)?.toInt() ?? 0;
       }
     } catch (_) {
       readOk = false; // couldn't read cloud — treat as incomplete below
     }
     var pushed = 0, failed = 0;
-    for (final e in all()) {
-      final key = _key(e.sourceId, e.showId);
+    for (final e in _entriesFor(profileId)) {
+      final key = _key(e.sourceId, e.showId, profileId);
       final cloudT = cloudTimes[key];
       if (cloudT != null && cloudT >= e.updatedAt) continue; // cloud same/newer
       try {
-        await _remote.upsert(_rowFor(uid, e));
+        await _remote.upsert(_rowFor(uid, e, profileId));
         pushed++;
       } catch (_) {
         failed++;
@@ -282,7 +408,8 @@ class WatchHistory {
     final uid = _currentUserId();
     if (uid == null || !Hive.isBoxOpen(syncMetaBox)) return;
     final box = Hive.box(syncMetaBox);
-    final flag = '$_seedFlagPrefix$uid';
+    final profileId = _profileId;
+    final flag = profileScopedKey(profileId, '$_seedFlagPrefix$uid');
     if (box.get(flag) == true) return;
     final r = await pushAllLocalToCloud();
     if (r.failed == 0) await box.put(flag, true);
@@ -296,53 +423,109 @@ class WatchHistory {
   /// NEVER be able to wipe a device's Continue Watching. Deletions propagate
   /// through [remove]/[clearAll] deleting the cloud row directly, not through a
   /// pull observing an absence.
-  Future<void> pullFromCloud() async {
+  Future<void> pullFromCloud({String? forProfileId}) async {
     final uid = _currentUserId();
     if (uid == null) return;
+    final profileId = forProfileId ?? _profileId;
     try {
-      final rows = await _remote.listFor(uid);
-      for (final m in rows) {
-        final key = hiveKey('${m['source_id']}::${m['show_id']}');
-        final cloudUpdated = (m['updated_at'] as num?)?.toInt() ?? 0;
-        final localUpdated = (_box.get(key)?['updatedAt'] as num?)?.toInt() ?? -1;
-        if (cloudUpdated <= localUpdated) continue; // local is same/newer — keep it
-        final headers = m['cover_headers'];
-        await _box.put(key, {
-          'sourceId': m['source_id'],
-          'showId': m['show_id'],
-          'showTitle': m['show_title'],
-          'cover': m['cover'],
-          'coverHeaders': headers is String
-              ? jsonDecode(headers)
-              : headers is Map
-                  ? headers
-                  : null,
-          'showUrl': m['show_url'],
-          'category': m['category'],
-          'episodeId': m['episode_id'],
-          'episodeNumber': m['episode_number'],
-          'episodeUrl': m['episode_url'],
-          'positionMs': m['position_ms'],
-          'durationMs': m['duration_ms'],
-          'updatedAt': m['updated_at'],
-          'malId': int.tryParse('${m['mal_id']}'),
-        });
-      }
-      _markPulled();
-    } catch (_) {/* keep local */}
+      final rows = await _remote.pageFor(
+        uid,
+        profileId: _remoteProfileId(profileId),
+        offset: 0,
+      );
+      await _mergeCloudRows(rows, profileId);
+      final pageState = _cloudPageState(uid, profileId);
+      final oldOffset = pageState['offset'] as int? ?? 0;
+      await _saveCloudPageState(
+        uid,
+        profileId,
+        offset: oldOffset < rows.length ? rows.length : oldOffset,
+        hasMore: rows.length == HistoryRemote.pageSize,
+      );
+      _markPulled(profileId);
+    } catch (_) {
+      /* keep local */
+    }
+  }
+
+  Future<bool> loadMoreFromCloud({String? forProfileId}) async {
+    final uid = _currentUserId();
+    if (uid == null) return false;
+    final profileId = forProfileId ?? _profileId;
+    final state = _cloudPageState(uid, profileId);
+    if (state['hasMore'] == false) return false;
+    final offset = state['offset'] as int? ?? 0;
+    try {
+      final rows = await _remote.pageFor(
+        uid,
+        profileId: _remoteProfileId(profileId),
+        offset: offset,
+      );
+      await _mergeCloudRows(rows, profileId);
+      await _saveCloudPageState(
+        uid,
+        profileId,
+        offset: offset + rows.length,
+        hasMore: rows.length == HistoryRemote.pageSize,
+      );
+      return rows.length == HistoryRemote.pageSize;
+    } catch (_) {
+      return true; // Keep the same cursor so the next scroll can retry.
+    }
+  }
+
+  Future<void> _mergeCloudRows(
+    List<Map<String, dynamic>> rows,
+    String profileId,
+  ) async {
+    for (final m in rows) {
+      final key = _key('${m['source_id']}', '${m['show_id']}', profileId);
+      final cloudUpdated = (m['updated_at'] as num?)?.toInt() ?? 0;
+      final localUpdated = (_box.get(key)?['updatedAt'] as num?)?.toInt() ?? -1;
+      if (cloudUpdated <= localUpdated) continue;
+      final headers = m['cover_headers'];
+      await _box.put(key, {
+        'sourceId': m['source_id'],
+        'showId': m['show_id'],
+        'showTitle': m['show_title'],
+        'cover': m['cover'],
+        'coverHeaders': headers is String
+            ? jsonDecode(headers)
+            : headers is Map
+            ? headers
+            : null,
+        'showUrl': m['show_url'],
+        'category': m['category'],
+        'episodeId': m['episode_id'],
+        'episodeNumber': m['episode_number'],
+        'episodeUrl': m['episode_url'],
+        'positionMs': m['position_ms'],
+        'durationMs': m['duration_ms'],
+        'updatedAt': m['updated_at'],
+        'malId': int.tryParse('${m['mal_id']}'),
+      });
+    }
   }
 
   /// Remove a single show from Continue Watching, locally and (when signed in)
   /// from the cloud so it doesn't sync back. Best-effort on the cloud side.
   Future<void> remove(String sourceId, String showId) async {
-    final key = _key(sourceId, showId);
+    final profileId = _profileId;
+    final key = _key(sourceId, showId, profileId);
     await _box.delete(key);
     _lastCloudPush.remove(key);
     final uid = _currentUserId();
     if (uid == null) return;
     try {
-      await _remote.deleteRow(uid, sourceId, showId);
-    } catch (_) {/* best-effort */}
+      await _remote.deleteRow(
+        uid,
+        sourceId,
+        showId,
+        profileId: _remoteProfileId(profileId),
+      );
+    } catch (_) {
+      /* best-effort */
+    }
   }
 
   /// Pull from cloud only when the last successful pull is older than [maxAge]
@@ -352,21 +535,26 @@ class WatchHistory {
     Duration maxAge = const Duration(hours: 12),
   }) async {
     if (_currentUserId() == null) return;
+    final profileId = _profileId;
     int? last;
     if (Hive.isBoxOpen(syncMetaBox)) {
-      last = Hive.box(syncMetaBox).get(_syncMetaKey) as int?;
+      last =
+          Hive.box(syncMetaBox).get(profileScopedKey(profileId, _syncMetaKey))
+              as int?;
     }
     if (last != null) {
       final age = DateTime.now().millisecondsSinceEpoch - last;
       if (age >= 0 && age < maxAge.inMilliseconds) return; // still fresh
     }
-    await pullFromCloud();
+    await pullFromCloud(forProfileId: profileId);
   }
 
-  void _markPulled() {
+  void _markPulled(String profileId) {
     if (Hive.isBoxOpen(syncMetaBox)) {
-      Hive.box(syncMetaBox)
-          .put(_syncMetaKey, DateTime.now().millisecondsSinceEpoch);
+      Hive.box(syncMetaBox).put(
+        profileScopedKey(profileId, _syncMetaKey),
+        DateTime.now().millisecondsSinceEpoch,
+      );
     }
   }
 
@@ -375,7 +563,11 @@ class WatchHistory {
   Future<void> clearLocal() async {
     await _box.clear();
     if (Hive.isBoxOpen(syncMetaBox)) {
-      await Hive.box(syncMetaBox).delete(_syncMetaKey);
+      final meta = Hive.box(syncMetaBox);
+      await meta.delete(_syncMetaKey);
+      for (final key in meta.keys.toList()) {
+        if ('$key'.contains(_cloudPagePrefix)) await meta.delete(key);
+      }
     }
   }
 
@@ -385,15 +577,24 @@ class WatchHistory {
   /// Deletes the cloud rows first so even a racing pull sees nothing.
   Future<void> clearAll() async {
     final uid = _currentUserId();
+    final profileId = _profileId;
     if (uid != null) {
       try {
-        await _remote.deleteAllFor(uid);
-      } catch (_) {/* best-effort — local still clears */}
+        await _remote.deleteAllFor(uid, profileId: _remoteProfileId(profileId));
+      } catch (_) {
+        /* best-effort — local still clears */
+      }
     }
     _lastCloudPush.clear();
-    await _box.clear();
+    for (final key in _box.keys.toList()) {
+      if (profileOwnsKey(key, profileId)) await _box.delete(key);
+    }
     if (Hive.isBoxOpen(syncMetaBox)) {
-      await Hive.box(syncMetaBox).delete(_syncMetaKey);
+      final meta = Hive.box(syncMetaBox);
+      await meta.delete(profileScopedKey(profileId, _syncMetaKey));
+      if (uid != null) {
+        await meta.delete(_cloudPageKey(uid, profileId));
+      }
     }
   }
 }

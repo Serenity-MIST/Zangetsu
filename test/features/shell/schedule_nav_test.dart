@@ -25,6 +25,8 @@ import 'package:watch_app/core/playback/playback_prefs.dart';
 import 'package:watch_app/core/playback/search_history.dart';
 import 'package:watch_app/core/playback/search_prefs.dart';
 import 'package:watch_app/core/playback/search_source_prefs.dart';
+import 'package:watch_app/core/profiles/viewer_profile.dart';
+import 'package:watch_app/features/profiles/viewer_profiles_screen.dart';
 import 'package:watch_app/core/provider/cloudstream_provider.dart';
 import 'package:watch_app/core/provider/provider_manager.dart';
 import 'package:watch_app/core/provider/provider_registry.dart';
@@ -109,7 +111,6 @@ class _FakeMyListStore implements MyListStore {
   @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
-
   @override
   List<MediaItem> all() => const [];
 
@@ -128,7 +129,6 @@ class _FakeSearchHistory implements SearchHistory {
   @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
-
   @override
   List<String> recent() => const [];
 }
@@ -140,7 +140,6 @@ class _FakeSearchPrefs extends ChangeNotifier implements SearchPrefs {
   // provider is loaded before searching it. These fakes are already "loaded".
   @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
-
 
   @override
   SearchLayout get layout => SearchLayout.vertical;
@@ -176,7 +175,6 @@ class _FakeSearchSourcePrefs extends ChangeNotifier
   @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
-
   @override
   Set<String> get excluded => const {};
 
@@ -192,7 +190,6 @@ class _FakeProviderRegistry implements ProviderRegistry {
   @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
-
   @override
   List<ProviderRegistryEntry> getAll() => const [];
 
@@ -205,8 +202,8 @@ class _FakeProviderRegistry implements ProviderRegistry {
   @override
   Map<String, String> typeMapOf() => const {};
   @override
-  ({Map<String, String> types, Map<String, String> logos})
-  manifestMapsOf() => (types: const {}, logos: const {});
+  ({Map<String, String> types, Map<String, String> logos}) manifestMapsOf() =>
+      (types: const {}, logos: const {});
 }
 
 class _FakeAniListService extends ChangeNotifier implements AniListService {
@@ -216,7 +213,6 @@ class _FakeAniListService extends ChangeNotifier implements AniListService {
   // provider is loaded before searching it. These fakes are already "loaded".
   @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
-
 
   @override
   bool get isConnected => false;
@@ -239,7 +235,6 @@ class _FakeMalService extends ChangeNotifier implements MalService {
   @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
-
   @override
   bool get isConnected => false;
 
@@ -260,7 +255,6 @@ class _FakeSimklService extends ChangeNotifier implements SimklService {
   // provider is loaded before searching it. These fakes are already "loaded".
   @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
-
 
   @override
   bool get isConnected => false;
@@ -401,6 +395,7 @@ void main() {
     sl.registerSingleton<SearchPrefs>(_FakeSearchPrefs());
     sl.registerSingleton<SearchSourcePrefs>(_FakeSearchSourcePrefs());
     sl.registerSingleton<ListStatusStore>(ListStatusStore());
+    sl.registerSingleton<ViewerProfileStore>(ViewerProfileStore());
     sl.registerSingleton<DownloadManager>(DownloadManager(fakeRepo));
     sl.registerSingleton<ProviderRegistry>(_FakeProviderRegistry());
     sl.registerSingleton<CloudStreamManager>(CloudStreamManager());
@@ -513,6 +508,111 @@ void main() {
     expect(dockLabel('Search'), findsNothing);
   });
 
+  testWidgets('long-pressing the Profile dock item switches viewer profiles', (
+    tester,
+  ) async {
+    sl.registerSingleton<AppMode>(const AppMode(isTv: false));
+    final profiles = _TestViewerProfileStore([
+      const ViewerProfile(id: kDefaultProfileId, name: 'Home'),
+      const ViewerProfile(id: 'kids', name: 'Kids', isKids: true),
+    ]);
+    await sl.unregister<ViewerProfileStore>();
+    sl.registerSingleton<ViewerProfileStore>(profiles);
+
+    await tester.pumpWidget(wrap(const RootShell()));
+    await tester.pumpAndSettle();
+    await tester.longPress(dockLabel('Profile'));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const ValueKey('profile-switcher-sheet')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('profile-switcher-active')),
+      findsOneWidget,
+    );
+    await tester.tap(
+      find.byKey(const ValueKey('profile-switcher-choice-kids')),
+    );
+    await tester.pumpAndSettle();
+
+    expect(profiles.activeId, 'kids');
+  });
+
+  testWidgets('profile switcher brands the sheet and opens profile manager', (
+    tester,
+  ) async {
+    sl.registerSingleton<AppMode>(const AppMode(isTv: false));
+    final profiles = _TestViewerProfileStore([
+      const ViewerProfile(id: kDefaultProfileId, name: 'Home'),
+      const ViewerProfile(id: 'kids', name: 'Kids', isKids: true),
+    ]);
+    await sl.unregister<ViewerProfileStore>();
+    sl.registerSingleton<ViewerProfileStore>(profiles);
+
+    await tester.pumpWidget(wrap(const RootShell()));
+    await tester.pumpAndSettle();
+    await tester.longPress(dockLabel('Profile'));
+    await tester.pumpAndSettle();
+
+    final sheet = find.byKey(const ValueKey('profile-switcher-sheet'));
+    final optionsCard = find.byKey(
+      const ValueKey('profile-switcher-options-card'),
+    );
+    expect(optionsCard, findsOneWidget);
+    final optionsMaterial = tester.widget<Material>(
+      find.descendant(of: optionsCard, matching: find.byType(Material)),
+    );
+    expect(optionsMaterial.color, AppColors.surface);
+    expect(
+      (optionsMaterial.shape! as RoundedRectangleBorder).side.color,
+      AppColors.hairline,
+    );
+    final activeTile = tester.widget<ListTile>(
+      find.byKey(const ValueKey('profile-switcher-active')),
+    );
+    expect(activeTile.visualDensity, const VisualDensity(vertical: -1));
+    expect(
+      tester.getSize(find.byWidget(activeTile.leading!)),
+      const Size(38, 38),
+    );
+    expect(
+      find.descendant(
+        of: optionsCard,
+        matching: find.byKey(const ValueKey('profile-switcher-active')),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: optionsCard,
+        matching: find.byKey(const ValueKey('profile-switcher-add')),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('profile-switcher-brand-footer')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: sheet, matching: find.text('Zangetsu')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: sheet, matching: find.text('Add profile')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: sheet, matching: find.byType(Divider)),
+      findsNothing,
+    );
+
+    await tester.tap(find.byKey(const ValueKey('profile-switcher-add')));
+    await tester.pumpAndSettle();
+    expect(find.byType(ViewerProfilesScreen), findsOneWidget);
+  });
+
   testWidgets('TV shell keeps Downloads and gains a Schedule rail item', (
     tester,
   ) async {
@@ -615,7 +715,9 @@ void main() {
     expect(hub, isNot(genres));
   });
 
-  testWidgets('no Genres card when the catalogue cannot filter', (tester) async {
+  testWidgets('no Genres card when the catalogue cannot filter', (
+    tester,
+  ) async {
     sl.registerSingleton<AppMode>(const AppMode(isTv: false));
     sl.registerSingleton<MetadataRepository>(_FiltersRepo(supports: false));
     await tester.pumpWidget(wrap(const RootShell()));
@@ -679,5 +781,24 @@ class _FiltersRepo implements MetadataRepository {
   // provider is loaded before searching it. These fakes are already "loaded".
   @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
+}
 
+class _TestViewerProfileStore extends ViewerProfileStore {
+  _TestViewerProfileStore(this._profiles) {
+    active.value = _profiles.first;
+  }
+
+  final List<ViewerProfile> _profiles;
+
+  @override
+  List<ViewerProfile> get profiles => List.unmodifiable(_profiles);
+
+  @override
+  bool get askOnLaunch => true;
+
+  @override
+  Future<void> switchTo(String profileId) async {
+    active.value = _profiles.firstWhere((profile) => profile.id == profileId);
+    revision.value++;
+  }
 }

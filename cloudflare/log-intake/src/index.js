@@ -14,7 +14,9 @@
  *
  * Bindings (see wrangler.toml):
  *   LOGS            KV namespace
+ *   AVATARS         R2 bucket for profile photos
  *   DISCORD_WEBHOOK secret — `wrangler secret put DISCORD_WEBHOOK`
+ *   SUPABASE_JWT_SECRET secret — `wrangler secret put SUPABASE_JWT_SECRET`
  */
 
 /** Refuse anything bigger. A full log is ~25KB gzipped; this is for a
@@ -25,7 +27,17 @@ const MAX_BYTES = 1_000_000;
 /** Bumped by hand when the Worker changes, so `/health` can prove which code
  *  is actually serving. Cloudflare takes a while to roll a new version out and
  *  there is otherwise no way to tell from outside. */
-const BUILD = 'ctx-1';
+const BUILD = 'ctx-5';
+
+/** Supabase JWKS endpoint (ES256, P-256). Cached in a module global;
+ *  refetched only when the token's `kid` misses the cache. */
+const JWKS_URL =
+  'https://eogwzrlfoercfwcfwlmv.supabase.co/auth/v1/.well-known/jwks.json';
+const JWT_ISSUER = `${new URL(JWKS_URL).origin}/auth/v1`;
+const AVATAR_MAX_BYTES = 512 * 1024;
+const AVATAR_GIF_MAX_DIMENSION = 512;
+const AVATAR_GIF_MAX_FRAMES = 60;
+let CACHED_JWKS = null;
 
 /** Long enough to still have the log when someone gets round to mentioning it,
  *  short enough that nothing accumulates. KV expires these itself. */
@@ -33,8 +45,8 @@ const KEEP_SECONDS = 60 * 60 * 24 * 30;
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, X-App-Version, X-Device',
+  'Access-Control-Allow-Methods': 'POST, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, X-App-Version, X-Device, Authorization',
 };
 
 export default {
@@ -56,6 +68,62 @@ export default {
           : 'missing',
         build: BUILD,
       });
+    }
+    if (url.pathname === '/v1/avatar-slot' && request.method === 'POST') {
+      const declaredLength = request.headers.get('content-length');
+      if (declaredLength !== null) {
+        const parsedLength = Number(declaredLength);
+        if (!Number.isSafeInteger(parsedLength) || parsedLength < 0) {
+          return json({ error: 'bad image size' }, 400);
+        }
+        if (parsedLength > AVATAR_MAX_BYTES) {
+          return json({ error: 'image too large' }, 413);
+        }
+      }
+      const user = await verifyAppUser(request, env);
+      if (!user) return json({ error: 'unauthorized' }, 401);
+      const type = (request.headers.get('content-type') || '')
+        .split(';')[0]
+        .trim()
+        .toLowerCase();
+      if (
+        type !== 'image/jpeg' &&
+        type !== 'image/png' &&
+        type !== 'image/webp' &&
+        type !== 'image/gif'
+      ) {
+        return json({ error: 'bad type' }, 400);
+      }
+      const body = await readBodyUpTo(request, AVATAR_MAX_BYTES);
+      if (body === null) return json({ error: 'image too large' }, 413);
+      if (!body.byteLength || !matchesImageSignature(type, body)) {
+        return json({ error: 'bad image' }, 400);
+      }
+      const extension = type === 'image/gif' ? 'gif' : 'jpg';
+      const key = `avatars/${user}/${crypto.randomUUID()}.${extension}`;
+      await env.AVATARS.put(key, body, { httpMetadata: { contentType: type } });
+      return json({ url: `${env.AVATAR_PUBLIC_BASE}/${key}` });
+    }
+    if (url.pathname === '/v1/avatar-slot' && request.method === 'DELETE') {
+      const user = await verifyAppUser(request, env);
+      if (!user) return json({ error: 'unauthorized' }, 401);
+      const body = await readBodyUpTo(request, 512);
+      if (body === null) return json({ error: 'bad avatar URL' }, 400);
+      let target;
+      try {
+        target = JSON.parse(new TextDecoder().decode(body)).url;
+      } catch (_) {
+        return json({ error: 'bad avatar URL' }, 400);
+      }
+      const prefix = `${env.AVATAR_PUBLIC_BASE.replace(/\/+$/, '')}/avatars/${user}/`;
+      const file = typeof target === 'string' && target.startsWith(prefix)
+        ? target.slice(prefix.length)
+        : '';
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(?:jpg|gif)$/i.test(file)) {
+        return json({ error: 'bad avatar URL' }, 400);
+      }
+      await env.AVATARS.delete(`avatars/${user}/${file}`);
+      return json({ ok: true });
     }
     if (url.pathname !== '/v1/logs' || request.method !== 'POST') {
       return json({ error: 'not found' }, 404);
@@ -154,6 +222,234 @@ function json(data, status = 200) {
     status,
     headers: { 'Content-Type': 'application/json', ...CORS },
   });
+}
+
+async function getJwk(kid) {
+  const hit =
+    CACHED_JWKS &&
+    Array.isArray(CACHED_JWKS.keys) &&
+    CACHED_JWKS.keys.find((k) => k.kid === kid);
+  if (hit) return hit;
+  const res = await fetch(JWKS_URL);
+  if (!res.ok) return null;
+  CACHED_JWKS = await res.json();
+  const keys = (CACHED_JWKS && CACHED_JWKS.keys) || [];
+  return keys.find((k) => k.kid === kid) || null;
+}
+
+async function readBodyUpTo(request, maxBytes) {
+  const reader = request.body?.getReader();
+  if (!reader) return new Uint8Array();
+
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch (_) {}
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
+function matchesImageSignature(type, bytes) {
+  if (type === 'image/jpeg') {
+    return (
+      bytes.length >= 3 &&
+      bytes[0] === 0xff &&
+      bytes[1] === 0xd8 &&
+      bytes[2] === 0xff
+    );
+  }
+  if (type === 'image/png') {
+    return [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a].every(
+      (value, index) => bytes[index] === value,
+    );
+  }
+  if (type === 'image/webp') {
+    return (
+      bytes.length >= 12 &&
+      String.fromCharCode(...bytes.subarray(0, 4)) === 'RIFF' &&
+      String.fromCharCode(...bytes.subarray(8, 12)) === 'WEBP'
+    );
+  }
+  if (type === 'image/gif') {
+    return inspectGif(bytes);
+  }
+  return false;
+}
+
+function inspectGif(bytes) {
+  if (bytes.length < 14) return false;
+  const signature = String.fromCharCode(...bytes.subarray(0, 6));
+  if (signature !== 'GIF87a' && signature !== 'GIF89a') return false;
+
+  const read16 = (offset) => bytes[offset] | (bytes[offset + 1] << 8);
+  const width = read16(6);
+  const height = read16(8);
+  if (
+    width < 1 ||
+    width > AVATAR_GIF_MAX_DIMENSION ||
+    height < 1 ||
+    height > AVATAR_GIF_MAX_DIMENSION
+  ) {
+    return false;
+  }
+
+  let offset = 13;
+  const screenFlags = bytes[10];
+  const hasGlobalColorTable = (screenFlags & 0x80) !== 0;
+  if (hasGlobalColorTable) {
+    offset += 3 * (1 << ((screenFlags & 0x07) + 1));
+    if (offset > bytes.length) return false;
+  }
+
+  let frames = 0;
+  while (offset < bytes.length) {
+    const marker = bytes[offset++];
+    if (marker === 0x3b) {
+      return frames > 0 && offset === bytes.length;
+    }
+    if (marker === 0x2c) {
+      if (offset + 9 > bytes.length) return false;
+      const left = read16(offset);
+      const top = read16(offset + 2);
+      const frameWidth = read16(offset + 4);
+      const frameHeight = read16(offset + 6);
+      const frameFlags = bytes[offset + 8];
+      const hasLocalColorTable = (frameFlags & 0x80) !== 0;
+      if (
+        frameWidth < 1 ||
+        frameWidth > AVATAR_GIF_MAX_DIMENSION ||
+        frameHeight < 1 ||
+        frameHeight > AVATAR_GIF_MAX_DIMENSION ||
+        left + frameWidth > width ||
+        top + frameHeight > height
+      ) {
+        return false;
+      }
+      offset += 9;
+      if (hasLocalColorTable) {
+        offset += 3 * (1 << ((frameFlags & 0x07) + 1));
+        if (offset > bytes.length) return false;
+      } else if (!hasGlobalColorTable) {
+        return false;
+      }
+      if (offset >= bytes.length || bytes[offset] < 2 || bytes[offset] > 8) {
+        return false;
+      }
+      offset++;
+      offset = skipGifSubBlocks(bytes, offset);
+      if (offset < 0 || ++frames > AVATAR_GIF_MAX_FRAMES) return false;
+      continue;
+    }
+    if (marker === 0x21) {
+      if (offset >= bytes.length) return false;
+      offset++;
+      offset = skipGifSubBlocks(bytes, offset);
+      if (offset < 0) return false;
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+function skipGifSubBlocks(bytes, offset) {
+  while (offset < bytes.length) {
+    const length = bytes[offset++];
+    if (length === 0) return offset;
+    offset += length;
+    if (offset > bytes.length) return -1;
+  }
+  return -1;
+}
+
+function b64urlToBytes(seg) {
+  const b64 = seg.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+  return Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+}
+
+function b64urlToJson(seg) {
+  const bytes = b64urlToBytes(seg);
+  let text = '';
+  for (let i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i]);
+  return JSON.parse(text);
+}
+
+async function verifyAppUser(request, env) {
+  const header = request.headers.get('authorization') || '';
+  const [scheme, token] = header.split(' ');
+  if (scheme !== 'Bearer' || !token) return null;
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const [h, p, s] = parts;
+    if (!h || !p || !s) return null;
+    const decodedHeader = b64urlToJson(h);
+    if (
+      !decodedHeader ||
+      decodedHeader.alg !== 'ES256' ||
+      typeof decodedHeader.kid !== 'string' ||
+      !decodedHeader.kid
+    ) {
+      return null;
+    }
+    const jwk = await getJwk(decodedHeader.kid);
+    if (!jwk || (jwk.alg && jwk.alg !== decodedHeader.alg)) return null;
+    const key = await crypto.subtle.importKey(
+      'jwk',
+      jwk,
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      false,
+      ['verify'],
+    );
+    const data = new TextEncoder().encode(`${h}.${p}`);
+    const sig = b64urlToBytes(s);
+    const ok = await crypto.subtle.verify(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      key,
+      sig,
+      data,
+    );
+    if (!ok) return null;
+    const payload = b64urlToJson(p);
+    const now = Math.floor(Date.now() / 1000);
+    const audience = payload.aud;
+    if (
+      !Number.isFinite(payload.exp) ||
+      payload.exp <= now ||
+      payload.iss !== JWT_ISSUER ||
+      (audience !== 'authenticated' &&
+        !(Array.isArray(audience) && audience.includes('authenticated'))) ||
+      payload.role !== 'authenticated' ||
+      ('nbf' in payload &&
+        (!Number.isFinite(payload.nbf) || payload.nbf > now))
+    ) {
+      return null;
+    }
+    return typeof payload.sub === 'string' && payload.sub ? payload.sub : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 /** Posts the report to Discord with the log itself attached, so reading one is

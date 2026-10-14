@@ -16,16 +16,17 @@ PreferredSizeWidget settingsAppBar(
   String title, {
   List<Widget>? actions,
   bool showBack = true,
+  VoidCallback? onBack,
 }) {
   final tvBack = showBack && _isTvDevice();
   return AppBar(
     titleSpacing: tvBack ? 8 : (showBack ? 4 : 16),
-    automaticallyImplyLeading: showBack && !tvBack,
+    automaticallyImplyLeading: showBack && !tvBack && onBack == null,
     toolbarHeight: tvBack ? 72 : kToolbarHeight,
     title: tvBack
         ? Row(
             children: [
-              const TvBackButton(),
+              TvBackButton(onPressed: onBack),
               const SizedBox(width: 12),
               Expanded(
                 child: Text(
@@ -39,6 +40,13 @@ PreferredSizeWidget settingsAppBar(
           )
         : Text(title, style: AppText.barTitle),
     actions: actions,
+    leading: showBack && !tvBack && onBack != null
+        ? IconButton(
+            tooltip: 'Back',
+            onPressed: onBack,
+            icon: const Icon(Icons.arrow_back),
+          )
+        : null,
     bottom: const PreferredSize(
       preferredSize: Size.fromHeight(1),
       child: Divider(height: 1, thickness: 1, color: AppColors.hairline),
@@ -66,7 +74,9 @@ class SettingsTile extends StatelessWidget {
     this.destructive = false,
     this.subtitleMaxLines = 1,
     this.iconAccent = false,
+    this.iconHeroTag,
     this.autofocus = false,
+    this.leading,
   });
 
   final IconData icon;
@@ -88,8 +98,14 @@ class SettingsTile extends StatelessWidget {
   /// Accent-tint the icon tile (a card's lead row).
   final bool iconAccent;
 
+  /// Optional Hero source for the leading icon.
+  final Object? iconHeroTag;
+
   /// TV only: land D-pad focus here first (typically the first row on a page).
   final bool autofocus;
+
+  /// Custom leading widget. When null, the standard [icon] box is drawn.
+  final Widget? leading;
 
   @override
   Widget build(BuildContext context) {
@@ -131,26 +147,33 @@ class SettingsTile extends StatelessWidget {
       );
     }
 
+    Widget leading =
+        this.leading ??
+        Container(
+          width: 34,
+          height: 34,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: accented
+                ? AppColors.accent.withValues(alpha: 0.14)
+                : Colors.white.withValues(alpha: 0.08),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Icon(
+            icon,
+            color: accented ? AppColors.accent : AppColors.textSecondary,
+            size: 19,
+          ),
+        );
+    if (iconHeroTag != null) {
+      leading = Hero(tag: iconHeroTag!, child: leading);
+    }
+
     final body = Padding(
       padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 12),
       child: Row(
         children: [
-          Container(
-            width: 34,
-            height: 34,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              color: accented
-                  ? AppColors.accent.withValues(alpha: 0.14)
-                  : Colors.white.withValues(alpha: 0.08),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Icon(
-              icon,
-              color: accented ? AppColors.accent : AppColors.textSecondary,
-              size: 19,
-            ),
-          ),
+          leading,
           const SizedBox(width: 14),
           Expanded(
             child: Column(

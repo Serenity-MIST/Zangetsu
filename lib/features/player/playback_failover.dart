@@ -3,6 +3,51 @@ import 'dart:async';
 import '../../core/models/video_source.dart';
 import '../../core/playback/source_selection.dart';
 
+/// Whether a Z-mode episode should be resolved through its progressive sweep.
+/// A preferred local source, when available, should be opened first instead.
+bool shouldUseProgressivePlayback({
+  required bool progressiveAvailable,
+  required bool hasLocalSource,
+}) => progressiveAvailable && !hasLocalSource;
+
+/// Retry only a failed local codec open, once, when the user has not already
+/// chosen software decoding. Network playback and other local errors are left
+/// to their existing recovery paths.
+bool shouldRetryWithSoftwareDecoder({
+  required bool isLocalFile,
+  required bool alreadyRetried,
+  required bool softwareDecoderSelected,
+  required String error,
+}) =>
+    isLocalFile &&
+    !alreadyRetried &&
+    !softwareDecoderSelected &&
+    error.toLowerCase().contains('codec');
+
+bool isCurrentSoftwareDecoderRetry({
+  required int retryGeneration,
+  required int currentGeneration,
+}) =>
+    retryGeneration == currentGeneration;
+
+bool shouldInvalidateSoftwareDecoderRetry({
+  required bool retryInProgress,
+  required bool openingRetry,
+}) =>
+    retryInProgress && !openingRetry;
+
+/// Return a one-open `hwdec` override for a local software fallback, or null
+/// when the player's normal decoder preference should remain untouched.
+String? softwareDecoderOverride({
+  required bool retryWithSoftware,
+  required bool fallbackActive,
+  required String preferredHwdec,
+}) {
+  if (retryWithSoftware) return 'no';
+  if (fallbackActive) return preferredHwdec;
+  return null;
+}
+
 /// Polls a provider's existing resolution session briefly for late mirrors.
 /// Links already returned are retained and duplicate URLs are ignored.
 Future<List<VideoSource>> collectLatePlaybackMirrors({

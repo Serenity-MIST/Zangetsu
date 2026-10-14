@@ -18,6 +18,7 @@ import 'anime_catalogue.dart';
 import 'mal_catalogue.dart';
 import '../di/injector.dart';
 import '../playback/playback_prefs.dart';
+import '../profiles/viewer_profile.dart';
 import 'metadata_filters.dart';
 import 'metadata_provider_prefs.dart';
 import 'simkl_catalogue.dart';
@@ -121,6 +122,7 @@ class MetadataRepository implements CatalogueRepository {
   /// swap without waiting on AniList/TMDB again; the counterpart kind is
   /// prefetched after each successful home fetch.
   final Map<ZKind, List<HomeSection>> _homeCache = {};
+  int _homeCacheGeneration = 0;
 
   /// Home loads that are running RIGHT NOW, one per kind.
   ///
@@ -136,7 +138,11 @@ class MetadataRepository implements CatalogueRepository {
   /// [initDependencies] so [HomeCubit] can mirror them for instant toggles.
   void Function(ZKind kind, List<HomeSection> rows)? onStreamHomeCached;
 
-  void clearHomeCache() => _homeCache.clear();
+  void clearHomeCache() {
+    _homeCacheGeneration++;
+    _homeCache.clear();
+    _homeInFlight.clear();
+  }
 
   /// Synchronous read of cached home rows — used by [HomeCubit] on Anime ↔
   /// Movie/TV toggles so a prefetched counterpart swaps instantly.
@@ -147,14 +153,17 @@ class MetadataRepository implements CatalogueRepository {
   Future<List<HomeSection>> ensureHomeCached(ZKind kind) async {
     final hit = _homeCache[kind];
     if (hit != null) return hit;
+    final generation = _homeCacheGeneration;
     final sw = Stopwatch()..start();
     debugPrint('[metadata] warm · kind=$kind · fetch');
     final rows = await _homeForKind(kind);
-    if (!_homeFailed(rows)) _homeCache[kind] = rows; // same rule as home()
+    if (generation == _homeCacheGeneration) {
+      if (!_homeFailed(rows)) _homeCache[kind] = rows; // same rule as home()
+      _syncHomeCubitStreamCache(kind, rows);
+    }
     debugPrint(
       '[metadata] warm · kind=$kind · ${rows.length} rows · ${sw.elapsedMilliseconds}ms',
     );
-    _syncHomeCubitStreamCache(kind, rows);
     return rows;
   }
 
@@ -415,12 +424,13 @@ class MetadataRepository implements CatalogueRepository {
       debugPrint('[metadata] home · kind=$k · joined the load already running');
       return running;
     }
-    final started = _loadHome(k);
+    final generation = _homeCacheGeneration;
+    final started = _loadHome(k, generation);
     _homeInFlight[k] = started;
     return started;
   }
 
-  Future<List<HomeSection>> _loadHome(ZKind k) async {
+  Future<List<HomeSection>> _loadHome(ZKind k, int generation) async {
     final sw = Stopwatch()..start();
     debugPrint('[metadata] home · kind=$k · fetch');
     try {
@@ -431,17 +441,19 @@ class MetadataRepository implements CatalogueRepository {
       // cached emptiness instead of retrying, and a quarter of the cache hits
       // in the field were serving zero rows. HomeCubit already refuses to
       // remember empty rows for the same reason.
-      if (!_homeFailed(rows)) _homeCache[k] = rows;
+      if (generation == _homeCacheGeneration) {
+        if (!_homeFailed(rows)) _homeCache[k] = rows;
+        _syncHomeCubitStreamCache(k, rows);
+        _prefetchStreamingCounterpart(k, generation);
+      }
       debugPrint(
         '[metadata] home · kind=$k · ${rows.length} rows · ${sw.elapsedMilliseconds}ms',
       );
-      _syncHomeCubitStreamCache(k, rows);
-      _prefetchStreamingCounterpart(k);
       return rows;
     } finally {
       // Always, including on a throw: the slot must not outlive the load, or
       // every later caller joins a future that already failed.
-      _homeInFlight.remove(k);
+      if (generation == _homeCacheGeneration) _homeInFlight.remove(k);
     }
   }
 
@@ -457,7 +469,8 @@ class MetadataRepository implements CatalogueRepository {
     return rows;
   }
 
-  void _prefetchStreamingCounterpart(ZKind loaded) {
+  void _prefetchStreamingCounterpart(ZKind loaded, int generation) {
+    if (generation != _homeCacheGeneration) return;
     final other = switch (loaded) {
       ZKind.anime => ZKind.movie,
       ZKind.movie => ZKind.anime,
@@ -468,6 +481,7 @@ class MetadataRepository implements CatalogueRepository {
       final sw = Stopwatch()..start();
       try {
         final rows = await _homeForKind(other);
+        if (generation != _homeCacheGeneration) return;
         if (!_homeFailed(rows)) _homeCache[other] = rows; // same rule as home()
         _syncHomeCubitStreamCache(other, rows);
         debugPrint(
@@ -482,7 +496,10 @@ class MetadataRepository implements CatalogueRepository {
   /// The Privacy switch. Read through GetIt rather than injected because this
   /// is a guard, and a build that forgets to wire it must fail closed.
   bool _adultAllowed() =>
-      sl.isRegistered<PlaybackPrefs>() && sl<PlaybackPrefs>().adultMetadata;
+      sl.isRegistered<PlaybackPrefs>() &&
+      sl<PlaybackPrefs>().adultMetadata &&
+      (!sl.isRegistered<ViewerProfileStore>() ||
+          sl<ViewerProfileStore>().adultMetadataAllowed);
 
   /// Whether the CHOSEN provider filters server-side.
   ///
@@ -543,6 +560,31 @@ class MetadataRepository implements CatalogueRepository {
     };
     items.forEach(_remember);
     return items;
+  }
+
+  /// Search or filter one TMDB streaming-service catalogue. It stays on the
+  /// TMDB catalogue that owns the provider id, even if the global preference
+  /// changes while this page is open.
+  Future<MediaItemPage> streamingServicePage(
+    int providerId, {
+    String query = '',
+    MetaFilters filters = const MetaFilters(),
+    int page = 1,
+  }) async {
+    var safeFilters = filters;
+    if (safeFilters.adult && !_adultAllowed()) {
+      safeFilters = safeFilters.copyWith(adult: false);
+    }
+    final pageResult = query.trim().isEmpty
+        ? await _tmdb.browseProvider(providerId, page, filters: safeFilters)
+        : await _tmdb.searchProvider(
+            providerId,
+            query,
+            filters: safeFilters,
+            page: page,
+          );
+    pageResult.items.forEach(_remember);
+    return pageResult;
   }
 
   @override
@@ -612,6 +654,10 @@ class MetadataRepository implements CatalogueRepository {
     final d = _isTmdb(c.kind)
         ? await _viaVideo((x) => x.detail(c), prefer: prefer)
         : await _viaAnime((x) => x.detail(c), prefer: prefer);
+    final metadataAliases = [
+      if (d.nativeTitle != null) d.nativeTitle!,
+      ...d.synonyms,
+    ];
     _titles[c.key] = (title: d.title, alt: d.englishTitle, malId: d.malId);
     AppLogger.instance.log(
       '[metadata] detail catalogue title="${d.title}" eps=${d.episodes.length} '
@@ -640,6 +686,7 @@ class MetadataRepository implements CatalogueRepository {
         c,
         title: d.title,
         altTitle: d.englishTitle,
+        metadataAliases: metadataAliases,
         malId: d.malId,
         // `detail` accepted `abandoned` but never consulted it, so a source
         // sweep outlived the screen that asked for it. Fast back-and-tap
@@ -706,6 +753,7 @@ class MetadataRepository implements CatalogueRepository {
       c,
       title: d.title,
       altTitle: d.englishTitle,
+      metadataAliases: metadataAliases,
       malId: d.malId,
       // `detail` accepted `abandoned` but never consulted it, so a source
       // sweep outlived the screen that asked for it. Fast back-and-tap

@@ -12,33 +12,115 @@ import 'package:watch_app/core/supabase/supabase_service.dart';
 class FakeReadingHistoryRemote implements ReadingHistoryRemote {
   final List<Map<String, dynamic>> rows = [];
   int upsertCalls = 0;
+  int targetedReads = 0;
+  bool failNextPage = false;
 
   @override
   Future<void> upsert(Map<String, dynamic> row) async {
     upsertCalls++;
-    rows.removeWhere((r) =>
-        r['user_key'] == row['user_key'] &&
-        r['source_id'] == row['source_id'] &&
-        r['show_id'] == row['show_id']);
+    rows.removeWhere(
+      (r) =>
+          r['user_key'] == row['user_key'] &&
+          r['profile_id'] == row['profile_id'] &&
+          r['source_id'] == row['source_id'] &&
+          r['show_id'] == row['show_id'],
+    );
     rows.add(row);
   }
 
   @override
-  Future<List<Map<String, dynamic>>> listFor(String userKey) async {
-    return rows.where((r) => r['user_key'] == userKey).toList();
+  Future<List<Map<String, dynamic>>> listFor(
+    String userKey, {
+    String? profileId,
+  }) async {
+    return rows
+        .where((r) => r['user_key'] == userKey && r['profile_id'] == profileId)
+        .toList();
   }
 
   @override
-  Future<void> deleteRow(String userKey, String sourceId, String showId) async {
-    rows.removeWhere((r) =>
-        r['user_key'] == userKey &&
-        r['source_id'] == sourceId &&
-        r['show_id'] == showId);
+  Future<List<Map<String, dynamic>>> pageFor(
+    String userKey, {
+    String? profileId,
+    required ProviderType type,
+    required int offset,
+  }) async {
+    if (failNextPage) {
+      failNextPage = false;
+      throw Exception('network down');
+    }
+    final page =
+        rows
+            .where(
+              (r) =>
+                  r['user_key'] == userKey &&
+                  r['profile_id'] == profileId &&
+                  (type == ProviderType.manga
+                      ? r['type'] == ProviderType.manga.name
+                      : readEntryTypeFromName(r['type'] as String?) ==
+                            ProviderType.novel),
+            )
+            .toList()
+          ..sort((a, b) {
+            final updated = (b['updated_ms'] as num? ?? 0).compareTo(
+              a['updated_ms'] as num? ?? 0,
+            );
+            if (updated != 0) return updated;
+            final source = '${a['source_id']}'.compareTo('${b['source_id']}');
+            return source != 0
+                ? source
+                : '${a['show_id']}'.compareTo('${b['show_id']}');
+          });
+    return page.skip(offset).take(ReadingHistoryRemote.pageSize).toList();
   }
 
   @override
-  Future<void> deleteAllForType(String userKey, String typeName) async {
-    rows.removeWhere((r) => r['user_key'] == userKey && r['type'] == typeName);
+  Future<Map<String, dynamic>?> getFor(
+    String userKey, {
+    String? profileId,
+    required String sourceId,
+    required String showId,
+  }) async {
+    targetedReads++;
+    for (final row in rows) {
+      if (row['user_key'] == userKey &&
+          row['profile_id'] == profileId &&
+          row['source_id'] == sourceId &&
+          row['show_id'] == showId) {
+        return row;
+      }
+    }
+    return null;
+  }
+
+  @override
+  Future<void> deleteRow(
+    String userKey,
+    String sourceId,
+    String showId, {
+    String? profileId,
+  }) async {
+    rows.removeWhere(
+      (r) =>
+          r['user_key'] == userKey &&
+          r['profile_id'] == profileId &&
+          r['source_id'] == sourceId &&
+          r['show_id'] == showId,
+    );
+  }
+
+  @override
+  Future<void> deleteAllForType(
+    String userKey,
+    String typeName, {
+    String? profileId,
+  }) async {
+    rows.removeWhere(
+      (r) =>
+          r['user_key'] == userKey &&
+          r['profile_id'] == profileId &&
+          r['type'] == typeName,
+    );
   }
 }
 
@@ -51,17 +133,49 @@ class _BrokenReadingHistoryRemote implements ReadingHistoryRemote {
   }
 
   @override
-  Future<List<Map<String, dynamic>>> listFor(String userKey) async {
+  Future<List<Map<String, dynamic>>> listFor(
+    String userKey, {
+    String? profileId,
+  }) async {
     throw Exception('relation "reading_history" does not exist');
   }
 
   @override
-  Future<void> deleteRow(String userKey, String sourceId, String showId) async {
+  Future<List<Map<String, dynamic>>> pageFor(
+    String userKey, {
+    String? profileId,
+    required ProviderType type,
+    required int offset,
+  }) async {
     throw Exception('relation "reading_history" does not exist');
   }
 
   @override
-  Future<void> deleteAllForType(String userKey, String typeName) async {
+  Future<Map<String, dynamic>?> getFor(
+    String userKey, {
+    String? profileId,
+    required String sourceId,
+    required String showId,
+  }) async {
+    throw Exception('relation "reading_history" does not exist');
+  }
+
+  @override
+  Future<void> deleteRow(
+    String userKey,
+    String sourceId,
+    String showId, {
+    String? profileId,
+  }) async {
+    throw Exception('relation "reading_history" does not exist');
+  }
+
+  @override
+  Future<void> deleteAllForType(
+    String userKey,
+    String typeName, {
+    String? profileId,
+  }) async {
     throw Exception('relation "reading_history" does not exist');
   }
 }
@@ -85,9 +199,17 @@ void main() {
     int ts = 0,
     ProviderType type = ProviderType.novel,
   }) => ReadEntry(
-    sourceId: 'js:m', showId: show, title: show, cover: null,
-    chapterId: 'ch1', chapterNumber: 1, chapterUrl: 'u',
-    pos: pos, total: total, updatedMs: ts, type: type,
+    sourceId: 'js:m',
+    showId: show,
+    title: show,
+    cover: null,
+    chapterId: 'ch1',
+    chapterNumber: 1,
+    chapterUrl: 'u',
+    pos: pos,
+    total: total,
+    updatedMs: ts,
+    type: type,
   );
 
   test('save keeps one row per title (latest chapter wins)', () async {
@@ -98,6 +220,24 @@ void main() {
     expect(h.recent().single.pos, 5);
   });
 
+  test('reading progress is isolated by profile', () async {
+    var activeProfileId = 'default';
+    final h = ReadHistory(
+      SupabaseService(),
+      () => 'user1',
+      remote: FakeReadingHistoryRemote(),
+      currentProfileId: () => activeProfileId,
+    );
+
+    await h.save(entry('same', pos: 2, ts: 1));
+    activeProfileId = 'kid';
+    await h.save(entry('same', pos: 8, ts: 2));
+    expect(h.all().single.pos, 8);
+
+    activeProfileId = 'default';
+    expect(h.all().single.pos, 2);
+  });
+
   test('recent() excludes finished and sorts newest-first', () async {
     final h = ReadHistory(SupabaseService(), () => null);
     await h.save(entry('done', pos: 19, total: 20, ts: 1)); // finished
@@ -106,26 +246,33 @@ void main() {
     expect(h.recent().map((e) => e.showId).toList(), ['new', 'old']);
   });
 
-  test('recent() applies the novel permille finished rule (total == 1000)',
-      () async {
-    final h = ReadHistory(SupabaseService(), () => null);
-    await h.save(entry('almostDone', pos: 950, total: 1000, ts: 1));
-    await h.save(entry('reading', pos: 500, total: 1000, ts: 2));
-    expect(h.recent().map((e) => e.showId).toList(), ['reading']);
-  });
+  test(
+    'recent() applies the novel permille finished rule (total == 1000)',
+    () async {
+      final h = ReadHistory(SupabaseService(), () => null);
+      await h.save(entry('almostDone', pos: 950, total: 1000, ts: 1));
+      await h.save(entry('reading', pos: 500, total: 1000, ts: 2));
+      expect(h.recent().map((e) => e.showId).toList(), ['reading']);
+    },
+  );
 
-  test('recent(type:) returns only that kind — the box mixes manga and novel',
-      () async {
-    final h = ReadHistory(SupabaseService(), () => null);
-    await h.save(entry('m1', ts: 3, type: ProviderType.manga));
-    await h.save(entry('n1', ts: 2, type: ProviderType.novel));
-    await h.save(entry('m2', ts: 1, type: ProviderType.manga));
-    expect(h.recent(type: ProviderType.manga).map((e) => e.showId).toList(),
-        ['m1', 'm2']);
-    expect(h.recent(type: ProviderType.novel).map((e) => e.showId).toList(),
-        ['n1']);
-    expect(h.recent().length, 3); // no type → both (backward compatible)
-  });
+  test(
+    'recent(type:) returns only that kind — the box mixes manga and novel',
+    () async {
+      final h = ReadHistory(SupabaseService(), () => null);
+      await h.save(entry('m1', ts: 3, type: ProviderType.manga));
+      await h.save(entry('n1', ts: 2, type: ProviderType.novel));
+      await h.save(entry('m2', ts: 1, type: ProviderType.manga));
+      expect(h.recent(type: ProviderType.manga).map((e) => e.showId).toList(), [
+        'm1',
+        'm2',
+      ]);
+      expect(h.recent(type: ProviderType.novel).map((e) => e.showId).toList(), [
+        'n1',
+      ]);
+      expect(h.recent().length, 3); // no type → both (backward compatible)
+    },
+  );
 
   test('two save() calls for the same show within the throttle window '
       'push one upsert; the local read is always immediate', () async {
@@ -139,18 +286,20 @@ void main() {
     expect(fake.rows.single['pos'], 1); // throttled remote still has the first
   });
 
-  test('save(flush: true) forces an immediate upsert regardless of throttle',
-      () async {
-    final fake = FakeReadingHistoryRemote();
-    final h = ReadHistory(SupabaseService(), () => 'user1', remote: fake);
-    await h.save(entry('a', pos: 1, ts: 1));
-    expect(fake.upsertCalls, 1);
+  test(
+    'save(flush: true) forces an immediate upsert regardless of throttle',
+    () async {
+      final fake = FakeReadingHistoryRemote();
+      final h = ReadHistory(SupabaseService(), () => 'user1', remote: fake);
+      await h.save(entry('a', pos: 1, ts: 1));
+      expect(fake.upsertCalls, 1);
 
-    await h.save(entry('a', pos: 5, ts: 2), flush: true);
+      await h.save(entry('a', pos: 5, ts: 2), flush: true);
 
-    expect(fake.upsertCalls, 2);
-    expect(fake.rows.single['pos'], 5);
-  });
+      expect(fake.upsertCalls, 2);
+      expect(fake.rows.single['pos'], 5);
+    },
+  );
 
   test('pullFromCloud() merges cloud into local, keeping local-only rows '
       '(never wipes an un-synced Continue Reading item)', () async {
@@ -159,9 +308,16 @@ void main() {
     await loggedOut.save(entry('localOnly', pos: 3, ts: 5));
 
     fake.rows.add({
-      'user_key': 'user1', 'source_id': 'js:m', 'show_id': 'fromCloud',
-      'title': 'Cloud Title', 'cover': null, 'chapter_id': 'ch1',
-      'chapter_number': 1, 'chapter_url': 'u', 'pos': 2, 'total': 20,
+      'user_key': 'user1',
+      'source_id': 'js:m',
+      'show_id': 'fromCloud',
+      'title': 'Cloud Title',
+      'cover': null,
+      'chapter_id': 'ch1',
+      'chapter_number': 1,
+      'chapter_url': 'u',
+      'pos': 2,
+      'total': 20,
       'updated_ms': 9,
     });
 
@@ -169,7 +325,93 @@ void main() {
     await h.pullFromCloud();
 
     final ids = h.recent().map((e) => e.showId).toSet();
-    expect(ids, {'localOnly', 'fromCloud'}); // both survive — merge, not replace
+    expect(ids, {
+      'localOnly',
+      'fromCloud',
+    }); // both survive — merge, not replace
+  });
+
+  test(
+    'pullFromCloud() initially loads 200 newest rows per reading type',
+    () async {
+      final remote = FakeReadingHistoryRemote();
+      final h = ReadHistory(SupabaseService(), () => 'user1', remote: remote);
+      for (var i = 0; i < 201; i++) {
+        remote.rows.add({
+          'user_key': 'user1',
+          'source_id': 'src',
+          'show_id': 'manga$i',
+          'title': 'Manga $i',
+          'cover': null,
+          'chapter_id': 'chapter1',
+          'chapter_number': 1,
+          'chapter_url': 'https://x/manga$i/1',
+          'pos': 1,
+          'total': 20,
+          'updated_ms': i,
+          'type': 'manga',
+        });
+      }
+      remote.rows.add({
+        'user_key': 'user1',
+        'source_id': 'src',
+        'show_id': 'novel1',
+        'title': 'Novel 1',
+        'cover': null,
+        'chapter_id': 'chapter1',
+        'chapter_number': 1,
+        'chapter_url': 'https://x/novel1/1',
+        'pos': 1,
+        'total': 20,
+        'updated_ms': 1,
+        'type': 'novel',
+      });
+
+      await h.pullFromCloud();
+
+      expect(
+        h.all().where((e) => e.type == ProviderType.manga),
+        hasLength(200),
+      );
+      expect(h.all().where((e) => e.type == ProviderType.novel), hasLength(1));
+
+      await h.loadMoreFromCloud(ProviderType.manga);
+
+      expect(
+        h.all().where((e) => e.type == ProviderType.manga),
+        hasLength(201),
+      );
+      expect(h.all().where((e) => e.type == ProviderType.novel), hasLength(1));
+    },
+  );
+
+  test('failed reading-history pages keep the cursor for retry', () async {
+    final remote = FakeReadingHistoryRemote();
+    final h = ReadHistory(SupabaseService(), () => 'user1', remote: remote);
+    for (var i = 0; i < 201; i++) {
+      remote.rows.add({
+        'user_key': 'user1',
+        'source_id': 'src',
+        'show_id': 'novel$i',
+        'title': 'Novel $i',
+        'cover': null,
+        'chapter_id': 'chapter1',
+        'chapter_number': 1,
+        'chapter_url': 'https://x/novel$i/1',
+        'pos': 1,
+        'total': 20,
+        'updated_ms': i,
+        'type': 'novel',
+      });
+    }
+    await h.pullFromCloud();
+    remote.failNextPage = true;
+
+    await h.loadMoreFromCloud(ProviderType.novel);
+    expect(h.all(), hasLength(200));
+    await h.loadMoreFromCloud(ProviderType.novel);
+
+    expect(h.all(), hasLength(201));
   });
 
   test('pullFromCloud() does NOT overwrite a local row when the cloud copy '
@@ -190,7 +432,10 @@ void main() {
 
     final row = h.recent().single;
     expect(row.pos, 8); // local content kept
-    expect(row.chapterId, 'ch1'); // local content kept, not the cloud's 'chCloud'
+    expect(
+      row.chapterId,
+      'ch1',
+    ); // local content kept, not the cloud's 'chCloud'
     expect(row.updatedMs, 100);
   });
 
@@ -212,7 +457,10 @@ void main() {
 
     final row = h.recent().single;
     expect(row.pos, 15); // cloud content won
-    expect(row.chapterId, 'chCloud'); // cloud content won, not the local's 'ch1'
+    expect(
+      row.chapterId,
+      'chCloud',
+    ); // cloud content won, not the local's 'ch1'
     expect(row.updatedMs, 99);
   });
 
@@ -226,7 +474,10 @@ void main() {
     await h.clearLocal();
 
     expect(h.recent(), isEmpty); // local dropped
-    expect(fake.rows.where((r) => r['user_key'] == 'user1'), hasLength(1)); // cloud survives
+    expect(
+      fake.rows.where((r) => r['user_key'] == 'user1'),
+      hasLength(1),
+    ); // cloud survives
 
     await h.pullFromCloud(); // cloud still has it — a pull brings it back
     expect(h.recent().single.showId, 'a');
@@ -268,21 +519,62 @@ void main() {
   // ever restores on sign-in.
 
   Map<String, dynamic> cloudRow(String showId, {int updatedMs = 100}) => {
-    'user_key': 'user1', 'source_id': 'js:m', 'show_id': showId,
-    'title': 'Cloud $showId', 'cover': null, 'chapter_id': 'chCloud',
-    'chapter_number': 1, 'chapter_url': 'u', 'pos': 1, 'total': 20,
+    'user_key': 'user1',
+    'source_id': 'js:m',
+    'show_id': showId,
+    'title': 'Cloud $showId',
+    'cover': null,
+    'chapter_id': 'chCloud',
+    'chapter_number': 1,
+    'chapter_url': 'u',
+    'pos': 1,
+    'total': 20,
     'updated_ms': updatedMs,
   };
 
-  test('pullFromCloudIfStale() pulls when there is no prior pull marker',
-      () async {
-    final fake = FakeReadingHistoryRemote()..rows.add(cloudRow('fromCloud'));
-    final h = ReadHistory(SupabaseService(), () => 'user1', remote: fake);
+  test('title progress can be fetched by its exact cloud key', () async {
+    final remote = FakeReadingHistoryRemote()
+      ..rows.add(cloudRow('olderTitle', updatedMs: 10));
+    final history = ReadHistory(
+      SupabaseService(),
+      () => 'user1',
+      remote: remote,
+    );
 
-    await h.pullFromCloudIfStale();
+    final entry = await history.refreshFromCloud('js:m', 'olderTitle');
 
-    expect(h.recent().map((e) => e.showId), contains('fromCloud'));
+    expect(entry?.chapterId, 'chCloud');
+    expect(remote.targetedReads, 1);
   });
+
+  test('title refresh never replaces newer local reading progress', () async {
+    final remote = FakeReadingHistoryRemote()
+      ..rows.add(cloudRow('title', updatedMs: 10));
+    final history = ReadHistory(
+      SupabaseService(),
+      () => 'user1',
+      remote: remote,
+    );
+    await history.save(entry('title', pos: 8, ts: 20));
+
+    final refreshed = await history.refreshFromCloud('js:m', 'title');
+
+    expect(refreshed?.pos, 8);
+    expect(refreshed?.updatedMs, 20);
+    expect(remote.targetedReads, 1);
+  });
+
+  test(
+    'pullFromCloudIfStale() pulls when there is no prior pull marker',
+    () async {
+      final fake = FakeReadingHistoryRemote()..rows.add(cloudRow('fromCloud'));
+      final h = ReadHistory(SupabaseService(), () => 'user1', remote: fake);
+
+      await h.pullFromCloudIfStale();
+
+      expect(h.recent().map((e) => e.showId), contains('fromCloud'));
+    },
+  );
 
   test('pullFromCloudIfStale() skips the pull when the marker is fresher '
       'than maxAge', () async {
@@ -300,22 +592,25 @@ void main() {
     );
   });
 
-  test('pullFromCloudIfStale() pulls when the marker is older than maxAge',
-      () async {
-    final fake = FakeReadingHistoryRemote()..rows.add(cloudRow('fromCloud'));
-    final h = ReadHistory(SupabaseService(), () => 'user1', remote: fake);
-    await h.pullFromCloud();
-    // Back-date the marker past maxAge so the next call treats it as stale.
-    Hive.box(ReadHistory.syncMetaBox).put(
-      'reading_history_lastPullMs',
-      DateTime.now().millisecondsSinceEpoch - const Duration(days: 1).inMilliseconds,
-    );
-    fake.rows.add(cloudRow('addedLater', updatedMs: 200));
+  test(
+    'pullFromCloudIfStale() pulls when the marker is older than maxAge',
+    () async {
+      final fake = FakeReadingHistoryRemote()..rows.add(cloudRow('fromCloud'));
+      final h = ReadHistory(SupabaseService(), () => 'user1', remote: fake);
+      await h.pullFromCloud();
+      // Back-date the marker past maxAge so the next call treats it as stale.
+      Hive.box(ReadHistory.syncMetaBox).put(
+        'reading_history_lastPullMs',
+        DateTime.now().millisecondsSinceEpoch -
+            const Duration(days: 1).inMilliseconds,
+      );
+      fake.rows.add(cloudRow('addedLater', updatedMs: 200));
 
-    await h.pullFromCloudIfStale(maxAge: const Duration(hours: 12));
+      await h.pullFromCloudIfStale(maxAge: const Duration(hours: 12));
 
-    expect(h.recent().map((e) => e.showId), contains('addedLater'));
-  });
+      expect(h.recent().map((e) => e.showId), contains('addedLater'));
+    },
+  );
 
   test('pullFromCloudIfStale() does nothing when signed out', () async {
     final fake = FakeReadingHistoryRemote()..rows.add(cloudRow('fromCloud'));
@@ -382,9 +677,52 @@ void main() {
     );
   });
 
+  test('preferredHistoryUrl prefers the metadata URL from a MAL id', () {
+    expect(
+      preferredHistoryUrl(
+        ProviderType.manga,
+        malId: 42,
+        showId: 'src:abc',
+        showUrl: 'https://manga.example/title/42',
+      ),
+      'zm://manga/mal:42',
+    );
+    expect(
+      preferredHistoryUrl(
+        ProviderType.novel,
+        malId: 7,
+        showId: 'src:xyz',
+        showUrl: 'https://novel.example/title/7',
+      ),
+      'zm://novel/mal:7',
+    );
+  });
+
+  test('preferredHistoryUrl keeps an existing metadata URL untouched', () {
+    expect(
+      preferredHistoryUrl(
+        ProviderType.manga,
+        malId: 99,
+        showId: 'src:abc',
+        showUrl: 'zm://manga/mal:42',
+      ),
+      'zm://manga/mal:42',
+    );
+  });
+
+  test('preferredHistoryUrl keeps the source URL when no id exists', () {
+    expect(
+      preferredHistoryUrl(
+        ProviderType.manga,
+        showId: 'src:abc',
+        showUrl: 'https://manga.example/title/42',
+      ),
+      'https://manga.example/title/42',
+    );
+  });
+
   test('save() then reading back from the box preserves a manga entry\'s '
-      'type (Hive round trip, not just toJson/fromJson in memory)',
-      () async {
+      'type (Hive round trip, not just toJson/fromJson in memory)', () async {
     final h = ReadHistory(SupabaseService(), () => null);
     await h.save(entry('m', type: ProviderType.manga));
     expect(h.recent().single.type, ProviderType.manga);
@@ -395,7 +733,13 @@ void main() {
   test('all() returns every row (finished included) newest-first', () async {
     final h = ReadHistory(SupabaseService(), () => null);
     await h.save(
-      entry('finishedManga', pos: 19, total: 20, ts: 1, type: ProviderType.manga),
+      entry(
+        'finishedManga',
+        pos: 19,
+        total: 20,
+        ts: 1,
+        type: ProviderType.manga,
+      ),
     );
     await h.save(entry('novelA', pos: 2, ts: 5));
     final all = h.all();

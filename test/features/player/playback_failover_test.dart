@@ -68,4 +68,153 @@ void main() {
     expect(fallback?.url, 'https://example.test/unknown');
     expect(fallback?.kind, AudioKind.unknown);
   });
+
+  test('a saved local source takes precedence over progressive resolution', () {
+    expect(
+      shouldUseProgressivePlayback(
+        progressiveAvailable: true,
+        hasLocalSource: true,
+      ),
+      isFalse,
+    );
+    expect(
+      shouldUseProgressivePlayback(
+        progressiveAvailable: true,
+        hasLocalSource: false,
+      ),
+      isTrue,
+    );
+    expect(
+      shouldUseProgressivePlayback(
+        progressiveAvailable: false,
+        hasLocalSource: false,
+      ),
+      isFalse,
+    );
+  });
+
+  test('local codec failure gets one software-decoder retry', () {
+    expect(
+      shouldRetryWithSoftwareDecoder(
+        isLocalFile: true,
+        alreadyRetried: false,
+        softwareDecoderSelected: false,
+        error: 'Could not open codec.',
+      ),
+      isTrue,
+    );
+  });
+
+  test('software-decoder retry is limited to local codec failures', () {
+    expect(
+      shouldRetryWithSoftwareDecoder(
+        isLocalFile: false,
+        alreadyRetried: false,
+        softwareDecoderSelected: false,
+        error: 'Could not open codec.',
+      ),
+      isFalse,
+    );
+    expect(
+      shouldRetryWithSoftwareDecoder(
+        isLocalFile: true,
+        alreadyRetried: false,
+        softwareDecoderSelected: false,
+        error: 'Network timeout.',
+      ),
+      isFalse,
+    );
+  });
+
+  test(
+    'software retry does not override a user software setting or repeat',
+    () {
+      expect(
+        shouldRetryWithSoftwareDecoder(
+          isLocalFile: true,
+          alreadyRetried: false,
+          softwareDecoderSelected: true,
+          error: 'Could not open codec.',
+        ),
+        isFalse,
+      );
+      expect(
+        shouldRetryWithSoftwareDecoder(
+          isLocalFile: true,
+          alreadyRetried: true,
+          softwareDecoderSelected: false,
+          error: 'Could not open codec.',
+        ),
+        isFalse,
+      );
+    },
+  );
+
+  test('software fallback is temporary and restores the saved decoder', () {
+    expect(
+      softwareDecoderOverride(
+        retryWithSoftware: true,
+        fallbackActive: false,
+        preferredHwdec: 'mediacodec-copy',
+      ),
+      'no',
+    );
+    expect(
+      softwareDecoderOverride(
+        retryWithSoftware: false,
+        fallbackActive: true,
+        preferredHwdec: 'mediacodec-copy',
+      ),
+      'mediacodec-copy',
+    );
+    expect(
+      softwareDecoderOverride(
+        retryWithSoftware: false,
+        fallbackActive: false,
+        preferredHwdec: 'mediacodec-copy',
+      ),
+      isNull,
+    );
+  });
+
+  test('does not apply a software retry error after a newer source opens', () {
+    expect(
+      isCurrentSoftwareDecoderRetry(
+        retryGeneration: 4,
+        currentGeneration: 5,
+      ),
+      isFalse,
+    );
+    expect(
+      isCurrentSoftwareDecoderRetry(
+        retryGeneration: 5,
+        currentGeneration: 5,
+      ),
+      isTrue,
+    );
+  });
+
+  test('a normal open invalidates an in-progress software retry', () {
+    expect(
+      shouldInvalidateSoftwareDecoderRetry(
+        retryInProgress: true,
+        openingRetry: false,
+      ),
+      isTrue,
+    );
+    expect(
+      shouldInvalidateSoftwareDecoderRetry(
+        retryInProgress: true,
+        openingRetry: true,
+      ),
+      isFalse,
+    );
+    expect(
+      shouldInvalidateSoftwareDecoderRetry(
+        retryInProgress: false,
+        openingRetry: false,
+      ),
+      isFalse,
+    );
+  });
 }

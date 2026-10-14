@@ -26,6 +26,7 @@ class MediaItem extends Equatable {
   final String url;
   final ProviderType type;
   final String sourceId;
+
   /// Release quality the source claims for this title — "4K", "HD", "CAM"…
   /// Shown as a poster badge. CloudStream is the only ecosystem that reports
   /// one, and plenty of its providers leave it unset, so null is the norm.
@@ -108,6 +109,9 @@ class MediaItem extends Equatable {
   /// without any caller having to ask which kind of row it is holding.
   final int? score;
 
+  /// True only when a catalogue explicitly marks this listing adult.
+  final bool isAdult;
+
   const MediaItem({
     required this.id,
     required this.title,
@@ -132,6 +136,7 @@ class MediaItem extends Equatable {
     this.genres = const [],
     this.status,
     this.score,
+    this.isAdult = false,
   });
 
   factory MediaItem.fromJson(Map<String, dynamic> json) =>
@@ -176,6 +181,7 @@ class MediaItem extends Equatable {
     genres: genres,
     status: status,
     score: score,
+    isAdult: isAdult,
   );
 
   @override
@@ -201,7 +207,17 @@ class MediaItem extends Equatable {
     genres,
     status,
     score,
+    isAdult,
   ];
+}
+
+/// A catalogue page keeps its paging signal even when client-side filters
+/// remove every item from that page.
+class MediaItemPage {
+  const MediaItemPage({required this.items, required this.hasMore});
+
+  final List<MediaItem> items;
+  final bool hasMore;
 }
 
 /// Decorations source catalogues routinely bolt onto a title — a year,
@@ -264,14 +280,16 @@ bool titleIdentityMatches(MediaItem m, String wanted, {int? wantedMalId}) {
 }
 
 /// Whether [m] is the title being looked for: same MAL id, or a normalized
-/// title (or English title) equal to [wanted] or [altTitle] once decorations
-/// (see [_stripTitleDecorations]) are stripped from both sides. This is the
-/// acceptance rule [bestTitleMatch] ranks by, exposed so callers that must
-/// reject its fallback-to-first-result can apply the same test.
+/// title (or English title) equal to [wanted], [altTitle], or one of
+/// [metadataAliases] once decorations (see [_stripTitleDecorations]) are
+/// stripped from both sides. This is the acceptance rule [bestTitleMatch]
+/// ranks by, exposed so callers that must reject its fallback-to-first-result
+/// can apply the same test.
 bool titleMatches(
   MediaItem m,
   String wanted, {
   String? altTitle,
+  Iterable<String> metadataAliases = const [],
   int? wantedMalId,
 }) {
   if (wantedMalId != null && m.malId != null && m.malId == wantedMalId) {
@@ -281,6 +299,8 @@ bool titleMatches(
     normalizeTitle(_stripTitleDecorations(wanted)),
     if (altTitle != null && altTitle.isNotEmpty)
       normalizeTitle(_stripTitleDecorations(altTitle)),
+    for (final alias in metadataAliases)
+      if (alias.isNotEmpty) normalizeTitle(_stripTitleDecorations(alias)),
   }..removeWhere((s) => s.isEmpty);
   final title = normalizeTitle(_stripTitleDecorations(m.title));
   final english = m.englishTitle == null
@@ -290,9 +310,9 @@ bool titleMatches(
 }
 
 /// Pick the search result that best matches a tapped relation / work. Prefers a
-/// [MediaItem.malId] match (exact + unique), then an exact normalized match on
-/// EITHER the English [wanted] or the Romaji [altTitle] against the result's
-/// title/englishTitle, else the first result.
+/// [MediaItem.malId] match, then an exact normalized match against the result's
+/// title/englishTitle using [wanted], [altTitle], and [metadataAliases], else
+/// the first result.
 ///
 /// The alt title matters because metadata APIs return English titles while many
 /// sources index by Romaji — tapping "Mushoku Tensei: Jobless Reincarnation
@@ -306,6 +326,7 @@ MediaItem? bestTitleMatch(
   List<MediaItem> results,
   String wanted, {
   String? altTitle,
+  Iterable<String> metadataAliases = const [],
   int? wantedMalId,
 }) {
   if (results.isEmpty) return null;
@@ -315,7 +336,14 @@ MediaItem? bestTitleMatch(
     }
   }
   for (final m in results) {
-    if (titleMatches(m, wanted, altTitle: altTitle)) return m;
+    if (titleMatches(
+      m,
+      wanted,
+      altTitle: altTitle,
+      metadataAliases: metadataAliases,
+    )) {
+      return m;
+    }
   }
   return results.first;
 }
@@ -325,16 +353,45 @@ MediaItem? bestTitleMatch(
 /// could never equal a source's "Pokemon" (`pokemon`) — the same title, never
 /// matching. Only the Latin-1 range that actually shows up in titles.
 const Map<String, String> _foldedLetters = {
-  'á': 'a', 'à': 'a', 'â': 'a', 'ä': 'a', 'ã': 'a', 'å': 'a', 'ā': 'a',
-  'é': 'e', 'è': 'e', 'ê': 'e', 'ë': 'e', 'ē': 'e',
-  'í': 'i', 'ì': 'i', 'î': 'i', 'ï': 'i', 'ī': 'i',
-  'ó': 'o', 'ò': 'o', 'ô': 'o', 'ö': 'o', 'õ': 'o', 'ø': 'o', 'ō': 'o',
-  'ú': 'u', 'ù': 'u', 'û': 'u', 'ü': 'u', 'ū': 'u',
-  'ñ': 'n', 'ç': 'c', 'ý': 'y', 'ÿ': 'y',
-  'ß': 'ss', 'æ': 'ae', 'œ': 'oe',
+  'á': 'a',
+  'à': 'a',
+  'â': 'a',
+  'ä': 'a',
+  'ã': 'a',
+  'å': 'a',
+  'ā': 'a',
+  'é': 'e',
+  'è': 'e',
+  'ê': 'e',
+  'ë': 'e',
+  'ē': 'e',
+  'í': 'i',
+  'ì': 'i',
+  'î': 'i',
+  'ï': 'i',
+  'ī': 'i',
+  'ó': 'o',
+  'ò': 'o',
+  'ô': 'o',
+  'ö': 'o',
+  'õ': 'o',
+  'ø': 'o',
+  'ō': 'o',
+  'ú': 'u',
+  'ù': 'u',
+  'û': 'u',
+  'ü': 'u',
+  'ū': 'u',
+  'ñ': 'n',
+  'ç': 'c',
+  'ý': 'y',
+  'ÿ': 'y',
+  'ß': 'ss',
+  'æ': 'ae',
+  'œ': 'oe',
 };
 
-/// Lowercase + strip non-alphanumerics, for tolerant title comparison.
+/// Lowercase + strip non-letter/number characters, for tolerant title matching.
 ///
 /// Two things happen before the strip, both for the same reason: the strip
 /// DELETES what it doesn't understand, which silently turns a title into
@@ -348,5 +405,5 @@ String normalizeTitle(String s) {
   _foldedLetters.forEach((accented, plain) {
     if (out.contains(accented)) out = out.replaceAll(accented, plain);
   });
-  return out.replaceAll(RegExp(r'[^a-z0-9]+'), '');
+  return out.replaceAll(RegExp(r'[^\p{L}\p{N}]+', unicode: true), '');
 }

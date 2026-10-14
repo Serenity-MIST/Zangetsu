@@ -1,6 +1,9 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:dio/dio.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import '../../core/ui/settings_widgets.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
@@ -8,9 +11,14 @@ import 'package:image_picker/image_picker.dart';
 
 import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
+import '../../core/profiles/profile_avatar_uploader.dart';
+import '../../core/profiles/viewer_profile.dart';
+import '../../core/profiles/viewer_profile_avatar.dart';
+import '../../core/supabase/supabase_service.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/ui/buttons.dart';
+import '../../core/tv/tv_focusable.dart';
 import 'auth_cubit.dart';
 import 'auth_screens_tv.dart';
 import 'pair_tv_screen.dart';
@@ -36,9 +44,9 @@ bool requireLogin(BuildContext context, {String? action}) {
         action: SnackBarAction(
           label: context.l10n.signIn,
           textColor: AppColors.accent,
-          onPressed: () => Navigator.of(context).push(
-            MaterialPageRoute(builder: (_) => const LoginScreen()),
-          ),
+          onPressed: () => Navigator.of(
+            context,
+          ).push(MaterialPageRoute(builder: (_) => const LoginScreen())),
         ),
       ),
     );
@@ -73,10 +81,15 @@ class _Field extends StatelessWidget {
       decoration: InputDecoration(
         hintText: hint,
         hintStyle: AppText.body.copyWith(color: AppColors.textTertiary),
-        prefixIcon: icon == null ? null : Icon(icon, color: AppColors.textTertiary, size: 20),
+        prefixIcon: icon == null
+            ? null
+            : Icon(icon, color: AppColors.textTertiary, size: 20),
         filled: true,
         fillColor: AppColors.surface,
-        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 16,
+        ),
         enabledBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(14),
           borderSide: const BorderSide(color: AppColors.hairline, width: 0.5),
@@ -163,11 +176,9 @@ class _LoginScreenState extends State<LoginScreen> {
     if (email == null || email.isEmpty || !context.mounted) return;
     final err = await context.read<AuthCubit>().sendRecovery(email);
     if (!context.mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(err ?? context.l10n.resetLinkSent),
-      ),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(err ?? context.l10n.resetLinkSent)));
   }
 
   @override
@@ -177,9 +188,19 @@ class _LoginScreenState extends State<LoginScreen> {
       title: context.l10n.welcomeBack,
       subtitle: context.l10n.signInToSyncYourListAcrossDevices,
       children: [
-        _Field(controller: _email, hint: context.l10n.email, icon: Icons.mail_outline, keyboard: TextInputType.emailAddress),
+        _Field(
+          controller: _email,
+          hint: context.l10n.email,
+          icon: Icons.mail_outline,
+          keyboard: TextInputType.emailAddress,
+        ),
         const SizedBox(height: 12),
-        _Field(controller: _password, hint: context.l10n.password, icon: Icons.lock_outline, obscure: true),
+        _Field(
+          controller: _password,
+          hint: context.l10n.password,
+          icon: Icons.lock_outline,
+          obscure: true,
+        ),
         Align(
           alignment: AlignmentDirectional.centerEnd,
           child: TextButton(
@@ -253,7 +274,11 @@ class _SignupScreenState extends State<SignupScreen> {
     if (_password.text.length < 8) {
       ScaffoldMessenger.of(context)
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(content: Text(context.l10n.passwordMustBeAtLeast8Characters)));
+        ..showSnackBar(
+          SnackBar(
+            content: Text(context.l10n.passwordMustBeAtLeast8Characters),
+          ),
+        );
       return;
     }
     final auth = context.read<AuthCubit>();
@@ -275,13 +300,29 @@ class _SignupScreenState extends State<SignupScreen> {
       title: context.l10n.createAccount,
       subtitle: context.l10n.saveYourListAndContinueWatchingAnywhere,
       children: [
-        Center(child: _AvatarPicker(path: _avatarPath, onTap: _pickAvatar)),
+        Center(
+          child: _AvatarPicker(path: _avatarPath, onTap: _pickAvatar),
+        ),
         const SizedBox(height: 24),
-        _Field(controller: _name, hint: context.l10n.name, icon: Icons.person_outline),
+        _Field(
+          controller: _name,
+          hint: context.l10n.name,
+          icon: Icons.person_outline,
+        ),
         const SizedBox(height: 12),
-        _Field(controller: _email, hint: context.l10n.email, icon: Icons.mail_outline, keyboard: TextInputType.emailAddress),
+        _Field(
+          controller: _email,
+          hint: context.l10n.email,
+          icon: Icons.mail_outline,
+          keyboard: TextInputType.emailAddress,
+        ),
         const SizedBox(height: 12),
-        _Field(controller: _password, hint: context.l10n.password8Characters, icon: Icons.lock_outline, obscure: true),
+        _Field(
+          controller: _password,
+          hint: context.l10n.password8Characters,
+          icon: Icons.lock_outline,
+          obscure: true,
+        ),
         const SizedBox(height: 20),
         BlocBuilder<AuthCubit, AuthState>(
           builder: (context, state) => _SubmitBlock(
@@ -308,25 +349,145 @@ class _SignupScreenState extends State<SignupScreen> {
 // Profile (logged-in)
 // ─────────────────────────────────────────────────────────────────────────────
 
-class ProfileScreen extends StatelessWidget {
-  const ProfileScreen({super.key});
+class ProfileAccountSection extends StatefulWidget {
+  const ProfileAccountSection({super.key});
+
+  @override
+  State<ProfileAccountSection> createState() => _ProfileAccountSectionState();
+}
+
+class _ProfileAccountSectionState extends State<ProfileAccountSection> {
+  bool _avatarUploading = false;
 
   Future<void> _pickAvatar(BuildContext context) async {
-    final x = await ImagePicker().pickImage(
-      source: ImageSource.gallery,
-      // Avatars render at ~40–96px, so 256px is still 2–3× the display size —
-      // keeps the Appwrite bucket tiny (~15–30 KB/pic) with no visible quality loss.
-      maxWidth: 256,
-      maxHeight: 256,
-      imageQuality: 80,
+    final pickGif = await showModalBottomSheet<bool>(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_outlined),
+              title: const Text('Photo from gallery'),
+              onTap: () => Navigator.of(context).pop(false),
+            ),
+            ListTile(
+              leading: const Icon(Icons.movie_filter_outlined),
+              title: const Text('Animated GIF file'),
+              onTap: () => Navigator.of(context).pop(true),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
     );
-    if (x != null && context.mounted) {
-      await context.read<AuthCubit>().updateAvatar(x.path);
+    if (pickGif == null || !mounted) return;
+
+    late final Uint8List bytes;
+    if (pickGif) {
+      try {
+        final file = await FilePicker.pickFile(
+          type: FileType.custom,
+          allowedExtensions: const ['gif'],
+        );
+        if (file == null || !mounted) return;
+        if (await file.length() > ProfileAvatarUploader.maxGifSourceBytes) {
+          if (context.mounted) {
+            ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+              const SnackBar(
+                content: Text(
+                  'This GIF is too large to optimize safely. Try a smaller file.',
+                ),
+              ),
+            );
+          }
+          return;
+        }
+        if (!mounted) return;
+        bytes = await file.readAsBytes();
+      } catch (_) {
+        if (context.mounted) {
+          ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+            const SnackBar(content: Text('Could not read that GIF file.')),
+          );
+        }
+        return;
+      }
+    } else {
+      final x = await ImagePicker().pickImage(
+        source: ImageSource.gallery,
+        maxWidth: ProfileAvatarUploader.maxAvatarDimension.toDouble(),
+        maxHeight: ProfileAvatarUploader.maxAvatarDimension.toDouble(),
+        imageQuality: 100,
+      );
+      if (x == null || !context.mounted) return;
+      bytes = await x.readAsBytes();
+    }
+
+    if (!context.mounted) return;
+    await _uploadAccountAvatar(context, bytes);
+  }
+
+  Future<void> _uploadAccountAvatar(
+    BuildContext context,
+    Uint8List bytes,
+  ) async {
+    if (!context.mounted) return;
+    final profiles = sl<ViewerProfileStore>();
+    final profile = profiles.profiles.firstWhere(
+      (profile) => profile.id == kDefaultProfileId,
+    );
+    final token = sl<SupabaseService>().client.auth.currentSession?.accessToken;
+    if (token == null) {
+      ScaffoldMessenger.maybeOf(
+        context,
+      )?.showSnackBar(SnackBar(content: Text(context.l10n.couldntUpdatePhoto)));
+      return;
+    }
+
+    setState(() => _avatarUploading = true);
+    final uploader = ProfileAvatarUploader(sl<Dio>());
+    String? uploadedUrl;
+    var savedLocally = false;
+    try {
+      uploadedUrl = await uploader.upload(bytes: bytes, token: token);
+      if (uploadedUrl == null) throw StateError('Avatar upload failed');
+
+      final synced = await profiles.update(
+        profile.id,
+        photoUrl: uploadedUrl,
+        clearPhotoUrl: false,
+      );
+      savedLocally = profiles.profiles.any(
+        (item) => item.id == profile.id && item.photoUrl == uploadedUrl,
+      );
+      if (!savedLocally) throw StateError('Profile photo was not saved');
+
+      if (synced &&
+          profile.photoUrl != null &&
+          profile.photoUrl != uploadedUrl &&
+          !profiles.profiles.any(
+            (other) =>
+                other.id != profile.id && other.photoUrl == profile.photoUrl,
+          )) {
+        await uploader.delete(url: profile.photoUrl!, token: token);
+      }
+    } catch (_) {
+      if (uploadedUrl != null && !savedLocally) {
+        await uploader.delete(url: uploadedUrl, token: token);
+      }
+      if (context.mounted) {
+        ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+          SnackBar(content: Text(context.l10n.couldntUpdatePhoto)),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _avatarUploading = false);
     }
   }
 
-  /// Rename dialog → AuthCubit.updateName (writes display_name to the profile
-  /// + auth metadata). No-op if unchanged/blank; a snackbar surfaces failure.
+  /// Keep the sign-in account name and default viewer-profile name in sync.
   Future<void> _editName(BuildContext context, String current) async {
     final ctrl = TextEditingController(text: current);
     final name = await showDialog<String>(
@@ -354,102 +515,278 @@ class ProfileScreen extends StatelessWidget {
         ],
       ),
     );
-    if (name == null || name.isEmpty || name == current || !context.mounted) {
+    if (name == null || name.isEmpty || !context.mounted) {
       return;
     }
+    final auth = context.read<AuthCubit>();
+    final profiles = sl<ViewerProfileStore>();
+    final defaultProfile = profiles.profiles.firstWhere(
+      (profile) => profile.id == kDefaultProfileId,
+    );
+    final updateAccount = auth.state.displayName != name;
+    final updateProfile = defaultProfile.name != name;
+    if (!updateAccount && !updateProfile) return;
+
     final messenger = ScaffoldMessenger.of(context);
-    final ok = await context.read<AuthCubit>().updateName(name);
-    if (!ok) {
+    final oldAccountName = auth.state.displayName;
+    if (updateAccount && !await auth.updateName(name)) {
+      if (!context.mounted) return;
       messenger.showSnackBar(
         SnackBar(content: Text(context.l10n.couldnTUpdateYourName)),
+      );
+      return;
+    }
+    if (!updateProfile || await profiles.rename(defaultProfile.id, name)) {
+      return;
+    }
+
+    final profileRestored = await profiles.rename(
+      defaultProfile.id,
+      defaultProfile.name,
+    );
+    final accountRestored =
+        !updateAccount || await auth.updateName(oldAccountName);
+    if (context.mounted) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(
+            profileRestored && accountRestored
+                ? context.l10n.couldnTUpdateYourName
+                : 'Could not restore both names. Check your connection.',
+          ),
+        ),
       );
     }
   }
 
   @override
-  Widget build(BuildContext context) {
-    if (sl<AppMode>().isTv) return const ProfileScreenTv();
-    return Scaffold(
-      backgroundColor: AppColors.bg,
-      appBar: settingsAppBar(context.l10n.profile),
-      body: BlocBuilder<AuthCubit, AuthState>(
-        builder: (context, state) {
-          if (!state.isLoggedIn) {
-            return Center(child: Text(context.l10n.notSignedIn));
-          }
-          return ListView(
-            padding: const EdgeInsets.fromLTRB(24, 28, 24, 24),
+  Widget build(BuildContext context) => BlocBuilder<AuthCubit, AuthState>(
+    builder: (context, state) {
+      final isTv = sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
+      if (!state.isLoggedIn) {
+        void signIn() {
+          Navigator.of(
+            context,
+          ).push(MaterialPageRoute(builder: (_) => const LoginScreen()));
+        }
+
+        return Padding(
+          padding: EdgeInsets.fromLTRB(24, isTv ? 20 : 28, 24, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              Center(
-                child: GestureDetector(
-                  onTap: state.busy ? null : () => _pickAvatar(context),
-                  child: Stack(
-                    alignment: AlignmentDirectional.bottomEnd,
-                    children: [
-                      CircleAvatar(
-                        radius: 48,
-                        backgroundColor: AppColors.surface2,
-                        backgroundImage: state.avatarUrl != null
-                            ? CachedNetworkImageProvider(state.avatarUrl!)
-                            : null,
-                        child: state.avatarUrl == null
-                            ? Text(
-                                state.displayName.isNotEmpty
-                                    ? state.displayName[0].toUpperCase()
-                                    : '?',
-                                style: AppText.largeTitle,
-                              )
-                            : null,
+              Text(context.l10n.notSignedIn),
+              const SizedBox(height: 12),
+              if (isTv)
+                TvFocusable(
+                  autofocus: true,
+                  semanticLabel: context.l10n.signIn,
+                  onTap: signIn,
+                  variant: TvFocusVariant.row,
+                  borderRadius: 14,
+                  child: Container(
+                    height: 56,
+                    decoration: BoxDecoration(
+                      color: const Color(0x1AFFFFFF),
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(color: AppColors.hairline, width: 0.5),
+                    ),
+                    child: Center(
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(
+                            Icons.login_rounded,
+                            color: AppColors.textPrimary,
+                            size: 20,
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            context.l10n.signIn,
+                            style: AppText.button.copyWith(
+                              color: AppColors.textPrimary,
+                            ),
+                          ),
+                        ],
                       ),
-                      Container(
-                        padding: const EdgeInsets.all(6),
-                        decoration: BoxDecoration(
-                          color: AppColors.accent,
-                          shape: BoxShape.circle,
-                        ),
-                        child: state.busy
-                            ? const SizedBox(
-                                width: 14,
-                                height: 14,
-                                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                              )
-                            : const Icon(Icons.camera_alt_rounded, size: 14, color: Colors.white),
-                      ),
-                    ],
+                    ),
                   ),
+                )
+              else
+                SecondaryButton(
+                  label: context.l10n.signIn,
+                  icon: Icons.login_rounded,
+                  onPressed: signIn,
                 ),
+            ],
+          ),
+        );
+      }
+
+      Widget accountAvatar() {
+        final radius = isTv ? 56.0 : 48.0;
+        final profiles = sl.isRegistered<ViewerProfileStore>()
+            ? sl<ViewerProfileStore>()
+            : null;
+        Widget buildAvatar(String? accountPhotoUrl) => CircleAvatar(
+          radius: radius,
+          backgroundColor: AppColors.surface2,
+          backgroundImage: accountPhotoUrl != null
+              ? CachedNetworkImageProvider(accountPhotoUrl)
+              : null,
+          child: accountPhotoUrl == null
+              ? Text(
+                  state.displayName.isNotEmpty
+                      ? state.displayName[0].toUpperCase()
+                      : '?',
+                  style: AppText.largeTitle,
+                )
+              : null,
+        );
+        if (profiles == null) return buildAvatar(state.avatarUrl);
+        return ValueListenableBuilder<int>(
+          valueListenable: profiles.revision,
+          builder: (context, _, _) {
+            final defaultProfile = profiles.profiles.firstWhere(
+              (profile) => profile.id == kDefaultProfileId,
+            );
+            return buildAvatar(
+              profilePhotoForFace(
+                profile: defaultProfile,
+                accountPhotoUrl: state.avatarUrl,
               ),
-              const SizedBox(height: 16),
-              Center(
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(8),
-                  onTap: () => _editName(context, state.displayName),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            );
+          },
+        );
+      }
+
+      final avatar = accountAvatar();
+      final avatarBusy = state.busy || _avatarUploading;
+      final name = Text(state.displayName, style: AppText.title);
+      final logout = isTv
+          ? TvFocusable(
+              onTap: () {
+                context.read<AuthCubit>().logout();
+                Navigator.of(context).pop();
+              },
+              child: SizedBox(
+                height: 56,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: const Color(0x1AFFFFFF),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: AppColors.hairline, width: 0.5),
+                  ),
+                  child: Center(
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Flexible(
-                          child: Text(
-                            state.displayName,
-                            style: AppText.title,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        const SizedBox(width: 7),
                         const Icon(
-                          Icons.edit_rounded,
-                          size: 15,
-                          color: AppColors.textTertiary,
+                          Icons.logout_rounded,
+                          color: AppColors.textPrimary,
+                          size: 20,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          context.l10n.logOut,
+                          style: AppText.button.copyWith(
+                            color: AppColors.textPrimary,
+                          ),
                         ),
                       ],
                     ),
                   ),
                 ),
               ),
-              const SizedBox(height: 4),
-              Center(child: Text(state.user?.email ?? '', style: AppText.caption)),
-              const SizedBox(height: 32),
+            )
+          : SecondaryButton(
+              label: context.l10n.logOut,
+              icon: Icons.logout_rounded,
+              onPressed: () async {
+                // Backs up an un-synced library first / warns before wiping.
+                final done = await safeLogout(context);
+                if (done && context.mounted) Navigator.of(context).pop();
+              },
+            );
+
+      return Padding(
+        padding: EdgeInsets.fromLTRB(24, isTv ? 20 : 28, 24, 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Center(
+              child: isTv
+                  ? avatar
+                  : GestureDetector(
+                      onTap: avatarBusy ? null : () => _pickAvatar(context),
+                      child: Stack(
+                        alignment: AlignmentDirectional.bottomEnd,
+                        children: [
+                          avatar,
+                          Container(
+                            padding: const EdgeInsets.all(6),
+                            decoration: BoxDecoration(
+                              color: AppColors.accent,
+                              shape: BoxShape.circle,
+                            ),
+                            child: avatarBusy
+                                ? const SizedBox(
+                                    width: 14,
+                                    height: 14,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : const Icon(
+                                    Icons.camera_alt_rounded,
+                                    size: 14,
+                                    color: Colors.white,
+                                  ),
+                          ),
+                        ],
+                      ),
+                    ),
+            ),
+            const SizedBox(height: 16),
+            Center(
+              child: isTv
+                  ? name
+                  : InkWell(
+                      borderRadius: BorderRadius.circular(8),
+                      onTap: () => _editName(context, state.displayName),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Flexible(
+                              child: Text(
+                                state.displayName,
+                                style: AppText.title,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            const SizedBox(width: 7),
+                            const Icon(
+                              Icons.edit_rounded,
+                              size: 15,
+                              color: AppColors.textTertiary,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+            ),
+            const SizedBox(height: 4),
+            Center(
+              child: Text(state.user?.email ?? '', style: AppText.caption),
+            ),
+            SizedBox(height: isTv ? 24 : 32),
+            if (!isTv) ...[
               SizedBox(
                 width: double.infinity,
                 child: SecondaryButton(
@@ -460,22 +797,25 @@ class ProfileScreen extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 12),
-              SizedBox(
-                width: double.infinity,
-                child: SecondaryButton(
-                  label: context.l10n.logOut,
-                  icon: Icons.logout_rounded,
-                  onPressed: () async {
-                    // Backs up an un-synced library first / warns before wiping.
-                    final done = await safeLogout(context);
-                    if (done && context.mounted) Navigator.of(context).pop();
-                  },
-                ),
-              ),
             ],
-          );
-        },
-      ),
+            SizedBox(width: double.infinity, child: logout),
+          ],
+        ),
+      );
+    },
+  );
+}
+
+class ProfileScreen extends StatelessWidget {
+  const ProfileScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    if (sl<AppMode>().isTv) return const ProfileScreenTv();
+    return Scaffold(
+      backgroundColor: AppColors.bg,
+      appBar: settingsAppBar(context.l10n.profile),
+      body: ListView(children: const [ProfileAccountSection()]),
     );
   }
 }
@@ -507,8 +847,11 @@ class _AvatarPicker extends StatelessWidget {
                 backgroundColor: AppColors.surface2,
                 backgroundImage: path != null ? FileImage(File(path!)) : null,
                 child: path == null
-                    ? const Icon(Icons.person_outline,
-                        size: 40, color: AppColors.textTertiary)
+                    ? const Icon(
+                        Icons.person_outline,
+                        size: 40,
+                        color: AppColors.textTertiary,
+                      )
                     : null,
               ),
               Container(
@@ -517,8 +860,11 @@ class _AvatarPicker extends StatelessWidget {
                   color: AppColors.accent,
                   shape: BoxShape.circle,
                 ),
-                child: const Icon(Icons.camera_alt_rounded,
-                    size: 14, color: Colors.white),
+                child: const Icon(
+                  Icons.camera_alt_rounded,
+                  size: 14,
+                  color: Colors.white,
+                ),
               ),
             ],
           ),
@@ -595,7 +941,10 @@ class _SubmitBlock extends StatelessWidget {
                   child: SizedBox(
                     width: 24,
                     height: 24,
-                    child: CircularProgressIndicator(strokeWidth: 2.4, color: AppColors.accent),
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2.4,
+                      color: AppColors.accent,
+                    ),
                   ),
                 )
               : PrimaryButton(label: label, onPressed: onPressed),
@@ -606,7 +955,11 @@ class _SubmitBlock extends StatelessWidget {
 }
 
 class _SwitchLink extends StatelessWidget {
-  const _SwitchLink({required this.prompt, required this.action, required this.onTap});
+  const _SwitchLink({
+    required this.prompt,
+    required this.action,
+    required this.onTap,
+  });
   final String prompt;
   final String action;
   final VoidCallback onTap;

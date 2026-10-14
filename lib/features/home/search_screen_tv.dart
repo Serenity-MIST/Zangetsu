@@ -6,6 +6,7 @@ import '../../core/di/injector.dart';
 import '../../core/mode/content_mode.dart';
 import '../../core/models/media_item.dart';
 import '../../core/playback/playback_prefs.dart';
+import '../../core/profiles/viewer_profile.dart';
 import '../../core/playback/search_history.dart';
 import '../../core/playback/search_scope.dart';
 import '../../core/theme/app_colors.dart';
@@ -14,6 +15,7 @@ import '../../l10n/l10n.dart';
 import '../../core/tv/tv_focusable.dart';
 import '../../core/tv/tv_list_focusable.dart';
 import '../../core/tv/tv_poster_tile.dart';
+import '../../core/ui/poster_card.dart';
 import '../../core/tv/tv_shell_tab_scope.dart';
 import '../../core/tv/tv_text_field.dart';
 import '../../core/ui/dock_visibility.dart';
@@ -32,10 +34,10 @@ import '../search/search_meta_filter_helpers.dart';
 /// TV Search: D-pad-navigable layout backed by the same [SearchBloc] provided
 /// by the parent [SearchScreen].
 ///
-/// The query box is a [TvTextField]: focus lands without raising the leanback
-/// IME (which would swallow arrows). OK opens the keyboard; arrows leave the
-/// field for Filters / genres / results. [onSubmitted] dispatches
-/// [SearchRunRequested] to the bloc, identical to the phone path.
+/// The query box is a [TvTextField]: D-pad lands on navigation focus without
+/// raising the leanback IME. OK moves focus into the editable field so the
+/// keyboard opens on the same text box. Arrows leave for Filters / genres /
+/// results.
 ///
 /// Results render as a 6-column focusable poster grid using [TvPosterTile].
 /// OK on a card opens Detail via the same [DetailScreen.route] the phone uses.
@@ -66,7 +68,6 @@ class SearchScreenTv extends StatefulWidget {
 
 class _SearchScreenTvState extends State<SearchScreenTv> {
   /// 6 columns fills a 1920-wide TV at ~140 dp card width with comfortable gaps.
-  static const int _crossAxisCount = 6;
 
   bool get _isLibrary => widget.scope == SearchScope.library;
 
@@ -213,9 +214,12 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
 
   Widget _libraryControls() {
     final filterCount = metaFilterActiveCount(_metaFilters);
-    final showAdult = sl<PlaybackPrefs>().adultMetadata;
+    final showAdult =
+        sl<PlaybackPrefs>().adultMetadata &&
+        (!sl.isRegistered<ViewerProfileStore>() ||
+            sl<ViewerProfileStore>().adultMetadataAllowed);
     return Padding(
-      padding: const EdgeInsets.fromLTRB(48, 0, 48, 4),
+      padding: const EdgeInsets.fromLTRB(48, 0, 48, 20),
       child: Row(
         children: [
           TvFocusable(
@@ -528,9 +532,8 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   // ── Search field ──────────────────────────────────────────────────
-                  // TvTextField lands focus without opening the leanback IME, so
-                  // D-pad DOWN reaches Filters / chips / results. OK shows the
-                  // keyboard when the user actually wants to type.
+                  // TvTextField: D-pad lands without IME; OK focuses the same
+                  // editable box so leanback opens inline (no popup).
                   Padding(
                     padding: const EdgeInsets.fromLTRB(48, 20, 48, 10),
                     child: Row(
@@ -632,7 +635,8 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
                             return Padding(
                               padding: const EdgeInsets.fromLTRB(40, 8, 40, 40),
                               child: SkeletonGrid(
-                                crossAxisCount: _crossAxisCount,
+                                crossAxisCount: tvPosterGridColumns(context),
+                                childAspectRatio: tvPosterGridAspect(context),
                               ),
                             );
                           case SearchStatus.error:
@@ -835,11 +839,11 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
     final items = state.visibleResults;
     if (items.isEmpty) return _noResults(state);
     return GridView.builder(
-      padding: const EdgeInsets.fromLTRB(40, 0, 40, 40),
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: _crossAxisCount,
-        // Poster art + title below (outline hugs the art).
-        childAspectRatio: 0.56,
+      padding: const EdgeInsets.fromLTRB(40, 8, 40, 40),
+      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: tvPosterGridColumns(context),
+        // Keep the grid geometry aligned with the selected title placement.
+        childAspectRatio: tvPosterGridAspect(context),
         crossAxisSpacing: 18,
         mainAxisSpacing: 22,
       ),
@@ -850,8 +854,13 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
         return TvPosterTile(
           autofocus: i == 0,
           title: item.title,
+          logoItem: item,
           imageUrl: item.cover,
+          wideImageUrl: item.banner,
           headers: item.coverHeaders,
+          genres: item.genres,
+          isAdult: item.isAdult,
+          scoreBadge: item.score,
           tags: _tagsFor(item),
           qualityBadge: item.quality,
           dubBadge: item.dubBadge,
@@ -919,7 +928,11 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
             ),
             SizedBox(
               // Poster (130 × 195 at 2:3) + title + focus-scale headroom.
-              height: 250,
+              height:
+                  (posterLayout(context) == PosterCardLayout.wide
+                      ? 175.0
+                      : 250.0) *
+                  posterCardScale(context),
               child: ListView.builder(
                 scrollDirection: Axis.horizontal,
                 // Don't clip the focused card's scale-up + glow.
@@ -931,14 +944,23 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
                   return Padding(
                     padding: const EdgeInsetsDirectional.only(end: 16),
                     child: SizedBox(
-                      width: 130,
+                      width:
+                          (posterLayout(context) == PosterCardLayout.wide
+                              ? 208.0
+                              : 130.0) *
+                          posterCardScale(context),
                       // First tile of the first row gets autofocus so D-pad DOWN
                       // from the field/suggestions lands on a result.
                       child: TvPosterTile(
                         autofocus: gi == 0 && i == 0,
                         title: item.title,
+                        logoItem: item,
                         imageUrl: item.cover,
+                        wideImageUrl: item.banner,
                         headers: item.coverHeaders,
+                        genres: item.genres,
+                        isAdult: item.isAdult,
+                        scoreBadge: item.score,
                         tags: _tagsFor(item),
                         qualityBadge: item.quality,
                         dubBadge: item.dubBadge,

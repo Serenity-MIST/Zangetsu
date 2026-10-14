@@ -63,6 +63,7 @@ import 'my_list_screen.dart';
 import 'tracker_continue_section.dart';
 import '../../core/ui/content_row.dart';
 import '../../core/ui/banner_style.dart';
+import '../../core/ui/featured_banner_edge.dart';
 import '../../core/ui/featured_banner_panels.dart';
 import '../../core/ui/featured_carousel.dart';
 import '../../core/ui/featured_hero.dart';
@@ -327,20 +328,18 @@ class _HomeViewState extends State<_HomeView>
     if (e.episodeUrl.isEmpty) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      ProviderManager.inBackground(
-        () {
-          // Z Mode's source id is only a catalogue pseudo-id. Use the actual
-          // source remembered for this title and stop there: a speculative
-          // startup warm must never turn into an Auto Resolve sweep.
-          if (e.sourceId == ZmodeIds.sourceId) {
-            if (!sl.isRegistered<PlaybackResolver>()) {
-              return Future.value(<VideoSource>[]);
-            }
-            return sl<PlaybackResolver>().prewarmRememberedSource(e.episodeUrl);
+      ProviderManager.inBackground(() {
+        // Z Mode's source id is only a catalogue pseudo-id. Use the actual
+        // source remembered for this title and stop there: a speculative
+        // startup warm must never turn into an Auto Resolve sweep.
+        if (e.sourceId == ZmodeIds.sourceId) {
+          if (!sl.isRegistered<PlaybackResolver>()) {
+            return Future.value(<VideoSource>[]);
           }
-          return _repo.sources(e.episodeUrl, sourceId: e.sourceId, fast: true);
-        },
-      ).catchError((_) => <VideoSource>[]);
+          return sl<PlaybackResolver>().prewarmRememberedSource(e.episodeUrl);
+        }
+        return _repo.sources(e.episodeUrl, sourceId: e.sourceId, fast: true);
+      }).catchError((_) => <VideoSource>[]);
     });
   }
 
@@ -642,23 +641,24 @@ class _HomeViewState extends State<_HomeView>
   Widget _animated(Widget child) => child;
 
   /// Floating brand header — always positioned on top of the hero or bg.
-  Widget _buildHeader() {
+  Widget _buildHeader({bool edgeBanner = false}) {
     return SafeArea(
       bottom: false,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-        child: Row(
-          children: [
-            // Brand wordmark — the actual logo lettering (exact font).
-            // Tapping it swaps the metadata provider for wherever you are
-            // (AniList/MyAnimeList, or TMDB/Simkl on movies), which used to
-            // mean digging through Settings. Align sizes to the image, so
-            // the tap area is the wordmark itself and the rest of the row
-            // is untouched.
-            Expanded(
-              child: Align(
-                alignment: AlignmentDirectional.centerStart,
-                child: GestureDetector(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final splitEdgeHeader = edgeBanner && constraints.maxWidth < 520;
+          final brand = edgeBanner
+              ? IconButton(
+                  tooltip: 'Zangetsu',
+                  onPressed: () => showMetadataSwitchSheet(context),
+                  icon: Image.asset(
+                    'assets/icon/logo_mark.png',
+                    width: 36,
+                    height: 36,
+                    fit: BoxFit.contain,
+                  ),
+                )
+              : GestureDetector(
                   behavior: HitTestBehavior.opaque,
                   onTap: () => showMetadataSwitchSheet(context),
                   child: Padding(
@@ -672,16 +672,65 @@ class _HomeViewState extends State<_HomeView>
                       fit: BoxFit.contain,
                     ),
                   ),
-                ),
-              ),
-            ),
-            const _IncognitoChip(),
-            _headerDownloadButton(),
-            _notificationBell(context),
-            const HomeSearchAction(),
-            const HomeSourceSwitcherSlot(),
-          ],
-        ),
+                );
+          final actions = [
+            _headerDownloadButton(edgeBanner: edgeBanner),
+            _notificationBell(context, edgeBanner: edgeBanner),
+            HomeSearchAction(edgeBanner: edgeBanner),
+          ];
+
+          return Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+            child: splitEdgeHeader
+                ? Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Row(children: [brand, const Spacer(), ...actions]),
+                      ValueListenableBuilder<int>(
+                        valueListenable: ZModePrefs.revision,
+                        builder: (context, _, _) {
+                          final showSource = !ZModePrefs.enabled;
+                          return ValueListenableBuilder<bool>(
+                            valueListenable: IncognitoMode.notifier,
+                            builder: (context, incognito, _) {
+                              if (!showSource && !incognito) {
+                                return const SizedBox.shrink();
+                              }
+                              return Padding(
+                                padding: const EdgeInsets.only(top: 4),
+                                child: Wrap(
+                                  alignment: WrapAlignment.end,
+                                  spacing: 4,
+                                  runSpacing: 4,
+                                  children: [
+                                    if (incognito) const _IncognitoChip(),
+                                    if (showSource)
+                                      const HomeSourceSwitcherSlot(),
+                                  ],
+                                ),
+                              );
+                            },
+                          );
+                        },
+                      ),
+                    ],
+                  )
+                : Row(
+                    children: [
+                      Expanded(
+                        child: Align(
+                          alignment: AlignmentDirectional.centerStart,
+                          child: brand,
+                        ),
+                      ),
+                      const _IncognitoChip(),
+                      ...actions,
+                      const HomeSourceSwitcherSlot(),
+                    ],
+                  ),
+          );
+        },
       ),
     );
   }
@@ -714,6 +763,13 @@ class _HomeViewState extends State<_HomeView>
           onToggleList: toggleList,
           meta: _heroMeta,
         );
+      case BannerStyle.edgeId:
+        return FeaturedBannerEdge(
+          items: heroItems,
+          reading: reading,
+          onInfo: _openDetail,
+          meta: _heroMeta,
+        );
       default:
         // Auto-rotating carousel (up to 6 trending items)
         return FeaturedCarousel(
@@ -733,14 +789,15 @@ class _HomeViewState extends State<_HomeView>
   /// [HomeSearchAction]: flat icon, no badge — the screen itself is the
   /// progress view, so there's nothing to surface here. Pushed as a normal
   /// route (with back), unlike the dock tab which suppresses it.
-  Widget _headerDownloadButton() {
+  Widget _headerDownloadButton({bool edgeBanner = false}) {
     return IconButton(
-      icon: const DockIcon(
+      icon: DockIcon(
         DockGlyph.download,
-        color: AppColors.textSecondary,
+        color: edgeBanner ? Colors.white : AppColors.textSecondary,
         size: 22,
       ),
       tooltip: context.l10n.downloads,
+      style: edgeBanner ? _edgeHeaderButtonStyle() : null,
       onPressed: () => Navigator.of(
         context,
       ).push(MaterialPageRoute<void>(builder: (_) => const DownloadsScreen())),
@@ -750,43 +807,51 @@ class _HomeViewState extends State<_HomeView>
   /// Flat bell → Notifications screen. The accent dot shows while any
   /// announcement is unseen and clears itself reactively (the screen calls
   /// markAllSeen, the Hive box updates, the listenable rebuilds).
-  Widget _notificationBell(BuildContext context) {
-    // Built fresh inside the listenable's builder — a captured widget
-    // instance would be canonical and the rebuild would be skipped.
-    Widget bell() => GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () => Navigator.of(context).push(
-        MaterialPageRoute<void>(builder: (_) => const SubscriptionsScreen()),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(4),
-        child: Stack(
-          clipBehavior: Clip.none,
-          children: [
-            const DockIcon(
-              DockGlyph.bell,
-              color: AppColors.textSecondary,
-              size: 22,
-            ),
-            if (Hive.isBoxOpen(AnnouncementStore.boxName) &&
-                AnnouncementStore().unseenCount() > 0)
-              Positioned(
-                top: 1,
-                right: 2,
-                child: Container(
-                  width: 8,
-                  height: 8,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: AppColors.accent,
-                    border: Border.all(color: AppColors.bg, width: 1.5),
-                  ),
-                ),
-              ),
-          ],
-        ),
-      ),
+  Widget _notificationBell(BuildContext context, {bool edgeBanner = false}) {
+    void openNotifications() => Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => const SubscriptionsScreen()),
     );
+
+    Widget icon() => Stack(
+      clipBehavior: Clip.none,
+      children: [
+        DockIcon(
+          DockGlyph.bell,
+          color: edgeBanner ? Colors.white : AppColors.textSecondary,
+          size: 22,
+        ),
+        if (Hive.isBoxOpen(AnnouncementStore.boxName) &&
+            AnnouncementStore().unseenCount() > 0)
+          Positioned(
+            top: 1,
+            right: 2,
+            child: Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: AppColors.accent,
+                border: Border.all(color: AppColors.bg, width: 1.5),
+              ),
+            ),
+          ),
+      ],
+    );
+
+    // Build the same action fresh inside the listenable's builder so its badge
+    // updates when an announcement is seen.
+    Widget bell() => edgeBanner
+        ? IconButton(
+            tooltip: context.l10n.notifications,
+            style: _edgeHeaderButtonStyle(),
+            onPressed: openNotifications,
+            icon: icon(),
+          )
+        : GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: openNotifications,
+            child: Padding(padding: const EdgeInsets.all(4), child: icon()),
+          );
     // Rebuild the dot when the announcements box changes (e.g. markAllSeen).
     if (!Hive.isBoxOpen(AnnouncementStore.boxName)) return bell();
     return ValueListenableBuilder(
@@ -802,15 +867,19 @@ class _HomeViewState extends State<_HomeView>
     return _animated(
       ContentRow(
         title: section.title,
-        itemWidth: 116,
-        itemHeight: 216,
+        itemWidth: posterRowWidth(context),
+        itemHeight: posterRowHeight(context),
         itemCount: items.length,
         onSeeAll: () => _openSeeAll(section),
         itemBuilder: (c, i) => PosterCard(
           title: items[i].title,
+          logoItem: items[i],
           imageUrl: items[i].cover,
           headers: items[i].coverHeaders,
-          cellWidth: 116,
+          cellWidth: posterRowWidth(c),
+          wideImageUrl: items[i].banner,
+          genres: items[i].genres,
+          isAdult: items[i].isAdult,
           qualityBadge: items[i].quality,
           scoreBadge: items[i].score,
           dubBadge: items[i].dubBadge,
@@ -847,6 +916,13 @@ class _HomeViewState extends State<_HomeView>
           items: first,
           onTap: (m) => Navigator.push(context, DetailScreen.route(m)),
           onLoadMore: (page) => repo.browseMore(more, page),
+          filterKind: ZKind.movie,
+          onSearch: (query, filters, page) => repo.streamingServicePage(
+            s.id,
+            query: query,
+            filters: filters,
+            page: page,
+          ),
         ),
       ),
     );
@@ -857,9 +933,8 @@ class _HomeViewState extends State<_HomeView>
   /// switch makes a future row type a compile error here instead of a silent
   /// gap, and the local row reuses [ContinueSection] itself so its reactive
   /// Hive/mode behaviour is identical wherever the user drags it.
-  Widget _homeRowSliver(HomeRow row, {required bool loggedIn}) => switch (row) {
+  Widget _homeRowSliver(HomeRow row) => switch (row) {
     LocalContinueHomeRow() => ContinueSection(
-      loggedIn: loggedIn,
       onResume: _resume,
       onLongPress: _showContinueInfo,
       onSeeAll: _openHistory,
@@ -1641,7 +1716,8 @@ class _HomeViewState extends State<_HomeView>
   @override
   Widget build(BuildContext context) {
     if (sl<AppMode>().isTv) return const HomeScreenTv();
-    // Continue Watching is a logged-in feature; hide the row when signed out.
+    // Local Continue Watching/Reading stays visible signed out; cloud sync
+    // still needs an account.
     final authState = context.watch<AuthCubit>().state;
     final loggedIn = authState.isLoggedIn;
     // Session lapsed (logged-in from cache only) → cloud sync is silently off.
@@ -1735,7 +1811,10 @@ class _HomeViewState extends State<_HomeView>
                                       top: 0,
                                       left: 0,
                                       right: 0,
-                                      child: _buildHeader(),
+                                      child: _buildHeader(
+                                        edgeBanner:
+                                            bannerId == BannerStyle.edgeId,
+                                      ),
                                     ),
                                   ],
                                 ),
@@ -1771,12 +1850,9 @@ class _HomeViewState extends State<_HomeView>
                       // ContinueSection keeps its old spot above the skeletons
                       // so the loading screen is exactly today's.
                       if (state.rows case final rows?)
-                        ...rows.map(
-                          (r) => _homeRowSliver(r, loggedIn: loggedIn),
-                        )
+                        ...rows.map(_homeRowSliver)
                       else
                         ContinueSection(
-                          loggedIn: loggedIn,
                           onResume: _resume,
                           onLongPress: _showContinueInfo,
                           onSeeAll: _openHistory,
@@ -1865,23 +1941,31 @@ class _HomeViewState extends State<_HomeView>
 /// between the metadata catalogue and the active source, so the header icon
 /// that reaches it doesn't need to.
 class HomeSearchAction extends StatelessWidget {
-  const HomeSearchAction({super.key});
+  const HomeSearchAction({super.key, this.edgeBanner = false});
+
+  final bool edgeBanner;
 
   @override
   Widget build(BuildContext context) {
     return IconButton(
-      icon: const DockIcon(
+      icon: DockIcon(
         DockGlyph.search,
-        color: AppColors.textSecondary,
+        color: edgeBanner ? Colors.white : AppColors.textSecondary,
         size: 22,
       ),
       tooltip: context.l10n.search,
+      style: edgeBanner ? _edgeHeaderButtonStyle() : null,
       onPressed: () => Navigator.of(
         context,
       ).push(MaterialPageRoute<void>(builder: (_) => const SearchScreen())),
     );
   }
 }
+
+ButtonStyle _edgeHeaderButtonStyle() => IconButton.styleFrom(
+  backgroundColor: Colors.black.withValues(alpha: 0.5),
+  shape: const CircleBorder(),
+);
 
 /// The header's source switcher. Hidden while Z Mode is on — the active
 /// source doesn't affect anything on screen there (Home is metadata-driven)

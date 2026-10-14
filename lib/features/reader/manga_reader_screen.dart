@@ -21,6 +21,10 @@ import '../../core/di/injector.dart';
 import '../../core/error/exceptions.dart';
 import '../../core/models/episode.dart';
 import '../../core/reading/chapter_nav.dart';
+import '../../core/reading/manga_translation/manga_page_translation_models.dart';
+import '../../core/reading/manga_translation/manga_page_translation_overlay.dart';
+import '../../core/reading/manga_translation/manga_page_translation_service.dart';
+import '../../core/reading/manga_translation/manga_translation_languages.dart';
 import '../../core/ui/native_page_provider.dart';
 import '../../core/download/cbz_image.dart';
 import '../../core/models/page_content.dart';
@@ -48,6 +52,8 @@ import 'reader_auto_scroll_ui.dart';
 import 'reader_comfort.dart';
 import '../../l10n/l10n.dart';
 import 'reader_pull_chapter.dart';
+import 'manga_page_translation_settings_sheet.dart';
+import 'manga_translation_floating_control.dart';
 
 /// Image reader for manga chapters — the paged/webtoon counterpart of
 /// [package:watch_app/features/reader/novel_reader_screen.dart]'s text
@@ -65,6 +71,8 @@ class MangaReaderScreen extends StatefulWidget {
     this.malId,
     this.resolveChapters = false,
     this.peek = false,
+    this.translationService,
+    this.pageFileCache,
   });
 
   final String sourceId;
@@ -93,6 +101,14 @@ class MangaReaderScreen extends StatefulWidget {
   /// `_maybeResolveChapters`. Default false: every other caller (Detail
   /// screen) already passes the full list, so this is a no-op for them.
   final bool resolveChapters;
+
+  /// Per-reader session service. The optional injection is also the seam for
+  /// reader tests; production creates a fresh service for each open reader.
+  final MangaPageTranslationService? translationService;
+
+  /// Optional page-file cache seam for tests; production keeps its normal
+  /// reader-owned cache instance.
+  final PageFileCache? pageFileCache;
 
   @override
   State<MangaReaderScreen> createState() => _MangaReaderScreenState();
@@ -184,6 +200,24 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   int get _pageIndex => _pageIndexVN.value;
   set _pageIndex(int value) => _pageIndexVN.value = value;
 
+  late final MangaPageTranslationService _translationService =
+      widget.translationService ?? MangaPageTranslationService();
+  final Map<String, MangaPageTranslationResult> _translatedPages = {};
+  final Map<String, _MangaTranslationPage> _failedTranslationPages = {};
+  int? _translationChapterIndex;
+  String? _translationSourceLanguage;
+  String? _translationTargetLanguage;
+  MangaTranslationEngine? _translationEngine;
+  MangaOnlineTranslationProvider? _translationOnlineProvider;
+  int _translationCompletedPages = 0;
+  int _translationTotalPages = 0;
+  int _translationRequestGeneration = 0;
+  bool _showFloatingMangaTranslation = false;
+  bool _chapterTranslationRunning = false;
+  bool _chapterTranslationStopRequested = false;
+  bool _chapterTranslationStopped = false;
+  bool _showChapterTranslations = true;
+
   bool _chromeVisible = false;
   int _lastScrollSaveMs = 0;
 
@@ -196,6 +230,26 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// page being read. See [_reanchorToCurrentPage].
   Offset? _lastDoubleTapPos;
   final Map<int, TransformationController> _zoomControllers = {};
+  late final AnimationController _doubleTapZoomController;
+  TransformationController? _animatedZoomTarget;
+  Animation<Matrix4>? _doubleTapZoomAnimation;
+
+  /// Paged mode observes raw pointers outside the gesture arena. That matters
+  /// when PageView has already accepted a one-finger drag before finger two
+  /// lands: a child ScaleGestureRecognizer cannot take that pointer back, but
+  /// the reader can still freeze the pager and keep scaling the page.
+  final Map<int, Offset> _pagedPointerPositions = {};
+  final GlobalKey _pagedViewportKey = GlobalKey();
+  int? _pagedGestureStartPosition;
+  TransformationController? _pagedGestureController;
+  Size _pagedGestureViewport = Size.zero;
+  Offset _pagedGestureViewportOrigin = Offset.zero;
+  _PagedPinchStart? _pagedPinchStart;
+  _PagedPanStart? _pagedPanStart;
+  bool _pagedPinchActive = false;
+  bool _pagedZoomed = false;
+
+  bool get _lockPagedScroll => _pagedPinchActive || _pagedZoomed;
 
   // Webtoon (vertical) pinch-zoom. The strip stays a lazy ListView for
   // one-finger scrolling; a two-finger pinch drives this scale/offset which a
@@ -228,8 +282,13 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   @override
   void initState() {
     super.initState();
+    _pageIndexVN.addListener(_refreshTranslationForPageChanges);
     _index = widget.startIndex;
     _pageController = PageController();
+    _doubleTapZoomController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 240),
+    )..addListener(_tickDoubleTapZoom);
     // Built here, NOT lazily: createTicker reads TickerMode off the
     // context, and a `late final` initialiser would run that on first
     // access — which, if auto-scroll was never used, is dispose(), where
@@ -245,7 +304,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       fetch: (key) async =>
           await (_queueTasks.remove(key)?.call() ?? Future.value()),
     );
-    _pageFiles = PageFileCache();
+    _pageFiles = widget.pageFileCache ?? PageFileCache();
     _tileDecoder = TileDecoder();
     _verticalController = ScrollController(keepScrollOffset: false)
       ..addListener(_onVerticalScroll);
@@ -273,6 +332,8 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     // is only updated on scroll events, so re-derive it from the live
     // ScrollController one last time before that controller goes away.
     ReaderImageBudget.release(); // hands the page bitmaps back to the OS
+    _pageIndexVN.removeListener(_refreshTranslationForPageChanges);
+    _invalidateMangaTranslationRequests();
     _captureFinalVerticalIndex();
     _flushProgress(); // reader close: don't lose the last-read position
     _autoScroll.dispose();
@@ -285,6 +346,9 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     _verticalController.removeListener(_onVerticalScroll);
     _verticalController.dispose();
     _pageController.dispose();
+    _doubleTapZoomController
+      ..removeListener(_tickDoubleTapZoom)
+      ..dispose();
     for (final c in _zoomControllers.values) {
       c.dispose();
     }
@@ -339,6 +403,20 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   }
 
   Future<void> _load() async {
+    _invalidateMangaTranslationRequests();
+    _translatedPages.clear();
+    _failedTranslationPages.clear();
+    _translationChapterIndex = null;
+    _translationSourceLanguage = null;
+    _translationTargetLanguage = null;
+    _translationEngine = null;
+    _translationOnlineProvider = null;
+    _translationCompletedPages = 0;
+    _translationTotalPages = 0;
+    _chapterTranslationRunning = false;
+    _chapterTranslationStopRequested = false;
+    _chapterTranslationStopped = false;
+    _showChapterTranslations = true;
     setState(() {
       _loading = true;
       _error = null;
@@ -926,12 +1004,558 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     // _pageIndexVN. The next-chapter overlay and chrome's page counter each
     // listen for this themselves.
     _pageIndex = page;
+    if (!_pagedPinchActive) {
+      final zoomed =
+          (_zoomControllers[page]?.value.getMaxScaleOnAxis() ?? 1.0) > 1.01;
+      if (zoomed != _pagedZoomed) {
+        setState(() => _pagedZoomed = zoomed);
+      }
+    }
     // A slider drag drives this too (jumpToPage fires onPageChanged) —
     // _commitSeek does the preload/save exactly once when the drag ends.
     if (_seeking) return;
     final pages = _pages;
     if (pages != null) _preload(page, pages);
     _saveProgress(flush: false);
+  }
+
+  void _refreshTranslationForPageChanges() {
+    if (!mounted || (_translatedPages.isEmpty && !_chapterTranslationRunning)) {
+      return;
+    }
+    // Page changes only select which retained result is visible. They must not
+    // cancel the chapter queue or discard pages that already finished.
+    setState(() {});
+  }
+
+  void _onMangaTranslationSelectionChanged(
+    String sourceLanguage,
+    String targetLanguage,
+    MangaTranslationEngine engine,
+    MangaOnlineTranslationProvider provider,
+  ) {
+    _invalidateMangaTranslationRequests();
+    setState(() {
+      _translatedPages.clear();
+      _failedTranslationPages.clear();
+      _translationChapterIndex = null;
+      _translationSourceLanguage = null;
+      _translationTargetLanguage = null;
+      _translationEngine = null;
+      _translationOnlineProvider = null;
+      _translationCompletedPages = 0;
+      _translationTotalPages = 0;
+      _chapterTranslationRunning = false;
+      _chapterTranslationStopRequested = false;
+      _chapterTranslationStopped = false;
+      _showChapterTranslations = true;
+    });
+    unawaited(
+      _persistMangaTranslationSelection(
+        sourceLanguage,
+        targetLanguage,
+        engine,
+        provider,
+      ),
+    );
+  }
+
+  Future<void> _persistMangaTranslationSelection(
+    String sourceLanguage,
+    String targetLanguage,
+    MangaTranslationEngine engine,
+    MangaOnlineTranslationProvider provider,
+  ) async {
+    try {
+      final prefs = sl<ReaderPrefs>();
+      await prefs.setMangaTranslationSourceLanguage(sourceLanguage);
+      await prefs.setMangaTranslationTargetLanguage(targetLanguage);
+      await prefs.setMangaTranslationEngine(engine);
+      await prefs.setMangaOnlineTranslationProvider(provider);
+    } catch (_) {
+      // Translation remains usable for this session if a preference write
+      // fails; no reader or page-loading behavior depends on these values.
+    }
+  }
+
+  Future<void> _openMangaTranslationSheet() async {
+    try {
+      final sourceLanguages = MangaTranslationLanguages.ocrIntersection(
+        await _translationService.supportedOcrLanguages(),
+      );
+      final offlineLanguages = MangaTranslationLanguages.offlineIntersection(
+        await _translationService.supportedOfflineLanguages(),
+      );
+      if (!mounted) return;
+      if (sourceLanguages.isEmpty) {
+        showAppToast(context, context.l10n.mangaTranslationError);
+        return;
+      }
+
+      setState(() => _showFloatingMangaTranslation = true);
+      final prefs = sl<ReaderPrefs>();
+      await showModalBottomSheet<void>(
+        context: context,
+        backgroundColor: Colors.transparent,
+        isScrollControlled: true,
+        builder: (context) => MangaPageTranslationSettingsSheet(
+          sourceLanguages: sourceLanguages,
+          onlineTargetLanguages: MangaTranslationLanguages.online,
+          offlineTargetLanguages: offlineLanguages,
+          initialSourceLanguage: prefs.mangaTranslationSourceLanguage,
+          initialTargetLanguage: prefs.mangaTranslationTargetLanguage,
+          initialEngine: prefs.mangaTranslationEngine,
+          initialProvider: prefs.mangaOnlineTranslationProvider,
+          closeOnSuccess: true,
+          onSelectionChanged: _onMangaTranslationSelectionChanged,
+          onTranslate: _translateMangaChapter,
+          onCheckProviderKey: _translationService.isProviderConfigured,
+          onSaveProviderKey: _translationService.saveProviderKey,
+          onDeleteProviderKey: _translationService.removeProviderKey,
+        ),
+      );
+    } on Object {
+      if (mounted) showAppToast(context, context.l10n.mangaTranslationError);
+    }
+  }
+
+  Future<MangaPageTranslationResult?> _translateMangaChapter(
+    String sourceLanguage,
+    String targetLanguage,
+    MangaTranslationEngine engine,
+    MangaOnlineTranslationProvider provider,
+  ) async {
+    final pages = _pages;
+    final pageIndex = _pageIndex;
+    if (pages == null || pageIndex < 0 || pageIndex >= pages.length) {
+      throw StateError('There is no visible manga page to translate.');
+    }
+    final page = pages[pageIndex];
+    final chapterIndex = _slotAt(pageIndex)?.chapterIdx ?? _index;
+    final orderedTargets = _chapterTranslationTargets(
+      pages,
+      chapterIndex,
+      pageIndex,
+    );
+    if (orderedTargets.isEmpty) {
+      throw StateError('There are no pages in the current manga chapter.');
+    }
+    if (_chapterTranslationRunning) {
+      return _translatedPages[page.url];
+    }
+
+    final sameSession =
+        _translationChapterIndex == chapterIndex &&
+        _translationSourceLanguage == sourceLanguage &&
+        _translationTargetLanguage == targetLanguage &&
+        _translationEngine == engine &&
+        _translationOnlineProvider == provider;
+    if (sameSession && _failedTranslationPages.isEmpty) {
+      final hasEveryPage = orderedTargets.every(
+        (target) => _translatedPages.containsKey(target.page.url),
+      );
+      if (hasEveryPage) {
+        if (!_showChapterTranslations) {
+          setState(() => _showChapterTranslations = true);
+        }
+        return _translatedPages[page.url];
+      }
+    }
+
+    final targets = sameSession
+        ? orderedTargets
+              .where((target) => !_translatedPages.containsKey(target.page.url))
+              .toList(growable: false)
+        : orderedTargets;
+    if (targets.isEmpty) return _translatedPages[page.url];
+
+    _invalidateMangaTranslationRequests();
+    final requestGeneration = _translationRequestGeneration;
+    final status = await _translationService.modelStatus(
+      sourceLanguage: sourceLanguage,
+      targetLanguage: targetLanguage,
+      engine: engine,
+    );
+    if (!_isCurrentMangaTranslationSetup(requestGeneration)) {
+      return null;
+    }
+    if (status.requiresConsentFor(engine)) {
+      final consent = await _confirmMangaTranslationModelDownload(engine);
+      if (!_isCurrentMangaTranslationSetup(requestGeneration) ||
+          consent != true) {
+        return null;
+      }
+      await _downloadMangaTranslationModels(
+        sourceLanguage: sourceLanguage,
+        targetLanguage: targetLanguage,
+        engine: engine,
+      );
+    }
+    if (!_isCurrentMangaTranslationSetup(requestGeneration)) {
+      return null;
+    }
+
+    final firstResult = Completer<MangaPageTranslationResult?>();
+    setState(() {
+      if (!sameSession) {
+        _translatedPages.clear();
+        _failedTranslationPages.clear();
+      }
+      _translationChapterIndex = chapterIndex;
+      _translationSourceLanguage = sourceLanguage;
+      _translationTargetLanguage = targetLanguage;
+      _translationEngine = engine;
+      _translationOnlineProvider = provider;
+      _translationTotalPages = orderedTargets.length;
+      _translationCompletedPages = _translatedPages.length;
+      _chapterTranslationRunning = true;
+      _chapterTranslationStopRequested = false;
+      _chapterTranslationStopped = false;
+      _showChapterTranslations = true;
+    });
+
+    final alreadyTranslated = _translatedPages[page.url];
+    if (alreadyTranslated != null) firstResult.complete(alreadyTranslated);
+    unawaited(
+      _runMangaChapterTranslation(
+        targets: targets,
+        chapterIndex: chapterIndex,
+        sourceLanguage: sourceLanguage,
+        targetLanguage: targetLanguage,
+        engine: engine,
+        provider: provider,
+        generation: requestGeneration,
+        firstPageResult: firstResult,
+      ),
+    );
+    return firstResult.future;
+  }
+
+  List<_MangaTranslationPage> _chapterTranslationTargets(
+    List<PageImage> pages,
+    int chapterIndex,
+    int startingPageIndex,
+  ) {
+    final pageIndices = [
+      for (var index = 0; index < pages.length; index++)
+        if ((_slotAt(index)?.chapterIdx ?? _index) == chapterIndex) index,
+    ];
+    final orderedIndices = [
+      ...pageIndices.where((index) => index >= startingPageIndex),
+      ...pageIndices.where((index) => index < startingPageIndex),
+    ];
+    return [
+      for (final index in orderedIndices)
+        _MangaTranslationPage(index: index, page: pages[index]),
+    ];
+  }
+
+  Future<void> _runMangaChapterTranslation({
+    required List<_MangaTranslationPage> targets,
+    required int chapterIndex,
+    required String sourceLanguage,
+    required String targetLanguage,
+    required MangaTranslationEngine engine,
+    required MangaOnlineTranslationProvider provider,
+    required int generation,
+    required Completer<MangaPageTranslationResult?> firstPageResult,
+  }) async {
+    var stoppedBeforeQueueFinished = false;
+    try {
+      for (final target in targets) {
+        if (!_isCurrentMangaTranslation(generation, chapterIndex)) break;
+        if (_chapterTranslationStopRequested) {
+          stoppedBeforeQueueFinished = true;
+          break;
+        }
+        try {
+          final file = await _translationPageFile(target);
+          if (!_isCurrentMangaTranslation(generation, chapterIndex)) break;
+          final result = await _translationService.translatePage(
+            pageUrl: target.page.url,
+            filePath: file.path,
+            sourceLanguage: sourceLanguage,
+            targetLanguage: targetLanguage,
+            engine: engine,
+            onlineProvider: provider,
+          );
+          if (!_isCurrentMangaTranslation(generation, chapterIndex)) break;
+          if (result == null) {
+            throw StateError('Manga page translation was cancelled.');
+          }
+          setState(() {
+            _translatedPages[target.page.url] = result;
+            _failedTranslationPages.remove(target.page.url);
+            _translationCompletedPages++;
+          });
+          if (!firstPageResult.isCompleted) firstPageResult.complete(result);
+        } on Object catch (error, stackTrace) {
+          if (!_isCurrentMangaTranslation(generation, chapterIndex)) break;
+          setState(() {
+            _failedTranslationPages[target.page.url] = target;
+            _translationCompletedPages++;
+          });
+          if (!firstPageResult.isCompleted) {
+            firstPageResult.completeError(error, stackTrace);
+          }
+        }
+      }
+    } finally {
+      if (!firstPageResult.isCompleted) firstPageResult.complete(null);
+      if (_isCurrentMangaTranslation(generation, chapterIndex)) {
+        setState(() {
+          _chapterTranslationRunning = false;
+          _chapterTranslationStopRequested = false;
+          _chapterTranslationStopped = stoppedBeforeQueueFinished;
+        });
+      }
+    }
+  }
+
+  Future<File> _translationPageFile(_MangaTranslationPage target) async {
+    final cachedPath = _pageFile[target.page.url];
+    if (cachedPath != null) {
+      final cachedFile = File(cachedPath);
+      if (await cachedFile.exists()) return cachedFile;
+      // PageFileCache trims old files independently from this reader's
+      // in-memory path map. Do not hand OCR a path that was evicted; clear it
+      // so the normal cache lookup/recovery path below can resolve the page.
+      _pageFile.remove(target.page.url);
+      if (!mounted) {
+        throw StateError('The manga reader closed while resolving a page.');
+      }
+    }
+
+    final width = _effectiveDirection(sl<ReaderPrefs>()) == 'vertical'
+        ? _webtoonDecodeWidth(context)
+        : _decodeWidth(context);
+    var file = await _pageFiles.fileFor(target.page.url, target.page.headers);
+    if (file == null &&
+        target.page.url.startsWith('http') &&
+        !_drawnLocally(target.page)) {
+      // Warm through the same cache manager used by the reader. PageFileCache
+      // deliberately does not fetch ordinary network pages itself, because a
+      // second independent fetch would download every page twice.
+      await _fetchPageBytes(target.page, target.index, width);
+      file = await _pageFiles.fileFor(target.page.url, target.page.headers);
+    }
+    if (file == null) {
+      throw StateError('The manga page is not available for OCR.');
+    }
+    _pageFile[target.page.url] = file.path;
+    return file;
+  }
+
+  bool _isCurrentMangaTranslationSetup(int generation) =>
+      mounted && generation == _translationRequestGeneration;
+
+  bool _isCurrentMangaTranslation(int generation, int chapterIndex) =>
+      _isCurrentMangaTranslationSetup(generation) &&
+      _translationChapterIndex == chapterIndex;
+
+  void _invalidateMangaTranslationRequests() {
+    _translationRequestGeneration++;
+    _translationService.invalidatePendingRequests();
+  }
+
+  void _requestMangaTranslationStop() {
+    if (!_chapterTranslationRunning || _chapterTranslationStopRequested) return;
+    setState(() => _chapterTranslationStopRequested = true);
+  }
+
+  Future<void> _onFloatingMangaTranslationTap() async {
+    if (_chapterTranslationRunning) return;
+    final pages = _pages;
+    final pageIndex = _pageIndex;
+    if (pages == null || pageIndex < 0 || pageIndex >= pages.length) return;
+
+    final chapterIndex = _slotAt(pageIndex)?.chapterIdx ?? _index;
+    final hasCurrentChapterSession = _translationChapterIndex == chapterIndex;
+    final prefs = sl<ReaderPrefs>();
+    if (hasCurrentChapterSession && _chapterTranslationStopped) {
+      if (!await _ensureMangaTranslationProviderConfigured(prefs)) return;
+      try {
+        await _translateMangaChapter(
+          prefs.mangaTranslationSourceLanguage,
+          prefs.mangaTranslationTargetLanguage,
+          prefs.mangaTranslationEngine,
+          prefs.mangaOnlineTranslationProvider,
+        );
+      } on Object {
+        if (mounted) showAppToast(context, context.l10n.mangaTranslationError);
+      }
+      return;
+    }
+    if (hasCurrentChapterSession && _failedTranslationPages.isNotEmpty) {
+      if (!await _ensureMangaTranslationProviderConfigured(prefs)) return;
+      try {
+        await _retryFailedMangaTranslationPages(
+          pages,
+          chapterIndex,
+          prefs.mangaTranslationSourceLanguage,
+          prefs.mangaTranslationTargetLanguage,
+          prefs.mangaTranslationEngine,
+          prefs.mangaOnlineTranslationProvider,
+        );
+      } on Object {
+        if (mounted) showAppToast(context, context.l10n.mangaTranslationError);
+      }
+      return;
+    }
+    if (hasCurrentChapterSession && _translatedPages.isNotEmpty) {
+      setState(() => _showChapterTranslations = !_showChapterTranslations);
+      return;
+    }
+    if (!await _ensureMangaTranslationProviderConfigured(prefs)) return;
+    try {
+      await _translateMangaChapter(
+        prefs.mangaTranslationSourceLanguage,
+        prefs.mangaTranslationTargetLanguage,
+        prefs.mangaTranslationEngine,
+        prefs.mangaOnlineTranslationProvider,
+      );
+    } on Object {
+      if (mounted) showAppToast(context, context.l10n.mangaTranslationError);
+    }
+  }
+
+  Future<bool> _ensureMangaTranslationProviderConfigured(
+    ReaderPrefs prefs,
+  ) async {
+    if (prefs.mangaTranslationEngine == MangaTranslationEngine.offline ||
+        prefs.mangaOnlineTranslationProvider ==
+            MangaOnlineTranslationProvider.google) {
+      return true;
+    }
+    final configured = await _translationService.isProviderConfigured(
+      prefs.mangaOnlineTranslationProvider,
+    );
+    if (!mounted) return false;
+    if (!configured) {
+      showAppToast(context, context.l10n.mangaTranslationApiKeyMissing);
+      return false;
+    }
+    return true;
+  }
+
+  Future<void> _retryFailedMangaTranslationPages(
+    List<PageImage> pages,
+    int chapterIndex,
+    String sourceLanguage,
+    String targetLanguage,
+    MangaTranslationEngine engine,
+    MangaOnlineTranslationProvider provider,
+  ) async {
+    if (_translationSourceLanguage != sourceLanguage ||
+        _translationTargetLanguage != targetLanguage ||
+        _translationEngine != engine ||
+        _translationOnlineProvider != provider) {
+      return;
+    }
+    final targets = _failedTranslationPages.values.toList(growable: false);
+    if (targets.isEmpty) return;
+    _invalidateMangaTranslationRequests();
+    final generation = _translationRequestGeneration;
+    final firstResult = Completer<MangaPageTranslationResult?>();
+    setState(() {
+      _translationTotalPages = _chapterTranslationTargets(
+        pages,
+        chapterIndex,
+        _pageIndex,
+      ).length;
+      _translationCompletedPages = _translatedPages.length;
+      _chapterTranslationRunning = true;
+      _chapterTranslationStopRequested = false;
+      _chapterTranslationStopped = false;
+      _showChapterTranslations = true;
+    });
+    unawaited(
+      _runMangaChapterTranslation(
+        targets: targets,
+        chapterIndex: chapterIndex,
+        sourceLanguage: sourceLanguage,
+        targetLanguage: targetLanguage,
+        engine: engine,
+        provider: provider,
+        generation: generation,
+        firstPageResult: firstResult,
+      ),
+    );
+    await firstResult.future;
+  }
+
+  Future<bool> _confirmMangaTranslationModelDownload(
+    MangaTranslationEngine engine,
+  ) async {
+    final l10n = context.l10n;
+    final message = switch (engine) {
+      MangaTranslationEngine.online => l10n.mangaTranslationOnlineModelConsent,
+      MangaTranslationEngine.offline =>
+        l10n.mangaTranslationOfflineModelConsent,
+    };
+    return await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: Text(l10n.mangaTranslationModelConsentTitle),
+            content: Text(message),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: Text(l10n.cancel),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(context).pop(true),
+                child: Text(l10n.download),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
+
+  Future<void> _downloadMangaTranslationModels({
+    required String sourceLanguage,
+    required String targetLanguage,
+    required MangaTranslationEngine engine,
+  }) async {
+    final l10n = context.l10n;
+    final navigator = Navigator.of(context, rootNavigator: true);
+    final progressRoute = DialogRoute<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) {
+        final title = switch (engine) {
+          MangaTranslationEngine.online => l10n.mangaTranslationDownloadingOcr,
+          MangaTranslationEngine.offline =>
+            l10n.mangaTranslationDownloadingOfflineModels,
+        };
+        return AlertDialog(
+          key: const ValueKey('manga-translation-download-dialog'),
+          title: Text(title),
+          content: Row(
+            children: [
+              const SizedBox(
+                width: 24,
+                height: 24,
+                child: CircularProgressIndicator(strokeWidth: 2.5),
+              ),
+              const SizedBox(width: 16),
+              Expanded(child: Text(l10n.mangaTranslationDownloadingMessage)),
+            ],
+          ),
+        );
+      },
+    );
+    unawaited(navigator.push<void>(progressRoute));
+    try {
+      await _translationService.downloadModels(
+        sourceLanguage: sourceLanguage,
+        targetLanguage: targetLanguage,
+        engine: engine,
+      );
+    } finally {
+      if (progressRoute.isActive) navigator.removeRoute(progressRoute);
+    }
   }
 
   /// The double-page spread grouping in effect right now, or null when the
@@ -1140,7 +1764,15 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       ReadEntry(
         sourceId: widget.sourceId,
         showId: widget.showId,
-        showUrl: widget.showUrl,
+        // Metadata link when the title has one, so the Continue Reading
+        // card reopens the metadata detail like streaming cards do —
+        // otherwise it reopens whichever source page the session began on.
+        showUrl: preferredHistoryUrl(
+          ProviderType.manga,
+          malId: widget.malId,
+          showId: widget.showId,
+          showUrl: widget.showUrl,
+        ),
         title: widget.showTitle,
         cover: widget.cover,
         chapterId: ep.id,
@@ -1191,10 +1823,16 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     // context.l10n.nextChapter2 footer button is the common path). Going BACKWARDS is
     // not completion, so it just saves the real position.
     _saveProgress(flush: true, complete: newIndex > _index);
+    _cancelDoubleTapZoom();
     for (final c in _zoomControllers.values) {
       c.dispose();
     }
     _zoomControllers.clear();
+    _pagedPointerPositions.clear();
+    _pagedGestureStartPosition = null;
+    _pagedGestureController = null;
+    _pagedPinchStart = null;
+    _pagedPanStart = null;
     setState(() {
       _index = newIndex;
       _pages = null;
@@ -1216,6 +1854,8 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       _wScale = 1.0;
       _wOffset = Offset.zero;
       _wZooming = false;
+      _pagedPinchActive = false;
+      _pagedZoomed = false;
     });
     _load();
   }
@@ -1321,15 +1961,14 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     final prefs = sl<ReaderPrefs>();
     final mode = _effectiveDirection(prefs);
     final layout = prefs.tapZonesForMode(mode);
-    _runReaderAction(
-      layout.actionAt(
-        Offset(
-          (global.dx / size.width).clamp(0.0, 1.0),
-          (global.dy / size.height).clamp(0.0, 1.0),
-        ),
-        rtl: mode == 'rtl',
+    final action = layout.actionAt(
+      Offset(
+        (global.dx / size.width).clamp(0.0, 1.0),
+        (global.dy / size.height).clamp(0.0, 1.0),
       ),
+      rtl: mode == 'rtl',
     );
+    _runReaderAction(action);
   }
 
   void _runReaderAction(ReaderAction action) {
@@ -1368,18 +2007,63 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   }
 
   void _toggleZoom(TransformationController ctrl) {
-    if (ctrl.value != Matrix4.identity()) {
-      ctrl.value = Matrix4.identity();
+    _cancelDoubleTapZoom();
+    if (ctrl.value.getMaxScaleOnAxis() > 1.01) {
+      _animateDoubleTapZoom(ctrl, Matrix4.identity());
       return;
     }
     final pos = _lastDoubleTapPos;
+    late final Matrix4 target;
     if (pos == null) {
-      ctrl.value = Matrix4.identity()..scaleByDouble(2.0, 2.0, 2.0, 1.0);
+      target = Matrix4.identity()..scaleByDouble(2.0, 2.0, 2.0, 1.0);
+    } else {
+      target = Matrix4.identity()
+        ..translateByDouble(-pos.dx, -pos.dy, 0, 1.0)
+        ..scaleByDouble(2.0, 2.0, 2.0, 1.0);
+    }
+    if (mounted && !_pagedZoomed) setState(() => _pagedZoomed = true);
+    _animateDoubleTapZoom(ctrl, target);
+  }
+
+  void _animateDoubleTapZoom(TransformationController ctrl, Matrix4 target) {
+    _animatedZoomTarget = ctrl;
+    _doubleTapZoomAnimation =
+        Matrix4Tween(begin: Matrix4.copy(ctrl.value), end: target)
+            .chain(CurveTween(curve: Curves.easeInOutCubic))
+            .animate(_doubleTapZoomController);
+    _doubleTapZoomController
+      ..value = 0
+      ..forward();
+  }
+
+  void _tickDoubleTapZoom() {
+    final ctrl = _animatedZoomTarget;
+    final animation = _doubleTapZoomAnimation;
+    if (ctrl == null || animation == null) return;
+    final tracked = _zoomControllers.values.any(
+      (candidate) => identical(candidate, ctrl),
+    );
+    if (!tracked) {
+      _cancelDoubleTapZoom();
       return;
     }
-    ctrl.value = Matrix4.identity()
-      ..translateByDouble(-pos.dx, -pos.dy, 0, 1.0)
-      ..scaleByDouble(2.0, 2.0, 2.0, 1.0);
+
+    ctrl.value = animation.value;
+    if (!_doubleTapZoomController.isCompleted) return;
+
+    _animatedZoomTarget = null;
+    _doubleTapZoomAnimation = null;
+    final remainsZoomed = ctrl.value.getMaxScaleOnAxis() > 1.01;
+    if (mounted && _pagedZoomed != remainsZoomed) {
+      setState(() => _pagedZoomed = remainsZoomed);
+    }
+  }
+
+  void _cancelDoubleTapZoom([TransformationController? ctrl]) {
+    if (ctrl != null && !identical(ctrl, _animatedZoomTarget)) return;
+    _doubleTapZoomController.stop();
+    _animatedZoomTarget = null;
+    _doubleTapZoomAnimation = null;
   }
 
   @override
@@ -1396,6 +2080,10 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
           // why that doesn't let a hidden bar eat page taps.
           _buildTopBar(),
           _buildBottomBar(),
+          if (_showFloatingMangaTranslation &&
+              _pages != null &&
+              _pages!.isNotEmpty)
+            _buildFloatingMangaTranslationControl(),
           if (prefs.autoScrollButton)
             ReaderAutoScrollButton(
               autoScroll: _autoScroll,
@@ -1571,28 +2259,241 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     final spreads = _activeSpreads();
     final extra = _hasTransitionPage ? 1 : 0;
     if (spreads == null) {
-      return PageView.builder(
-        key: const ValueKey('manga-pageview'),
-        controller: _pageController,
-        reverse: direction == 'rtl',
-        itemCount: pages.length + extra,
-        onPageChanged: _onPageChanged,
-        itemBuilder: (context, index) => index >= pages.length
-            ? _chapterEndPage()
-            : _pagedItem(pages[index], index),
+      return _pagedGestureLayer(
+        PageView.builder(
+          key: const ValueKey('manga-pageview'),
+          controller: _pageController,
+          reverse: direction == 'rtl',
+          physics: _lockPagedScroll ? const _PagedPinchLockPhysics() : null,
+          itemCount: pages.length + extra,
+          onPageChanged: _onPageChanged,
+          itemBuilder: (context, index) => index >= pages.length
+              ? _chapterEndPage()
+              : _pagedItem(pages[index], index),
+        ),
       );
     }
     // Double-page landscape: each PageView page is a spread. `onPageChanged`
     // still maps the spread index back to a real page (see there).
-    return PageView.builder(
-      key: const ValueKey('manga-pageview'),
-      controller: _pageController,
-      reverse: direction == 'rtl',
-      itemCount: spreads.length + extra,
-      onPageChanged: _onPageChanged,
-      itemBuilder: (context, index) => index >= spreads.length
-          ? _chapterEndPage()
-          : _spreadItem(spreads[index], pages),
+    return _pagedGestureLayer(
+      PageView.builder(
+        key: const ValueKey('manga-pageview'),
+        controller: _pageController,
+        reverse: direction == 'rtl',
+        physics: _lockPagedScroll ? const _PagedPinchLockPhysics() : null,
+        itemCount: spreads.length + extra,
+        onPageChanged: _onPageChanged,
+        itemBuilder: (context, index) => index >= spreads.length
+            ? _chapterEndPage()
+            : _spreadItem(spreads[index], pages),
+      ),
+    );
+  }
+
+  Widget _pagedGestureLayer(Widget pageView) => SizedBox.expand(
+    key: _pagedViewportKey,
+    child: Listener(
+      behavior: HitTestBehavior.translucent,
+      onPointerDown: _onPagedPointerDown,
+      onPointerMove: _onPagedPointerMove,
+      onPointerUp: _onPagedPointerEnd,
+      onPointerCancel: _onPagedPointerEnd,
+      child: pageView,
+    ),
+  );
+
+  void _capturePagedGestureStart() {
+    _pagedGestureStartPosition = _pageController.hasClients
+        ? _pageController.page?.round()
+        : null;
+  }
+
+  void _onPagedItemPointerDown(
+    TransformationController controller,
+    Size viewport,
+    PointerDownEvent event,
+  ) {
+    if (event.kind != PointerDeviceKind.touch) return;
+    _cancelDoubleTapZoom(controller);
+
+    final viewportObject = _pagedViewportKey.currentContext?.findRenderObject();
+    final viewportPosition = viewportObject is RenderBox
+        ? viewportObject.globalToLocal(event.position)
+        : event.localPosition;
+    if (_pagedPointerPositions.isEmpty) _capturePagedGestureStart();
+    _pagedPointerPositions[event.pointer] = viewportPosition;
+
+    if (_pagedGestureController == null) {
+      _pagedGestureController = controller;
+      _pagedGestureViewport = viewport;
+      _pagedGestureViewportOrigin = viewportPosition - event.localPosition;
+      final zoomed = controller.value.getMaxScaleOnAxis() > 1.01;
+      if (zoomed != _pagedZoomed) {
+        setState(() => _pagedZoomed = zoomed);
+      }
+    }
+
+    _tryBeginPagedPinch();
+    _tryBeginPagedPan();
+  }
+
+  void _onPagedPointerDown(PointerDownEvent event) {
+    if (event.kind != PointerDeviceKind.touch) return;
+    if (_pagedPointerPositions.isEmpty) _capturePagedGestureStart();
+    _pagedPointerPositions[event.pointer] = event.localPosition;
+    _tryBeginPagedPinch();
+    _tryBeginPagedPan();
+  }
+
+  void _onPagedPointerMove(PointerMoveEvent event) {
+    if (event.kind != PointerDeviceKind.touch ||
+        !_pagedPointerPositions.containsKey(event.pointer)) {
+      return;
+    }
+    _pagedPointerPositions[event.pointer] = event.localPosition;
+    if (_pagedPointerPositions.length >= 2) {
+      _tryBeginPagedPinch();
+      _updatePagedPinch();
+    } else {
+      _tryBeginPagedPan();
+      _updatePagedPan();
+    }
+  }
+
+  void _onPagedPointerEnd(PointerEvent event) {
+    if (event.kind != PointerDeviceKind.touch ||
+        !_pagedPointerPositions.containsKey(event.pointer)) {
+      return;
+    }
+    _pagedPointerPositions.remove(event.pointer);
+    if (_pagedPinchActive && _pagedPointerPositions.length < 2) {
+      final scale = _pagedGestureController?.value.getMaxScaleOnAxis() ?? 1.0;
+      setState(() {
+        _pagedPinchActive = false;
+        _pagedZoomed = scale > 1.01;
+      });
+      _pagedPinchStart = null;
+      _pagedPanStart = null;
+      _tryBeginPagedPan();
+    }
+    if (_pagedPointerPositions.isEmpty) {
+      _pagedGestureStartPosition = null;
+      _pagedGestureController = null;
+      _pagedGestureViewport = Size.zero;
+      _pagedGestureViewportOrigin = Offset.zero;
+      _pagedPinchStart = null;
+      _pagedPanStart = null;
+    }
+  }
+
+  void _tryBeginPagedPinch() {
+    if (_pagedPinchActive ||
+        _pagedPointerPositions.length < 2 ||
+        _pagedGestureController == null) {
+      return;
+    }
+    final points = _pagedPointerPositions.values.take(2).toList();
+    final first = points[0] - _pagedGestureViewportOrigin;
+    final second = points[1] - _pagedGestureViewportOrigin;
+    final span = (first - second).distance;
+    if (span <= 0) return;
+
+    final focal = (first + second) / 2;
+    final controller = _pagedGestureController!;
+    _pagedPinchStart = _PagedPinchStart(
+      scale: controller.value.getMaxScaleOnAxis(),
+      span: span,
+      focalScene: controller.toScene(focal),
+      viewport: _pagedGestureViewport,
+    );
+    _pagedPanStart = null;
+    setState(() => _pagedPinchActive = true);
+
+    final startPosition = _pagedGestureStartPosition;
+    if (startPosition != null && _pageController.hasClients) {
+      final currentPosition = _pageController.page;
+      if (currentPosition == null ||
+          (currentPosition - startPosition).abs() > 0.001) {
+        // A drag may already have moved the current page partway through the
+        // viewport. Return to the page where finger one began before scaling.
+        _pageController.jumpToPage(startPosition);
+      }
+    }
+  }
+
+  void _tryBeginPagedPan() {
+    final controller = _pagedGestureController;
+    if (_pagedPanStart != null ||
+        _pagedPinchActive ||
+        _pagedPointerPositions.length != 1 ||
+        !_pagedZoomed ||
+        controller == null) {
+      return;
+    }
+    final pointer = _pagedPointerPositions.entries.first;
+    final position = pointer.value - _pagedGestureViewportOrigin;
+    final matrix = controller.value;
+    _pagedPanStart = _PagedPanStart(
+      pointer: position,
+      translation: Offset(matrix.storage[12], matrix.storage[13]),
+    );
+  }
+
+  void _updatePagedPinch() {
+    final controller = _pagedGestureController;
+    final start = _pagedPinchStart;
+    if (controller == null ||
+        start == null ||
+        _pagedPointerPositions.length < 2) {
+      return;
+    }
+    final points = _pagedPointerPositions.values.take(2).toList();
+    final first = points[0] - _pagedGestureViewportOrigin;
+    final second = points[1] - _pagedGestureViewportOrigin;
+    final span = (first - second).distance;
+    final scale = (start.scale * span / start.span).clamp(1.0, 4.0).toDouble();
+    final focal = (first + second) / 2;
+    final translation = _clampPagedTranslation(
+      focal - start.focalScene * scale,
+      start.viewport,
+      scale,
+    );
+    controller.value = Matrix4.identity()
+      ..translateByDouble(translation.dx, translation.dy, 0, 1.0)
+      ..scaleByDouble(scale, scale, scale, 1.0);
+  }
+
+  void _updatePagedPan() {
+    final controller = _pagedGestureController;
+    final start = _pagedPanStart;
+    if (controller == null ||
+        start == null ||
+        _pagedPointerPositions.length != 1) {
+      return;
+    }
+    final scale = controller.value.getMaxScaleOnAxis();
+    if (scale <= 1.01) return;
+    final pointer =
+        _pagedPointerPositions.values.first - _pagedGestureViewportOrigin;
+    final translation = _clampPagedTranslation(
+      start.translation + pointer - start.pointer,
+      _pagedGestureViewport,
+      scale,
+    );
+    controller.value = Matrix4.identity()
+      ..translateByDouble(translation.dx, translation.dy, 0, 1.0)
+      ..scaleByDouble(scale, scale, scale, 1.0);
+  }
+
+  Offset _clampPagedTranslation(
+    Offset translation,
+    Size viewport,
+    double scale,
+  ) {
+    if (scale <= 1.0) return Offset.zero;
+    return Offset(
+      translation.dx.clamp(viewport.width * (1 - scale), 0.0).toDouble(),
+      translation.dy.clamp(viewport.height * (1 - scale), 0.0).toDouble(),
     );
   }
 
@@ -1896,7 +2797,10 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
         .where((k) => (k - current).abs() > 3)
         .toList();
     for (final k in stale) {
-      _zoomControllers.remove(k)?.dispose();
+      final controller = _zoomControllers.remove(k);
+      if (controller == null) continue;
+      _cancelDoubleTapZoom(controller);
+      controller.dispose();
     }
   }
 
@@ -1905,6 +2809,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       index,
       () => TransformationController(),
     );
+    final fit = _pageBoxFit(_effectiveFit(sl<ReaderPrefs>()));
     _evictFarZoomControllers(_pageIndex);
     // RepaintBoundary: a page's own raster is expensive (a decoded bitmap up
     // to readerDecodeWidth), and without this it can get swept into the same
@@ -1916,58 +2821,73 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       child: LayoutBuilder(
         builder: (context, constraints) {
           final width = _decodeWidth(context);
+          final viewport = constraints.biggest;
+          final image = Center(
+            child: _cropIfEnabled(
+              _withPageTranslation(
+                _drawnLocally(page)
+                    ? Image(
+                        image: _pageProvider(page, width),
+                        fit: fit,
+                        // Same gap as the strip had: nothing at all while
+                        // the page decodes.
+                        frameBuilder: (context, child, frame, wasSync) {
+                          if (frame != null) _loaded.add(index);
+                          if (wasSync || frame != null) return child;
+                          return Center(
+                            child: _shimmerSlot(context, label: '${index + 1}'),
+                          );
+                        },
+                        errorBuilder: (_, _, _) => const Icon(
+                          Icons.broken_image_outlined,
+                          color: Colors.white24,
+                        ),
+                      )
+                    : CachedNetworkImage(
+                        imageUrl: page.url,
+                        httpHeaders: page.headers,
+                        memCacheWidth: width,
+                        maxWidthDiskCache: width,
+                        fit: fit,
+                        // Static, not an animated spinner — see ColoredBox usage in
+                        // poster_card.dart/continue_card.dart for the same convention.
+                        placeholder: (_, _) => SizedBox.expand(
+                          child: ColoredBox(color: AppColors.surface2),
+                        ),
+                        errorWidget: (_, _, _) => const Icon(
+                          Icons.broken_image_outlined,
+                          color: Colors.white38,
+                          size: 48,
+                        ),
+                      ),
+                page: page,
+                index: index,
+                fit: fit,
+              ),
+              page.url,
+            ),
+          );
           return GestureDetector(
             behavior: HitTestBehavior.opaque,
             onTapUp: (d) => _dispatchTap(d.globalPosition),
             onDoubleTapDown: (d) => _lastDoubleTapPos = d.localPosition,
             onDoubleTap: () => _toggleZoom(ctrl),
             onLongPress: () => _showPageActions(page),
-            child: InteractiveViewer(
-              transformationController: ctrl,
-              minScale: 1.0,
-              maxScale: 4.0,
-              child: Center(
-                child: _cropIfEnabled(
-                  _drawnLocally(page)
-                      ? Image(
-                          image: _pageProvider(page, width),
-                          fit: _pageBoxFit(_effectiveFit(sl<ReaderPrefs>())),
-                          // Same gap as the strip had: nothing at all while
-                          // the page decodes.
-                          frameBuilder: (context, child, frame, wasSync) {
-                            if (frame != null) _loaded.add(index);
-                            if (wasSync || frame != null) return child;
-                            return Center(
-                              child: _shimmerSlot(
-                                context,
-                                label: '${index + 1}',
-                              ),
-                            );
-                          },
-                          errorBuilder: (_, _, _) => const Icon(
-                            Icons.broken_image_outlined,
-                            color: Colors.white24,
-                          ),
-                        )
-                      : CachedNetworkImage(
-                          imageUrl: page.url,
-                          httpHeaders: page.headers,
-                          memCacheWidth: width,
-                          maxWidthDiskCache: width,
-                          fit: _pageBoxFit(_effectiveFit(sl<ReaderPrefs>())),
-                          // Static, not an animated spinner — see ColoredBox usage in
-                          // poster_card.dart/continue_card.dart for the same convention.
-                          placeholder: (_, _) => SizedBox.expand(
-                            child: ColoredBox(color: AppColors.surface2),
-                          ),
-                          errorWidget: (_, _, _) => const Icon(
-                            Icons.broken_image_outlined,
-                            color: Colors.white38,
-                            size: 48,
-                          ),
-                        ),
-                  page.url,
+            child: Listener(
+              behavior: HitTestBehavior.opaque,
+              onPointerDown: (event) =>
+                  _onPagedItemPointerDown(ctrl, viewport, event),
+              child: AnimatedBuilder(
+                animation: ctrl,
+                builder: (context, child) => ClipRect(
+                  child: Transform(
+                    key: ValueKey('manga-page-transform-$index'),
+                    alignment: Alignment.topLeft,
+                    transform: ctrl.value,
+                    child: child,
+                  ),
                 ),
+                child: image,
               ),
             ),
           );
@@ -2003,6 +2923,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   }
 
   Widget _verticalItem(BuildContext context, PageImage page, int index) {
+    final fit = _verticalBoxFit(_effectiveFit(sl<ReaderPrefs>()));
     // See the comment on _pagedItem's RepaintBoundary — same reasoning here.
     return RepaintBoundary(
       child: GestureDetector(
@@ -2010,10 +2931,58 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
         onTapUp: (d) => _dispatchTap(d.globalPosition),
         onLongPress: () => _showPageActions(page),
         child: _cropIfEnabled(
-          _verticalPageImage(context, page, index),
+          _withPageTranslation(
+            _verticalPageImage(context, page, index),
+            page: page,
+            index: index,
+            fit: fit,
+          ),
           page.url,
         ),
       ),
+    );
+  }
+
+  /// Adds the translated text as a sibling of the exact image widget, inside
+  /// the same page, crop and zoom transforms. The default reader path returns
+  /// [image] unchanged when no translation was explicitly requested.
+  Widget _withPageTranslation(
+    Widget image, {
+    required PageImage page,
+    required int index,
+    required BoxFit fit,
+  }) {
+    final chapterIndex = _slotAt(index)?.chapterIdx ?? _index;
+    final result = _translatedPages[page.url];
+    if (!_showChapterTranslations ||
+        _translationChapterIndex != chapterIndex ||
+        result == null ||
+        result.regions.isEmpty) {
+      return image;
+    }
+    final translationAppearance = sl<ReaderPrefs>();
+    return Stack(
+      fit: StackFit.passthrough,
+      children: [
+        image,
+        Positioned.fill(
+          child: MangaPageTranslationOverlay(
+            result: result,
+            fit: fit,
+            textStyle: TextStyle(
+              color: translationAppearance.mangaTranslationTextColor,
+              fontSize: translationAppearance.mangaTranslationFontSize,
+              fontWeight: FontWeight.w600,
+            ),
+            backgroundColor: translationAppearance
+                .mangaTranslationBackgroundColor
+                .withValues(
+                  alpha:
+                      translationAppearance.mangaTranslationBackgroundOpacity,
+                ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -2653,6 +3622,64 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     );
   }
 
+  Widget _buildFloatingMangaTranslationControl() {
+    final pages = _pages;
+    if (pages == null || pages.isEmpty) return const SizedBox.shrink();
+
+    final pageIndex = _pageIndex;
+    if (pageIndex < 0 || pageIndex >= pages.length) {
+      return const SizedBox.shrink();
+    }
+    final chapterIndex = _slotAt(pageIndex)?.chapterIdx ?? _index;
+    final hasCurrentChapterResults =
+        _translationChapterIndex == chapterIndex && _translatedPages.isNotEmpty;
+    final shouldRetryFailedPages =
+        !_chapterTranslationRunning &&
+        _translationChapterIndex == chapterIndex &&
+        _failedTranslationPages.isNotEmpty;
+    final shouldContinueStoppedTranslation =
+        !_chapterTranslationRunning &&
+        _translationChapterIndex == chapterIndex &&
+        _chapterTranslationStopped;
+    final label = _chapterTranslationRunning
+        ? '${context.l10n.mangaTranslationInProgress} '
+              '$_translationCompletedPages/$_translationTotalPages'
+        : shouldContinueStoppedTranslation
+        ? context.l10n.mangaTranslationContinue
+        : shouldRetryFailedPages
+        ? context.l10n.mangaTranslationRetryFailed
+        : hasCurrentChapterResults && _showChapterTranslations
+        ? context.l10n.mangaTranslationTurnOff
+        : hasCurrentChapterResults
+        ? '${context.l10n.mangaTranslationSuccess} · '
+              '${context.l10n.mangaTranslationAction}'
+        : context.l10n.mangaTranslationAction;
+    return AnimatedPositioned(
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOutCubic,
+      right: 16,
+      bottom: MediaQuery.paddingOf(context).bottom + (_chromeVisible ? 82 : 16),
+      child: MangaTranslationFloatingControl(
+        key: const ValueKey('manga-translation-floating-control'),
+        label: label,
+        stopLabel: context.l10n.mangaTranslationStop,
+        showTranslations: _showChapterTranslations,
+        showOriginalLabel: context.l10n.mangaTranslationShowOriginal,
+        showTranslationsLabel: context.l10n.mangaTranslationShowTranslations,
+        active:
+            _chapterTranslationRunning ||
+            (hasCurrentChapterResults && _showChapterTranslations),
+        running: _chapterTranslationRunning,
+        stopRequested: _chapterTranslationStopRequested,
+        onTap: () => unawaited(_onFloatingMangaTranslationTap()),
+        onToggleVisibility: () => setState(
+          () => _showChapterTranslations = !_showChapterTranslations,
+        ),
+        onStop: _requestMangaTranslationStop,
+      ),
+    );
+  }
+
   /// Start/stop hands-free reading. Works in every mode: the webtoon strip
   /// creeps, the paged views turn a page every so often — a mode where the
   /// feature simply doesn't exist is what made the first attempt feel broken.
@@ -2897,6 +3924,9 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// panel; this is just the way in.
   Future<void> _openReaderMenu() async {
     final chapter = _chapter;
+    final pages = _pages;
+    final canTranslatePage =
+        pages != null && pages.isNotEmpty && _pageIndex < pages.length;
     final canBrowse = source_actions.canOpenInBrowser(
       widget.sourceId,
       chapter.url,
@@ -2936,6 +3966,15 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
             ),
           ),
         ],
+        if (canTranslatePage)
+          PopupMenuItem(
+            key: const ValueKey('reader-menu-translate-page'),
+            value: _ReaderMenuAction.translatePage,
+            child: _menuRow(
+              Icons.translate_rounded,
+              context.l10n.mangaPageTranslationTitle,
+            ),
+          ),
         PopupMenuItem(
           value: _ReaderMenuAction.toggleRead,
           child: _menuRow(
@@ -2946,6 +3985,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
           ),
         ),
         PopupMenuItem(
+          key: const ValueKey('reader-menu-settings'),
           value: _ReaderMenuAction.settings,
           child: _menuRow(Icons.tune_rounded, context.l10n.readingSettings),
         ),
@@ -2968,7 +4008,9 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       case _ReaderMenuAction.toggleRead:
         await _toggleReadFromMenu();
       case _ReaderMenuAction.settings:
-        _openSettingsSheet();
+        await _openSettingsSheet();
+      case _ReaderMenuAction.translatePage:
+        await _openMangaTranslationSheet();
     }
   }
 
@@ -2976,7 +4018,14 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     children: [
       Icon(icon, size: 20, color: AppColors.textSecondary),
       const SizedBox(width: 12),
-      Text(label, style: AppText.body),
+      Expanded(
+        child: Text(
+          label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: AppText.body,
+        ),
+      ),
     ],
   );
 
@@ -2999,8 +4048,9 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     );
   }
 
-  void _openSettingsSheet() {
-    showModalBottomSheet<void>(
+  Future<void> _openSettingsSheet() async {
+    var openTranslationSettings = false;
+    await showModalBottomSheet<void>(
       context: context,
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
@@ -3086,6 +4136,29 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                           context.l10n.readerSettings,
                           style: AppText.headline,
                         ),
+                        readerSheetSection(
+                          context.l10n.mangaTranslationSection,
+                        ),
+                        readerSheetGroup([
+                          KeyedSubtree(
+                            key: const ValueKey(
+                              'reader-settings-manga-translation',
+                            ),
+                            child: readerSheetRow(
+                              icon: Icons.translate_rounded,
+                              label: context.l10n.mangaTranslationSettings,
+                              trailing: const Icon(
+                                Icons.chevron_right_rounded,
+                                color: AppColors.textSecondary,
+                                size: 20,
+                              ),
+                              onTap: () {
+                                openTranslationSettings = true;
+                                Navigator.of(ctx).pop();
+                              },
+                            ),
+                          ),
+                        ]),
                         readerSheetSection(context.l10n.statusReading),
                         readerSheetGroup([
                           readerSheetRow(
@@ -3297,6 +4370,9 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
         },
       ),
     );
+    if (openTranslationSettings && mounted) {
+      await _openMangaTranslationSheet();
+    }
   }
 
   String _directionLabel(String d) => switch (d) {
@@ -3586,6 +4662,13 @@ class _ChapterLoadingBar extends StatelessWidget {
   }
 }
 
+class _MangaTranslationPage {
+  const _MangaTranslationPage({required this.index, required this.page});
+
+  final int index;
+  final PageImage page;
+}
+
 /// Where one page of the strip came from.
 ///
 /// The strip is flat — a single list the reader scrolls — but it can hold
@@ -3602,6 +4685,53 @@ class _PageSlot {
 
   /// Last page of its chapter — where the transition card goes.
   bool get isChapterEnd => pageInChapter == chapterPages - 1;
+}
+
+class _PagedPinchStart {
+  const _PagedPinchStart({
+    required this.scale,
+    required this.span,
+    required this.focalScene,
+    required this.viewport,
+  });
+
+  final double scale;
+  final double span;
+  final Offset focalScene;
+  final Size viewport;
+}
+
+class _PagedPanStart {
+  const _PagedPanStart({required this.pointer, required this.translation});
+
+  final Offset pointer;
+  final Offset translation;
+}
+
+/// Stops both an already-active drag and its release fling while the user is
+/// pinching/drag-panning a page. `NeverScrollableScrollPhysics` alone rejects
+/// new drags but leaves an existing drag's user offset untouched.
+class _PagedPinchLockPhysics extends PageScrollPhysics {
+  const _PagedPinchLockPhysics({super.parent});
+
+  @override
+  _PagedPinchLockPhysics applyTo(ScrollPhysics? ancestor) =>
+      _PagedPinchLockPhysics(parent: buildParent(ancestor));
+
+  @override
+  bool get allowUserScrolling => false;
+
+  @override
+  bool get allowImplicitScrolling => false;
+
+  @override
+  double applyPhysicsToUserOffset(ScrollMetrics position, double offset) => 0;
+
+  @override
+  Simulation? createBallisticSimulation(
+    ScrollMetrics position,
+    double velocity,
+  ) => null;
 }
 
 class _TwoFingerScaleRecognizer extends ScaleGestureRecognizer {
@@ -3739,4 +4869,10 @@ int estimateIndexFromScroll(double pixels, double maxExtent, int pageCount) {
 /// [openInWebView] is the in-app WebView; [openInBrowser] leaves the app for
 /// the system browser. Both, and named apart, the way Mihon does it — one
 /// item called "Open in browser" that opened a WebView was the confusing part.
-enum _ReaderMenuAction { openInWebView, openInBrowser, toggleRead, settings }
+enum _ReaderMenuAction {
+  openInWebView,
+  openInBrowser,
+  toggleRead,
+  settings,
+  translatePage,
+}

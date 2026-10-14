@@ -15,6 +15,7 @@ import 'package:watch_app/core/repository/source_repository.dart';
 import 'package:watch_app/core/zmode/anilist_catalogue.dart';
 import 'package:watch_app/core/zmode/mal_catalogue.dart';
 import 'package:watch_app/core/provider/cf_solve_needed.dart';
+import 'package:watch_app/core/ui/streaming_prefs.dart';
 import 'package:watch_app/core/zmode/match_store.dart';
 import 'package:watch_app/core/zmode/zmode_source_prefs.dart';
 import 'package:watch_app/core/zmode/metadata_repository.dart';
@@ -43,6 +44,7 @@ MetadataRepository _metaRepo({
   required ZSourcePrefs prefs,
   required ZKind Function() browseKind,
   AniListCatalogue? anilist,
+  TmdbCatalogue? tmdb,
   MalCatalogue? mal,
   void Function(String message)? onProviderFallback,
   List<({String id, String name})> Function(ZKind)? candidates,
@@ -65,7 +67,7 @@ MetadataRepository _metaRepo({
             },
         };
       }),
-  tmdb: TmdbCatalogue((p, q) async => {'results': []}),
+  tmdb: tmdb ?? TmdbCatalogue((p, q) async => {'results': []}),
   mal: mal,
   onProviderFallback: onProviderFallback,
   sources: sources,
@@ -344,6 +346,106 @@ void main() {
     expect(a, isNotEmpty);
     expect(b, same(a));
     expect(g.calls.length, 1, reason: 'the second read came from the cache');
+  });
+
+  test(
+    'streaming service search stays on TMDB and checks its provider',
+    () async {
+      StreamingPrefs.deviceRegion = () => 'IN';
+      addTearDown(StreamingPrefs.resetDeviceRegionForTest);
+      final calls = <String>[];
+      final tmdb = TmdbCatalogue((path, params) async {
+        calls.add(path);
+        return switch (path) {
+          '/search/multi' => {
+            'results': [
+              {'id': 11, 'media_type': 'movie', 'title': 'The Office'},
+            ],
+          },
+          '/movie/11/watch/providers' => {
+            'results': {
+              'IN': {
+                'flatrate': [
+                  {'provider_id': 8},
+                ],
+              },
+            },
+          },
+          _ => null,
+        };
+      });
+      final r = _metaRepo(
+        sources: src,
+        store: store,
+        prefs: prefs,
+        browseKind: () => ZKind.anime,
+        matcher: SourceMatcher(
+          sources: src,
+          store: store,
+          prefs: prefs,
+          candidates: (_) => [(id: 'allanime', name: 'AllAnime')],
+        ),
+        tmdb: tmdb,
+      );
+
+      final items = (await r.streamingServicePage(
+        8,
+        query: 'The Office',
+      )).items;
+
+      expect(items.single.title, 'The Office');
+      expect(calls, ['/search/multi', '/movie/11/watch/providers']);
+    },
+  );
+
+  test('clearing home cache discards an older in-flight result', () async {
+    final oldGate = Completer<void>();
+    var calls = 0;
+    final catalogue = AniListCatalogue((query, variables) async {
+      final aliases = RegExp(
+        r'(r\d+):',
+      ).allMatches(query).map((match) => match.group(1)!);
+      if (aliases.isEmpty) return {'Media': _al()};
+      final call = ++calls;
+      if (call == 1) await oldGate.future;
+      final title = call == 1 ? 'old cached title' : 'fresh safe title';
+      return {
+        for (final alias in aliases)
+          alias: {
+            'media': [
+              {
+                ..._al(),
+                'title': {'romaji': title, 'english': title},
+              },
+            ],
+          },
+      };
+    });
+    final r = _metaRepo(
+      sources: src,
+      store: store,
+      prefs: prefs,
+      browseKind: () => kind,
+      matcher: SourceMatcher(
+        sources: src,
+        store: store,
+        prefs: prefs,
+        candidates: (_) => [(id: 'allanime', name: 'AllAnime')],
+      ),
+      anilist: catalogue,
+    );
+
+    final oldLoad = r.home();
+    r.clearHomeCache();
+    final freshLoad = r.home();
+    oldGate.complete();
+
+    final fresh = await freshLoad;
+    await oldLoad;
+    final cached = await r.home();
+    expect(fresh.first.items.first.title, 'fresh safe title');
+    expect(cached.first.items.first.title, 'fresh safe title');
+    expect(calls, 2);
   });
 
   test(

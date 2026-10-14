@@ -28,6 +28,7 @@ import 'core/notify/notification_service.dart';
 import 'core/notify/push_service.dart';
 import 'core/ui/home_rows_prefs.dart';
 import 'core/ui/route_observer.dart';
+import 'core/ui/poster_card.dart';
 import 'core/notify/subscription_checker.dart';
 import 'core/notify/subscription_store.dart';
 import 'core/playback/category_store.dart';
@@ -35,6 +36,7 @@ import 'core/playback/my_list.dart';
 import 'core/playback/history_merge.dart';
 import 'core/playback/resume_store.dart';
 import 'core/playback/watch_history.dart';
+import 'core/profiles/viewer_profile.dart';
 import 'core/reading/read_history.dart';
 import 'core/state/active_source_cubit.dart';
 import 'core/locale/locale_controller.dart';
@@ -52,6 +54,7 @@ import 'features/auth/auth_cubit.dart';
 import 'features/home/cubit/home_cubit.dart';
 import 'features/onboarding/boot_error_screen.dart';
 import 'features/onboarding/onboarding_screen.dart';
+import 'features/profiles/profile_launch_gate.dart';
 import 'features/shell/root_shell.dart';
 import 'features/watch_together/ui/party_bar.dart';
 import 'features/companion/companion_catalogue.dart';
@@ -329,18 +332,36 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
 
   bool? _onboardedOverride; // set true once onboarding finishes this session
   bool _handledLaunchTaps = false; // route a notification-tap launch once
+  DateTime? _lastSubscriptionCheck;
 
   /// How stale the local library may be before a launch/resume re-pull. Short
   /// enough that switching devices shows fresh data on open, long enough to
   /// debounce app-switching so the DB isn't hammered.
   static const Duration _syncFreshness = Duration(minutes: 2);
+  static const Duration _subscriptionCheckCooldown = Duration(minutes: 15);
 
-  /// TV (and a phone left on My List) stays in [AppLifecycleState.resumed]
-  /// for hours, so [_syncOnResume] never fires again. Poll while foregrounded
-  /// so a watch/add/remove on another device lands without relaunching.
-  static const Duration _foregroundPoll = Duration(seconds: 30);
-
-  Timer? _foregroundSync;
+  Future<void> _checkSubscriptions({bool syncCloudStream = false}) async {
+    if (!Platform.isAndroid ||
+        !sl.isRegistered<SubscriptionChecker>() ||
+        !sl.isRegistered<SubscriptionStore>()) {
+      return;
+    }
+    final now = DateTime.now();
+    if (_lastSubscriptionCheck != null &&
+        now.difference(_lastSubscriptionCheck!) < _subscriptionCheckCooldown) {
+      return;
+    }
+    _lastSubscriptionCheck = now;
+    try {
+      if (syncCloudStream) {
+        await CsNotify.sync(sl<SubscriptionStore>().all());
+      }
+      await sl<SubscriptionChecker>().checkAll();
+      await CsNotify.checkNow();
+    } catch (e) {
+      AppLogger.instance.log('[notify] foreground check failed · $e');
+    }
+  }
 
   void _onThemeChanged() {
     if (mounted) {
@@ -411,7 +432,6 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
     MetadataProviderPrefs.revision.removeListener(_onMetadataProviderChanged);
     HomeRowsPrefs.revision.removeListener(_onHomeRowsChanged);
     WidgetsBinding.instance.removeObserver(this);
-    _foregroundSync?.cancel();
     _tvShellGate.dispose();
     super.dispose();
   }
@@ -428,19 +448,15 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
         unawaited(sl<AuthCubit>().revalidateIfFlagged());
       }
       _syncOnResume();
-      _startForegroundSync();
+      unawaited(_checkSubscriptions());
       // The wallpaper may have changed while we were away. No-op unless
       // Material You is on, and only rebuilds if the colours actually moved.
       ThemeController.refresh();
     } else if (state == AppLifecycleState.paused) {
-      _foregroundSync?.cancel();
-      _foregroundSync = null;
       // Opening the in-app player (native surface / immersive) fires paused
       // even though the user is still watching. Do not drop Rich Presence.
       discord?.onPaused();
     } else if (state == AppLifecycleState.detached) {
-      _foregroundSync?.cancel();
-      _foregroundSync = null;
       discord?.onDetached();
     }
   }
@@ -449,33 +465,18 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
   /// library if it's older than [_syncFreshness] (debounced inside
   /// [MyListStore.pullFromCloudIfStale], so rapid app-switching doesn't hammer
   /// the DB). Also flushes any un-synced My List adds.
-  void _syncOnResume() =>
-      _syncLibrary(maxAge: _syncFreshness, forceMyList: true);
+  void _syncOnResume() => _syncLibrary(maxAge: _syncFreshness);
 
-  void _startForegroundSync() {
-    _foregroundSync?.cancel();
-    // Don't wait for the first period — TV sits in resumed and phone
-    // app-switch used to skip a pull for two minutes.
-    _syncLibrary(maxAge: _foregroundPoll, forceMyList: true);
-    _foregroundSync = Timer.periodic(_foregroundPoll, (_) {
-      _syncLibrary(maxAge: _foregroundPoll, forceMyList: true);
-    });
-  }
-
-  void _syncLibrary({required Duration maxAge, bool forceMyList = false}) {
+  void _syncLibrary({required Duration maxAge}) {
     if (!sl.isRegistered<AuthCubit>() || !sl<AuthCubit>().state.isLoggedIn) {
       return;
     }
-    if (forceMyList) {
-      unawaited(sl<MyListStore>().pullFromCloud());
-    } else {
-      unawaited(sl<MyListStore>().pullFromCloudIfStale(maxAge: maxAge));
-    }
+    unawaited(sl<MyListStore>().pullFromCloudIfStale(maxAge: maxAge));
     unawaited(sl<WatchHistory>().pullFromCloudIfStale(maxAge: maxAge));
     unawaited(sl<ReadHistory>().pullFromCloudIfStale(maxAge: maxAge));
     // My List categories ride the same trigger — two small SELECTs, and they
     // have to arrive with the list they label.
-    unawaited(sl<CategoryStore>().pullFromCloud());
+    unawaited(sl<CategoryStore>().pullFromCloudIfStale(maxAge: maxAge));
     unawaited(sl<MyListStore>().retryPending());
   }
 
@@ -488,7 +489,9 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
     CompanionCatalogue.bind();
     if (Platform.isAndroid || Platform.isIOS) {
       if (sl<AppMode>().isTv) {
-        unawaited(CompanionCatalogue.channel.invokeMethod<void>('restoreReceiver'));
+        unawaited(
+          CompanionCatalogue.channel.invokeMethod<void>('restoreReceiver'),
+        );
       } else {
         unawaited(RemoteSession.instance.start());
       }
@@ -516,6 +519,9 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
     try {
       await sl<AuthCubit>().restore().timeout(const Duration(seconds: 5));
       if (sl<AuthCubit>().state.isLoggedIn) {
+        await sl<ViewerProfileStore>().loadForUser(
+          displayName: sl<AuthCubit>().state.displayName,
+        );
         Future<void> cloudSync() async {
           await Future.wait([
             sl<MyListStore>().seedCloudIfNeeded(),
@@ -526,7 +532,7 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
             sl<MyListStore>().pullFromCloudIfStale(maxAge: _syncFreshness),
             sl<WatchHistory>().pullFromCloudIfStale(maxAge: _syncFreshness),
             sl<ReadHistory>().pullFromCloudIfStale(maxAge: _syncFreshness),
-            sl<CategoryStore>().pullFromCloud(),
+            sl<CategoryStore>().pullFromCloudIfStale(maxAge: _syncFreshness),
           ]).timeout(const Duration(seconds: 6));
           unawaited(sl<MyListStore>().retryPending());
         }
@@ -537,11 +543,15 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
         } else {
           await cloudSync();
         }
-        // Launch never delivers [AppLifecycleState.resumed] if the app started
-        // in the foreground (TV sits there all day). Start the poll now.
-        _startForegroundSync();
       }
     } catch (_) {}
+    if (!sl<ViewerProfileStore>().isLoadedForCurrentUser) {
+      try {
+        await sl<ViewerProfileStore>().loadForUser(
+          displayName: sl<AuthCubit>().state.displayName,
+        );
+      } catch (_) {}
+    }
     // Rows saved under a source before the browse screen started resolving
     // titles to the catalogue: move them onto the show they belong to so
     // Continue Watching stops listing the same title twice. Once, after the
@@ -566,10 +576,8 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
         try {
           await NotificationService.instance.init();
           // Mirror CS subs to native + (re)schedule the background worker, then
-          // run the launch sweep: JS sources here, CS via the native worker.
-          await CsNotify.sync(sl<SubscriptionStore>().all());
-          await sl<SubscriptionChecker>().checkAll();
-          await CsNotify.checkNow();
+          // run the launch/resume sweep: JS sources here, CS via native worker.
+          await _checkSubscriptions(syncCloudStream: true);
         } catch (_) {}
       });
     }
@@ -590,6 +598,9 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
   /// listener mounts, so no double pull).
   Future<void> _onAuthChange(BuildContext context, AuthState state) async {
     if (state.status == AuthStatus.authenticated) {
+      await sl<ViewerProfileStore>().loadForUser(
+        displayName: state.displayName,
+      );
       Future<void> sync() async {
         await sl<MyListStore>().seedCloudIfNeeded();
         await sl<WatchHistory>().seedCloudIfNeeded();
@@ -597,6 +608,7 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
         await sl<MyListStore>().pullFromCloud();
         await sl<WatchHistory>().pullFromCloud();
         await sl<ReadHistory>().pullFromCloud();
+        await sl<CategoryStore>().pullFromCloud();
         unawaited(sl<MyListStore>().retryPending());
         if (!sl.isRegistered<AppMode>() ||
             !sl<AppMode>().isTv ||
@@ -613,6 +625,7 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
         await sync();
       }
     } else if (state.status == AuthStatus.unauthenticated) {
+      await sl<ViewerProfileStore>().loadForUser();
       await sl<MyListStore>().clearLocal();
       await sl<WatchHistory>().clearLocal();
       await sl<ReadHistory>().clearLocal();
@@ -622,7 +635,7 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
   Widget _buildShellHome() {
     final onboarded = _onboardedOverride ?? isOnboarded();
     return onboarded
-        ? RootShell()
+        ? ProfileLaunchGate(child: RootShell())
         : OnboardingScreen(
             onDone: () {
               setState(() => _onboardedOverride = true);
@@ -635,7 +648,9 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
                   ..value = true;
               } else {
                 rootNavigatorKey.currentState?.pushReplacement(
-                  MaterialPageRoute<void>(builder: (_) => RootShell()),
+                  MaterialPageRoute<void>(
+                    builder: (_) => ProfileLaunchGate(child: RootShell()),
+                  ),
                 );
               }
             },
@@ -760,7 +775,9 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
               )
             : (child ?? const SizedBox.shrink());
         final isTv = sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
-        return isTv ? TvViewport(child: content) : content;
+        return PosterCardScope(
+          child: isTv ? TvViewport(child: content) : content,
+        );
       },
     );
   }

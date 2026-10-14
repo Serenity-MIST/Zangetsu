@@ -13,6 +13,12 @@ import '../companion/companion_settings_screen.dart';
 import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
 import '../../core/playback/my_list.dart';
+import '../../core/playback/category_store.dart';
+import '../../core/playback/watch_history.dart';
+import '../../core/profiles/viewer_profile.dart';
+import '../../core/profiles/viewer_profile_avatar.dart';
+import '../../core/profiles/profile_shell_scope.dart';
+import '../../core/reading/read_history.dart';
 import '../../core/mode/content_mode.dart';
 import '../../core/mode/content_mode_cubit.dart';
 import '../../core/theme/app_colors.dart';
@@ -22,6 +28,7 @@ import '../../l10n/l10n.dart';
 import '../../core/ui/nav_prefs.dart';
 import '../downloads/downloads_screen.dart';
 import '../history/history_screen.dart';
+import '../profiles/viewer_profiles_screen.dart';
 import '../auth/auth_cubit.dart';
 import '../home/cubit/home_cubit.dart';
 import '../home/home_screen.dart';
@@ -33,9 +40,8 @@ import 'mode_bar.dart';
 import '../../core/ui/dock_visibility.dart';
 import 'root_shell_tv.dart';
 
-/// The four pages used by both [RootShell] (phone bottom nav) and
-/// [RootShellTv] (TV left rail). Any change to the page set must be
-/// reflected in BOTH shells; this single function is the one source of truth.
+/// Shared pages for [RootShell] (phone bottom nav) and [RootShellTv] (TV left
+/// rail). Settings stays at index 3 for both shells.
 ///
 /// [searchFocusSignal] is bumped each time the Search rail item is
 /// (re)selected on TV so the embedded search screen can auto-focus its
@@ -108,6 +114,55 @@ class _RootShellState extends State<RootShell>
     _switch = CurvedAnimation(parent: _switchCtrl, curve: Curves.easeOutCubic);
     _navPrefs.addListener(_onTabsChanged);
     ZModePrefs.revision.addListener(_onZMode);
+    if (sl.isRegistered<ViewerProfileStore>()) {
+      sl<ViewerProfileStore>().active.addListener(_onProfileChanged);
+      sl<ViewerProfileStore>().contextRevision.addListener(
+        _onProfileContextChanged,
+      );
+    }
+  }
+
+  void _onProfileChanged() {
+    if (!mounted || (sl.isRegistered<AppMode>() && sl<AppMode>().isTv)) return;
+    setState(() {});
+  }
+
+  void _onProfileContextChanged() {
+    // RootShellTv owns these listeners when the TV shell is active.
+    if (!mounted || (sl.isRegistered<AppMode>() && sl<AppMode>().isTv)) return;
+    final profileId = sl<ViewerProfileStore>().activeId;
+    if (sl.isRegistered<HomeCubit>()) {
+      unawaited(sl<HomeCubit>().reloadAfterProfileChange());
+    }
+    unawaited(_syncProfile(profileId));
+  }
+
+  Future<void> _syncProfile(String profileId) async {
+    if (!sl.isRegistered<MyListStore>() ||
+        !sl.isRegistered<WatchHistory>() ||
+        !sl.isRegistered<ReadHistory>() ||
+        !sl.isRegistered<CategoryStore>()) {
+      return;
+    }
+    try {
+      await Future.wait([
+        sl<MyListStore>().seedCloudIfNeeded(),
+        sl<WatchHistory>().seedCloudIfNeeded(),
+        sl<ReadHistory>().seedCloudIfNeeded(),
+      ]).timeout(const Duration(seconds: 8));
+      if (!mounted || sl<ViewerProfileStore>().activeId != profileId) return;
+      await Future.wait([
+        sl<MyListStore>().pullFromCloud(forProfileId: profileId),
+        sl<WatchHistory>().pullFromCloud(forProfileId: profileId),
+        sl<ReadHistory>().pullFromCloud(forProfileId: profileId),
+        sl<CategoryStore>().pullFromCloud(),
+      ]).timeout(const Duration(seconds: 8));
+      if (mounted && sl<ViewerProfileStore>().activeId == profileId) {
+        sl<HomeCubit>().relayout();
+      }
+    } catch (_) {
+      // Keep the already-available local profile usable when cloud sync fails.
+    }
   }
 
   /// The toggle changed: close the mode bar and, as a safety net, bounce off
@@ -144,6 +199,12 @@ class _RootShellState extends State<RootShell>
   void dispose() {
     _navPrefs.removeListener(_onTabsChanged);
     ZModePrefs.revision.removeListener(_onZMode);
+    if (sl.isRegistered<ViewerProfileStore>()) {
+      sl<ViewerProfileStore>().active.removeListener(_onProfileChanged);
+      sl<ViewerProfileStore>().contextRevision.removeListener(
+        _onProfileContextChanged,
+      );
+    }
     _switchCtrl.dispose();
     super.dispose();
   }
@@ -197,32 +258,38 @@ class _RootShellState extends State<RootShell>
   /// One page per visible tab, in the same order the dock draws them, so the
   /// [IndexedStack] index is just the tab's position in that list.
   ///
-  /// [buildShellPages] stays the shared Home/Search/My List/Settings set that
-  /// the TV rail also builds from — untouched, so TV is unaffected. Search is
-  /// no longer a phone dock tab (it's a Home header icon now), so this never
-  /// places `shared[1]` — it's still built, just unused here, the same way
-  /// Settings only ever takes `shared.last`.
-  List<Widget> _pagesFor(List<DockTab> tabs) {
+  /// Search is no longer a phone dock tab (it's a Home header icon now), so
+  /// this never places `shared[1]`. The Profile dock item opens Settings.
+  List<Widget> _pagesFor(List<DockTab> tabs, String profileId) {
     final shared = buildShellPages(null);
     return [
       for (final t in tabs)
-        switch (t) {
-          DockTab.home => shared[0],
-          DockTab.myList => shared[2],
-          DockTab.profile => shared.last, // Settings, shown as "Profile"
-          // Both normally get pushed with a back button; as tabs they own the
-          // whole screen, so their own back affordance is suppressed.
-          DockTab.downloads => const DownloadsScreen(showBack: false),
-          DockTab.history => const HistoryScreen(showBack: false),
-          DockTab.sources => const BrowseSourcesScreen(),
-          DockTab.remote => CompanionSettingsScreen(showBack: false, active: _tab == DockTab.remote),
-        },
+        KeyedSubtree(
+          key: ValueKey('$profileId:${t.name}'),
+          child: switch (t) {
+            DockTab.home => shared[0],
+            DockTab.myList => shared[2],
+            DockTab.profile => shared[3], // Settings
+            // Both normally get pushed with a back button; as tabs they own the
+            // whole screen, so their own back affordance is suppressed.
+            DockTab.downloads => const DownloadsScreen(showBack: false),
+            DockTab.history => const HistoryScreen(showBack: false),
+            DockTab.sources => const BrowseSourcesScreen(),
+            DockTab.remote => CompanionSettingsScreen(
+              showBack: false,
+              active: _tab == DockTab.remote,
+            ),
+          },
+        ),
     ];
   }
 
   @override
   Widget build(BuildContext context) {
-    if (sl<AppMode>().isTv) return const RootShellTv();
+    final deferContent = ProfileShellScope.shouldDeferContent(context);
+    if (sl<AppMode>().isTv) {
+      return deferContent ? const SizedBox.expand() : const RootShellTv();
+    }
     return PopScope(
       // Intercept Back at the app root: first press toasts, second exits.
       canPop: false,
@@ -244,47 +311,53 @@ class _RootShellState extends State<RootShell>
           // Content runs under the floating dock (screens keep their own bottom
           // padding so the last row scrolls clear of it).
           extendBody: true,
-          body: NotificationListener<ScrollNotification>(
-            // One place, so no screen has to know the dock exists. Returns
-            // false throughout — it reads the scroll, never eats it.
-            onNotification: DockScrollCollapse.onNotification,
-            child: Builder(
-              builder: (context) {
-                final visible = _visibleTabs();
-                final active = visible.indexOf(_tab);
-                return AnimatedBuilder(
-                  animation: _switch,
-                  builder: (context, child) {
-                    final v = _switch.value;
-                    // Incoming tab fades in from 0.4 and slides up 20px. Never blanks.
-                    return Opacity(
-                      opacity: 0.4 + 0.6 * v,
-                      child: Transform.translate(
-                        offset: Offset(0, (1 - v) * 20),
-                        child: child,
-                      ),
-                    );
-                  },
-                  // RepaintBoundary → the page is a single cached layer the transition
-                  // just composites (opacity + translate), so no repaint per frame.
-                  child: RepaintBoundary(
-                    child: IndexedStack(
-                      // indexOf can be -1 for one frame if the mode flipped before
-                      // the listener ran; clamp rather than throw.
-                      index: active < 0 ? 0 : active,
-                      children: _pagesFor(visible),
-                    ),
+          body: deferContent
+              ? const SizedBox.expand()
+              : NotificationListener<ScrollNotification>(
+                  // One place, so no screen has to know the dock exists. Returns
+                  // false throughout — it reads the scroll, never eats it.
+                  onNotification: DockScrollCollapse.onNotification,
+                  child: Builder(
+                    builder: (context) {
+                      final visible = _visibleTabs();
+                      final active = visible.indexOf(_tab);
+                      return AnimatedBuilder(
+                        animation: _switch,
+                        builder: (context, child) {
+                          final v = _switch.value;
+                          // Incoming tab fades in from 0.4 and slides up 20px. Never blanks.
+                          return Opacity(
+                            opacity: 0.4 + 0.6 * v,
+                            child: Transform.translate(
+                              offset: Offset(0, (1 - v) * 20),
+                              child: child,
+                            ),
+                          );
+                        },
+                        // RepaintBoundary → the page is a single cached layer the transition
+                        // just composites (opacity + translate), so no repaint per frame.
+                        child: RepaintBoundary(
+                          child: IndexedStack(
+                            // indexOf can be -1 for one frame if the mode flipped before
+                            // the listener ran; clamp rather than throw.
+                            index: active < 0 ? 0 : active,
+                            children: _pagesFor(
+                              visible,
+                              sl.isRegistered<ViewerProfileStore>()
+                                  ? sl<ViewerProfileStore>().activeId
+                                  : 'default',
+                            ),
+                          ),
+                        ),
+                      );
+                    },
                   ),
-                );
-              },
-            ),
-          ),
+                ),
           bottomNavigationBar: ValueListenableBuilder<bool>(
             valueListenable: dockHiddenBySection,
             builder: (context, sectionOpen, _) {
               // Slide the dock away only when a Settings section is open AND the
-              // Settings (Profile, last) tab is the one showing — every other tab
-              // keeps its dock.
+              // Profile (Settings) tab is showing — every other tab keeps its dock.
               final hide = sectionOpen && _tab == DockTab.profile;
               return Column(
                 mainAxisSize: MainAxisSize.min,
@@ -747,9 +820,58 @@ class _ProfileDockItem extends StatelessWidget {
   final bool selected;
   final VoidCallback onTap;
 
+  Future<void> _openProfileSwitcher(BuildContext context) async {
+    if (!sl.isRegistered<ViewerProfileStore>()) return;
+    final profiles = sl<ViewerProfileStore>();
+    if (profiles.profiles.length < 2) return;
+
+    final addProfile = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      backgroundColor: AppColors.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+      ),
+      builder: (sheetContext) => _ProfileSwitcherSheet(
+        profiles: profiles,
+        onSelected: (profile) {
+          Navigator.of(sheetContext).pop();
+          unawaited(_switchProfile(context, profiles, profile));
+        },
+        onAddProfile: () => Navigator.of(sheetContext).pop(true),
+      ),
+    );
+    if (addProfile == true && context.mounted) {
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute<void>(builder: (_) => const ViewerProfilesScreen()),
+      );
+    }
+  }
+
+  Future<void> _switchProfile(
+    BuildContext context,
+    ViewerProfileStore profiles,
+    ViewerProfile profile,
+  ) async {
+    try {
+      await profiles.switchTo(profile.id);
+    } catch (_) {
+      if (context.mounted) {
+        ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+          const SnackBar(content: Text("Couldn't switch profile. Try again.")),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final color = selected ? AppColors.accent : AppColors.textSecondary;
+    final profile = sl.isRegistered<ViewerProfileStore>()
+        ? sl<ViewerProfileStore>().activeProfile
+        : null;
     return Expanded(
       // See [_DockItem]: the name has to survive the label folding away.
       child: Semantics(
@@ -757,8 +879,11 @@ class _ProfileDockItem extends StatelessWidget {
         button: true,
         selected: selected,
         container: true,
+        hint: 'Long-press to switch profiles',
+        onLongPress: () => unawaited(_openProfileSwitcher(context)),
         child: InkWell(
           onTap: onTap,
+          onLongPress: () => unawaited(_openProfileSwitcher(context)),
           borderRadius: BorderRadius.circular(18),
           child: ConstrainedBox(
             constraints: const BoxConstraints(minHeight: _FloatingDock._tapMin),
@@ -773,67 +898,105 @@ class _ProfileDockItem extends StatelessWidget {
                       child: Center(
                         child: _DockPop(
                           selected: selected,
-                          child: BlocBuilder<AuthCubit, AuthState>(
-                            builder: (context, auth) {
-                              final ring = selected
-                                  ? Border.all(
-                                      color: AppColors.accent,
-                                      width: 1.8,
-                                    )
-                                  : null;
-                              if (auth.isLoggedIn) {
-                                final initial = auth.displayName.isNotEmpty
-                                    ? auth.displayName[0].toUpperCase()
-                                    : '?';
-                                return Container(
-                                  width: 24,
-                                  height: 24,
-                                  decoration: BoxDecoration(
-                                    shape: BoxShape.circle,
-                                    border: ring,
-                                    color: AppColors.surface2,
-                                    image: auth.avatarUrl != null
-                                        ? DecorationImage(
-                                            image: CachedNetworkImageProvider(
-                                              auth.avatarUrl!,
-                                            ),
-                                            fit: BoxFit.cover,
+                          child: profile == null
+                              ? BlocBuilder<AuthCubit, AuthState>(
+                                  builder: (context, auth) {
+                                    final ring = selected
+                                        ? Border.all(
+                                            color: AppColors.accent,
+                                            width: 1.8,
                                           )
-                                        : null,
+                                        : null;
+                                    if (auth.isLoggedIn) {
+                                      final initial =
+                                          auth.displayName.isNotEmpty
+                                          ? auth.displayName[0].toUpperCase()
+                                          : '?';
+                                      return Container(
+                                        width: 24,
+                                        height: 24,
+                                        decoration: BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          border: ring,
+                                          color: AppColors.surface2,
+                                          image: auth.avatarUrl != null
+                                              ? DecorationImage(
+                                                  image:
+                                                      CachedNetworkImageProvider(
+                                                        auth.avatarUrl!,
+                                                      ),
+                                                  fit: BoxFit.cover,
+                                                )
+                                              : null,
+                                        ),
+                                        alignment: Alignment.center,
+                                        child: auth.avatarUrl == null
+                                            ? Text(
+                                                initial,
+                                                style: TextStyle(
+                                                  fontSize: 11,
+                                                  fontWeight: FontWeight.w800,
+                                                  color: selected
+                                                      ? AppColors.accent
+                                                      : AppColors.textPrimary,
+                                                ),
+                                              )
+                                            : null,
+                                      );
+                                    }
+                                    // Signed out — quiet person glyph in a hairline circle.
+                                    return Container(
+                                      width: 24,
+                                      height: 24,
+                                      decoration: BoxDecoration(
+                                        shape: BoxShape.circle,
+                                        border:
+                                            ring ??
+                                            Border.all(
+                                              color: color,
+                                              width: 1.4,
+                                            ),
+                                      ),
+                                      child: Icon(
+                                        Icons.person_outline,
+                                        size: 15,
+                                        color: color,
+                                      ),
+                                    );
+                                  },
+                                )
+                              : Hero(
+                                  tag: viewerProfileHeroTag(profile.id),
+                                  child: Container(
+                                    width: 24,
+                                    height: 24,
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      border: selected
+                                          ? Border.all(
+                                              color: AppColors.accent,
+                                              width: 1.8,
+                                            )
+                                          : null,
+                                      color: viewerProfileAvatarColor(
+                                        profile.avatar,
+                                      ),
+                                    ),
+                                    alignment: Alignment.center,
+                                    child: ProfileAvatarFace(
+                                      profile: profile,
+                                      photoUrl: profilePhotoForFace(
+                                        profile: profile,
+                                        accountPhotoUrl:
+                                            sl.isRegistered<AuthCubit>()
+                                            ? sl<AuthCubit>().state.avatarUrl
+                                            : null,
+                                      ),
+                                      iconSize: 14,
+                                      photoDiameter: 24,
+                                    ),
                                   ),
-                                  alignment: Alignment.center,
-                                  child: auth.avatarUrl == null
-                                      ? Text(
-                                          initial,
-                                          style: TextStyle(
-                                            fontSize: 11,
-                                            fontWeight: FontWeight.w800,
-                                            color: selected
-                                                ? AppColors.accent
-                                                : AppColors.textPrimary,
-                                          ),
-                                        )
-                                      : null,
-                                );
-                              }
-                              // Signed out — quiet person glyph in a hairline circle.
-                              return Container(
-                                width: 24,
-                                height: 24,
-                                decoration: BoxDecoration(
-                                  shape: BoxShape.circle,
-                                  border:
-                                      ring ??
-                                      Border.all(color: color, width: 1.4),
                                 ),
-                                child: Icon(
-                                  Icons.person_outline,
-                                  size: 15,
-                                  color: color,
-                                ),
-                              );
-                            },
-                          ),
                         ),
                       ),
                     ),
@@ -872,6 +1035,162 @@ class _ProfileDockItem extends StatelessWidget {
                 ),
               ),
             ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ProfileSwitcherSheet extends StatelessWidget {
+  const _ProfileSwitcherSheet({
+    required this.profiles,
+    required this.onSelected,
+    required this.onAddProfile,
+  });
+
+  final ViewerProfileStore profiles;
+  final ValueChanged<ViewerProfile> onSelected;
+  final VoidCallback onAddProfile;
+
+  @override
+  Widget build(BuildContext context) {
+    final choices = profiles.profiles;
+    final activeId = profiles.activeId;
+    final accountPhotoUrl = sl.isRegistered<AuthCubit>()
+        ? sl<AuthCubit>().state.avatarUrl
+        : null;
+
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 2, 14, 8),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.sizeOf(context).height * 0.7,
+          ),
+          child: Column(
+            key: const ValueKey('profile-switcher-sheet'),
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Flexible(
+                child: ClipRRect(
+                  key: const ValueKey('profile-switcher-options-card'),
+                  borderRadius: BorderRadius.circular(18),
+                  child: Material(
+                    color: AppColors.surface,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(18),
+                      side: BorderSide(color: AppColors.hairline),
+                    ),
+                    child: ListView(
+                      shrinkWrap: true,
+                      padding: const EdgeInsets.fromLTRB(6, 4, 6, 4),
+                      children: [
+                        for (final profile in choices) ...[
+                          Semantics(
+                            button: true,
+                            selected: profile.id == activeId,
+                            label: profile.name,
+                            child: ListTile(
+                              key: ValueKey(
+                                profile.id == activeId
+                                    ? 'profile-switcher-active'
+                                    : 'profile-switcher-choice-${profile.id}',
+                              ),
+                              selected: profile.id == activeId,
+                              visualDensity: const VisualDensity(vertical: -1),
+                              contentPadding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                              ),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(16),
+                              ),
+                              onTap: () => onSelected(profile),
+                              leading: Container(
+                                width: 38,
+                                height: 38,
+                                decoration: BoxDecoration(
+                                  color: viewerProfileAvatarColor(
+                                    profile.avatar,
+                                  ),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: ClipOval(
+                                  child: ProfileAvatarFace(
+                                    profile: profile,
+                                    photoUrl: profilePhotoForFace(
+                                      profile: profile,
+                                      accountPhotoUrl: accountPhotoUrl,
+                                    ),
+                                    iconSize: 17,
+                                    photoDiameter: 38,
+                                  ),
+                                ),
+                              ),
+                              title: Text(profile.name, maxLines: 1),
+                              trailing: profile.id == activeId
+                                  ? Icon(
+                                      Icons.check_circle_rounded,
+                                      color: AppColors.accent,
+                                    )
+                                  : null,
+                            ),
+                          ),
+                        ],
+                        ListTile(
+                          key: const ValueKey('profile-switcher-add'),
+                          visualDensity: const VisualDensity(vertical: -1),
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          leading: Container(
+                            width: 38,
+                            height: 38,
+                            decoration: BoxDecoration(
+                              color: AppColors.surface,
+                              shape: BoxShape.circle,
+                              border: Border.all(color: AppColors.hairline),
+                            ),
+                            child: Icon(
+                              Icons.add_rounded,
+                              color: AppColors.textSecondary,
+                            ),
+                          ),
+                          title: const Text('Add profile'),
+                          trailing: const Icon(Icons.chevron_right_rounded),
+                          onTap: onAddProfile,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                key: const ValueKey('profile-switcher-brand-footer'),
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Image.asset(
+                    'assets/icon/logo_mark.png',
+                    width: 18,
+                    height: 18,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    'Zangetsu',
+                    style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                      color: AppColors.textSecondary,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: 0.2,
+                    ),
+                  ),
+                ],
+              ),
+            ],
           ),
         ),
       ),

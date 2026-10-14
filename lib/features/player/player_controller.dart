@@ -243,6 +243,9 @@ class PlayerCubit extends Cubit<PlayerState> {
     required this.resume,
     required Future<List<VideoSource>> Function(String episodeUrl)
     resolveSources,
+    Future<List<VideoSource>?> Function(String episodeUrl)?
+    resolveDownloadedSources,
+    this.localOnly = false,
     Future<({List<VideoSource> sources, bool done})> Function(
       String episodeUrl,
     )?
@@ -265,6 +268,7 @@ class PlayerCubit extends Cubit<PlayerState> {
     this.initialSource,
     this.onDrmSource,
   }) : _resolveSources = resolveSources,
+       _resolveDownloadedSources = resolveDownloadedSources,
        _pollSources = pollSources,
        _dio = dio,
        _activeCategory = category ?? 'sub',
@@ -277,6 +281,13 @@ class PlayerCubit extends Cubit<PlayerState> {
   List<Episode> episodes;
   final ResumeStore resume;
   final Future<List<VideoSource>> Function(String episodeUrl) _resolveSources;
+
+  final Future<List<VideoSource>?> Function(String episodeUrl)?
+  _resolveDownloadedSources;
+
+  /// True only for the Downloads screen, where a missing local file is an
+  /// error rather than a request to find an online substitute.
+  final bool localOnly;
 
   /// Reads the links that have arrived since [_resolveSources] returned.
   /// Optional — null keeps the previous behaviour exactly (one batch, no poll).
@@ -492,6 +503,15 @@ class PlayerCubit extends Cubit<PlayerState> {
   // reason to cycle sources (which spuriously showed "No source could be
   // played" over working playback and broke the watch-progress scrobble).
   bool _startedThisSource = false;
+
+  /// True while the open source is a local file (download). Read by
+  /// [_tryNextSource]; set on every [_open].
+  bool _openedLocalFile = false;
+  bool _softwareDecodeRetried = false;
+  bool _softwareDecodeRetryInProgress = false;
+  int? _softwareDecodeRetryGeneration;
+  String? _softwareDecodeRetryError;
+  bool _softwareDecoderFallbackActive = false;
 
   /// True once ANY source has actually produced picture in this player
   /// session, unlike [_startedThisSource] which resets on every source switch.
@@ -1299,6 +1319,7 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// the video. Also persisted as the new default for future opens.
   Future<void> setDecoder(String mode) async {
     await sl<PlaybackPrefs>().setVideoDecoder(mode);
+    _softwareDecoderFallbackActive = false;
     final p = player.platform;
     if (p is NativePlayer) {
       try {
@@ -2089,7 +2110,23 @@ class PlayerCubit extends Cubit<PlayerState> {
     }
     try {
       final epUrl = _episodeUrl(currentEpisode);
-      if (_useProgressive(epUrl)) {
+      final downloaded = await _resolveDownloadedSources?.call(epUrl);
+      if (gen != _gen || isClosed) return;
+      final hasLocalSource = downloaded != null && downloaded.isNotEmpty;
+      final useProgressive = shouldUseProgressivePlayback(
+        progressiveAvailable: _useProgressive(epUrl),
+        hasLocalSource: hasLocalSource,
+      );
+      if (hasLocalSource) {
+        await _openResolved(downloaded, gen);
+      } else if (localOnly) {
+        emit(
+          state.copyWith(
+            loadingSources: false,
+            error: () => 'No playable sources for this episode.',
+          ),
+        );
+      } else if (useProgressive) {
         await _openProgressive(epUrl, gen);
       } else {
         final resolved = await _resolveNoted(epUrl);
@@ -2290,7 +2327,9 @@ class PlayerCubit extends Cubit<PlayerState> {
     // Playback is running — collect the mirrors that resolved after the fast
     // return, so the Sources sheet ends up complete. Started here rather than
     // alongside the open above so it can't compete with the stream starting.
-    unawaited(_pollForMoreSources(_episodeUrl(currentEpisode)));
+    if (!_openedLocalFile) {
+      unawaited(_pollForMoreSources(_episodeUrl(currentEpisode)));
+    }
     if (roomRole == RoomRole.host)
       onLocalPlayback?.call('episode', Duration.zero);
     return true;
@@ -2639,8 +2678,13 @@ class PlayerCubit extends Cubit<PlayerState> {
     // source (so the picker highlight is unchanged). Used to transparently swap
     // a Cloudflare-blocked Aniyomi stream onto its hidden proxy fallback.
     String? playUrlOverride,
+    bool softwareDecodeRetry = false,
   }) async {
     final g = gen ?? ++_gen;
+    final invalidatesSoftwareRetry = shouldInvalidateSoftwareDecoderRetry(
+      retryInProgress: _softwareDecodeRetryInProgress,
+      openingRetry: softwareDecodeRetry,
+    );
     final openToken = _lifecycle.beginOpen();
     if (openToken < 0) return;
     // DRM (clearkey CENC/DASH) can't play in mpv — hand off to the native
@@ -2662,6 +2706,12 @@ class PlayerCubit extends Cubit<PlayerState> {
     }
     _startTimer?.cancel();
     _startedThisSource = false; // reset; set true once this source plays
+    // Remember local-file playback for [_tryNextSource]: only plain paths and
+    // file/content URIs count — http(s), including torrent-resolved local
+    // servers, keeps today's failover behaviour.
+    final scheme = Uri.tryParse(s.url)?.scheme.toLowerCase() ?? '';
+    _openedLocalFile =
+        scheme.isEmpty || scheme == 'file' || scheme == 'content';
     // A source that never produces a frame and emits no error (a 403 HLS
     // playlist mpv retries forever) used to spin forever: the error listener
     // needs an error event and the stall watchdog needs a started source, so
@@ -2743,6 +2793,17 @@ class PlayerCubit extends Cubit<PlayerState> {
     final plat = player.platform;
     final setupSteps = <Future<void> Function()>[];
     if (plat is NativePlayer) {
+      final hwdecOverride = softwareDecoderOverride(
+        retryWithSoftware: softwareDecodeRetry,
+        fallbackActive: _softwareDecoderFallbackActive,
+        preferredHwdec: sl<PlaybackPrefs>().hwdecValue,
+      );
+      if (hwdecOverride != null) {
+        setupSteps.add(() async {
+          await plat.setProperty('hwdec', hwdecOverride);
+          _softwareDecoderFallbackActive = softwareDecodeRetry;
+        });
+      }
       final isHls = s.container == SourceContainer.hls;
       // Opening a LOCAL playlist makes FFmpeg clamp nested protocols to
       // 'file,crypto,data', so the https renditions inside it are refused
@@ -2809,7 +2870,16 @@ class PlayerCubit extends Cubit<PlayerState> {
         }
       });
     }
-    setupSteps.add(() => player.open(Media(playUrl, httpHeaders: s.headers)));
+    setupSteps.add(() async {
+      if (!softwareDecodeRetry) {
+        _softwareDecodeRetried = false;
+        _softwareDecodeRetryInProgress = false;
+        _softwareDecodeRetryGeneration = null;
+        _softwareDecodeRetryError = null;
+        if (invalidatesSoftwareRetry) _recovering = false;
+      }
+      await player.open(Media(playUrl, httpHeaders: s.headers));
+    });
     if (g != _gen || isClosed || !_lifecycle.canContinue(openToken)) return;
     final didOpen = await _lifecycle.runPlayerOpenSteps(openToken, setupSteps);
     if (!didOpen || g != _gen || isClosed) return;
@@ -2877,16 +2947,43 @@ class PlayerCubit extends Cubit<PlayerState> {
     }
   }
 
+  /// Errors about the things AROUND the video rather than the video itself:
+  /// a missing output device, a failed subtitle track, a filter this mpv
+  /// build wasn't compiled with (dynaudnorm on some Android builds — mpv
+  /// plays on fine without it). None mean the stream is unplayable, and
+  /// cycling sources would not fix any of them.
+  static bool isHarmlessPlaybackError(String message) {
+    const harmless = [
+      'audio device',
+      'audio output',
+      'subtitle',
+      'sub file',
+      'fontconfig',
+      'libass',
+      'ffmpeg-fallback',
+      'dynaudnorm',
+    ];
+    return harmless.any(message.toLowerCase().contains);
+  }
+
   /// Try the next source after the current one fails (dead/DRM/unsupported),
   /// preserving the live position and the audio kind.
   Future<void> _onPlaybackError(String e) async {
     debugPrint('[player] error: $e');
+    if (_softwareDecodeRetryInProgress) {
+      if (isCurrentSoftwareDecoderRetry(
+        retryGeneration: _softwareDecodeRetryGeneration ?? -1,
+        currentGeneration: _gen,
+      )) {
+        _softwareDecodeRetryError ??= e;
+      }
+      return;
+    }
     // A torrent local stream buffers/blips while pieces download — that's normal,
     // not a dead source. Never fail over: it would restart the torrent from
     // scratch (re-fetch metadata, wipe the cache) and churn native SessionManagers
     // until the app force-closes. mpv recovers on its own once the pieces land.
     if (_activeTorrentId != null) return;
-    final lower = e.toLowerCase();
     // If THIS source is already playing (position advanced), the error is a
     // transient/secondary one (HLS segment blip, failed sub track) — ignore it.
     // Only a source that NEVER started is worth cycling away from.
@@ -2907,16 +3004,58 @@ class PlayerCubit extends Cubit<PlayerState> {
     // isn't there (the iOS Simulator has none), a subtitle track that failed
     // on its own, libass not finding a font. None of those mean the stream is
     // unplayable, and cycling sources would not fix any of them.
-    const harmless = [
-      'audio device',
-      'audio output',
-      'subtitle',
-      'sub file',
-      'fontconfig',
-      'libass',
-      'ffmpeg-fallback',
-    ];
-    if (harmless.any(lower.contains)) return;
+    if (isHarmlessPlaybackError(e)) return;
+    final active = state.active;
+    if (active != null &&
+        player.platform is NativePlayer &&
+        shouldRetryWithSoftwareDecoder(
+          isLocalFile: _openedLocalFile,
+          alreadyRetried: _softwareDecodeRetried,
+          softwareDecoderSelected: sl<PlaybackPrefs>().videoDecoder == 'sw',
+          error: e,
+        )) {
+      _softwareDecodeRetried = true;
+      final retryGen = ++_gen;
+      _softwareDecodeRetryGeneration = retryGen;
+      _softwareDecodeRetryInProgress = true;
+      _softwareDecodeRetryError = null;
+      _recovering = true;
+      _neverStartedTimer?.cancel();
+      _toast('Hardware decoding failed. Retrying in software.');
+      try {
+        await _open(
+          active,
+          seekTo: _lastPos,
+          gen: retryGen,
+          softwareDecodeRetry: true,
+        );
+      } catch (error) {
+        _softwareDecodeRetryError = 'Software decoder retry failed: $error';
+      } finally {
+        if (_softwareDecodeRetryGeneration == retryGen &&
+            isCurrentSoftwareDecoderRetry(
+              retryGeneration: retryGen,
+              currentGeneration: _gen,
+            )) {
+          _softwareDecodeRetryInProgress = false;
+          _softwareDecodeRetryGeneration = null;
+          _recovering = false;
+        }
+      }
+      if (!isCurrentSoftwareDecoderRetry(
+            retryGeneration: retryGen,
+            currentGeneration: _gen,
+          ) ||
+          isClosed) {
+        return;
+      }
+      final retryError = _softwareDecodeRetryError;
+      _softwareDecodeRetryError = null;
+      if (retryError != null && !isClosed) {
+        await _onPlaybackError(retryError);
+      }
+      return;
+    }
     // A direct Aniyomi stream that failed on Cloudflare → swap to its hidden
     // proxy fallback (same quality) rather than cycling through other qualities.
     final act = state.active;
@@ -3015,6 +3154,16 @@ class PlayerCubit extends Cubit<PlayerState> {
   ///
   /// Returns true when something new is playing.
   Future<bool> _tryNextSource() async {
+    // Local-file playback never sweeps the network: a download that won't
+    // open is reported as-is instead of hunting online mirrors for a file
+    // the viewer asked to play offline.
+    if (_openedLocalFile) {
+      debugPrint(
+        '[player] source failover · local file failed — not substituting '
+        'a network source',
+      );
+      return false;
+    }
     final url = showUrl;
     if (url == null ||
         !ZmodeIds.isZ(url) ||

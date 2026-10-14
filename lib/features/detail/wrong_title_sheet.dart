@@ -14,6 +14,7 @@ import '../../core/repository/source_actions.dart' as source_actions;
 import '../../core/repository/source_repository.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/ui/poster_card.dart';
+import '../../core/playback/playback_prefs.dart';
 import '../../core/ui/reveal_item.dart';
 import '../../core/ui/states.dart';
 import '../../core/ui/source_switcher.dart';
@@ -39,12 +40,14 @@ class MatchLine extends StatefulWidget {
     required this.title,
     this.altTitle,
     this.malId,
+    this.metadataAliases = const [],
   });
 
   final ZCanonical canonical;
   final String title;
   final String? altTitle;
   final int? malId;
+  final List<String> metadataAliases;
 
   @override
   State<MatchLine> createState() => _MatchLineState();
@@ -59,6 +62,7 @@ class _MatchLineState extends State<MatchLine> {
     title: widget.title,
     altTitle: widget.altTitle,
     malId: widget.malId,
+    metadataAliases: widget.metadataAliases,
   )..load();
 
   @override
@@ -268,6 +272,8 @@ class _MatchLineState extends State<MatchLine> {
       canonical: widget.canonical,
       title: widget.title,
       sourceId: sourceId,
+      metadataAliases: widget.metadataAliases,
+      malId: widget.malId,
     );
     if (!mounted) return;
     if (picked == null) {
@@ -510,7 +516,9 @@ class _MatchLineState extends State<MatchLine> {
                               child: SizedBox(
                                 height: 52,
                                 child: Padding(
-                                  padding: const EdgeInsetsDirectional.only(start: 14),
+                                  padding: const EdgeInsetsDirectional.only(
+                                    start: 14,
+                                  ),
                                   child: labelRow,
                                 ),
                               ),
@@ -587,6 +595,8 @@ Future<SourceMatch?> showWrongTitleSheet(
   required ZCanonical canonical,
   required String title,
   required String sourceId,
+  List<String> metadataAliases = const [],
+  int? malId,
 }) {
   return showModalBottomSheet<SourceMatch>(
     context: context,
@@ -599,6 +609,8 @@ Future<SourceMatch?> showWrongTitleSheet(
       canonical: canonical,
       initialQuery: title,
       sourceId: sourceId,
+      metadataAliases: metadataAliases,
+      malId: malId,
     ),
   );
 }
@@ -608,20 +620,30 @@ class _WrongTitleBody extends StatelessWidget {
     required this.canonical,
     required this.initialQuery,
     required this.sourceId,
+    required this.metadataAliases,
+    required this.malId,
   });
   final ZCanonical canonical;
   final String initialQuery;
   final String sourceId;
+  final List<String> metadataAliases;
+  final int? malId;
 
   @override
   Widget build(BuildContext context) {
     return BlocProvider(
-      create: (_) => WrongTitleCubit(
-        sources: sl<SourceRepository>(),
-        matcher: sl<SourceMatcher>(),
-        canonical: canonical,
-        sourceId: sourceId,
-      )..search(initialQuery),
+      create: (_) =>
+          WrongTitleCubit(
+            sources: sl<SourceRepository>(),
+            matcher: sl<SourceMatcher>(),
+            canonical: canonical,
+            sourceId: sourceId,
+          )..search(
+            initialQuery,
+            retryWithMetadataAliases: true,
+            metadataAliases: metadataAliases,
+            malId: malId,
+          ),
       child: _WrongTitleView(initialQuery: initialQuery),
     );
   }
@@ -668,7 +690,7 @@ class _WrongTitleViewState extends State<_WrongTitleView> {
     // Matches the Search screen's grid exactly: 3 up, 12 across, 16 down, and
     // the same aspect helper — so a result here is the same object a search
     // result is, at the same size, with the same press animation.
-    final cellWidth = (MediaQuery.sizeOf(context).width - 32 - 24) / 3;
+    final cellWidth = posterGridCellWidth(context);
     return SafeArea(
       child: Padding(
         padding: EdgeInsets.only(
@@ -915,13 +937,23 @@ class _Results extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final l10n = context.l10n;
-    final aspect = posterCellAspect(cellWidth);
+    final aspect = posterCellAspect(
+      cellWidth,
+      wide: posterLayout(context) == PosterCardLayout.wide,
+      titleInside: posterTitleInside(
+        context,
+        wide: posterLayout(context) == PosterCardLayout.wide,
+      ),
+    );
     final isTv = sl<AppMode>().isTv;
     if (state.results.isEmpty) {
       if (state.loading) {
         return Padding(
           padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-          child: SkeletonGrid(crossAxisCount: 3, childAspectRatio: aspect),
+          child: SkeletonGrid(
+            crossAxisCount: posterGridColumns(context),
+            childAspectRatio: aspect,
+          ),
         );
       }
       return EmptyState(
@@ -941,7 +973,7 @@ class _Results extends StatelessWidget {
       scrollCacheExtent: const ScrollCacheExtent.pixels(800),
       keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
       gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 3,
+        crossAxisCount: posterGridColumns(context),
         childAspectRatio: aspect,
         crossAxisSpacing: 12,
         mainAxisSpacing: 16,
@@ -956,7 +988,11 @@ class _Results extends StatelessWidget {
         final isCurrent = currentUrl != null && r.url == currentUrl;
         Widget cell = PosterCard(
           title: r.title,
+          logoItem: r,
           imageUrl: r.cover,
+          wideImageUrl: r.banner,
+          genres: r.genres,
+          isAdult: r.isAdult,
           headers: r.coverHeaders,
           cellWidth: cellWidth,
           qualityBadge: r.quality,

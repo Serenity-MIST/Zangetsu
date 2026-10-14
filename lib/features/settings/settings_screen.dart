@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
@@ -34,6 +33,8 @@ import '../../core/playback/playback_prefs.dart';
 import '../../core/playback/watch_history.dart';
 import '../auth/reconnect.dart';
 import '../../core/privacy/incognito_mode.dart';
+import '../../core/profiles/viewer_profile.dart';
+import '../../core/profiles/viewer_profile_avatar.dart';
 import '../../core/playback/search_prefs.dart';
 import '../../core/playback/subtitle_language.dart';
 import '../../core/aniyomi/aniyomi_provider.dart';
@@ -45,6 +46,7 @@ import '../history/history_screen.dart';
 import 'app_face_screen.dart';
 import 'appearance_screen.dart';
 import '../companion/companion_settings_screen.dart';
+import 'poster_card_settings_screen.dart';
 import 'home_rows_screen.dart';
 import 'nav_tabs_screen.dart';
 import 'reader_settings_screen.dart';
@@ -57,6 +59,7 @@ import '../../core/theme/app_colors.dart';
 import '../../core/locale/app_language_picker.dart';
 import '../../l10n/l10n.dart';
 import '../home/metadata_switch_sheet.dart';
+import '../home/cubit/home_cubit.dart';
 import '../../l10n/ui_strings.dart';
 import '../../core/ui/subtitle_language_picker.dart';
 import '../../core/theme/app_text.dart';
@@ -72,7 +75,7 @@ import 'donate_screen.dart';
 import '../auth/auth_cubit.dart';
 import '../backup/backup_screen.dart';
 import '../watch_together/ui/watch_party_lobby_screen.dart';
-import '../auth/auth_screens.dart';
+import '../profiles/viewer_profiles_screen.dart';
 import '../onboarding/how_it_works.dart';
 import '../notify/subscriptions_screen.dart';
 import 'tracker_settings_screen.dart';
@@ -95,7 +98,9 @@ part 'settings_tv_pickers.dart';
 /// Top-level Settings screen — a grouped list of cards mirroring the
 /// iOS Settings look in our dark/coral language.
 class SettingsScreen extends StatefulWidget {
-  const SettingsScreen({super.key});
+  const SettingsScreen({super.key, this.showBackButton = false});
+
+  final bool showBackButton;
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -666,91 +671,51 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (mounted) setState(() {});
   }
 
-  /// Account header — a single profile card at the top of Settings. Signed in:
-  /// avatar + name + email → Profile. Signed out: an avatar placeholder + a
-  /// clear "Sign in" call-to-action → Login (its own card, so it no longer
-  /// reads as a flat duplicate of the "Account & sync" row below it).
+  /// One Settings entry for both the active viewer profile and the account.
   Widget _accountCard(BuildContext context) {
+    final profiles = sl<ViewerProfileStore>();
     return BlocBuilder<AuthCubit, AuthState>(
-      builder: (context, auth) {
-        final Widget row;
-        if (auth.isLoggedIn) {
-          final initial = auth.displayName.isNotEmpty
-              ? auth.displayName[0].toUpperCase()
-              : '?';
-          row = _accountRow(
-            onTap: () => _push(const ProfileScreen()),
-            autofocus: _isTv,
-            semanticLabel: auth.displayName,
-            avatar: CircleAvatar(
-              radius: 24,
-              backgroundColor: AppColors.surface2,
-              backgroundImage: auth.avatarUrl != null
-                  ? CachedNetworkImageProvider(auth.avatarUrl!)
-                  : null,
-              child: auth.avatarUrl == null
-                  ? Text(
-                      initial,
-                      style: AppText.headline.copyWith(fontSize: 18),
-                    )
-                  : null,
-            ),
-            title: auth.displayName,
-            subtitle: auth.user?.email ?? '',
-            trailing: const Icon(
-              Icons.chevron_right_rounded,
-              color: AppColors.textTertiary,
-              size: 20,
-            ),
-          );
-        } else {
-          row = _accountRow(
-            onTap: () => _push(const LoginScreen()),
-            autofocus: _isTv,
-            semanticLabel: context.l10n.signIn,
-            avatar: CircleAvatar(
-              radius: 24,
-              backgroundColor: AppColors.accentSoft,
-              child: Icon(
-                Icons.person_outline_rounded,
-                color: AppColors.accent,
-                size: 24,
-              ),
-            ),
-            title: context.l10n.signIn,
-            subtitle: _isTv
-                ? context.l10n.signInSubtitleTv
-                : context.l10n.signInSubtitle,
-            trailing: _isTv
-                ? const Icon(
-                    Icons.chevron_right_rounded,
-                    color: AppColors.textTertiary,
-                    size: 22,
-                  )
-                : Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 7,
-                    ),
-                    decoration: BoxDecoration(
-                      color: AppColors.accent,
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Text(
-                      context.l10n.signIn,
-                      style: AppText.caption.copyWith(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w700,
+      builder: (context, auth) => ValueListenableBuilder<ViewerProfile?>(
+        valueListenable: profiles.active,
+        builder: (context, active, _) {
+          final profile = active ?? profiles.activeProfile;
+          final accountStatus = auth.isLoggedIn
+              ? (auth.user?.email ?? auth.displayName)
+              : context.l10n.notSignedIn;
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: SettingsCard(
+              children: [
+                _accountRow(
+                  onTap: () => _push(const ViewerProfilesScreen()),
+                  autofocus: _isTv,
+                  semanticLabel: 'Profiles & account',
+                  avatar: CircleAvatar(
+                    radius: 24,
+                    backgroundColor: viewerProfileAvatarColor(profile.avatar),
+                    child: ProfileAvatarFace(
+                      profile: profile,
+                      photoUrl: profilePhotoForFace(
+                        profile: profile,
+                        accountPhotoUrl: auth.avatarUrl,
                       ),
+                      iconSize: 24,
+                      photoDiameter: 48,
                     ),
                   ),
+                  title: 'Profiles & account',
+                  subtitle: 'Watching as ${profile.name} · $accountStatus',
+                  trailing: const Icon(
+                    Icons.chevron_right_rounded,
+                    color: AppColors.textTertiary,
+                    size: 20,
+                  ),
+                ),
+              ],
+            ),
           );
-        }
-        return Padding(
-          padding: const EdgeInsets.only(bottom: 10),
-          child: SettingsCard(children: [row]),
-        );
-      },
+        },
+      ),
     );
   }
 
@@ -1166,6 +1131,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
             'home banner card panels face',
         onTap: () => _push(const AppFaceScreen()),
       ),
+    _SettingsEntry(
+      section: SettingsSection.interface,
+      group: 'Look',
+      icon: Icons.view_carousel_outlined,
+      title: 'Poster cards',
+      subtitle: 'Shape and labels for title cards',
+      keywords:
+          'poster landscape portrait wide badges quality sub dub '
+          'score genre age 18 progress customize cards',
+      onTap: () => _push(const PosterCardSettingsScreen()),
+    ),
     if (!_isTv)
       _SettingsEntry(
         section: SettingsSection.interface,
@@ -1390,6 +1366,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Widget _buildHub(List<_SettingsEntry> entries) {
     return Scaffold(
       backgroundColor: AppColors.bg,
+      appBar: widget.showBackButton ? settingsAppBar('Settings') : null,
       // bottom: false — the shell's floating dock overlays the content
       // (extendBody); a full SafeArea would clip the list at the dock's top
       // edge, leaving a dead band on both sides of the capsule.

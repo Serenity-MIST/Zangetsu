@@ -14,6 +14,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../core/zmode/season_chain.dart';
 import '../../core/zmode/metadata_provider_prefs.dart';
 import '../../core/ui/poster_card.dart';
+import '../../core/ui/mobile_hero_art.dart';
 import '../../core/metadata/synopsis.dart';
 import '../../core/mode/content_mode_cubit.dart';
 import '../../core/zmode/metadata_filters.dart';
@@ -25,6 +26,7 @@ import 'open_related.dart';
 import '../../core/ui/episode_unavailable_dialog.dart';
 import '../../core/zmode/playback_resolver.dart';
 import 'episode_sources_sheet.dart';
+import '../downloads/downloads_screen.dart';
 import 'epub_export_sheet.dart';
 import 'chapter_download_range_sheet.dart';
 import 'chapter_download_selection.dart';
@@ -427,6 +429,8 @@ class _DetailViewState extends State<_DetailView>
   // The episode url we've already kicked a background source-prefetch for, so we
   // don't re-fire it on every rebuild (see _maybePrefetch).
   String? _prefetchedEpUrl;
+  final Map<(String, String), Future<ReadEntry?>> _cloudReadHistoryLookups = {};
+  final Set<(String, String)> _cloudReadHistoryChecked = {};
 
   /// How long the viewer must stay on the screen before a source resolve is
   /// started for them. Long enough that a back-and-forth browse never starts
@@ -858,9 +862,11 @@ class _DetailViewState extends State<_DetailView>
       );
       await NotificationService.instance.init(); // ask for permission now
       _snack(
-        reading
-            ? l10n.youllBeNotifiedOfNewChaptersFor(item.title)
-            : l10n.youllBeNotifiedOfNewEpisodesFor(item.title),
+        await NotificationService.instance.canShowAlerts
+            ? reading
+                  ? l10n.youllBeNotifiedOfNewChaptersFor(item.title)
+                  : l10n.youllBeNotifiedOfNewEpisodesFor(item.title)
+            : l10n.allowNotificationsForAlerts,
       );
     }
     // Mirror CS subs to native so the background worker picks up the change.
@@ -1218,6 +1224,42 @@ class _DetailViewState extends State<_DetailView>
     /// adaptive default. One-shot — the cubit clears it after this episode.
     VideoSource? initialSource,
   }) async {
+    // A finished download of this exact episode plays from disk — no sweep,
+    // no links, no waiting. Exact keys first, then the source episode URL,
+    // then MAL id + number — so a file saved from a source page is still
+    // found from the metadata page and back.
+    if (initialSource == null && index >= 0 && index < episodes.length) {
+      final ep = episodes[index];
+      final dl = await sl<DownloadManager>().finishedForEpisode(
+        sourceId: widget.item.sourceId,
+        showId: widget.item.id,
+        episodeId: ep.id,
+        episodeUrl: ep.url,
+        malId: detail.malId ?? widget.item.malId,
+        episodeNumber: ep.number,
+      );
+      if (dl != null) {
+        if (!mounted) return;
+        await launchDownloadedEpisode(
+          context,
+          dl,
+          episodes: episodes,
+          startIndex: index,
+          fallbackResolveSources: (url) => sl<CatalogueRepository>().sources(
+            url,
+            sourceId: widget.item.sourceId,
+            fast: true,
+          ),
+          pollSources: (url) => sl<CatalogueRepository>().polledSources(
+            url,
+            sourceId: widget.item.sourceId,
+          ),
+          playerOverride: playerOverride?.package,
+        );
+        return;
+      }
+    }
+    if (!mounted) return;
     // The catalogue lists this episode but the one source we checked stops
     // short of it (see [Episode.unavailable]). Say which source, and let the
     // viewer decide whether to spend the sweep — asking every installed
@@ -1252,8 +1294,13 @@ class _DetailViewState extends State<_DetailView>
         detail.type == ProviderType.manga ||
         widget.item.type == ProviderType.novel ||
         widget.item.type == ProviderType.manga;
+    final readingSourceId = _readingSourceId(detail);
+    if (reading) {
+      await _loadCloudReadHistory(readingSourceId);
+      if (!mounted) return;
+    }
     final resume = reading
-        ? _readResumeIndex(episodes, sourceId: _readingSourceId(detail))
+        ? _readResumeIndex(episodes, sourceId: readingSourceId)
         : (index: _resumeIndex(episodes), hasResume: _hasVideoResume(episodes));
     var peek = false;
     if (shouldAskBeforeJump(
@@ -1635,6 +1682,31 @@ class _DetailViewState extends State<_DetailView>
     return (index: 0, hasResume: false);
   }
 
+  Future<ReadEntry?> _loadCloudReadHistory(String sourceId) {
+    final history = sl<ReadHistory>();
+    final showId = widget.item.id;
+    final key = (sourceId, showId);
+    final pending = _cloudReadHistoryLookups[key];
+    if (pending != null) return pending;
+    if (!_cloudReadHistoryChecked.add(key)) {
+      return Future.value(history.get(sourceId, showId));
+    }
+
+    final future = () async {
+      try {
+        final entry = await history.refreshFromCloud(sourceId, showId);
+        if (entry != null && mounted) setState(() {});
+        return entry;
+      } catch (_) {
+        return null;
+      } finally {
+        _cloudReadHistoryLookups.remove(key);
+      }
+    }();
+    _cloudReadHistoryLookups[key] = future;
+    return future;
+  }
+
   // ── Downloads ─────────────────────────────────────────────────────────────
 
   /// The main Download button. A single movie/episode goes straight to the
@@ -1784,6 +1856,7 @@ class _DetailViewState extends State<_DetailView>
           ),
           builder: (_) => _SourcePickerSheet(
             title: ep.title.trim().isNotEmpty ? ep.title : detail.title,
+            category: category,
             resolve: () => sl<CatalogueRepository>().sources(
               ep.url,
               sourceId: item.sourceId,
@@ -1874,6 +1947,7 @@ class _DetailViewState extends State<_DetailView>
                   episodesLoading: true,
                 ),
                 partial,
+                sourceMetadataReady: false,
               );
             }
             return const _DetailSkeleton(heroHeight: _expandedHeight);
@@ -1890,7 +1964,12 @@ class _DetailViewState extends State<_DetailView>
             if (fallback != null) {
               return Stack(
                 children: [
-                  _buildBody(context, state, fallback),
+                  _buildBody(
+                    context,
+                    state,
+                    fallback,
+                    sourceMetadataReady: false,
+                  ),
                   Positioned(
                     left: 0,
                     right: 0,
@@ -1962,8 +2041,9 @@ class _DetailViewState extends State<_DetailView>
   Widget _buildBody(
     BuildContext context,
     DetailState state,
-    MediaDetail detail,
-  ) {
+    MediaDetail detail, {
+    bool sourceMetadataReady = true,
+  }) {
     final item = widget.item;
     final cubit = context.read<DetailCubit>();
     final category = state.category;
@@ -1986,6 +2066,7 @@ class _DetailViewState extends State<_DetailView>
     // (harmlessly but wrongly) say "start over".
     final resume = _resumeTarget(eps);
     final readingSourceId = _readingSourceId(detail);
+    if (isReading) unawaited(_loadCloudReadHistory(readingSourceId));
     final readResume = isReading
         ? _readResumeIndex(eps, sourceId: readingSourceId)
         : null;
@@ -2009,10 +2090,13 @@ class _DetailViewState extends State<_DetailView>
               ? context.l10n.continueEpisode(episodeNum)
               : context.l10n.play);
 
-    // Cover / backdrop — the wide banner when Z Mode supplied one, else the
-    // regular poster cover, exactly as before [MediaDetail.banner] existed.
+    // Tall phone hero: prefer TMDB's portrait art; other sources stay as-is.
     final coverUrl =
-        detail.banner ?? item.banner ?? detail.cover ?? item.cover ?? '';
+        mobileHeroArt(
+          detail.cover ?? item.cover,
+          detail.banner ?? item.banner,
+        ) ??
+        '';
     final coverHeaders = detail.coverHeaders ?? item.coverHeaders;
     final hasCover = coverUrl.isNotEmpty;
 
@@ -2256,12 +2340,22 @@ class _DetailViewState extends State<_DetailView>
                 ),
               // Z Mode: matched source + "Wrong title?", kept with the
               // actions it controls instead of under the synopsis.
-              if (ZmodeIds.isZ(widget.item.url))
+              // The first frame may be built from the tapped catalogue card,
+              // which has no synonyms/native title. Don't start a canonical
+              // source search until full metadata arrives: resolve() shares
+              // in-flight work by title id, so an early search would make the
+              // later alias-aware lookup reuse the incomplete one.
+              if (sourceMetadataReady && ZmodeIds.isZ(widget.item.url))
                 MatchLine(
                   canonical: ZmodeIds.parseShow(widget.item.url)!,
                   title: detail.title,
                   altTitle: detail.englishTitle,
                   malId: detail.malId,
+                  metadataAliases: [
+                    if (detail.englishTitle != null) detail.englishTitle!,
+                    if (detail.nativeTitle != null) detail.nativeTitle!,
+                    ...detail.synonyms,
+                  ],
                 ),
             ],
           ),
@@ -2332,7 +2426,8 @@ class _DetailViewState extends State<_DetailView>
                       : context.l10n.addToMyList,
                   onTap: () => _openListSheet(detail),
                 ),
-                if (Platform.isAndroid)
+                if (Platform.isAndroid &&
+                    (_subscribed || (!state.episodesLoading && eps.isNotEmpty)))
                   _IconAction(
                     icon: _subscribed
                         ? Icons.notifications_active_rounded
