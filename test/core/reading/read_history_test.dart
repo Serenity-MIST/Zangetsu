@@ -13,11 +13,13 @@ class FakeReadingHistoryRemote implements ReadingHistoryRemote {
   final List<Map<String, dynamic>> rows = [];
   int upsertCalls = 0;
   int targetedReads = 0;
+  bool failUpserts = false;
   bool failNextPage = false;
 
   @override
   Future<void> upsert(Map<String, dynamic> row) async {
     upsertCalls++;
+    if (failUpserts) throw Exception('network down');
     rows.removeWhere(
       (r) =>
           r['user_key'] == row['user_key'] &&
@@ -298,6 +300,66 @@ void main() {
 
       expect(fake.upsertCalls, 2);
       expect(fake.rows.single['pos'], 5);
+    },
+  );
+
+  test(
+    'failed progress upload survives restart and retries the newest row',
+    () async {
+      final fake = FakeReadingHistoryRemote()..failUpserts = true;
+      final h = ReadHistory(SupabaseService(), () => 'user1', remote: fake);
+      await h.save(entry('retry', pos: 2, ts: 100), flush: true);
+      await h.save(entry('retry', pos: 8, ts: 200), flush: true);
+      final failedAttempts = fake.upsertCalls;
+      expect(fake.rows, isEmpty);
+
+      fake.failUpserts = false;
+      final restarted = ReadHistory(
+        SupabaseService(),
+        () => 'user1',
+        remote: fake,
+      );
+      await restarted.retryPending();
+
+      expect(fake.targetedReads, 1);
+      expect(fake.upsertCalls, failedAttempts + 1);
+      expect(fake.rows.single['pos'], 8);
+
+      await restarted.retryPending();
+      expect(fake.upsertCalls, failedAttempts + 1);
+    },
+  );
+
+  test(
+    'retry does not overwrite newer reading progress already in cloud',
+    () async {
+      final fake = FakeReadingHistoryRemote()
+        ..rows.add({
+          'user_key': 'user1',
+          'source_id': 'js:m',
+          'show_id': 'shared',
+          'title': 'Cloud shared',
+          'cover': null,
+          'chapter_id': 'chapter1',
+          'chapter_number': 1,
+          'chapter_url': 'u',
+          'pos': 18,
+          'total': 20,
+          'updated_ms': 200,
+          'type': 'novel',
+        })
+        ..failUpserts = true;
+      final h = ReadHistory(SupabaseService(), () => 'user1', remote: fake);
+      await h.save(entry('shared', pos: 4, ts: 100), flush: true);
+      fake.failUpserts = false;
+      final failedAttempts = fake.upsertCalls;
+
+      await h.retryPending();
+
+      expect(fake.upsertCalls, failedAttempts);
+      expect(fake.rows.single['updated_ms'], 200);
+      expect(fake.rows.single['pos'], 18);
+      expect(h.get('js:m', 'shared')?.pos, 18);
     },
   );
 

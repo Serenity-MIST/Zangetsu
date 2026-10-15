@@ -10,6 +10,8 @@ import 'ui/party_player_route.dart';
 import 'watch_room_service.dart';
 
 class WatchTogetherController extends ChangeNotifier {
+  static const bool isEnabled = false;
+
   WatchTogetherController(this._svc);
   final WatchRoomService _svc;
 
@@ -40,6 +42,7 @@ class WatchTogetherController extends ChangeNotifier {
     required void Function(RoomState room) onEpisodeChange,
     Map<String, dynamic>? content,
   }) {
+    if (!isEnabled) return;
     this.localPosition = localPosition;
     this.onApplyRemote = onApplyRemote;
     this.onEpisodeChange = onEpisodeChange;
@@ -74,6 +77,7 @@ class WatchTogetherController extends ChangeNotifier {
   int get _now => DateTime.now().millisecondsSinceEpoch;
 
   Future<void> host(RoomState initial) async {
+    if (!isEnabled) return;
     if (room != null) return;
     final created = await _svc.createRoom(initial.copyWith(
         hostId: _uid, hostName: _uname, updatedAt: _now, status: 'active'));
@@ -84,6 +88,7 @@ class WatchTogetherController extends ChangeNotifier {
   }
 
   Future<bool> join(String code) async {
+    if (!isEnabled) return false;
     if (room != null) return false;
     final r = await _svc.getRoom(code);
     if (r == null || r.status == 'ended') return false;

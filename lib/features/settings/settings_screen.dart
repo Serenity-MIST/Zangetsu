@@ -75,6 +75,7 @@ import 'donate_screen.dart';
 import '../auth/auth_cubit.dart';
 import '../backup/backup_screen.dart';
 import '../watch_together/ui/watch_party_lobby_screen.dart';
+import '../watch_together/watch_together_controller.dart';
 import '../profiles/viewer_profiles_screen.dart';
 import '../onboarding/how_it_works.dart';
 import '../notify/subscriptions_screen.dart';
@@ -891,22 +892,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
           if (mounted) setState(() {});
         },
       ),
-    _SettingsEntry(
-      section: SettingsSection.account,
-      icon: Icons.groups_2_outlined,
-      title: l10n.watchParty,
-      subtitle: l10n.watchPartySubtitle,
-      keywords: 'watch party together',
-      onTap: () {
-        if (sl<AuthCubit>().state.user == null) {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(SnackBar(content: Text(l10n.signInToWatchTogether)));
-          return;
-        }
-        _push(const WatchPartyLobbyScreen());
-      },
-    ),
+    if (WatchTogetherController.isEnabled)
+      _SettingsEntry(
+        section: SettingsSection.account,
+        icon: Icons.groups_2_outlined,
+        title: l10n.watchParty,
+        subtitle: l10n.watchPartySubtitle,
+        keywords: 'watch party together',
+        onTap: () {
+          if (sl<AuthCubit>().state.user == null) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text(l10n.signInToWatchTogether)));
+            return;
+          }
+          _push(const WatchPartyLobbyScreen());
+        },
+      ),
     _SettingsEntry(
       section: SettingsSection.account,
       icon: Icons.cloud_upload_outlined,

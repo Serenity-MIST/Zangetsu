@@ -315,6 +315,7 @@ class ReadHistory {
   static const String _syncMetaKey = 'reading_history_lastPullMs';
   static const String _seedFlagPrefix = 'reading_history_seeded_';
   static const String _cloudPagePrefix = 'reading_history_page:';
+  static const String _pendingKey = 'reading_history_pending';
 
   static Future<void> init() async {
     if (!Hive.isBoxOpen(boxName)) {
@@ -330,7 +331,10 @@ class ReadHistory {
       final meta = Hive.box(syncMetaBox);
       await meta.delete(_syncMetaKey);
       for (final key in meta.keys.toList()) {
-        if ('$key'.contains(_cloudPagePrefix)) await meta.delete(key);
+        final value = '$key';
+        if (value.contains(_cloudPagePrefix) || value.contains(_pendingKey)) {
+          await meta.delete(key);
+        }
       }
     }
   }
@@ -339,6 +343,33 @@ class ReadHistory {
   String _key(String sourceId, String showId, [String? profileId]) =>
       profileScopedKey(profileId ?? _profileId, hiveKey('$sourceId::$showId'));
   final Map<String, int> _lastCloudPush = {};
+
+  String _pendingMetaKey([String? profileId]) =>
+      profileScopedKey(profileId ?? _profileId, _pendingKey);
+
+  Set<String> pendingKeys([String? profileId]) {
+    if (!Hive.isBoxOpen(syncMetaBox)) return <String>{};
+    final raw = Hive.box(syncMetaBox).get(_pendingMetaKey(profileId));
+    return raw is List ? raw.map((value) => '$value').toSet() : <String>{};
+  }
+
+  Future<void> _markPending(String key, String profileId) async {
+    if (!Hive.isBoxOpen(syncMetaBox)) return;
+    final pending = pendingKeys(profileId)..add(key);
+    await Hive.box(
+      syncMetaBox,
+    ).put(_pendingMetaKey(profileId), pending.toList());
+  }
+
+  Future<void> _clearPending(String key, String profileId) async {
+    if (!Hive.isBoxOpen(syncMetaBox)) return;
+    final pending = pendingKeys(profileId);
+    if (pending.remove(key)) {
+      await Hive.box(
+        syncMetaBox,
+      ).put(_pendingMetaKey(profileId), pending.toList());
+    }
+  }
 
   String _cloudPageKey(String userId, String profileId, ProviderType type) =>
       profileScopedKey(
@@ -417,10 +448,62 @@ class ReadHistory {
     final last = _lastCloudPush[key] ?? 0;
     if (!force && now - last < _cloudThrottleMs) return;
     _lastCloudPush[key] = now;
+    final pendingWrite = _markPending(key, profileId);
     try {
-      await _remote.upsert(_rowFor(uid, e, profileId));
+      await Future.wait([
+        pendingWrite,
+        _remote.upsert(_rowFor(uid, e, profileId)),
+      ]);
+      if (_matchesLocalEntry(key, e)) await _clearPending(key, profileId);
     } catch (_) {
       /* best-effort — missing table / offline degrades silently */
+    }
+  }
+
+  bool _matchesLocalEntry(String key, ReadEntry entry) {
+    final raw = _box.get(key);
+    return raw != null &&
+        raw['updatedMs'] == entry.updatedMs &&
+        raw['chapterId'] == entry.chapterId &&
+        raw['pos'] == entry.pos &&
+        raw['total'] == entry.total;
+  }
+
+  /// Retry only progress rows whose last cloud upsert failed. Read the current
+  /// Hive value so multiple saves for one title collapse to the newest row.
+  Future<void> retryPending() async {
+    final uid = _currentUserId();
+    if (uid == null) return;
+    final profileId = _profileId;
+    for (final key in pendingKeys(profileId)) {
+      final raw = _box.get(key);
+      if (raw == null) {
+        await _clearPending(key, profileId);
+        continue;
+      }
+      try {
+        final entry = _fromMap(raw);
+        final cloud = await _remote.getFor(
+          uid,
+          profileId: _remoteProfileId(profileId),
+          sourceId: entry.sourceId,
+          showId: entry.showId,
+        );
+        final cloudUpdated = (cloud?['updated_ms'] as num?)?.toInt() ?? -1;
+        if (cloud != null && cloudUpdated > entry.updatedMs) {
+          await _mergeCloudRows([cloud], profileId);
+          final currentUpdated =
+              (_box.get(key)?['updatedMs'] as num?)?.toInt() ?? -1;
+          if (currentUpdated == cloudUpdated) {
+            await _clearPending(key, profileId);
+          }
+          continue;
+        }
+        await _remote.upsert(_rowFor(uid, entry, profileId));
+        if (_matchesLocalEntry(key, entry)) await _clearPending(key, profileId);
+      } catch (_) {
+        /* keep pending for a later attempt */
+      }
     }
   }
 
@@ -486,6 +569,7 @@ class ReadHistory {
       try {
         await _remote.upsert(_rowFor(uid, e, profileId));
         pushed++;
+        if (_matchesLocalEntry(key, e)) await _clearPending(key, profileId);
       } catch (_) {
         failed++;
       }
@@ -605,6 +689,7 @@ class ReadHistory {
         'updatedMs': m['updated_ms'],
         'type': m['type'],
       });
+      await _clearPending(key, profileId);
     }
   }
 
@@ -671,6 +756,7 @@ class ReadHistory {
     final key = _key(sourceId, showId, profileId);
     await _box.delete(key);
     _lastCloudPush.remove(key);
+    await _clearPending(key, profileId);
     final uid = _currentUserId();
     if (uid == null) return;
     try {
@@ -712,6 +798,7 @@ class ReadHistory {
     for (final k in keys) {
       await _box.delete(k);
       _lastCloudPush.remove(k);
+      await _clearPending('$k', profileId);
     }
     if (uid != null && Hive.isBoxOpen(syncMetaBox)) {
       await Hive.box(syncMetaBox).delete(_cloudPageKey(uid, profileId, type));
@@ -731,7 +818,8 @@ class ReadHistory {
                 (k) =>
                     '$k' == _syncMetaKey ||
                     '$k'.startsWith('p:') ||
-                    '$k'.contains(_cloudPagePrefix),
+                    '$k'.contains(_cloudPagePrefix) ||
+                    '$k'.contains(_pendingKey),
               )
               .toList()) {
         await meta.delete(key);

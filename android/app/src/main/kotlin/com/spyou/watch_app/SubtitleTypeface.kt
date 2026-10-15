@@ -14,7 +14,7 @@ import java.io.File
  * The fallback chain needs API 29; older devices keep today's bare custom
  * font (same behaviour as now, no regression).
  */
-internal fun subtitleTypeface(fontPath: String?): Typeface {
+fun subtitleTypeface(fontPath: String?): Typeface {
     if (fontPath.isNullOrBlank()) return Typeface.DEFAULT
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
         return runCatching { Typeface.createFromFile(fontPath) }

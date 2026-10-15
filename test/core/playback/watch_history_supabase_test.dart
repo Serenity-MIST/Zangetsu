@@ -10,11 +10,14 @@ import 'package:watch_app/core/supabase/supabase_service.dart';
 class FakeHistoryRemote implements HistoryRemote {
   final List<Map<String, dynamic>> rows = [];
   int upsertCalls = 0;
+  int targetedReads = 0;
+  bool failUpserts = false;
   bool failNextPage = false;
 
   @override
   Future<void> upsert(Map<String, dynamic> row) async {
     upsertCalls++;
+    if (failUpserts) throw Exception('network down');
     rows.removeWhere(
       (r) =>
           r['user_key'] == row['user_key'] &&
@@ -23,6 +26,25 @@ class FakeHistoryRemote implements HistoryRemote {
           r['show_id'] == row['show_id'],
     );
     rows.add(row);
+  }
+
+  @override
+  Future<Map<String, dynamic>?> getFor(
+    String userKey, {
+    String? profileId,
+    required String sourceId,
+    required String showId,
+  }) async {
+    targetedReads++;
+    for (final row in rows) {
+      if (row['user_key'] == userKey &&
+          row['profile_id'] == profileId &&
+          row['source_id'] == sourceId &&
+          row['show_id'] == showId) {
+        return row;
+      }
+    }
+    return null;
   }
 
   @override
@@ -195,6 +217,74 @@ void main() {
         fake.rows.single['position_ms'],
         const Duration(minutes: 5).inMilliseconds,
       );
+    },
+  );
+
+  test(
+    'failed progress upload survives restart and retries the newest row',
+    () async {
+      fake.failUpserts = true;
+      await history.save(
+        _entry(showId: 'retry', position: const Duration(minutes: 1)),
+        flush: true,
+      );
+      await history.save(
+        _entry(showId: 'retry', position: const Duration(minutes: 2)),
+        flush: true,
+      );
+      final failedAttempts = fake.upsertCalls;
+      expect(fake.rows, isEmpty);
+
+      fake.failUpserts = false;
+      final restarted = WatchHistory(
+        SupabaseService(),
+        () => 'user1',
+        remote: fake,
+      );
+      await restarted.retryPending();
+
+      expect(fake.targetedReads, 1);
+      expect(fake.upsertCalls, failedAttempts + 1);
+      expect(
+        fake.rows.single['position_ms'],
+        const Duration(minutes: 2).inMilliseconds,
+      );
+
+      await restarted.retryPending();
+      expect(fake.upsertCalls, failedAttempts + 1);
+    },
+  );
+
+  test(
+    'retry does not overwrite newer watch progress already in cloud',
+    () async {
+      fake.rows.add({
+        'user_key': 'user1',
+        'source_id': 'src',
+        'show_id': 'shared',
+        'show_title': 'Cloud',
+        'cover': null,
+        'cover_headers': null,
+        'show_url': 'u',
+        'category': 'sub',
+        'episode_id': 'ep2',
+        'episode_number': 2,
+        'episode_url': 'u/2',
+        'position_ms': 9000,
+        'duration_ms': 10000,
+        'updated_at': 200,
+        'mal_id': null,
+      });
+      fake.failUpserts = true;
+      await history.save(entryAt('shared', 100), flush: true);
+      fake.failUpserts = false;
+      final failedAttempts = fake.upsertCalls;
+
+      await history.retryPending();
+
+      expect(fake.upsertCalls, failedAttempts);
+      expect(fake.rows.single['updated_at'], 200);
+      expect(history.all().single.position, const Duration(seconds: 9));
     },
   );
 

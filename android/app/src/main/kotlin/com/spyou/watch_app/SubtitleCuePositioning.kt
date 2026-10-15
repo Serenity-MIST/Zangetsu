@@ -19,7 +19,7 @@ import androidx.media3.common.text.Cue
  * Media3's own renderer does once a line is set. The first cue keeps the chosen
  * position, so a lone subtitle lands on exactly the fraction it always did.
  */
-internal object SubtitleCuePositioning {
+object SubtitleCuePositioning {
 
     /** Gap left above the view before a stacked cue is clamped against the top. */
     private const val TOP_MARGIN = 0.02f

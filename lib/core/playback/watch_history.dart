@@ -76,6 +76,24 @@ class HistoryRemote {
     await _service.client.from(table).upsert(row, onConflict: conflict);
   }
 
+  Future<Map<String, dynamic>?> getFor(
+    String userKey, {
+    String? profileId,
+    required String sourceId,
+    required String showId,
+  }) async {
+    final table = profileId == null ? 'history' : 'profile_history';
+    var query = _service.client
+        .from(table)
+        .select(_historyColumns)
+        .eq('user_key', userKey)
+        .eq('source_id', sourceId)
+        .eq('show_id', showId);
+    if (profileId != null) query = query.eq('profile_id', profileId);
+    final row = await query.maybeSingle();
+    return (row as Map?)?.cast<String, dynamic>();
+  }
+
   Future<void> deleteRow(
     String userKey,
     String sourceId,
@@ -185,6 +203,7 @@ class WatchHistory {
   static const String syncMetaBox = 'library_sync_meta';
   static const String _syncMetaKey = 'history_lastPullMs';
   static const String _cloudPagePrefix = 'watch_history_page:';
+  static const String _pendingKey = 'watch_history_pending';
 
   static Future<void> init() async {
     if (!Hive.isBoxOpen(boxName)) {
@@ -200,7 +219,10 @@ class WatchHistory {
       final meta = Hive.box(syncMetaBox);
       await meta.delete(_syncMetaKey);
       for (final key in meta.keys.toList()) {
-        if ('$key'.contains(_cloudPagePrefix)) await meta.delete(key);
+        final value = '$key';
+        if (value.contains(_cloudPagePrefix) || value.contains(_pendingKey)) {
+          await meta.delete(key);
+        }
       }
     }
   }
@@ -211,6 +233,33 @@ class WatchHistory {
 
   String _cloudPageKey(String userId, String profileId) =>
       profileScopedKey(profileId, '$_cloudPagePrefix${hiveKey(userId)}');
+
+  String _pendingMetaKey([String? profileId]) =>
+      profileScopedKey(profileId ?? _profileId, _pendingKey);
+
+  Set<String> pendingKeys([String? profileId]) {
+    if (!Hive.isBoxOpen(syncMetaBox)) return <String>{};
+    final raw = Hive.box(syncMetaBox).get(_pendingMetaKey(profileId));
+    return raw is List ? raw.map((value) => '$value').toSet() : <String>{};
+  }
+
+  Future<void> _markPending(String key, String profileId) async {
+    if (!Hive.isBoxOpen(syncMetaBox)) return;
+    final pending = pendingKeys(profileId)..add(key);
+    await Hive.box(
+      syncMetaBox,
+    ).put(_pendingMetaKey(profileId), pending.toList());
+  }
+
+  Future<void> _clearPending(String key, String profileId) async {
+    if (!Hive.isBoxOpen(syncMetaBox)) return;
+    final pending = pendingKeys(profileId);
+    if (pending.remove(key)) {
+      await Hive.box(
+        syncMetaBox,
+      ).put(_pendingMetaKey(profileId), pending.toList());
+    }
+  }
 
   Map _cloudPageState(String userId, String profileId) {
     if (!Hive.isBoxOpen(syncMetaBox)) return const {};
@@ -306,10 +355,62 @@ class WatchHistory {
     final last = _lastCloudPush[key] ?? 0;
     if (!force && now - last < _cloudThrottleMs) return;
     _lastCloudPush[key] = now;
+    final pendingWrite = _markPending(key, profileId);
     try {
-      await _remote.upsert(_rowFor(uid, e, profileId));
+      await Future.wait([
+        pendingWrite,
+        _remote.upsert(_rowFor(uid, e, profileId)),
+      ]);
+      if (_matchesLocalEntry(key, e)) await _clearPending(key, profileId);
     } catch (_) {
       /* best-effort */
+    }
+  }
+
+  bool _matchesLocalEntry(String key, HistoryEntry entry) {
+    final raw = _box.get(key);
+    return raw != null &&
+        raw['updatedAt'] == entry.updatedAt &&
+        raw['episodeId'] == entry.episodeId &&
+        raw['positionMs'] == entry.position.inMilliseconds &&
+        raw['durationMs'] == entry.duration.inMilliseconds;
+  }
+
+  /// Retry only rows whose last cloud upsert failed. The local Hive row is the
+  /// payload source so repeated player saves collapse to the newest progress.
+  Future<void> retryPending() async {
+    final uid = _currentUserId();
+    if (uid == null) return;
+    final profileId = _profileId;
+    for (final key in pendingKeys(profileId)) {
+      final raw = _box.get(key);
+      if (raw == null) {
+        await _clearPending(key, profileId);
+        continue;
+      }
+      try {
+        final entry = _fromMap(raw);
+        final cloud = await _remote.getFor(
+          uid,
+          profileId: _remoteProfileId(profileId),
+          sourceId: entry.sourceId,
+          showId: entry.showId,
+        );
+        final cloudUpdated = (cloud?['updated_at'] as num?)?.toInt() ?? -1;
+        if (cloud != null && cloudUpdated > entry.updatedAt) {
+          await _mergeCloudRows([cloud], profileId);
+          final currentUpdated =
+              (_box.get(key)?['updatedAt'] as num?)?.toInt() ?? -1;
+          if (currentUpdated == cloudUpdated) {
+            await _clearPending(key, profileId);
+          }
+          continue;
+        }
+        await _remote.upsert(_rowFor(uid, entry, profileId));
+        if (_matchesLocalEntry(key, entry)) await _clearPending(key, profileId);
+      } catch (_) {
+        /* keep pending for a later attempt */
+      }
     }
   }
 
@@ -391,6 +492,7 @@ class WatchHistory {
       try {
         await _remote.upsert(_rowFor(uid, e, profileId));
         pushed++;
+        if (_matchesLocalEntry(key, e)) await _clearPending(key, profileId);
       } catch (_) {
         failed++;
       }
@@ -504,6 +606,7 @@ class WatchHistory {
         'updatedAt': m['updated_at'],
         'malId': int.tryParse('${m['mal_id']}'),
       });
+      await _clearPending(key, profileId);
     }
   }
 
@@ -514,6 +617,7 @@ class WatchHistory {
     final key = _key(sourceId, showId, profileId);
     await _box.delete(key);
     _lastCloudPush.remove(key);
+    await _clearPending(key, profileId);
     final uid = _currentUserId();
     if (uid == null) return;
     try {
@@ -566,7 +670,12 @@ class WatchHistory {
       final meta = Hive.box(syncMetaBox);
       await meta.delete(_syncMetaKey);
       for (final key in meta.keys.toList()) {
-        if ('$key'.contains(_cloudPagePrefix)) await meta.delete(key);
+        final value = '$key';
+        if (value.startsWith('p:') ||
+            value.contains(_cloudPagePrefix) ||
+            value.contains(_pendingKey)) {
+          await meta.delete(key);
+        }
       }
     }
   }
@@ -592,6 +701,7 @@ class WatchHistory {
     if (Hive.isBoxOpen(syncMetaBox)) {
       final meta = Hive.box(syncMetaBox);
       await meta.delete(profileScopedKey(profileId, _syncMetaKey));
+      await meta.delete(_pendingMetaKey(profileId));
       if (uid != null) {
         await meta.delete(_cloudPageKey(uid, profileId));
       }
