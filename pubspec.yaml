@@ -268,6 +268,9 @@ flutter:
   generate: true
   uses-material-design: true
   assets:
+    # Shared with Android's native network security configuration.
+    - android/app/src/main/res/raw/trusted_roots.pem
+    - LICENSE-MPL-2.0.txt
     # No built-in providers — sources are installed from the Zangetsu repo.
     # Extractors stay bundled (shared video-host helpers, not providers).
     - extractors/example_embed.js

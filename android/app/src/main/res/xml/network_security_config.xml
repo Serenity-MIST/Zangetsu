@@ -8,10 +8,17 @@
     from targetSdk 28 on — so proxying an extractor's local URL died with
     "CLEARTEXT communication to localhost not permitted".
 
-    Only loopback is listed. There's no base-config here, so everything else
-    keeps the platform default: cleartext still refused for real hosts.
+    Only loopback permits cleartext. The base configuration supplements trusted
+    public roots for old TVs while still refusing cleartext for real hosts.
 -->
 <network-security-config>
+    <!-- Supplement outdated TV CA stores without accepting arbitrary certificates. -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="@raw/trusted_roots" />
+        </trust-anchors>
+    </base-config>
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">localhost</domain>
         <domain includeSubdomains="false">127.0.0.1</domain>

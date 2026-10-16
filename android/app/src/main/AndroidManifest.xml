@@ -33,6 +33,7 @@
          or Classic changes their home screen, not this. -->
     <application
         android:label="Zangetsu"
+        android:extractNativeLibs="true"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher_crescent"
         android:banner="@drawable/tv_banner"

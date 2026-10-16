@@ -1269,6 +1269,17 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.spyou.watch_app/device")
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+                    // Use PackageManager's ABI-specific extraction directory,
+                    // rather than relying on the device linker's basename search.
+                    "mpvLibraryPath" -> {
+                        val library = java.io.File(applicationInfo.nativeLibraryDir, "libmpv.so")
+                        if (library.isFile) {
+                            result.success(library.absolutePath)
+                        } else {
+                            result.error("native_library_missing",
+                                "libmpv.so missing from ${library.parent}; ABIs=${android.os.Build.SUPPORTED_ABIS.joinToString()}", null)
+                        }
+                    }
                     "isTv" -> {
                         val uiModeManager = getSystemService(android.content.Context.UI_MODE_SERVICE) as android.app.UiModeManager
                         val isTv = uiModeManager.currentModeType == android.content.res.Configuration.UI_MODE_TYPE_TELEVISION ||

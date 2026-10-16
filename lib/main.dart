@@ -22,6 +22,8 @@ import 'core/environment.dart';
 import 'core/logging/app_logger.dart';
 import 'core/logging/crash_reports.dart';
 import 'core/platform/apple_tv.dart';
+import 'core/platform/android_mpv.dart';
+import 'core/platform/trusted_certificates.dart';
 import 'core/notify/cs_notify.dart';
 import 'core/notify/notification_service.dart';
 import 'core/notify/push_service.dart';
@@ -85,6 +87,16 @@ Future<void> main() async {
         CrashReports.record(error, stack, fatal: true);
         return true;
       };
+      // Install public roots before Firebase, Supabase, images, or providers
+      // create HTTPS clients. A broken asset falls back to platform validation.
+      if (Platform.isAndroid) {
+        try {
+          await installSupplementalTrustRoots();
+          AppLogger.instance.log('[tls] Supplemental public CA roots loaded');
+        } catch (e, st) {
+          AppLogger.instance.logError(e, st);
+        }
+      }
       // Cap the in-memory image cache so a heavy source's posters + heroes can't
       // pile up and OOM-crash (default is 100 MB; libmpv adds a big native
       // baseline). On-screen images stay full quality; far-off-screen ones reload
@@ -143,7 +155,11 @@ Future<void> main() async {
       // those so the UI still comes up (playback may be unavailable there).
       if (!appleTv) {
         try {
-          MediaKit.ensureInitialized();
+          final library = Platform.isAndroid
+              ? await resolveAndroidMpvLibrary()
+              : null;
+          MediaKit.ensureInitialized(libmpv: library);
+          AppLogger.instance.log('[media] Native playback library initialized');
         } catch (e, st) {
           AppLogger.instance.logError(e, st);
         }

@@ -56,6 +56,13 @@ Aniyomi / Tachiyomi
 Other dependencies (Flutter/Dart packages and Android libraries) are used under
 their respective open-source licenses; refer to each package for details.
 
+Mozilla CA certificate bundle
+  https://curl.se/docs/caextract.html
+  Source: Mozilla NSS certdata, extracted by curl's mk-ca-bundle.
+  License: Mozilla Public License 2.0 (https://www.mozilla.org/MPL/2.0/).
+  The dated, unmodified PEM is bundled at
+  android/app/src/main/res/raw/trusted_roots.pem for Android/Dart HTTPS trust.
+
 ────────────────────────────────────────────────────────────────────────────
 Keeping this file current
 ────────────────────────────────────────────────────────────────────────────
