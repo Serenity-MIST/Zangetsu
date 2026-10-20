@@ -1,3 +1,4 @@
+import '../desktop/extension_runtime.dart';
 // Native-backed image provider for Mihon (manga) source covers and pages.
 //
 // The manga twin of [AniyomiImage] (`lib/core/aniyomi/aniyomi_image_provider.dart`)
@@ -23,7 +24,7 @@ import 'package:flutter/services.dart';
 
 import '../cache/app_image_cache.dart';
 
-const MethodChannel _kMihonChannel = MethodChannel('zangetsu/mihon');
+const ExtensionChannel _kMihonChannel = ExtensionChannel('zangetsu/mihon');
 
 /// [ImageProvider] that fetches image bytes via the native Mihon OkHttpClient.
 ///
@@ -51,17 +52,20 @@ class MihonImage extends ImageProvider<MihonImage> {
     MihonImage key,
     ImageDecoderCallback decode,
   ) async {
-    final Uint8List? bytes = await _kMihonChannel.invokeMethod<Uint8List>(
-      'getImage',
-      {'sourceId': key.sourceId, 'url': key.url},
-    );
+    final Uint8List? bytes = await _kMihonChannel
+        .invokeMethod<Uint8List>('getImage', {
+          'sourceId': key.sourceId,
+          'url': key.url,
+        })
+        .timeout(const Duration(seconds: 40));
     if (bytes == null || bytes.isEmpty) {
       throw Exception(
         'MihonImage: native getImage returned empty bytes for ${key.url}',
       );
     }
-    final ui.ImmutableBuffer buffer =
-        await ui.ImmutableBuffer.fromUint8List(bytes);
+    final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(
+      bytes,
+    );
     final ui.Codec codec = await decode(buffer);
     final ui.FrameInfo frame = await codec.getNextFrame();
     return ImageInfo(image: frame.image);

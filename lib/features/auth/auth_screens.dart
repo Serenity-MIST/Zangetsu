@@ -786,11 +786,12 @@ class _ProfileAccountSectionState extends State<ProfileAccountSection> {
               child: Text(state.user?.email ?? '', style: AppText.caption),
             ),
             SizedBox(height: isTv ? 24 : 32),
-            if (!isTv) ...[
+            // Phone pairing remains available on mobile; desktop signs in directly.
+            if (!isTv && !Platform.isWindows) ...[
               SizedBox(
                 width: double.infinity,
                 child: SecondaryButton(
-                  label: context.l10n.pairATV,
+                  label: 'Pair a TV or PC',
                   icon: Icons.tv_rounded,
                   onPressed: () =>
                       Navigator.of(context).push(PairTvScreen.route()),

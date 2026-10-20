@@ -1,9 +1,11 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:screen_brightness/screen_brightness.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../../core/di/injector.dart';
+import '../../core/desktop/desktop_window.dart';
 import '../../core/reading/reader_prefs.dart';
 
 /// Shared "reading comfort" side effects for both readers — keep-awake,
@@ -17,6 +19,22 @@ import '../../core/reading/reader_prefs.dart';
 /// Nothing in `main.dart` locks orientation at startup, so "restore to
 /// default" here means all four orientations, not a single one.
 mixin ReaderComfortMixin<T extends StatefulWidget> on State<T> {
+  bool? _previousWindowFullscreen;
+  Future<void> _windowChanges = Future.value();
+
+  /// Serializes changes and disposal so a late native reply cannot fullscreen
+  /// the library after the reader has already closed.
+  void _applyWindowFullscreen(bool? enabled) {
+    _windowChanges = _windowChanges
+        .then((_) async {
+          _previousWindowFullscreen ??= await DesktopWindow.isFullscreen();
+          await DesktopWindow.setFullscreen(
+            enabled ?? _previousWindowFullscreen!,
+          );
+        })
+        .catchError((Object _) {});
+  }
+
   static const List<DeviceOrientation> _allOrientations =
       DeviceOrientation.values;
 
@@ -43,6 +61,10 @@ mixin ReaderComfortMixin<T extends StatefulWidget> on State<T> {
       );
     }
 
+    if (Platform.isWindows) {
+      _applyWindowFullscreen(prefs.fullscreen);
+      return;
+    }
     SystemChrome.setPreferredOrientations(_orientationsFor(prefs.orientation));
 
     // Bars off while reading. `immersiveSticky`, not `immersive`: a swipe from
@@ -60,6 +82,10 @@ mixin ReaderComfortMixin<T extends StatefulWidget> on State<T> {
     ScreenBrightness.instance.resetApplicationScreenBrightness().catchError(
       (_) {},
     );
+    if (Platform.isWindows) {
+      _applyWindowFullscreen(null);
+      return;
+    }
     SystemChrome.setPreferredOrientations(_allOrientations);
     // Unconditionally, even when fullscreen was off: the toggle can be flipped
     // from the settings sheet mid-session, so restoring only when the CURRENT

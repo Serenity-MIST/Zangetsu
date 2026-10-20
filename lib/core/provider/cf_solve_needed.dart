@@ -22,14 +22,33 @@ class CfSolveNeeded {
   // bootstrap tags every fetch with its provider's __src, but that's null
   // for a request made outside any loaded provider's namespace.
   static final Map<String, ({String? sourceId, String url})> _hosts = {};
+  static int _revision = 0;
+  static final Map<String, int> _sourceRevisions = {};
 
-  static void needsSolve(String host, String url, {String? sourceId}) =>
-      _hosts[host] = (sourceId: sourceId, url: url);
+  /// Changes when this source reports a new challenge, even on an existing host.
+  /// Callers compare before/after requests to distinguish current/stale flags.
+  static int sourceRevision(String sourceId) => _sourceRevisions[sourceId] ?? 0;
+
+  static void needsSolve(String host, String url, {String? sourceId}) {
+    _hosts[host] = (sourceId: sourceId, url: url);
+    if (sourceId != null) _sourceRevisions[sourceId] = ++_revision;
+  }
 
   /// Clears the flag for [host] — call once a solve for it succeeds.
   static void clear(String host) => _hosts.remove(host);
 
   static bool hostFlagged(String host) => _hosts.containsKey(host);
+
+  /// Identifies the transport that must receive this host's verified session.
+  static String? sourceForHost(String host) => _hosts[host]?.sourceId;
+
+  /// The flag also covers native extensions; its presence alone does not
+  /// mean that the session belongs in ProviderManager's JavaScript cookie jar.
+  static bool usesJsSolver(String host) {
+    final sourceId = _hosts[host]?.sourceId;
+    if (sourceId == null) return hostFlagged(host);
+    return !['mihon:', 'ani:', 'cs:', 'lnr:'].any(sourceId.startsWith);
+  }
 
   static bool sourceFlagged(String sourceId) =>
       _hosts.values.any((v) => v.sourceId == sourceId);

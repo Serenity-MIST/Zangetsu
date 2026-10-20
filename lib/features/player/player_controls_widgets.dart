@@ -87,7 +87,6 @@ class _MegaSkipPill extends StatelessWidget {
     // Deliberately the twin of the timestamp chip it now sits beside — same
     // fill, radius and type. The accent-outlined stadium it used to be was
     // louder than anything else on the bar and read as a stray element.
-    // No tooltip: "+85s" already says what it does.
     return Material(
       color: Colors.black.withValues(alpha: 0.3),
       borderRadius: BorderRadius.circular(13),
@@ -140,20 +139,20 @@ class _RoundIconButton extends StatelessWidget {
     return _withTooltip(
       semanticLabel,
       Semantics(
-      button: true,
-      label: semanticLabel,
-      child: Material(
-        color: Colors.black.withValues(alpha: 0.5),
-        shape: const CircleBorder(),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: onTap,
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Icon(icon, color: Colors.white, size: 24),
+        button: true,
+        label: semanticLabel,
+        child: Material(
+          color: Colors.black.withValues(alpha: 0.5),
+          shape: const CircleBorder(),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: onTap,
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Icon(icon, color: Colors.white, size: 24),
+            ),
           ),
         ),
-      ),
       ),
     );
   }

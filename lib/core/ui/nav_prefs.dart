@@ -14,6 +14,7 @@ enum DockTab {
   downloads('Downloads'),
   history('History'),
   sources('Sources'),
+  search('Search'),
   profile('Profile');
 
   const DockTab(this.label);
@@ -76,13 +77,28 @@ class NavPrefs extends ChangeNotifier {
   /// navigate out of.
   List<DockTab> get tabs {
     final raw = _box?.get(_tabsKey);
-    if (raw is! List || raw.isEmpty) return defaultTabs;
+    if (raw is! List || raw.isEmpty) return _desktopTabs(defaultTabs);
     final out = <DockTab>[];
     for (final name in raw) {
       final tab = DockTab.values.where((t) => t.name == name).firstOrNull;
       if (tab != null && !out.contains(tab)) out.add(tab);
     }
-    return _sanitize(out);
+    return _desktopTabs(_sanitize(out));
+  }
+
+  /// Preserves explicit desktop dock choices when reading saved/default tabs.
+  List<DockTab> _desktopTabs(List<DockTab> tabs) => tabs;
+
+  /// Classic has its own media filter; New follows the dock's current media.
+  String get myListStyle =>
+      _box?.get('myListStyle', defaultValue: 'classic') == 'new'
+      ? 'new'
+      : 'classic';
+
+  /// Persists a supported list style and refreshes subscribed list/settings UI.
+  Future<void> setMyListStyle(String style) async {
+    await _box?.put('myListStyle', style == 'new' ? 'new' : 'classic');
+    notifyListeners();
   }
 
   Future<void> setTabs(List<DockTab> tabs) async {
@@ -127,7 +143,7 @@ class NavPrefs extends ChangeNotifier {
   }
 
   bool get isDefault =>
-      listEquals(tabs, defaultTabs) &&
+      listEquals(tabs, _desktopTabs(defaultTabs)) &&
       startTab == defaultTabs.first &&
       !keepDockExpanded;
 

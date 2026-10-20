@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:convert';
 
 import 'package:flutter/services.dart';
@@ -26,9 +27,9 @@ void main() {
     log.clear();
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
-      log.add(call);
-      return handler(call);
-    });
+          log.add(call);
+          return handler(call);
+        });
   }
 
   tearDown(() {
@@ -43,18 +44,17 @@ void main() {
     String lang = 'en',
     String baseUrl = 'https://m.example.com',
     Map<String, String> headers = const {},
-  }) =>
-      MihonSourceInfo(
-        id: id,
-        name: name,
-        lang: lang,
-        baseUrl: baseUrl,
-        pkg: 'com.test.manga',
-        nsfw: false,
-        headers: headers,
-        version: '2.3',
-        versionCode: 9,
-      );
+  }) => MihonSourceInfo(
+    id: id,
+    name: name,
+    lang: lang,
+    baseUrl: baseUrl,
+    pkg: 'com.test.manga',
+    nsfw: false,
+    headers: headers,
+    version: '2.3',
+    versionCode: 9,
+  );
 
   group('identity', () {
     test('sourceId is namespaced mihon:<id>, not ani:<id>', () {
@@ -63,22 +63,27 @@ void main() {
       expect(p.sourceId, isNot('ani:42'));
     });
 
-    test('getInfo returns ProviderType.manga with the source metadata',
-        () async {
-      final p = MihonProvider(
-        info: srcInfo(name: 'Mangalib', lang: 'fr', baseUrl: 'https://x.test'),
-      );
-      final info = await p.getInfo();
-      expect(info.type, ProviderType.manga);
-      expect(info.name, 'Mangalib');
-      expect(info.lang, 'fr');
-      expect(info.baseUrl, 'https://x.test');
-    });
+    test(
+      'getInfo returns ProviderType.manga with the source metadata',
+      () async {
+        final p = MihonProvider(
+          info: srcInfo(
+            name: 'Mangalib',
+            lang: 'fr',
+            baseUrl: 'https://x.test',
+          ),
+        );
+        final info = await p.getInfo();
+        expect(info.type, ProviderType.manga);
+        expect(info.name, 'Mangalib');
+        expect(info.lang, 'fr');
+        expect(info.baseUrl, 'https://x.test');
+      },
+    );
   });
 
   group('getEpisodes → native getChapters (the M6 trap)', () {
-    test(
-        'invokes "getChapters", never "getEpisodes", with sourceId/url, and '
+    test('invokes "getChapters", never "getEpisodes", with sourceId/url, and '
         'normalises the newest-first reply to chronological order', () async {
       install((call) async {
         if (call.method == 'getChapters') {
@@ -123,125 +128,136 @@ void main() {
       expect(chapters[1].id, 'ch-1100.0-TCB');
     });
 
-    test('a channel call to the wrong method name would leave chapters empty',
-        () async {
-      // Regression guard: if getEpisodes ever called "getEpisodes" on the
-      // channel instead of "getChapters", this mock (which only answers
-      // getChapters) would return null and the list would come back empty.
-      // isEmpty alone wouldn't catch a renamed call (null decodes to []
-      // either way) — it's the method-name assertion below that's load-bearing.
-      install((call) async => call.method == 'getChapters' ? '[]' : null);
-      final p = MihonProvider(info: srcInfo());
-      final chapters = await p.getEpisodes('/x');
-      expect(chapters, isEmpty);
-      expect(log.single.method, 'getChapters');
-    });
+    test(
+      'a channel call to the wrong method name would leave chapters empty',
+      () async {
+        // Regression guard: if getEpisodes ever called "getEpisodes" on the
+        // channel instead of "getChapters", this mock (which only answers
+        // getChapters) would return null and the list would come back empty.
+        // isEmpty alone wouldn't catch a renamed call (null decodes to []
+        // either way) — it's the method-name assertion below that's load-bearing.
+        install((call) async => call.method == 'getChapters' ? '[]' : null);
+        final p = MihonProvider(info: srcInfo());
+        final chapters = await p.getEpisodes('/x');
+        expect(chapters, isEmpty);
+        expect(log.single.method, 'getChapters');
+      },
+    );
   });
 
   group('getDetail', () {
-    test('fetches getDetails + getChapters in parallel and merges them',
-        () async {
-      install((call) async {
-        switch (call.method) {
-          case 'getDetails':
-            return jsonEncode({
-              'url': '/manga/one-piece',
-              'title': 'One Piece',
-              'thumbnail_url': 'https://cdn.example.com/op.jpg',
-              'description': 'Pirates.',
-              'status': 1,
-              'genre': 'Action, Adventure',
-            });
-          case 'getChapters':
-            return jsonEncode([
-              {'url': '/c1', 'name': 'Chapter 1', 'chapter_number': 1.0},
-            ]);
-          default:
-            return null;
+    test(
+      'fetches getDetails + getChapters in parallel and merges them',
+      () async {
+        install((call) async {
+          switch (call.method) {
+            case 'getDetails':
+              return jsonEncode({
+                'url': '/manga/one-piece',
+                'title': 'One Piece',
+                'thumbnail_url': 'https://cdn.example.com/op.jpg',
+                'description': 'Pirates.',
+                'status': 1,
+                'genre': 'Action, Adventure',
+              });
+            case 'getChapters':
+              return jsonEncode([
+                {'url': '/c1', 'name': 'Chapter 1', 'chapter_number': 1.0},
+              ]);
+            default:
+              return null;
+          }
+        });
+        final p = MihonProvider(info: srcInfo(id: 7));
+        final detail = await p.getDetail('/manga/one-piece');
+
+        final methods = log.map((c) => c.method).toSet();
+        expect(methods, {'getDetails', 'getChapters'});
+        for (final call in log) {
+          final args = call.arguments as Map;
+          expect(args['sourceId'], 7);
+          expect(args['url'], '/manga/one-piece');
         }
-      });
-      final p = MihonProvider(info: srcInfo(id: 7));
-      final detail = await p.getDetail('/manga/one-piece');
 
-      final methods = log.map((c) => c.method).toSet();
-      expect(methods, {'getDetails', 'getChapters'});
-      for (final call in log) {
-        final args = call.arguments as Map;
-        expect(args['sourceId'], 7);
-        expect(args['url'], '/manga/one-piece');
-      }
-
-      expect(detail.title, 'One Piece');
-      expect(detail.type, ProviderType.manga);
-      expect(detail.sourceId, 'mihon:7');
-      expect(detail.episodes, hasLength(1));
-      expect(detail.episodes.single.title, 'Chapter 1');
-    });
+        expect(detail.title, 'One Piece');
+        expect(detail.type, ProviderType.manga);
+        expect(detail.sourceId, 'mihon:7');
+        expect(detail.episodes, hasLength(1));
+        expect(detail.episodes.single.title, 'Chapter 1');
+      },
+    );
   });
 
   group('search', () {
-    test('forwards query/page and only includes filters when non-empty',
-        () async {
-      install((call) async => call.method == 'search' ? '[]' : null);
-      final p = MihonProvider(info: srcInfo(id: 3));
+    test(
+      'forwards query/page and only includes filters when non-empty',
+      () async {
+        install((call) async => call.method == 'search' ? '[]' : null);
+        final p = MihonProvider(info: srcInfo(id: 3));
 
-      await p.search('luffy', 2);
-      expect(log.single.method, 'search');
-      var args = log.single.arguments as Map;
-      expect(args['sourceId'], 3);
-      expect(args['query'], 'luffy');
-      expect(args['page'], 2);
-      expect(args.containsKey('filters'), isFalse);
+        await p.search('luffy', 2);
+        expect(log.single.method, 'search');
+        var args = log.single.arguments as Map;
+        expect(args['sourceId'], 3);
+        expect(args['query'], 'luffy');
+        expect(args['page'], 2);
+        expect(args.containsKey('filters'), isFalse);
 
-      await p.search('luffy', 1, filtersJson: '[{"type":"header"}]');
-      args = log.last.arguments as Map;
-      expect(args['filters'], '[{"type":"header"}]');
-    });
+        await p.search('luffy', 1, filtersJson: '[{"type":"header"}]');
+        args = log.last.arguments as Map;
+        expect(args['filters'], '[{"type":"header"}]');
+      },
+    );
   });
 
   group('getPages — one unresolvable page must not fail the chapter', () {
-    test('drops the page with a null imageUrl, keeps the resolvable ones',
-        () async {
-      install((call) async {
-        if (call.method == 'getPages') {
-          return jsonEncode([
-            {
-              'index': 0,
-              'url': '/c1/p1',
-              'imageUrl': 'https://cdn.example.com/p1.jpg',
-              'headers': {'Referer': 'https://m.example.com'},
-            },
-            {
-              // Resolution genuinely failed for this one page server-side.
-              'index': 1,
-              'url': '/c1/p2',
-              'imageUrl': null,
-              'headers': <String, dynamic>{},
-            },
-            {
-              'index': 2,
-              'url': '/c1/p3',
-              'imageUrl': 'https://cdn.example.com/p3.jpg',
-            },
-          ]);
-        }
-        return null;
-      });
-      final p = MihonProvider(info: srcInfo(id: 7));
-      final pages = await p.getPages('/c1');
+    test(
+      'drops the page with a null imageUrl, keeps the resolvable ones',
+      () async {
+        install((call) async {
+          if (call.method == 'getPages') {
+            return jsonEncode([
+              {
+                'index': 0,
+                'url': '/c1/p1',
+                'imageUrl': 'https://cdn.example.com/p1.jpg',
+                'headers': {'Referer': 'https://m.example.com'},
+              },
+              {
+                // Resolution genuinely failed for this one page server-side.
+                'index': 1,
+                'url': '/c1/p2',
+                'imageUrl': null,
+                'headers': <String, dynamic>{},
+              },
+              {
+                'index': 2,
+                'url': '/c1/p3',
+                'imageUrl': 'https://cdn.example.com/p3.jpg',
+              },
+            ]);
+          }
+          return null;
+        });
+        final p = MihonProvider(info: srcInfo(id: 7));
+        final pages = await p.getPages('/c1');
 
-      expect(log.single.method, 'getPages');
-      final args = log.single.arguments as Map;
-      expect(args['sourceId'], 7);
-      expect(args['url'], '/c1');
+        expect(log.single.method, 'getPages');
+        final args = log.single.arguments as Map;
+        expect(args['sourceId'], 7);
+        expect(args['url'], '/c1');
 
-      // 3 pages sent, only the 2 resolvable ones survive — the bad page did
-      // NOT fail the whole chapter.
-      expect(pages, hasLength(2));
-      expect(pages[0].url, 'https://cdn.example.com/p1.jpg');
-      expect(pages[0].headers, {'Referer': 'https://m.example.com'});
-      expect(pages[1].url, 'https://cdn.example.com/p3.jpg');
-    });
+        // 3 pages sent, only the 2 resolvable ones survive — the bad page did
+        // NOT fail the whole chapter.
+        expect(pages, hasLength(2));
+        expect(pages[0].url, 'https://cdn.example.com/p1.jpg');
+        expect(pages[0].headers, {
+          'Referer': 'https://m.example.com',
+          if (Platform.isWindows) 'x-mihon-src': '7',
+        });
+        expect(pages[1].url, 'https://cdn.example.com/p3.jpg');
+      },
+    );
 
     test('a malformed reply is a failure, not an empty chapter', () async {
       // This used to degrade to []. That made "the source broke" and "this
@@ -275,7 +291,9 @@ void main() {
   group('getVideoSources — reading provider, no video leaf', () {
     test('always returns [] and never touches the channel', () async {
       install((call) async {
-        fail('MihonProvider.getVideoSources must not call the platform channel');
+        fail(
+          'MihonProvider.getVideoSources must not call the platform channel',
+        );
       });
       final p = MihonProvider(info: srcInfo());
       final result = await p.getVideoSources('/c1');
@@ -296,7 +314,11 @@ void main() {
       install((call) async {
         if (call.method == 'getPopular') {
           return jsonEncode([
-            {'url': '/m1', 'title': 'Manga One', 'thumbnail_url': 'https://cdn/m1.jpg'},
+            {
+              'url': '/m1',
+              'title': 'Manga One',
+              'thumbnail_url': 'https://cdn/m1.jpg',
+            },
           ]);
         }
         return null;
@@ -305,7 +327,10 @@ void main() {
         info: srcInfo(baseUrl: 'https://m.example.com', headers: const {}),
       );
       final items = await p.popular();
-      expect(items.single.coverHeaders, {'Referer': 'https://m.example.com'});
+      expect(items.single.coverHeaders, {
+        'Referer': 'https://m.example.com',
+        if (Platform.isWindows) 'x-mihon-src': '7',
+      });
     });
 
     test('leaves an existing Referer untouched (case-insensitive)', () async {
@@ -324,7 +349,10 @@ void main() {
         ),
       );
       final items = await p.popular();
-      expect(items.single.coverHeaders, {'referer': 'https://original.example.com'});
+      expect(items.single.coverHeaders, {
+        'referer': 'https://original.example.com',
+        if (Platform.isWindows) 'x-mihon-src': '7',
+      });
     });
 
     test('no headers and no baseUrl → coverHeaders is null', () async {
@@ -336,7 +364,9 @@ void main() {
         }
         return null;
       });
-      final p = MihonProvider(info: srcInfo(baseUrl: '', headers: const {}));
+      final p = MihonProvider(
+        info: srcInfo(baseUrl: '', headers: const {}),
+      );
       final items = await p.popular();
       expect(items.single.coverHeaders, isNull);
     });

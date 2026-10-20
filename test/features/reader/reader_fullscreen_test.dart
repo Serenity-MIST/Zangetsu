@@ -26,6 +26,7 @@ void main() {
 
   late Directory dir;
   late List<String> uiModes;
+  late _HostState state;
 
   setUp(() async {
     dir = await Directory.systemTemp.createTemp('reader_fullscreen');
@@ -36,6 +37,23 @@ void main() {
     // SystemChrome goes out over a platform channel, so a test can watch the
     // calls without a device.
     uiModes = [];
+    state = _HostState();
+    // Windows readers use the native window channel rather than phone bars.
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('com.spyou.zangetsu/window'),
+          (call) async {
+            if (call.method == 'isFullscreen') return false;
+            if (call.method == 'setFullscreen') {
+              uiModes.add(
+                call.arguments == true
+                    ? 'SystemUiMode.immersiveSticky'
+                    : 'SystemUiMode.edgeToEdge',
+              );
+            }
+            return null;
+          },
+        );
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(SystemChannels.platform, (call) async {
           if (call.method == 'SystemChrome.setEnabledSystemUIMode') {
@@ -47,6 +65,11 @@ void main() {
 
   tearDown(() async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('com.spyou.zangetsu/window'),
+          null,
+        );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(SystemChannels.platform, null);
     await sl.reset();
     await Hive.close();
@@ -55,7 +78,6 @@ void main() {
 
   // Neither comfort method touches `context` or `setState`, so the State on
   // its own is enough — no need to pump a widget tree.
-  final state = _HostState();
 
   // Platform-channel messages are delivered on the next turn of the event
   // loop, so the mock handler hasn't run yet when the call returns.
@@ -93,6 +115,7 @@ void main() {
   test('leaving the reader brings the bars back', () async {
     await sl<ReaderPrefs>().setFullscreen(true);
     state.applyReaderComfort();
+    await settle();
 
     uiModes.clear();
     state.restoreReaderComfort();
@@ -106,6 +129,7 @@ void main() {
     // says so would strand them hidden over the rest of the app.
     await sl<ReaderPrefs>().setFullscreen(true);
     state.applyReaderComfort();
+    await settle();
     await sl<ReaderPrefs>().setFullscreen(false);
 
     uiModes.clear();

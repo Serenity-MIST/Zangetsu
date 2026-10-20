@@ -7,6 +7,7 @@ import 'package:hive/hive.dart';
 
 import '../di/injector.dart';
 import '../repository/source_repository.dart';
+import '../provider/provider_registry.dart';
 import '../state/active_source_cubit.dart';
 import 'content_mode.dart';
 
@@ -51,11 +52,22 @@ class ContentModeCubit extends Cubit<ContentMode> {
   /// it's cheap and can't throw when the registry isn't up yet: `lnr:` = novel,
   /// `mihon:` = manga, everything else (JS / CloudStream / Aniyomi) = anime.
   /// Matches the prefix rules in [sourceTypeOf].
-  static bool _sourceInMode(String id, ContentMode m) => switch (m) {
-    ContentMode.novel => id.startsWith('lnr:'),
-    ContentMode.manga => id.startsWith('mihon:'),
-    ContentMode.anime => !id.startsWith('lnr:') && !id.startsWith('mihon:'),
-  };
+  static bool _sourceInMode(String id, ContentMode m) {
+    if (sl.isRegistered<ProviderRegistry>() && id.startsWith('js:')) {
+      final type = sl<ProviderRegistry>().typeOf(id);
+      if (type != null)
+        return switch (m) {
+          ContentMode.manga => type == 'manga',
+          ContentMode.novel => type == 'novel',
+          ContentMode.anime => type != 'manga' && type != 'novel',
+        };
+    }
+    return switch (m) {
+      ContentMode.novel => id.startsWith('lnr:'),
+      ContentMode.manga => id.startsWith('mihon:'),
+      ContentMode.anime => !id.startsWith('lnr:') && !id.startsWith('mihon:'),
+    };
+  }
 
   /// No valid remembered source for [m] — don't leave a source from another
   /// mode active (the "enter Novel and the header still shows an anime source"
@@ -87,7 +99,7 @@ class ContentModeCubit extends Cubit<ContentMode> {
     // under the OUTGOING mode's key instead of what was really active there.
     final outgoingMode = state;
     final outgoingSource = _active.state;
-    emit(m); // update the UI first; persistence below is fire-and-forget.
+    // Restore the source before notifying mode listeners.
 
     // Restore the incoming mode's remembered source — but only if it's still
     // loaded. A stale/uninstalled id would otherwise leave Home silently
@@ -96,7 +108,10 @@ class ContentModeCubit extends Cubit<ContentMode> {
     final remembered = _box.get('src.${m.name}') as String?;
     if (remembered != null &&
         remembered.isNotEmpty &&
-        _sourceStillLoaded(remembered)) {
+        _sourceStillLoaded(remembered) &&
+        (_sourceInMode(remembered, m) ||
+            (!sl.isRegistered<ProviderRegistry>() &&
+                remembered.startsWith('js:')))) {
       _active.setSource(remembered);
     } else {
       // No valid remembered source for this mode — don't strand a reading mode
@@ -104,20 +119,30 @@ class ContentModeCubit extends Cubit<ContentMode> {
       _fallBackToModeSource(m);
     }
 
+    emit(m);
+
     // Fire-and-forget; Hive serializes writes so ordering is preserved (same
     // rationale as ActiveSourceCubit.setSource). Each write catches its own
     // error so a failure can't surface as an unhandled zone error — the mode
     // switcher calls setMode without awaiting it — and can't block the other
     // key's write either.
     unawaited(
-      _box.put('src.${outgoingMode.name}', outgoingSource).catchError(
-        (e) => debugPrint('[ContentModeCubit] failed to park $outgoingSource: $e'),
-      ),
+      _box
+          .put('src.${outgoingMode.name}', outgoingSource)
+          .catchError(
+            (e) => debugPrint(
+              '[ContentModeCubit] failed to park $outgoingSource: $e',
+            ),
+          ),
     );
     unawaited(
-      _box.put('mode', m.name).catchError(
-        (e) => debugPrint('[ContentModeCubit] failed to persist mode ${m.name}: $e'),
-      ),
+      _box
+          .put('mode', m.name)
+          .catchError(
+            (e) => debugPrint(
+              '[ContentModeCubit] failed to persist mode ${m.name}: $e',
+            ),
+          ),
     );
   }
 }

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -15,8 +16,8 @@ import 'tv_pairing_service.dart';
 import '../../l10n/l10n.dart';
 
 class TvTrackerConnectScreen extends StatefulWidget {
-  const TvTrackerConnectScreen({super.key, required this.trackerId});
-  final String trackerId; // 'anilist' | 'mal' | 'simkl'
+  const TvTrackerConnectScreen({super.key, this.trackerId});
+  final String? trackerId; // null transfers every connected phone account
 
   @override
   State<TvTrackerConnectScreen> createState() => _TvTrackerConnectScreenState();
@@ -28,16 +29,20 @@ class _TvTrackerConnectScreenState extends State<TvTrackerConnectScreen> {
   Timer? _poll;
 
   String get _label => switch (widget.trackerId) {
+    null => 'all accounts',
     'anilist' => context.l10n.anilist,
     'mal' => context.l10n.myAnimeList,
     'simkl' => context.l10n.simkl,
-    _ => widget.trackerId,
+    'mangabaka' => 'MangaBaka',
+    _ => widget.trackerId ?? 'all accounts',
   };
 
   @override
   void initState() {
     super.initState();
-    _start();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _start();
+    });
   }
 
   @override
@@ -48,7 +53,14 @@ class _TvTrackerConnectScreenState extends State<TvTrackerConnectScreen> {
 
   Future<void> _start() async {
     try {
-      final r = await _svc.startPairing('TV · $_label');
+      _poll?.cancel();
+      setState(() {
+        _code = null;
+        _error = null;
+      });
+      final r = await _svc.startPairing(
+        '${Platform.isWindows ? 'Windows PC' : 'TV'} - $_label',
+      );
       if (!mounted) return;
       setState(() {
         _code = r.code;
@@ -69,7 +81,16 @@ class _TvTrackerConnectScreenState extends State<TvTrackerConnectScreen> {
     } catch (_) {
       return;
     }
-    if (!res.approved || !mounted) return;
+    if (!mounted) return;
+    if (res.expired) {
+      _poll?.cancel();
+      setState(() {
+        _code = null;
+        _error = 'Code expired. Get a new code.';
+      });
+      return;
+    }
+    if (!res.approved) return;
     _poll?.cancel();
     final ok = await _apply(res.trackerBlob);
     if (!mounted) return;
@@ -86,7 +107,9 @@ class _TvTrackerConnectScreenState extends State<TvTrackerConnectScreen> {
     try {
       final json = TrackerRelayCrypto.decrypt(blob, nonce);
       final applied = await sl<TrackerRelay>().unpack(TrackerBlob.decode(json));
-      return applied.contains(widget.trackerId);
+      return widget.trackerId == null
+          ? applied.isNotEmpty
+          : applied.contains(widget.trackerId);
     } catch (_) {
       return false;
     }
@@ -137,53 +160,71 @@ class _TvTrackerConnectScreenState extends State<TvTrackerConnectScreen> {
           ],
         ),
       ),
-      body: Center(
-        child: _code == null
-            ? (_error != null
-                  ? Text(_error!, style: AppText.body)
-                  : const CircularProgressIndicator())
-            : Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      // QR 1 — phone-app relay via deeplink. Opens the installed
-                      // app directly so it can approve and relay this $_label
-                      // session to the TV.
-                      _qrOption(
-                        data: PairLink.deepLink(
-                          code: _code!,
-                          nonce: _nonce,
-                          trackers: true,
+      body: SingleChildScrollView(
+        child: Center(
+          child: _code == null
+              ? (_error != null
+                    ? Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(_error!, style: AppText.body),
+                          const SizedBox(height: 16),
+                          OutlinedButton(
+                            onPressed: _start,
+                            child: const Text('Get a new code'),
+                          ),
+                        ],
+                      )
+                    : const CircularProgressIndicator())
+              : Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Wrap(
+                      alignment: WrapAlignment.center,
+                      spacing: 36,
+                      runSpacing: 24,
+                      children: [
+                        // QR 1 — phone-app relay via deeplink. Opens the installed
+                        // app directly so it can approve and relay this $_label
+                        // session to the TV.
+                        _qrOption(
+                          data: PairLink.qrData(
+                            code: _code!,
+                            nonce: _nonce,
+                            trackers: true,
+                          ),
+                          title: context.l10n.haveTheApp,
+                          subtitle: widget.trackerId == null
+                              ? 'Scan with Zangetsu on your phone and approve.\nYour linked AniList, MyAnimeList, Simkl and MangaBaka accounts transfer together.'
+                              : context.l10n.openZangetsuOnYourNphoneAndScan,
                         ),
-                        title: context.l10n.haveTheApp,
-                        subtitle: context.l10n.openZangetsuOnYourNphoneAndScan,
-                      ),
-                      const SizedBox(width: 36),
-                      // QR 2 — no app needed. Opens a web page that runs the
-                      // $_label login in the phone's browser and relays the token
-                      // to this TV (same encrypted-blob path the poll consumes).
-                      _qrOption(
-                        data:
-                            'https://zangetsu.online/tv-connect/'
-                            '?code=$_code&nonce=$_nonce&tracker=${widget.trackerId}',
-                        title: context.l10n.noApp,
-                        subtitle:
-                            'Scan to log in with\n$_label in your browser',
+                        // QR 2 — no app needed. Opens a web page that runs the
+                        // $_label login in the phone's browser and relays the token
+                        // to this TV (same encrypted-blob path the poll consumes).
+                        if (widget.trackerId != null &&
+                            widget.trackerId != 'mangabaka')
+                          _qrOption(
+                            data:
+                                'https://zangetsu.online/tv-connect/'
+                                '?code=$_code&nonce=$_nonce&tracker=${widget.trackerId}',
+                            title: context.l10n.noApp,
+                            subtitle:
+                                'Scan to log in with\n$_label in your browser',
+                          ),
+                      ],
+                    ),
+                    if (_error != null) ...[
+                      const SizedBox(height: 16),
+                      Text(
+                        _error!,
+                        style: AppText.caption.copyWith(
+                          color: Colors.redAccent,
+                        ),
                       ),
                     ],
-                  ),
-                  if (_error != null) ...[
-                    const SizedBox(height: 16),
-                    Text(
-                      _error!,
-                      style: AppText.caption.copyWith(color: Colors.redAccent),
-                    ),
                   ],
-                ],
-              ),
+                ),
+        ),
       ),
     );
   }

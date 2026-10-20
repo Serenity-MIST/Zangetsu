@@ -216,7 +216,9 @@ class ChapterDownloadStore {
       ..sort((a, b) => a.path.compareTo(b.path));
     if (files.isEmpty) return d;
 
-    final show = 'Zangetsu/${safeName(d.showTitle)}';
+    final show = Platform.isWindows
+        ? '${d.mode == ContentMode.novel ? 'Novels' : 'Manga'}/${safeName(d.showTitle)}'
+        : 'Zangetsu/${safeName(d.showTitle)}';
     final chapter = safeName(d.chapterTitle);
     // Manga leaves as one archive; a novel is a single html file already.
     final packed = d.mode == ContentMode.novel
@@ -329,10 +331,9 @@ class ChapterDownloadStore {
   Directory? _cachedRoot;
 
   /// Staging root, and where chapters from older builds still live.
-  Future<Directory> _root() async =>
-      _cachedRoot ??= Directory(
-        '${(await getApplicationSupportDirectory()).path}/chapters',
-      );
+  Future<Directory> _root() async => _cachedRoot ??= Directory(
+    '${(await getApplicationSupportDirectory()).path}/chapters',
+  );
 
   static String _hash(String url) =>
       crypto.sha1.convert(utf8.encode(url)).toString();

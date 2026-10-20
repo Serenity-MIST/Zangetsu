@@ -1,3 +1,5 @@
+import 'package:flutter/gestures.dart';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text.dart';
@@ -36,26 +38,37 @@ class ContentRow extends StatelessWidget {
       children: [
         _Header(title: title, overline: overline, onSeeAll: onSeeAll),
         SizedBox(
-          height: itemHeight,
-          child: ListView.builder(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            // With a screen reader on, build every item (not just the lazy
-            // window) so TalkBack can focus each one and the row auto-scrolls to
-            // it — otherwise horizontal swipe navigation stalls at the first few.
-            // Sighted users keep the lazy 600px window unchanged.
-            cacheExtent: MediaQuery.of(context).accessibleNavigation
-                ? double.infinity
-                : 600,
-            itemCount: itemCount,
-            itemBuilder: (context, index) => Padding(
-              padding: const EdgeInsetsDirectional.only(end: 12),
-              child: SizedBox(
-                width: itemWidth,
-                child: RepaintBoundary(
-                  child: RevealItem(
-                    index: index,
-                    child: itemBuilder(context, index),
+          height: Platform.isWindows
+              ? (itemHeight > itemWidth
+                    ? (itemHeight / itemWidth * 166).clamp(240.0, 320.0)
+                    : itemHeight * 1.2)
+              : itemHeight,
+          child: _DesktopHorizontalScroll(
+            builder: (controller) => ListView.builder(
+              controller: controller,
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              // With a screen reader on, build every item (not just the lazy
+              // window) so TalkBack can focus each one and the row auto-scrolls to
+              // it — otherwise horizontal swipe navigation stalls at the first few.
+              // Sighted users keep the lazy 600px window unchanged.
+              cacheExtent: MediaQuery.of(context).accessibleNavigation
+                  ? double.infinity
+                  : 600,
+              itemCount: itemCount,
+              itemBuilder: (context, index) => Padding(
+                padding: EdgeInsetsDirectional.only(
+                  end: Platform.isWindows ? 20 : 12,
+                ),
+                child: SizedBox(
+                  width: Platform.isWindows
+                      ? (itemHeight > itemWidth ? 166 : itemWidth * 1.2)
+                      : itemWidth,
+                  child: RepaintBoundary(
+                    child: RevealItem(
+                      index: index,
+                      child: itemBuilder(context, index),
+                    ),
                   ),
                 ),
               ),
@@ -63,6 +76,41 @@ class ContentRow extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+/// Gives a content row an owned controller and desktop pointer drag support.
+class _DesktopHorizontalScroll extends StatefulWidget {
+  const _DesktopHorizontalScroll({required this.builder});
+  final Widget Function(ScrollController) builder;
+  @override
+  State<_DesktopHorizontalScroll> createState() =>
+      _DesktopHorizontalScrollState();
+}
+
+/// Enables mouse/trackpad drags without consuming the outer page's wheel scroll.
+class _DesktopHorizontalScrollState extends State<_DesktopHorizontalScroll> {
+  final _controller = ScrollController();
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final child = widget.builder(_controller);
+    if (!Platform.isWindows) return child;
+    return ScrollConfiguration(
+      behavior: const MaterialScrollBehavior().copyWith(
+        dragDevices: {
+          PointerDeviceKind.touch,
+          PointerDeviceKind.mouse,
+          PointerDeviceKind.trackpad,
+        },
+      ),
+      child: child,
     );
   }
 }

@@ -6,6 +6,7 @@ import 'package:watch_app/core/models/media_item.dart';
 import 'package:watch_app/core/models/provider_info.dart';
 import 'package:watch_app/core/playback/my_list.dart';
 import 'package:watch_app/core/supabase/supabase_service.dart';
+import 'package:watch_app/core/profiles/profile_scope.dart';
 
 /// In-memory fake for [MyListRemote] so the store's pending-queue and
 /// pull-merge logic can be tested without a live Supabase project.
@@ -208,6 +209,134 @@ void main() {
     await Hive.deleteFromDisk();
     if (await tmpDir.exists()) await tmpDir.delete(recursive: true);
   });
+
+  test(
+    'legacy cloud duplicates repair automatically and stay removed',
+    () async {
+      for (final source in ['zm', 'anilist']) {
+        fake.rows.add({
+          'user_key': 'user1',
+          'source_id': source,
+          'item_id': 'mal:5114',
+          'title': 'FMA',
+          'url': 'zm://anime/mal:5114',
+          'type': 'anime',
+          'status': 'completed',
+        });
+      }
+      await store.pullFromCloud();
+      expect(store.all(), hasLength(1));
+      expect(fake.rows, hasLength(1));
+      expect(fake.rows.single['item_id'], 'anime:mal:5114');
+      expect(fake.rows.single['status'], 'completed');
+      expect(Hive.box<Map>('my_list_cloud_repair_backup').length, 2);
+      await store.pullFromCloud();
+      expect(store.all(), hasLength(1));
+      expect(fake.rows, hasLength(1));
+    },
+  );
+  test(
+    'saved-link repair preserves status and cloud scope for its viewer',
+    () async {
+      var profile = 'kid';
+      final scoped = MyListStore(
+        SupabaseService(),
+        () => 'user1',
+        remote: fake,
+        currentProfileId: () => profile,
+      );
+      final before = _item(sourceId: 'ani:42', id: '/old');
+      await scoped.add(before);
+    await scoped.seedCloudIfNeeded();
+    await scoped.pullFromCloud();
+      final statuses = await Hive.openBox('list_status');
+      final oldKey = profileScopedKey(profile, 'ani:42::/old');
+      await statuses.put(oldKey, 'completed');
+      final after = await scoped.repairLink(
+        before,
+        const MediaItem(
+          id: 'mal:41923',
+          title: 'Yi Nian Yongheng',
+          sourceId: 'zm',
+          url: 'zm://anime/mal:41923',
+          type: ProviderType.anime,
+        ),
+      );
+      expect(scoped.all().single.url, after.url);
+      expect(
+        statuses.get(profileScopedKey(profile, 'zm::anime:mal:41923')),
+        'completed',
+      );
+      expect(fake.rows.single['profile_id'], 'kid');
+    await scoped.pullFromCloud();
+    expect(scoped.all().single.url, after.url,
+      reason: 'The old cloud tombstone must not erase the repaired identity');
+      profile = 'default';
+      expect(scoped.all(), isEmpty);
+      expect(statuses.get('zm::anime:mal:41923'), isNull);
+    },
+  );
+
+  test('failed replacement upload retains the legacy cloud row', () async {
+    fake.rows.add({
+      'user_key': 'user1',
+      'source_id': 'zm',
+      'item_id': 'mal:5114',
+      'title': 'FMA',
+      'url': 'zm://anime/mal:5114',
+      'type': 'anime',
+    });
+    fake.failNext = true;
+    await store.pullFromCloud();
+    expect(fake.rows.single['item_id'], 'mal:5114');
+    expect(store.all(), hasLength(1));
+    await store.pullFromCloud();
+    expect(fake.rows.single['item_id'], 'anime:mal:5114');
+  });
+
+  test(
+    'broken source link becomes a durable catalogue link without re-adding',
+    () async {
+      final original = _item(
+        sourceId: 'ani:1571236147208399860',
+        id: '/watch/yi-nian-yong-heng-aizsj',
+      );
+      await store.add(original);
+      final categories = await Hive.openBox('list_categories');
+      await categories.put('${original.sourceId}::${original.id}', [
+        'favourites',
+      ]);
+      final status = await Hive.openBox('list_status');
+      await status.put('${original.sourceId}::${original.id}', 'planning');
+      final repaired = await store.repairLink(
+        original,
+        const MediaItem(
+          id: 'mal:41923',
+          title: 'Yi Nian Yongheng',
+          sourceId: 'zm',
+          url: 'zm://anime/mal:41923',
+          type: ProviderType.anime,
+        ),
+      );
+      expect(store.all(), hasLength(1));
+      expect(store.all().single.url, repaired.url);
+      expect(categories.get('zm::anime:mal:41923'), ['favourites']);
+      expect(status.get('zm::anime:mal:41923'), 'planning');
+      expect(fake.rows, hasLength(1));
+      fake.rows.add({
+        'user_key': 'user1',
+        'source_id': original.sourceId,
+        'item_id': original.id,
+        'title': original.title,
+        'url': original.url,
+        'type': 'anime',
+      });
+      await store.pullFromCloud();
+      expect(store.all(), hasLength(1));
+      expect(fake.rows, hasLength(1));
+      expect(fake.rows.single['source_id'], 'zm');
+    },
+  );
 
   test('add() upserts a row with the right composite key + fields', () async {
     await store.add(_item());

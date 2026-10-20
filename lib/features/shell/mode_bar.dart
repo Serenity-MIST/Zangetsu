@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 
 import '../../core/mode/content_mode.dart';
 import '../../core/ui/frosted_surface.dart';
@@ -76,8 +77,14 @@ class ModeBar extends StatelessWidget {
           opacity: open ? 1 : 0,
           duration: const Duration(milliseconds: 200),
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            // Match the bottom dock's glass while this selector is visible.
+            padding: EdgeInsets.symmetric(
+              horizontal: defaultTargetPlatform == TargetPlatform.windows
+                  ? ((MediaQuery.sizeOf(context).width - 440) / 2).clamp(
+                      16.0,
+                      double.infinity,
+                    )
+                  : 16,
+            ),
             child: FakeFrost(
               borderRadius: BorderRadius.circular(20),
               opacity: 0.55,

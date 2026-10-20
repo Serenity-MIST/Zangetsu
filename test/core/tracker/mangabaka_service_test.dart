@@ -1,11 +1,14 @@
 import 'dart:convert';
+import 'dart:async';
 import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/services.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/environment.dart';
+import 'package:watch_app/core/desktop/desktop_oauth.dart';
 import 'package:watch_app/core/models/watch_status.dart';
 import 'package:watch_app/core/tracker/mangabaka_service.dart';
 import 'package:watch_app/core/mode/content_mode.dart';
@@ -24,6 +27,15 @@ void main() {
   late Directory dir;
   late MangaBakaService svc;
 
+  setUpAll(() {
+    // Keep the actual app_links broadcast channel alive for callback delivery.
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('com.llfbandit.app_links/events'),
+          (_) async => null,
+        );
+  });
+
   setUp(() async {
     dir = await Directory.systemTemp.createTemp('mangabaka_test');
     Hive.init(dir.path);
@@ -37,7 +49,417 @@ void main() {
     if (await dir.exists()) await dir.delete(recursive: true);
   });
 
+  group('refresh recovery', () {
+    test('concurrent expired requests rotate the refresh token once', () async {
+      await svc.importSession({
+        'accessToken': 'old-access',
+        'refreshToken': 'old-refresh',
+      });
+      final dio = Dio();
+      var refreshes = 0;
+      dio.interceptors.add(
+        InterceptorsWrapper(
+          onRequest: (request, handler) async {
+            if (request.path == Environment.mangabakaTokenUrl) {
+              refreshes++;
+              await Future<void>.delayed(const Duration(milliseconds: 15));
+              handler.resolve(
+                Response(
+                  requestOptions: request,
+                  statusCode: 200,
+                  data: {
+                    'access_token': 'fresh-access',
+                    'refresh_token': 'rotated-refresh',
+                    'expires_in': 3600,
+                  },
+                ),
+              );
+            } else {
+              final renewed =
+                  request.headers['Authorization'] == 'Bearer fresh-access';
+              handler.resolve(
+                Response(
+                  requestOptions: request,
+                  statusCode: renewed ? 200 : 401,
+                  data: {'data': <dynamic>[]},
+                ),
+              );
+            }
+          },
+        ),
+      );
+      final service = MangaBakaService(dio);
+      addTearDown(service.dispose);
+      await Future.wait([service.fetchList(), service.fetchList()]);
+      expect(refreshes, 1);
+      expect(service.exportSession()?['refreshToken'], 'rotated-refresh');
+    });
+    test(
+      'Connect restores a refresh-only session without opening the browser',
+      () async {
+        await svc.importSession({'refreshToken': 'old-refresh'});
+        final dio = Dio();
+        var refreshes = 0;
+        dio.interceptors.add(
+          InterceptorsWrapper(
+            onRequest: (request, handler) {
+              if (request.path == Environment.mangabakaTokenUrl) {
+                refreshes++;
+                expect(request.data['grant_type'], 'refresh_token');
+                expect(request.data['refresh_token'], 'old-refresh');
+                handler.resolve(
+                  Response(
+                    requestOptions: request,
+                    statusCode: 200,
+                    data: {
+                      'access_token': 'fresh-access',
+                      'refresh_token': 'new-refresh',
+                      'expires_in': 3600,
+                    },
+                  ),
+                );
+              } else {
+                handler.resolve(
+                  Response(
+                    requestOptions: request,
+                    statusCode: 200,
+                    data: <String, dynamic>{},
+                  ),
+                );
+              }
+            },
+          ),
+        );
+        final service = MangaBakaService(
+          dio,
+          externalBrowserLauncher: (_) async {
+            fail('A renewable session must not require browser approval');
+          },
+        );
+        addTearDown(service.dispose);
+        expect(await service.connect(), isTrue);
+        expect(refreshes, 1);
+        expect(service.exportSession()?['refreshToken'], 'new-refresh');
+      },
+    );
+
+    for (final outcome in ['renewed', 'temporary outage', 'revoked']) {
+      test('library 401 handles $outcome refresh correctly', () async {
+        await svc.importSession({
+          'accessToken': 'old-access',
+          'refreshToken': 'old-refresh',
+        });
+        final dio = Dio();
+        var reads = 0;
+        var refreshes = 0;
+        dio.interceptors.add(
+          InterceptorsWrapper(
+            onRequest: (request, handler) {
+              if (request.path == Environment.mangabakaTokenUrl) {
+                refreshes++;
+                handler.resolve(
+                  Response(
+                    requestOptions: request,
+                    statusCode: outcome == 'renewed'
+                        ? 200
+                        : outcome == 'revoked'
+                        ? 400
+                        : 503,
+                    data: outcome == 'renewed'
+                        ? {
+                            'access_token': 'fresh-access',
+                            'refresh_token': 'new-refresh',
+                            'expires_in': 3600,
+                          }
+                        : outcome == 'revoked'
+                        ? {'error': 'invalid_grant'}
+                        : {'error': 'server_error'},
+                  ),
+                );
+              } else {
+                reads++;
+                final renewed =
+                    request.headers['Authorization'] == 'Bearer fresh-access';
+                handler.resolve(
+                  Response(
+                    requestOptions: request,
+                    statusCode: renewed ? 200 : 401,
+                    data: renewed ? {'data': <dynamic>[]} : <String, dynamic>{},
+                  ),
+                );
+              }
+            },
+          ),
+        );
+        final service = MangaBakaService(dio);
+        addTearDown(service.dispose);
+        await service.fetchList();
+        expect(refreshes, 1);
+        expect(reads, outcome == 'renewed' ? 2 : 1);
+        expect(service.isConnected, outcome != 'revoked');
+        expect(
+          Hive.box(MangaBakaService.boxName).get('refreshToken'),
+          outcome == 'revoked'
+              ? null
+              : outcome == 'renewed'
+              ? 'new-refresh'
+              : 'old-refresh',
+        );
+      });
+    }
+  });
+
   group('PKCE', () {
+    test('system browser approval returns through app_links only once', () async {
+      const windowChannel = MethodChannel('com.spyou.zangetsu/window');
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      var registrations = 0;
+      messenger.setMockMethodCallHandler(windowChannel, (call) async {
+        expect(call.method, 'registerOAuthProtocol');
+        registrations++;
+        return null;
+      });
+      addTearDown(
+        () => messenger.setMockMethodCallHandler(windowChannel, null),
+      );
+      final dio = Dio();
+      var exchanges = 0;
+      dio.interceptors.add(
+        InterceptorsWrapper(
+          onRequest: (request, handler) async {
+            if (request.path == Environment.mangabakaTokenUrl) {
+              exchanges++;
+              // Hold the exchange across duplicate delivery, as a real network does.
+              await Future<void>.delayed(const Duration(milliseconds: 10));
+              handler.resolve(
+                Response(
+                  requestOptions: request,
+                  statusCode: 200,
+                  data: {'access_token': 'test-access', 'expires_in': 3600},
+                ),
+              );
+            } else {
+              handler.resolve(
+                Response(
+                  requestOptions: request,
+                  statusCode: 200,
+                  data: <String, dynamic>{},
+                ),
+              );
+            }
+          },
+        ),
+      );
+      final service = MangaBakaService(
+        dio,
+        externalBrowserLauncher: (authorization) async {
+          final callback = Uri.parse(Environment.mangabakaRedirectUri).replace(
+            queryParameters: {
+              'code': 'test-code',
+              'state': authorization.queryParameters['state']!,
+            },
+          );
+          for (var delivery = 0; delivery < 2; delivery++) {
+            final delivered = Completer<void>();
+            messenger.handlePlatformMessage(
+              'com.llfbandit.app_links/events',
+              const StandardMethodCodec().encodeSuccessEnvelope(
+                callback.toString(),
+              ),
+              (_) => delivered.complete(),
+            );
+            await delivered.future;
+          }
+          return true;
+        },
+      );
+      addTearDown(service.dispose);
+      expect(await service.connect(), isTrue);
+      expect(registrations, 1);
+      expect(exchanges, 1);
+      expect(service.isConnected, isTrue);
+      expect(service.lastConnectionError, isNull);
+    });
+    test(
+      'external browser callback is registered with the Windows runner',
+      () async {
+        const channel = MethodChannel('com.spyou.zangetsu/window');
+        final calls = <String>[];
+        final messenger =
+            TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+        messenger.setMockMethodCallHandler(channel, (call) async {
+          calls.add(call.method);
+          return null;
+        });
+        addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+        await DesktopOAuth.prepareBrowserCallback();
+        expect(calls, ['registerOAuthProtocol']);
+      },
+    );
+    for (final error in ['invalid_client', 'invalid_grant']) {
+      test(
+        'approval failure reports $error without storing a session',
+        () async {
+          final dio = Dio();
+          dio.interceptors.add(
+            InterceptorsWrapper(
+              onRequest: (request, handler) {
+                handler.resolve(
+                  Response(
+                    requestOptions: request,
+                    statusCode: 400,
+                    data: {
+                      'error': error,
+                      'error_description': 'private server detail',
+                    },
+                  ),
+                );
+              },
+            ),
+          );
+          final service = MangaBakaService(
+            dio,
+            authorizationLauncher: (authorization, redirect) async {
+              return redirect.replace(
+                queryParameters: {
+                  'code': 'private-code',
+                  'state': authorization.queryParameters['state']!,
+                },
+              );
+            },
+          );
+          addTearDown(service.dispose);
+          expect(await service.connect(), isFalse);
+          expect(service.isConnected, isFalse);
+          expect(
+            service.lastConnectionError,
+            contains(
+              error == 'invalid_client'
+                  ? 'app registration'
+                  : 'already-used approval',
+            ),
+          );
+          expect(service.lastConnectionError, isNot(contains('private')));
+        },
+      );
+    }
+    test('desktop callbacks must match the configured destination', () {
+      final redirect = Uri.parse(Environment.mangabakaRedirectUri);
+      expect(
+        DesktopOAuth.isCallback(
+          Uri.parse('zangetsu://mangabaka-auth?code=fake'),
+          redirect,
+        ),
+        isTrue,
+      );
+      expect(
+        DesktopOAuth.isCallback(
+          Uri.parse('https://mangabaka-auth?code=fake'),
+          redirect,
+        ),
+        isFalse,
+      );
+      expect(
+        DesktopOAuth.isCallback(
+          Uri.parse('zangetsu://mangabaka-auth.evil.test?code=fake'),
+          redirect,
+        ),
+        isFalse,
+      );
+    });
+
+    test(
+      'desktop authorization exchanges matching state and PKCE without an OS callback',
+      () async {
+        final dio = Dio();
+        var tokenRequests = 0;
+        dio.interceptors.add(
+          InterceptorsWrapper(
+            onRequest: (request, handler) {
+              if (request.path == Environment.mangabakaTokenUrl) {
+                tokenRequests++;
+                expect(request.data['code'], 'test-code');
+                expect(request.data['code_verifier'], isNotEmpty);
+                expect(
+                  request.data['redirect_uri'],
+                  Environment.mangabakaRedirectUri,
+                );
+                handler.resolve(
+                  Response(
+                    requestOptions: request,
+                    statusCode: 200,
+                    data: {'access_token': 'test-access', 'expires_in': 3600},
+                  ),
+                );
+              } else {
+                handler.resolve(
+                  Response(
+                    requestOptions: request,
+                    statusCode: 200,
+                    data: <String, dynamic>{},
+                  ),
+                );
+              }
+            },
+          ),
+        );
+        final service = MangaBakaService(
+          dio,
+          authorizationLauncher: (authorization, redirect) async {
+            expect(
+              authorization.queryParameters['code_challenge_method'],
+              'S256',
+            );
+            expect(authorization.queryParameters['state'], isNotEmpty);
+            return redirect.replace(
+              queryParameters: {
+                'code': 'test-code',
+                'state': authorization.queryParameters['state']!,
+              },
+            );
+          },
+        );
+        addTearDown(service.dispose);
+        expect(await service.connect(), isTrue);
+        expect(service.isConnected, isTrue);
+        expect(tokenRequests, 1);
+      },
+    );
+
+    test(
+      'cancelled or mismatched desktop callbacks never exchange a code',
+      () async {
+        final dio = Dio();
+        var requests = 0;
+        dio.interceptors.add(
+          InterceptorsWrapper(
+            onRequest: (request, handler) {
+              requests++;
+              handler.resolve(
+                Response(
+                  requestOptions: request,
+                  statusCode: 200,
+                  data: <String, dynamic>{},
+                ),
+              );
+            },
+          ),
+        );
+        for (final callback in [
+          null,
+          Uri.parse('zangetsu://mangabaka-auth?code=fake&state=wrong'),
+        ]) {
+          final service = MangaBakaService(
+            dio,
+            authorizationLauncher: (_, _) async => callback,
+          );
+          expect(await service.connect(), isFalse);
+          service.dispose();
+        }
+        expect(requests, 0);
+      },
+    );
     test('the verifier is RFC 7636 legal and different every time', () {
       final a = MangaBakaService.newVerifier();
       final b = MangaBakaService.newVerifier();
@@ -45,32 +467,39 @@ void main() {
       for (final v in [a, b]) {
         expect(v.length, greaterThanOrEqualTo(43));
         expect(v.length, lessThanOrEqualTo(128));
-        expect(RegExp(r'^[A-Za-z0-9\-._~]+$').hasMatch(v), isTrue,
-            reason: 'unreserved characters only: $v');
+        expect(
+          RegExp(r'^[A-Za-z0-9\-._~]+$').hasMatch(v),
+          isTrue,
+          reason: 'unreserved characters only: $v',
+        );
       }
     });
 
-    test('the challenge is unpadded base64url of SHA-256, as S256 requires',
-        () {
-      const v = 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
-      final expected =
-          base64Url.encode(sha256.convert(ascii.encode(v)).bytes)
-              .replaceAll('=', '');
-      final got = MangaBakaService.challengeFor(v);
-      expect(got, expected);
-      expect(got.contains('='), isFalse, reason: 'padding breaks S256');
-      expect(got, isNot(v), reason: 'sending the verifier itself is the bug');
-    });
+    test(
+      'the challenge is unpadded base64url of SHA-256, as S256 requires',
+      () {
+        const v = 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
+        final expected = base64Url
+            .encode(sha256.convert(ascii.encode(v)).bytes)
+            .replaceAll('=', '');
+        final got = MangaBakaService.challengeFor(v);
+        expect(got, expected);
+        expect(got.contains('='), isFalse, reason: 'padding breaks S256');
+        expect(got, isNot(v), reason: 'sending the verifier itself is the bug');
+      },
+    );
   });
 
   group('status mapping', () {
-    test('reading maps to watching — the wording differs, the meaning does not',
-        () {
-      expect(MangaBakaService.statusFrom('reading'), WatchStatus.watching);
-      expect(MangaBakaService.statusFrom('completed'), WatchStatus.completed);
-      expect(MangaBakaService.statusFrom('on_hold'), WatchStatus.paused);
-      expect(MangaBakaService.statusFrom('dropped'), WatchStatus.dropped);
-    });
+    test(
+      'reading maps to watching — the wording differs, the meaning does not',
+      () {
+        expect(MangaBakaService.statusFrom('reading'), WatchStatus.watching);
+        expect(MangaBakaService.statusFrom('completed'), WatchStatus.completed);
+        expect(MangaBakaService.statusFrom('on_hold'), WatchStatus.paused);
+        expect(MangaBakaService.statusFrom('dropped'), WatchStatus.dropped);
+      },
+    );
 
     test('case and whitespace do not decide it', () {
       expect(MangaBakaService.statusFrom('  READING '), WatchStatus.watching);
@@ -79,7 +508,10 @@ void main() {
     test('an unknown status falls back instead of throwing', () {
       // The real spellings are unverified; one odd value must not take down a
       // whole library fetch.
-      expect(MangaBakaService.statusFrom('something_new'), WatchStatus.planning);
+      expect(
+        MangaBakaService.statusFrom('something_new'),
+        WatchStatus.planning,
+      );
       expect(MangaBakaService.statusFrom(null), WatchStatus.planning);
       expect(MangaBakaService.statusFrom(42), WatchStatus.planning);
     });
@@ -94,8 +526,11 @@ void main() {
 
     test('a status round-trips out and back', () {
       for (final s in WatchStatus.values) {
-        expect(MangaBakaService.statusFrom(MangaBakaService.statusOut[s]), s,
-            reason: '$s must survive a write followed by a read');
+        expect(
+          MangaBakaService.statusFrom(MangaBakaService.statusOut[s]),
+          s,
+          reason: '$s must survive a write followed by a read',
+        );
       }
     });
 
@@ -197,8 +632,10 @@ void main() {
 
     test('a round trip returns the score it started with', () {
       for (var i = 0; i <= 10; i++) {
-        expect(MangaBakaService.ratingIn(MangaBakaService.ratingOut(i.toDouble())),
-            i.toDouble());
+        expect(
+          MangaBakaService.ratingIn(MangaBakaService.ratingOut(i.toDouble())),
+          i.toDouble(),
+        );
       }
     });
 

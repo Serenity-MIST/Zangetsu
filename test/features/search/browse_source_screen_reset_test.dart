@@ -62,12 +62,15 @@ void main() {
   Widget harness(Widget child) => MaterialApp(home: child);
 
   setUp(() {
+    // Settings availability is a host query, not a real JVM integration test.
+    cloudStreamHostOverride = (method, args) async => false;
     sl.registerSingleton<ActiveSourceCubit>(ActiveSourceCubit(fallback: 'cs:1'));
     sl.registerSingleton<CloudStreamManager>(_FakeCloudStreamManager());
     sl.registerSingleton<SourceRepository>(_FakeRepo());
   });
 
   tearDown(() async {
+    cloudStreamHostOverride = null;
     await sl<ActiveSourceCubit>().close();
     await sl.reset();
   });

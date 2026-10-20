@@ -131,6 +131,9 @@ class ChapterDownloader extends ChangeNotifier {
     String? cover,
     required ContentMode mode,
   }) async {
+    if (sl.isRegistered<DownloadPrefs>() &&
+        !await sl<DownloadPrefs>().ensureDesktopFolder())
+      return;
     // Timestamps step by one so a batch keeps its list order. Stamping them
     // all `now` would leave the sort with nothing to separate them, and the
     // downloads screen reads this back as reading order.
@@ -299,7 +302,10 @@ class ChapterDownloader extends ChangeNotifier {
     ChapterDownload rec,
     Directory part,
   ) async {
-    final text = await _repo.chapterText(rec.chapterUrl, sourceId: rec.sourceId);
+    final text = await _repo.chapterText(
+      rec.chapterUrl,
+      sourceId: rec.sourceId,
+    );
     if (text.html.trim().isEmpty) throw Exception('Chapter has no text');
     final (html, imageBytes) = await _downloadImages(
       text.html,
@@ -369,9 +375,7 @@ class ChapterDownloader extends ChangeNotifier {
         final data = res.data;
         if (data == null || data.isEmpty) throw Exception('Empty image');
         final name = 'img_$index${_imgExt(resolved.path)}';
-        await File(
-          '${part.path}/$name',
-        ).writeAsBytes(data, flush: true);
+        await File('${part.path}/$name').writeAsBytes(data, flush: true);
         bytes += data.length;
         out
           ..write(m.group(1))
@@ -380,10 +384,7 @@ class ChapterDownloader extends ChangeNotifier {
           ..write(m.group(2));
         index++;
       } catch (e) {
-        AppLogger.instance.log(
-          '[chapters] image skipped — $e',
-          level: 'W',
-        );
+        AppLogger.instance.log('[chapters] image skipped — $e', level: 'W');
         out.write(m.group(0));
       }
     }
@@ -431,9 +432,7 @@ class ChapterDownloader extends ChangeNotifier {
       }
     }
 
-    await Future.wait([
-      for (var i = 0; i < _pageConcurrency; i++) worker(),
-    ]);
+    await Future.wait([for (var i = 0; i < _pageConcurrency; i++) worker()]);
     if (firstError != null) throw firstError!;
     return current;
   }

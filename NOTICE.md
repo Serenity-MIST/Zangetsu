@@ -53,6 +53,13 @@ Aniyomi / Tachiyomi
   eu/kanade/tachiyomi/ path, is a separate ecosystem on a separate version
   line and was not touched by this change.
 
+flutter_inappwebview_windows
+  https://github.com/pichillilorenzo/flutter_inappwebview
+  License: Apache-2.0 (included in third_party/flutter_inappwebview_windows/LICENSE)
+  The Windows implementation v0.6.0 is vendored under third_party/ with a Dart
+  channel-id fix: environment disposal targets the created environment rather
+  than the static factory, preserving successful verification/browser sessions.
+
 Other dependencies (Flutter/Dart packages and Android libraries) are used under
 their respective open-source licenses; refer to each package for details.
 

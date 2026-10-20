@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'core/desktop/desktop_storage.dart';
+import 'core/desktop/desktop_window.dart';
 import 'dart:io' show Platform;
 import 'dart:ui' show PlatformDispatcher;
 
@@ -66,6 +68,7 @@ Future<void> main() async {
   runZonedGuarded(
     () async {
       WidgetsFlutterBinding.ensureInitialized();
+      await DesktopStorage.initialize();
       await AppLogger.instance.init();
       // Mirror debugPrint into the log (still prints to the console too).
       final origDebugPrint = debugPrint;
@@ -113,14 +116,17 @@ Future<void> main() async {
       );
       // Firebase Analytics. Guarded so a build without google-services.json (or a
       // device without Play Services) still boots — analytics just stays off.
-      try {
-        await Firebase.initializeApp().timeout(const Duration(seconds: 8));
-        Analytics.enabled = true;
-        // After initializeApp, and only if it worked — a build with no
-        // google-services.json has no Firebase to report to.
-        await CrashReports.enable();
-      } catch (e, st) {
-        AppLogger.instance.logError(e, st);
+      // This Windows port has no desktop Firebase project configuration.
+      if (!Platform.isWindows) {
+        try {
+          await Firebase.initializeApp().timeout(const Duration(seconds: 8));
+          Analytics.enabled = true;
+          // After initializeApp, and only if it worked — a build with no
+          // google-services.json has no Firebase to report to.
+          await CrashReports.enable();
+        } catch (e, st) {
+          AppLogger.instance.logError(e, st);
+        }
       }
       // Resolve Apple TV before Supabase / media_kit — Dart reports tvOS as iOS,
       // and the version string often has no "tvos" token, so we ask the native
@@ -257,6 +263,7 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
   bool _bootFailed = false;
   Object? _bootError;
   StackTrace? _bootStack;
+  String _bootStage = 'initializing local services';
 
   Future<void> _startBoot() => _run().timeout(const Duration(seconds: 45));
 
@@ -289,6 +296,11 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
           }
         })
         .catchError((Object e, StackTrace st) {
+          AppLogger.instance.log(
+            'Startup failed during $_bootStage',
+            level: 'E',
+          );
+          AppLogger.instance.logError(e, st);
           if (!mounted) return;
           setState(() {
             _bootFailed = true;
@@ -506,7 +518,13 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
   /// the splash for a minimum so the intro animation reads even on fast boots.
   Future<void> _run() async {
     final start = DateTime.now();
-    await initDependencies();
+    await initDependencies(
+      onProgress: (stage) {
+        _bootStage = stage;
+        AppLogger.instance.log('[boot] $stage');
+      },
+    );
+    _bootStage = 'reading app version';
     if (mounted) {
       setState(() => _depsReady = true);
       if (_bootReady) {
@@ -528,8 +546,10 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
     // trap the splash). If signed in, pull the cloud library into the local
     // cache before Home warms so Continue Watching + My List are populated.
     try {
+      _bootStage = 'restoring sign-in';
       await sl<AuthCubit>().restore().timeout(const Duration(seconds: 5));
       if (sl<AuthCubit>().state.isLoggedIn) {
+        _bootStage = 'syncing library';
         await sl<ViewerProfileStore>().loadForUser(
           displayName: sl<AuthCubit>().state.displayName,
         );
@@ -574,6 +594,7 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
     // Continue Watching stops listing the same title twice. Once, after the
     // cloud pull so rows from another device are covered, and unawaited so it
     // never sits in front of the splash.
+    _bootStage = 'opening home';
     if (sl.isRegistered<MatchStore>()) {
       unawaited(
         HistoryCanonicalMerge.runOnce(
@@ -704,7 +725,8 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
     if (_bootFailed) {
       AppLogger.instance.logError(_bootError ?? 'startup failed', _bootStack);
       return BootErrorScreen(
-        details: '$_bootError\n\n${_bootStack ?? ''}'.trim(),
+        details: 'Startup step: $_bootStage\n$_bootError\n\n${_bootStack ?? ''}'
+            .trim(),
         onRetry: _retryBoot,
       );
     }
@@ -757,8 +779,10 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
               )
             : (child ?? const SizedBox.shrink());
         final isTv = sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
-        return PosterCardScope(
-          child: isTv ? TvViewport(child: content) : content,
+        return DesktopWindow(
+          child: PosterCardScope(
+            child: isTv ? TvViewport(child: content) : content,
+          ),
         );
       },
     );

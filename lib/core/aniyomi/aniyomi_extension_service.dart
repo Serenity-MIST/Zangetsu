@@ -1,3 +1,4 @@
+import '../desktop/extension_runtime.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -23,7 +24,7 @@ export 'aniyomi_source_info.dart';
 /// Android side. All methods are thin channel invocations; no caching or
 /// business logic lives here.
 class AniyomiExtensionService {
-  static const MethodChannel _channel = MethodChannel('zangetsu/aniyomi');
+  static const ExtensionChannel _channel = ExtensionChannel('zangetsu/aniyomi');
 
   /// Hive box name used to persist installed pkg → apk-path entries so they
   /// can be reloaded on a cold start without re-downloading.
@@ -63,10 +64,9 @@ class AniyomiExtensionService {
   /// null when the source has no filters or any channel error occurs.
   Future<String?> getFilterList(int sourceId) async {
     try {
-      return await _channel.invokeMethod<String>(
-        'getFilterList',
-        {'sourceId': sourceId},
-      );
+      return await _channel.invokeMethod<String>('getFilterList', {
+        'sourceId': sourceId,
+      });
     } on PlatformException {
       return null;
     } on MissingPluginException {
@@ -80,10 +80,9 @@ class AniyomiExtensionService {
   /// Returns false on any channel error (source not found, not configurable).
   Future<bool> hasSourceSettings(int sourceId) async {
     try {
-      final result = await _channel.invokeMethod<bool>(
-        'hasSourceSettings',
-        {'sourceId': sourceId},
-      );
+      final result = await _channel.invokeMethod<bool>('hasSourceSettings', {
+        'sourceId': sourceId,
+      });
       return result ?? false;
     } on PlatformException {
       return false;
@@ -95,7 +94,9 @@ class AniyomiExtensionService {
   /// No-op (returns without error) when the source has no settings.
   Future<void> openSourceSettings(int sourceId) async {
     try {
-      await _channel.invokeMethod<void>('openSourceSettings', {'sourceId': sourceId});
+      await _channel.invokeMethod<void>('openSourceSettings', {
+        'sourceId': sourceId,
+      });
     } on PlatformException catch (e) {
       debugPrint('[aniyomi] openSourceSettings($sourceId) failed: $e');
     }
@@ -179,6 +180,13 @@ class AniyomiExtensionService {
       }
       await apkDir.create(recursive: true);
       final apkPath = '${apkDir.path}/${entry.pkg}.apk';
+      if (DesktopExtensionRuntime.isAvailable) {
+        await DesktopExtensionRuntime.instance.invoke(
+          'aniyomi',
+          'prepareExtensionUpdate',
+          {'pkg': entry.pkg},
+        );
+      }
 
       // A prior load marks the apk read-only (Android W^X), which would block
       // re-downloading over it — remove any stale copy first.
@@ -211,7 +219,8 @@ class AniyomiExtensionService {
       }
 
       // 5. Register in the AniyomiManager.
-      final effectiveManager = manager ??
+      final effectiveManager =
+          manager ??
           (GetIt.instance.isRegistered<AniyomiManager>()
               ? GetIt.instance.get<AniyomiManager>()
               : null);

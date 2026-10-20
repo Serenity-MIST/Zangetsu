@@ -1,3 +1,5 @@
+import 'package:watch_app/core/ui/nav_prefs.dart';
+import 'package:watch_app/core/desktop/extension_runtime.dart';
 // Task E3 originally gave manga/novel sources their own "Zangetsu Manga" hub
 // row and a "Manga & Novel" Settings entry. BOTH were later removed —
 // (and the Sozo Read recommended-repo suggestion, tested elsewhere) was
@@ -166,13 +168,20 @@ void main() {
     });
 
     testWidgets(
-      'CloudStream and Aniyomi rows are unaffected — still Android-gated, '
-      'absent on this (non-Android) test host, same as before',
+      'CloudStream and Aniyomi rows are visible on supported platforms',
       (tester) async {
         await pump(tester);
 
-        expect(find.text('CloudStream'), findsNothing);
-        expect(find.text('Aniyomi'), findsNothing);
+        final expected = Platform.isAndroid || Platform.isWindows
+            ? findsOneWidget
+            : findsNothing;
+        expect(find.text('CloudStream'), expected);
+        expect(
+          find.text('Aniyomi'),
+          Platform.isAndroid || DesktopExtensionRuntime.isAvailable
+              ? findsOneWidget
+              : findsNothing,
+        );
       },
     );
 
@@ -277,6 +286,8 @@ void main() {
       await Hive.openBox(ThemeController.boxName);
       await Hive.openBox(PlaybackPrefs.boxName);
       await ViewerProfileStore.init();
+      await NavPrefs.init();
+      sl.registerSingleton<NavPrefs>(NavPrefs());
       sl
         ..registerSingleton<AppMode>(const AppMode(isTv: false))
         ..registerSingleton<SearchPrefs>(_StubSearchPrefs())

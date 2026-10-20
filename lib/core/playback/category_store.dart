@@ -1,9 +1,9 @@
 import 'dart:math';
+import 'library_repair.dart';
 
 import 'package:flutter/foundation.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
-import 'package:watch_app/core/hive/hive_key.dart';
 
 import '../models/media_item.dart';
 import '../profiles/profile_scope.dart';
@@ -219,7 +219,7 @@ class CategoryStore {
 
   /// Same key shape as [ListStatusStore] so the two line up per title.
   String keyOf(MediaItem m) =>
-      profileScopedKey(_profileId, hiveKey('${m.sourceId}::${m.id}'));
+      profileScopedKey(_profileId, libraryStorageKey(m));
 
   // ── the categories themselves ────────────────────────────────────────────
 
@@ -479,7 +479,7 @@ class CategoryStore {
       if (!knownIds.contains(cat)) continue;
       byKey
           .putIfAbsent(
-            profileScopedKey(profileId, hiveKey('$src::$item')),
+            profileScopedKey(profileId, repairedLibraryKey(src, item)),
             () => <String>{},
           )
           .add(cat);

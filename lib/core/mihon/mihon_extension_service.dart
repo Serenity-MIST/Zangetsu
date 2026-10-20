@@ -1,3 +1,4 @@
+import '../desktop/extension_runtime.dart';
 import '../models/source_pref.dart';
 import 'dart:convert';
 import 'dart:io';
@@ -37,7 +38,7 @@ export 'mihon_source_info.dart';
 /// `AniyomiRepo`: Mihon repos publish `index.json` in a different shape (see
 /// `mihon_repo.dart`).
 class MihonExtensionService {
-  static const MethodChannel _channel = MethodChannel('zangetsu/mihon');
+  static const ExtensionChannel _channel = ExtensionChannel('zangetsu/mihon');
 
   /// Hive box name used to persist installed pkg → apk-path entries so they
   /// can be reloaded on a cold start without re-downloading. Deliberately
@@ -60,6 +61,15 @@ class MihonExtensionService {
   /// Never throws: a failed uninstall must still leave the source list
   /// consistent, and the caller reports the reason to the user.
   static Future<String?> uninstall(String pkg, {Directory? mihonDir}) async {
+    if (DesktopExtensionRuntime.isAvailable) {
+      try {
+        // Use the same transport seam as other extension operations, so
+        // isolated Flutter tests cannot boot a real companion accidentally.
+        await _channel.invokeMethod<void>('uninstallExtension', {'pkg': pkg});
+      } catch (e) {
+        return '$e';
+      }
+    }
     String? apkPath;
     if (Hive.isBoxOpen(installedBoxName)) {
       final box = Hive.box<dynamic>(installedBoxName);
@@ -93,7 +103,8 @@ class MihonExtensionService {
     Directory? mihonDir,
   ) async {
     try {
-      final dir = mihonDir ??
+      final dir =
+          mihonDir ??
           Directory('${(await getApplicationSupportDirectory()).path}/mihon');
       final f = File('${dir.path}/$pkg.apk');
       return await f.exists() ? f.path : null;
@@ -337,6 +348,13 @@ class MihonExtensionService {
       }
       await apkDir.create(recursive: true);
       final apkPath = '${apkDir.path}/${entry.pkg}.apk';
+      if (DesktopExtensionRuntime.isAvailable) {
+        await DesktopExtensionRuntime.instance.invoke(
+          'mihon',
+          'prepareExtensionUpdate',
+          {'pkg': entry.pkg},
+        );
+      }
 
       // A prior load marks the apk read-only (Android W^X), which would block
       // re-downloading over it — remove any stale copy first.
@@ -356,6 +374,19 @@ class MihonExtensionService {
       }
 
       // 3. Install and list sources.
+      if (DesktopExtensionRuntime.isAvailable &&
+          entry.jarUrl.startsWith('https://')) {
+        final jarPath = apkPath.replaceFirst(RegExp(r'\.apk$'), '.jar');
+        if (downloader != null) {
+          await downloader(entry.jarUrl, jarPath);
+        } else {
+          await _downloadApk(
+            dio ?? GetIt.instance.get<Dio>(),
+            entry.jarUrl,
+            jarPath,
+          );
+        }
+      }
       await installExtension(apkPath);
       final allSources = await listSources();
       final providers = allSources

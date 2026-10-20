@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import '../desktop/desktop_storage.dart';
 
 import 'package:background_downloader/background_downloader.dart';
 import 'package:file_picker/file_picker.dart';
@@ -12,10 +13,10 @@ import '../platform/app_paths.dart';
 
 /// Returns a file name like `zangetsu-backup-20260702-0905.json`.
 String backupFileName(DateTime now) {
-  final y  = now.year.toString().padLeft(4, '0');
+  final y = now.year.toString().padLeft(4, '0');
   final mo = now.month.toString().padLeft(2, '0');
-  final d  = now.day.toString().padLeft(2, '0');
-  final h  = now.hour.toString().padLeft(2, '0');
+  final d = now.day.toString().padLeft(2, '0');
+  final h = now.hour.toString().padLeft(2, '0');
   final mi = now.minute.toString().padLeft(2, '0');
   return 'zangetsu-backup-$y$mo$d-$h$mi.json';
 }
@@ -30,7 +31,9 @@ Map<String, dynamic> parseBackupJson(String raw) {
     throw const FormatException('Backup file is not valid JSON');
   }
   if (decoded is! Map<String, dynamic>) {
-    throw const FormatException('Backup JSON must be a JSON object, not an array or primitive');
+    throw const FormatException(
+      'Backup JSON must be a JSON object, not an array or primitive',
+    );
   }
   return decoded;
 }
@@ -46,10 +49,15 @@ class BackupFile {
     Map<String, dynamic> payload, {
     bool keepLocalCopy = false,
   }) async {
-    final name    = backupFileName(DateTime.now());
-    final tmpDir  = await getTemporaryDirectory();
-    final file    = File('${tmpDir.path}/$name');
+    final name = backupFileName(DateTime.now());
+    final tmpDir = (Platform.isWindows && DesktopStorage.root != null
+        ? await Directory(
+            '${DesktopStorage.root}/Backups',
+          ).create(recursive: true)
+        : await getTemporaryDirectory());
+    final file = File('${tmpDir.path}/$name');
     await file.writeAsString(jsonEncode(payload));
+    if (Platform.isWindows && DesktopStorage.root != null) return file.path;
 
     // TV boxes usually have no document-picker UI, so restore-from-file can't
     // browse public Downloads. Keep an app-private, always-readable copy (no
@@ -59,8 +67,11 @@ class BackupFile {
     if (keepLocalCopy) {
       try {
         final dir = await _localBackupDir();
-        if (dir != null) localCopyPath = (await file.copy('${dir.path}/$name')).path;
-      } catch (_) {/* best-effort — never block the primary export */}
+        if (dir != null)
+          localCopyPath = (await file.copy('${dir.path}/$name')).path;
+      } catch (_) {
+        /* best-effort — never block the primary export */
+      }
     }
 
     // Move into public Downloads/Zangetsu for the user's file manager. On TV
@@ -76,7 +87,9 @@ class BackupFile {
         directory: 'Zangetsu',
       );
       if (shared != null && shared.isNotEmpty) return shared;
-    } catch (_) {/* shared storage unavailable (common on TV) */}
+    } catch (_) {
+      /* shared storage unavailable (common on TV) */
+    }
     return localCopyPath;
   }
 
@@ -106,7 +119,9 @@ class BackupFile {
             found[e.uri.pathSegments.last] = e;
           }
         }
-      } catch (_) {/* unreadable dir (scoped storage) — skip */}
+      } catch (_) {
+        /* unreadable dir (scoped storage) — skip */
+      }
     }
 
     await scan(await _localBackupDir());

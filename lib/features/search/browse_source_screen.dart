@@ -280,7 +280,21 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
       widget.sourceId,
     );
     if (target == null || target.isEmpty) return;
-    await MihonExtensionService.solveCloudflare(target);
+    final verified = await source_actions.verifySourceChallenge(
+      widget.sourceId,
+      target,
+    );
+    if (!mounted || !verified) return;
+    // Continue should retry the exact failed operation without making the
+    // user leave verification and then press a second Retry button.
+    final cubit = context.read<BrowseSourceCubit>();
+    if (_controller.text.trim().isNotEmpty) {
+      await cubit.search(_controller.text);
+    } else if (cubit.state.filtersJson.isNotEmpty) {
+      await cubit.applyFilters(cubit.state.filtersJson);
+    } else {
+      await cubit.load();
+    }
   }
 
   /// Let the user point this source's site actions at a domain of their own.
@@ -642,12 +656,7 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
       },
       child: GridView.builder(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
-        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: posterGridColumns(context),
-          childAspectRatio: posterGridAspect(context),
-          crossAxisSpacing: 12,
-          mainAxisSpacing: 16,
-        ),
+        gridDelegate: posterGridDelegate(context),
         // One trailing cell for the spinner while the next page is coming.
         itemCount: results.length + (state.loadingMore ? 1 : 0),
         itemBuilder: (_, i) {

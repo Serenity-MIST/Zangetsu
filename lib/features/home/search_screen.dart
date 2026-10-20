@@ -1923,12 +1923,7 @@ class _SearchViewState extends State<_SearchView>
           shrinkWrap: true,
           physics: const NeverScrollableScrollPhysics(),
           padding: const EdgeInsets.symmetric(horizontal: 16),
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: posterGridColumns(context),
-            childAspectRatio: posterGridAspect(context),
-            crossAxisSpacing: 12,
-            mainAxisSpacing: 16,
-          ),
+          gridDelegate: posterGridDelegate(context),
           itemCount: preview.length,
           itemBuilder: (context, i) {
             final item = preview[i];
@@ -2167,12 +2162,7 @@ class _SearchViewState extends State<_SearchView>
       ),
       cacheExtent: 800,
       keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: posterGridColumns(context),
-        childAspectRatio: posterGridAspect(context),
-        crossAxisSpacing: 12,
-        mainAxisSpacing: 16,
-      ),
+      gridDelegate: posterGridDelegate(context),
       itemCount: items.length,
       itemBuilder: (context, i) {
         final item = items[i];
@@ -2352,12 +2342,7 @@ class _SearchViewState extends State<_SearchView>
             GridView.builder(
               shrinkWrap: true,
               physics: const NeverScrollableScrollPhysics(),
-              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: posterGridColumns(context),
-                childAspectRatio: posterGridAspect(context),
-                crossAxisSpacing: 12,
-                mainAxisSpacing: 16,
-              ),
+              gridDelegate: posterGridDelegate(context),
               itemCount: trending.length,
               itemBuilder: (context, i) {
                 final item = trending[i];

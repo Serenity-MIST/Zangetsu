@@ -10,6 +10,7 @@ import 'package:hive/hive.dart';
 import 'package:watch_app/core/di/injector.dart';
 import 'package:watch_app/core/mode/content_mode.dart';
 import 'package:watch_app/core/models/media_item.dart';
+import 'package:watch_app/core/models/episode.dart';
 import 'package:watch_app/core/models/media_detail.dart';
 import 'package:watch_app/core/models/provider_info.dart';
 import 'package:watch_app/core/playback/title_prefs.dart';
@@ -56,6 +57,9 @@ class _Src implements SourceRepository {
   @override
   Future<List<MediaItem>> search(String q, {String category = 'sub', String? sourceId}) async =>
       bySource[sourceId] ?? const [];
+  @override
+  Future<List<Episode>> episodes(String url, {String category = 'sub', String? sourceId}) async =>
+      const [Episode(id: 'chapter-1', title: 'Chapter 1', number: 1, url: 'https://example.test/chapter-1')];
 }
 
 class _None implements SourceRepository {

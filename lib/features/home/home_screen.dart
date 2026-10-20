@@ -1,4 +1,7 @@
 import 'dart:async';
+
+import 'desktop_featured.dart';
+
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -20,6 +23,7 @@ import '../../core/models/watch_status.dart';
 import '../../core/tracker/tracker_hub.dart';
 import '../../core/notify/notification_service.dart';
 import '../../core/ui/global_messenger.dart';
+import '../../core/ui/artwork_quality.dart';
 import '../../core/update/extension_auto_updater.dart';
 import '../../core/provider/cloudstream_provider.dart';
 import '../../core/provider/provider_manager.dart';
@@ -128,6 +132,8 @@ class _HomeView extends StatefulWidget {
 
 class _HomeViewState extends State<_HomeView>
     with SingleTickerProviderStateMixin {
+  /// Selects the Windows featured/header presentation and desktop interactions.
+  bool get _isDesktop => Platform.isWindows;
   final _repo = sl<CatalogueRepository>();
   final _myList = sl<MyListStore>();
   final _sourceCatalogueController = SourceCatalogueHomeController();
@@ -754,7 +760,10 @@ class _HomeViewState extends State<_HomeView>
       bottom: false,
       child: LayoutBuilder(
         builder: (context, constraints) {
-          final splitEdgeHeader = edgeBanner && constraints.maxWidth < 520;
+          // A narrow desktop window also needs the second source row; its
+          // wider wordmark cannot share 320px with all header controls.
+          final splitEdgeHeader =
+              constraints.maxWidth < 520 && (edgeBanner || _isDesktop);
           final brand = edgeBanner
               ? IconButton(
                   tooltip: 'Zangetsu',
@@ -774,11 +783,19 @@ class _HomeViewState extends State<_HomeView>
                     // 48px minimum tap target, and vertical padding alone
                     // cannot shift a left-aligned image.
                     padding: const EdgeInsets.symmetric(vertical: 8),
-                    child: Image.asset(
-                      'assets/icon/wordmark.png',
-                      height: 22,
-                      fit: BoxFit.contain,
-                    ),
+                    child: _isDesktop
+                        ? const Text(
+                            'Discover',
+                            style: TextStyle(
+                              fontSize: 26,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          )
+                        : Image.asset(
+                            'assets/icon/wordmark.png',
+                            height: 22,
+                            fit: BoxFit.contain,
+                          ),
                   ),
                 );
           final actions = [
@@ -799,7 +816,17 @@ class _HomeViewState extends State<_HomeView>
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Row(children: [brand, const Spacer(), ...actions]),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Align(
+                              alignment: AlignmentDirectional.centerStart,
+                              child: brand,
+                            ),
+                          ),
+                          ...actions,
+                        ],
+                      ),
                       ValueListenableBuilder<int>(
                         valueListenable: ZModePrefs.revision,
                         builder: (context, _, _) {
@@ -883,6 +910,18 @@ class _HomeViewState extends State<_HomeView>
       }
     }
 
+    if (_isDesktop) {
+      return DesktopFeatured(
+        items: heroItems,
+        reading: reading,
+        inList: (m) => _myList.contains(m),
+        onPlay: _playFeatured,
+        onInfo: _openDetail,
+        onToggleList: toggleList,
+        meta: _heroMeta,
+        style: bannerId,
+      );
+    }
     switch (bannerId) {
       case BannerStyle.panelsId:
         return FeaturedBannerPanels(
@@ -1410,7 +1449,7 @@ class _HomeViewState extends State<_HomeView>
       child: ClipRRect(
         borderRadius: BorderRadius.circular(16),
         child: SizedBox(
-          height: 52,
+          height: _isDesktop ? 76 : 52,
           child: Stack(
             fit: StackFit.expand,
             children: [
@@ -1465,7 +1504,7 @@ class _HomeViewState extends State<_HomeView>
       child: ClipRRect(
         borderRadius: BorderRadius.circular(16),
         child: SizedBox(
-          height: 52,
+          height: _isDesktop ? 76 : 52,
           child: Stack(
             fit: StackFit.expand,
             children: [
@@ -1592,7 +1631,7 @@ class _HomeViewState extends State<_HomeView>
       child: ClipRRect(
         borderRadius: BorderRadius.circular(16),
         child: SizedBox(
-          height: 52,
+          height: _isDesktop ? 76 : 52,
           child: Stack(
             fit: StackFit.expand,
             children: [
@@ -1650,17 +1689,20 @@ class _HomeViewState extends State<_HomeView>
   /// show (streaming) or last read manga/novel. Null when there's nothing yet.
   ({String? cover, Map<String, String>? headers}) _modeArt(ContentMode m) {
     if (m == ContentMode.anime) {
-      if (!Hive.isBoxOpen(WatchHistory.boxName))
+      if (!Hive.isBoxOpen(WatchHistory.boxName)) {
         return (cover: null, headers: null);
+      }
       for (final e in sl<WatchHistory>().all()) {
         final c = e.thumbnail ?? e.cover;
-        if (c != null && c.isNotEmpty)
+        if (c != null && c.isNotEmpty) {
           return (cover: c, headers: e.coverHeaders);
+        }
       }
       return (cover: null, headers: null);
     }
-    if (!Hive.isBoxOpen(ReadHistory.boxName))
+    if (!Hive.isBoxOpen(ReadHistory.boxName)) {
       return (cover: null, headers: null);
+    }
     final type = m == ContentMode.manga
         ? ProviderType.manga
         : ProviderType.novel;
@@ -1732,30 +1774,42 @@ class _HomeViewState extends State<_HomeView>
     );
   }
 
-  Widget _art(String url, Map<String, String>? headers) {
-    if (headers?['x-ani-src'] != null || headers?['x-mihon-src'] != null) {
-      return Image(
-        image: ResizeImage(
-          headers?['x-ani-src'] != null
-              ? AniyomiImage(int.parse(headers!['x-ani-src']!), url)
-              : MihonImage(int.parse(headers!['x-mihon-src']!), url),
-          width: 420,
-        ),
+  /// Decodes shortcut artwork for its painted desktop width, avoiding the
+  /// phone's fixed 420-pixel thumbnail on wide or high-DPI windows.
+  Widget _art(String url, Map<String, String>? headers) => LayoutBuilder(
+    builder: (context, constraints) {
+      final width = Platform.isWindows
+          ? artworkDecodeWidth(
+              constraints.hasBoundedWidth ? constraints.maxWidth : 420,
+              MediaQuery.devicePixelRatioOf(context),
+              maximum: 2048,
+            )
+          : 420;
+      final imageUrl = Platform.isWindows ? desktopArtworkUrl(url) : url;
+      if (headers?['x-ani-src'] != null || headers?['x-mihon-src'] != null) {
+        return Image(
+          image: ResizeImage(
+            headers?['x-ani-src'] != null
+                ? AniyomiImage(int.parse(headers!['x-ani-src']!), imageUrl)
+                : MihonImage(int.parse(headers!['x-mihon-src']!), imageUrl),
+            width: width,
+          ),
+          fit: BoxFit.cover,
+          alignment: const Alignment(0, -0.2),
+          errorBuilder: (_, _, _) => ColoredBox(color: AppColors.surface2),
+        );
+      }
+      return CachedNetworkImage(
+        imageUrl: imageUrl,
+        httpHeaders: headers,
+        memCacheWidth: width,
         fit: BoxFit.cover,
         alignment: const Alignment(0, -0.2),
-        errorBuilder: (_, _, _) => ColoredBox(color: AppColors.surface2),
+        placeholder: (_, _) => ColoredBox(color: AppColors.surface2),
+        errorWidget: (_, _, _) => ColoredBox(color: AppColors.surface2),
       );
-    }
-    return CachedNetworkImage(
-      imageUrl: url,
-      httpHeaders: headers,
-      memCacheWidth: 420,
-      fit: BoxFit.cover,
-      alignment: const Alignment(0, -0.2),
-      placeholder: (_, _) => ColoredBox(color: AppColors.surface2),
-      errorWidget: (_, _, _) => ColoredBox(color: AppColors.surface2),
-    );
-  }
+    },
+  );
 
   /// Kicks off the slash transition into [m]. The actual mode swap happens
   /// mid-animation via the controller listener wired in [initState].
@@ -1968,133 +2022,141 @@ class _HomeViewState extends State<_HomeView>
                           ContentMode.novel => !activeId.startsWith('lnr:'),
                           ContentMode.anime => false,
                         };
-                  return CustomScrollView(
-                    slivers: [
-                      // ── Hero + floating header (first sliver) ─────────────────
-                      SliverToBoxAdapter(
-                        child: Builder(
-                          builder: (context) {
-                            final heroItems = _sourceCatalogueSelected
-                                ? _sourceCatalogueHeroItems
-                                : state.heroItems;
-                            final hasHero = heroItems.isNotEmpty;
-                            if (hasHero) _prewarmHeroMeta(heroItems);
+                  return Padding(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: _isDesktop ? 20 : 0,
+                    ),
+                    child: CustomScrollView(
+                      slivers: [
+                        SliverToBoxAdapter(
+                          child: Builder(
+                            builder: (context) {
+                              final heroItems = _sourceCatalogueSelected
+                                  ? _sourceCatalogueHeroItems
+                                  : state.heroItems;
+                              final hasHero = heroItems.isNotEmpty;
+                              if (hasHero) _prewarmHeroMeta(heroItems);
 
-                            return HomeBannerHeader(
-                              bannerStyle: BannerStyle.current,
-                              hasHero: hasHero && !noSourceForMode,
-                              bannerBuilder: (bannerId) =>
-                                  _featuredBanner(bannerId, heroItems),
-                              headerBuilder: (edgeBanner) =>
-                                  _buildHeader(edgeBanner: edgeBanner),
-                            );
-                          },
-                        ),
-                      ),
-
-                      // ── Mode cards, and Schedule ──────────────────────────────
-                      // Unconditional: _modeCards drops the mode switchers
-                      // itself under Z Mode and keeps Schedule, which has no
-                      // other entry point since it left the dock.
-                      SliverToBoxAdapter(child: _modeCards()),
-
-                      // ── Reconnect banner (session lapsed → sync is off) ───────
-                      if (needsReconnect)
-                        SliverToBoxAdapter(child: _reconnectBanner()),
-
-                      // ── The arrangement ─────────────────────────────────────
-                      // state.rows is the merged view of this load: the local
-                      // Continue row, the tracker rows the user enabled, and the
-                      // provider sections, in the saved order (Settings →
-                      // Interface → Appearance → Home rows). ContinueSection renders wherever
-                      // the layout puts it — the same widgets as before, just
-                      // arranged. Before the first merge lands (rows null), the
-                      // ContinueSection keeps its old spot above the skeletons
-                      // so the loading screen is exactly today's.
-                      if (state.rows case final rows?)
-                        if (_sourceCatalogueSelected)
-                          ..._sourceCatalogueHomeSlivers(rows)
-                        else
-                          ...rows.map(_homeRowSliver)
-                      else ...[
-                        ContinueSection(
-                          onResume: _resume,
-                          onLongPress: _showContinueInfo,
-                          onSeeAll: _openHistory,
-                          onResumeReading: _resumeReading,
-                          onLongPressReading: _showContinueReadingInfo,
-                        ),
-                        if (_sourceCatalogueSelected)
-                          _sourceCatalogueHomeSliver(),
-                      ],
-
-                      // ── Skeletons while the first load runs / empty states ───
-                      // The provider rows themselves are part of state.rows
-                      // above; this branch only owns the loading placeholders
-                      // and the "nothing came back" views.
-                      if (!_sourceCatalogueSelected &&
-                          showSkeletons &&
-                          !noSourceForMode)
-                        ...List.generate(
-                          3,
-                          (_) => const SliverToBoxAdapter(child: RowSkeleton()),
-                        )
-                      else if (!_sourceCatalogueSelected &&
-                          (noSourceForMode || loadedEmpty))
-                        SliverFillRemaining(
-                          hasScrollBody: false,
-                          child: HomeLoadedEmptyView(
-                            offline: state.offline,
-                            mode: sl<ContentModeCubit>().state,
-                            // Name whatever ACTUALLY answered: in Z Mode the
-                            // rows come from AniList/MAL/TMDB/Simkl, not the
-                            // active source, so blaming the source was simply
-                            // pointing at the wrong thing. The router hands
-                            // back the right name in either mode.
-                            sourceName: _repo.displayName(_repo.sourceId),
-                            // A metadata catalogue, not an installed source —
-                            // the "switch source at the top" advice does not
-                            // apply to it.
-                            isMetadataProvider:
-                                _repo.sourceId == ZmodeIds.sourceId,
-                            rateLimitedSeconds: state.rateLimitedSeconds,
-                            onRetry: () =>
-                                context.read<HomeCubit>().load(reset: true),
-                            // No-source guide points at the Providers hub (all
-                            // ecosystems); the source-returned-nothing case
-                            // (_SourceUnavailable) keeps its retry.
-                            onInstallSources: () => Navigator.of(context).push(
-                              MaterialPageRoute<void>(
-                                builder: (_) => const ProvidersHubScreen(),
-                              ),
-                            ),
-                            // Cloudflare-blocked (Mihon) source: offer the visible
-                            // solve, then reload once the user closes the WebView.
-                            cloudflareUrl: state.cloudflareUrl,
-                            onSolveCloudflare: state.cloudflareUrl == null
-                                ? null
-                                : () async {
-                                    await MihonExtensionService.solveCloudflare(
-                                      state.cloudflareUrl!,
-                                    );
-                                    if (context.mounted) {
-                                      context.read<HomeCubit>().load(
-                                        reset: true,
-                                      );
-                                    }
-                                  },
+                              return HomeBannerHeader(
+                                headerAboveBanner: _isDesktop,
+                                bannerStyle: BannerStyle.current,
+                                hasHero: hasHero && !noSourceForMode,
+                                bannerBuilder: (bannerId) =>
+                                    _featuredBanner(bannerId, heroItems),
+                                headerBuilder: (edgeBanner) =>
+                                    _buildHeader(edgeBanner: edgeBanner),
+                              );
+                            },
                           ),
                         ),
 
-                      // ── Bottom padding ────────────────────────────────────────
-                      // Clear the floating dock, which overlays content (the
-                      // shell's extendBody reserves it no space of its own).
-                      SliverToBoxAdapter(
-                        child: SizedBox(
-                          height: MediaQuery.paddingOf(context).bottom,
+                        // ── Mode cards, and Schedule ──────────────────────────────
+                        // Unconditional: _modeCards drops the mode switchers
+                        // itself under Z Mode and keeps Schedule, which has no
+                        // other entry point since it left the dock.
+                        SliverToBoxAdapter(child: _modeCards()),
+
+                        // ── Reconnect banner (session lapsed → sync is off) ───────
+                        if (needsReconnect)
+                          SliverToBoxAdapter(child: _reconnectBanner()),
+
+                        // ── The arrangement ─────────────────────────────────────
+                        // state.rows is the merged view of this load: the local
+                        // Continue row, the tracker rows the user enabled, and the
+                        // provider sections, in the saved order (Settings →
+                        // Interface → Appearance → Home rows). ContinueSection renders wherever
+                        // the layout puts it — the same widgets as before, just
+                        // arranged. Before the first merge lands (rows null), the
+                        // ContinueSection keeps its old spot above the skeletons
+                        // so the loading screen is exactly today's.
+                        if (state.rows case final rows?)
+                          if (_sourceCatalogueSelected)
+                            ..._sourceCatalogueHomeSlivers(rows)
+                          else
+                            ...rows.map(_homeRowSliver)
+                        else ...[
+                          ContinueSection(
+                            onResume: _resume,
+                            onLongPress: _showContinueInfo,
+                            onSeeAll: _openHistory,
+                            onResumeReading: _resumeReading,
+                            onLongPressReading: _showContinueReadingInfo,
+                          ),
+                          if (_sourceCatalogueSelected)
+                            _sourceCatalogueHomeSliver(),
+                        ],
+
+                        // ── Skeletons while the first load runs / empty states ───
+                        // The provider rows themselves are part of state.rows
+                        // above; this branch only owns the loading placeholders
+                        // and the "nothing came back" views.
+                        if (!_sourceCatalogueSelected &&
+                            showSkeletons &&
+                            !noSourceForMode)
+                          ...List.generate(
+                            3,
+                            (_) =>
+                                const SliverToBoxAdapter(child: RowSkeleton()),
+                          )
+                        else if (!_sourceCatalogueSelected &&
+                            (noSourceForMode || loadedEmpty))
+                          SliverFillRemaining(
+                            hasScrollBody: false,
+                            child: HomeLoadedEmptyView(
+                              offline: state.offline,
+                              mode: sl<ContentModeCubit>().state,
+                              // Name whatever ACTUALLY answered: in Z Mode the
+                              // rows come from AniList/MAL/TMDB/Simkl, not the
+                              // active source, so blaming the source was simply
+                              // pointing at the wrong thing. The router hands
+                              // back the right name in either mode.
+                              sourceName: _repo.displayName(_repo.sourceId),
+                              // A metadata catalogue, not an installed source —
+                              // the "switch source at the top" advice does not
+                              // apply to it.
+                              isMetadataProvider:
+                                  _repo.sourceId == ZmodeIds.sourceId,
+                              rateLimitedSeconds: state.rateLimitedSeconds,
+                              onRetry: () =>
+                                  context.read<HomeCubit>().load(reset: true),
+                              // No-source guide points at the Providers hub (all
+                              // ecosystems); the source-returned-nothing case
+                              // (_SourceUnavailable) keeps its retry.
+                              onInstallSources: () =>
+                                  Navigator.of(context).push(
+                                    MaterialPageRoute<void>(
+                                      builder: (_) =>
+                                          const ProvidersHubScreen(),
+                                    ),
+                                  ),
+                              // Cloudflare-blocked (Mihon) source: offer the visible
+                              // solve, then reload once the user closes the WebView.
+                              cloudflareUrl: state.cloudflareUrl,
+                              onSolveCloudflare: state.cloudflareUrl == null
+                                  ? null
+                                  : () async {
+                                      await MihonExtensionService.solveCloudflare(
+                                        state.cloudflareUrl!,
+                                      );
+                                      if (context.mounted) {
+                                        context.read<HomeCubit>().load(
+                                          reset: true,
+                                        );
+                                      }
+                                    },
+                            ),
+                          ),
+
+                        // ── Bottom padding ────────────────────────────────────────
+                        // Clear the floating dock, which overlays content (the
+                        // shell's extendBody reserves it no space of its own).
+                        SliverToBoxAdapter(
+                          child: SizedBox(
+                            height: MediaQuery.paddingOf(context).bottom,
+                          ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   );
                 },
               ),

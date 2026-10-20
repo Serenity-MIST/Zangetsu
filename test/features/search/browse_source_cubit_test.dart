@@ -1,4 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:watch_app/core/error/exceptions.dart';
+import 'package:watch_app/core/provider/cf_solve_needed.dart';
 import 'package:watch_app/core/models/home_section.dart';
 import 'package:watch_app/core/models/media_item.dart';
 import 'package:watch_app/core/models/provider_info.dart';
@@ -12,11 +14,13 @@ class _Repo implements CatalogueRepository {
     this.throws = false,
     this.searchResults = const [],
     this.searchThrows = false,
+    this.challenge,
   });
   final List<HomeSection> sections;
   final bool throws;
   final List<MediaItem> searchResults;
   final bool searchThrows;
+  final String? challenge;
   String? askedFor;
   String? lastFiltersJson;
   int? lastPage;
@@ -36,6 +40,7 @@ class _Repo implements CatalogueRepository {
   }) async {
     homeCalls++;
     askedFor = sourceId;
+    if (challenge != null) throw CloudflareRequiredException(challenge!);
     if (throws) throw StateError('boom');
     return sections;
   }
@@ -48,6 +53,7 @@ class _Repo implements CatalogueRepository {
   }) async {
     lastQuery = query;
     searchAskedFor = sourceId;
+    if (challenge != null) throw CloudflareRequiredException(challenge!);
     if (searchThrows) throw StateError('boom');
     return searchResults;
   }
@@ -86,6 +92,28 @@ MediaItem _item(String id, String title) => MediaItem(
 );
 
 void main() {
+  test(
+    'native browse and search challenges retain their source and target',
+    () async {
+      const target = 'https://native.example/search?q=title';
+      final cubit = BrowseSourceCubit(
+        repo: _Repo(const [], challenge: target),
+        sourceId: 'mihon:123',
+      );
+      try {
+        await cubit.load();
+        expect(cubit.state.failed, isTrue);
+        expect(CfSolveNeeded.urlFor('mihon:123'), target);
+        CfSolveNeeded.clear('native.example');
+        await cubit.search('title');
+        expect(cubit.state.searchFailed, isTrue);
+        expect(CfSolveNeeded.urlFor('mihon:123'), target);
+      } finally {
+        CfSolveNeeded.clear('native.example');
+        await cubit.close();
+      }
+    },
+  );
   test('loads the named source, not the active one', () async {
     final repo = _Repo([_section('Latest')]);
     final cubit = BrowseSourceCubit(repo: repo, sourceId: 'ani:1');
@@ -252,10 +280,8 @@ void main() {
   });
 
   test('scrolling asks for the next page and appends it', () async {
-    final repo = _Repo(
-      [_section('Latest')],
-      searchResults: [_item('1', 'One')],
-    )..pages = {
+    final repo = _Repo([_section('Latest')], searchResults: [_item('1', 'One')])
+      ..pages = {
         1: [_item('1', 'One')],
         2: [_item('2', 'Two')],
       };

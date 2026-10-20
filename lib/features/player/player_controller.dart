@@ -62,6 +62,7 @@ import 'playback_failover.dart';
 /// change only takes effect the next time the player is opened.
 String? _resolveVideoOutput() => resolveVideoOutput(
   isTv: sl<AppMode>().isTv,
+  isWindows: Platform.isWindows,
   choice: sl<PlaybackPrefs>().videoOutput,
   shaderStyle: sl<PlaybackPrefs>().videoShaderStyle,
 );
@@ -814,6 +815,12 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// hosts drop on a seek (which otherwise restarts playback at 0). HLS already
   /// seeks fine; this is what lets the MP4 mirrors behave like they do in
   /// ExoPlayer-based apps.
+  /// Apply runtime settings when returning from the Settings route.
+  Future<void> applySavedPlaybackSettings() async {
+    await _configureMpv();
+    await applySubtitleStyle();
+  }
+
   Future<void> _configureMpv() async {
     final p = player.platform;
     if (p is NativePlayer) {
@@ -2597,6 +2604,15 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// as a buffering overlay. Returns a playable local-url source, or null if it
   /// couldn't (a clean error is emitted, no throw). Stops any previous torrent.
   Future<VideoSource?> _resolveTorrent(VideoSource s, int g) async {
+    // No torrent method/event channel is registered by the Windows runner.
+    // Fail before subscribing: an absent event channel otherwise leaves the
+    // player stuck on "Finding peers" with an asynchronous plugin exception.
+    if (!Platform.isAndroid) {
+      emit(state.copyWith(torrentPhase: () => null, loadingSources: false,
+          error: () => 'Torrent streaming is not available on this platform. '
+              'Choose a direct video source.'));
+      return null;
+    }
     await _stopTorrent();
     emit(
       state.copyWith(torrentPhase: () => 'Finding peers…', error: () => null),
@@ -3365,38 +3381,31 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// past a stalling deep-seek), abandon the resume, restart from 0, and reset
   /// the bad mark so the title plays instead of freezing forever.
   Future<void> _resumeWatchdog(int g) async {
-    await Future.delayed(const Duration(seconds: 15));
-    if (g != _gen) return;
-    final before = _lastPos;
-    await Future.delayed(const Duration(seconds: 4));
-    if (g != _gen) return;
-    // Position hasn't advanced in 4s → playback is frozen (the resume seek
-    // stalled on a deep / corrupted-mark target the host can't serve). Abandon
-    // the resume, restart from 0, and reset the bad mark so the title plays.
-    if ((_lastPos - before).abs() < const Duration(milliseconds: 600)) {
-      _pendingResume = Duration.zero;
-      await player.seek(Duration.zero);
-      await resume.save(
-        sourceId,
-        _showKey,
-        currentEpisode.id,
-        Duration.zero,
-        _lastDur,
-      );
+    await Future.delayed(const Duration(seconds: 30));
+    if (g != _gen || _pendingResume <= Duration.zero || !player.state.playing)
+      return;
+    // A slow range request or paused video must never erase a valid resume
+    // mark. Keep the target; retry when seeking becomes possible.
+    final duration = player.state.duration;
+    if (duration > _pendingResume &&
+        player.state.position + const Duration(seconds: 3) < _pendingResume) {
+      await player.seek(_pendingResume);
     }
   }
 
   Future<void> _verifyResume(Duration target, int g) async {
+    final initialUserSeek = _userSeekMs;
     // A seek issued while the stream is still buffering at position 0 is
     // silently dropped, so a fixed 3-try window often expires before slow
     // sources (remote MP4s) start producing frames — and the user lands at 0.
-    // Poll for up to ~12s and only seek ONCE the player is actually playing
+    // Poll for up to ~60s and only seek ONCE the player is actually playing
     // (a real position or a known duration), retrying until it sticks.
-    for (var attempt = 0; attempt < 20; attempt++) {
+    for (var attempt = 0; attempt < 80; attempt++) {
       await Future.delayed(const Duration(milliseconds: 750));
-      if (g != _gen) return; // a newer open superseded this
+      if (g != _gen || isClosed || _userSeekMs != initialUserSeek)
+        return; // a newer open or user seek superseded this
       final pos = player.state.position;
-      if ((pos - target).abs() <= const Duration(seconds: 8)) return; // reached
+      if ((pos - target).abs() <= const Duration(seconds: 2)) return; // reached
       // Seeking needs a KNOWN duration: remote MP4s (file hosts) report
       // duration only after mpv reads the moov atom, and a seek issued before
       // then is clamped to 0 — the "always starts from 0" bug. Wait for it.

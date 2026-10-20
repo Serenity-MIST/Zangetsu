@@ -145,8 +145,10 @@ class MihonRepo {
     // otherwise it looks single-language (e.g. "af", the alphabetically-first
     // one) and the language filter wrongly hides it even though it contains
     // English. Only a genuinely single-language extension keeps its language.
-    final distinctLangs =
-        sources.map((s) => s.lang).where((l) => l.isNotEmpty).toSet();
+    final distinctLangs = sources
+        .map((s) => s.lang)
+        .where((l) => l.isNotEmpty)
+        .toSet();
     final lang = distinctLangs.length == 1 ? distinctLangs.first : 'all';
 
     return AniyomiRepoEntry(
@@ -162,6 +164,9 @@ class MihonRepo {
       sources: sources,
       repoBaseUrl: base,
       absoluteApkUrl: apkUrl,
+      jarUrl: _str(
+        raw['resources'] is Map ? (raw['resources'] as Map)['jarUrl'] : null,
+      ),
       absoluteIconUrl: iconUrl,
     );
   }

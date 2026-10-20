@@ -79,3 +79,7 @@ supabase/.temp/
 
 # Wrangler local scratch (dev cache, telemetry state) — never commit
 **/.wrangler/
+
+# Local desktop integration backups, verification logs, and release packages.
+/merge-work/
+/outputs/

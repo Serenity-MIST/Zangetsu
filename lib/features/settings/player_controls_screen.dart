@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 
 import '../../core/di/injector.dart';
@@ -140,7 +141,9 @@ class _PlayerControlsScreenState extends State<PlayerControlsScreen> {
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 4),
             child: Icon(
-              controlById(id)?.icon ?? Icons.help_outline,
+              Platform.isWindows && id == 'rotate'
+                  ? Icons.fullscreen_rounded
+                  : controlById(id)?.icon ?? Icons.help_outline,
               size: 16,
               color: Colors.white,
             ),
@@ -291,11 +294,13 @@ class _PlayerControlsScreenState extends State<PlayerControlsScreen> {
             )
           else
             const SizedBox(width: 29),
-          Icon(c.icon, size: 20, color: tint),
+          // Keep the stable stored id, but name the action the PC player uses.
+          Icon(Platform.isWindows && id == 'rotate'
+              ? Icons.fullscreen_rounded : c.icon, size: 20, color: tint),
           const SizedBox(width: 12),
           Expanded(
             child: Text(
-              c.label,
+              Platform.isWindows && id == 'rotate' ? 'Fullscreen' : c.label,
               style: AppText.body.copyWith(color: tint, fontSize: 14.5),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,

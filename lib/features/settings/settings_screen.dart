@@ -1,3 +1,4 @@
+import '../../core/ui/nav_prefs.dart';
 import 'dart:async';
 import 'dart:io';
 
@@ -99,8 +100,13 @@ part 'settings_tv_pickers.dart';
 /// Top-level Settings screen — a grouped list of cards mirroring the
 /// iOS Settings look in our dark/coral language.
 class SettingsScreen extends StatefulWidget {
-  const SettingsScreen({super.key, this.showBackButton = false});
+  const SettingsScreen({
+    super.key,
+    this.returnToPlayer = false,
+    this.showBackButton = false,
+  });
 
+  final bool returnToPlayer;
   final bool showBackButton;
 
   @override
@@ -460,9 +466,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (mounted) setState(() => _dnsChoice = picked!);
   }
 
-  /// Bottom sheet / TV dialog to pick the search results layout (grid vs
-  /// CloudStream-style rows). Persisted via [SearchPrefs]; the search screen
-  /// reads it live.
+  /// Selects the TV keyboard presentation independently of result layout.
+  Future<void> _pickTvSearchStyle() async {
+    final prefs = sl<SearchPrefs>();
+    final selected = await showDialog<String>(
+      context: context,
+      builder: (ctx) => _TvOptionPicker<String>(
+        title: 'Search style',
+        options: const [('classic', 'Classic'), ('new', 'New')],
+        current: prefs.tvSearchStyle,
+      ),
+    );
+    if (selected == null) return;
+    await prefs.setTvSearchStyle(selected);
+    if (mounted) setState(() {});
+  }
+
   Future<void> _pickSearchLayout() async {
     final prefs = sl<SearchPrefs>();
     final SearchLayout? picked;
@@ -632,6 +651,67 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
     if (picked == null) return;
     await prefs.setBatchDownloadStyle(picked);
+    if (mounted) setState(() {});
+  }
+
+  /// Chooses Classic or dock-following My List and persists it without changing
+  /// library records. The selected descriptive row displays an accent check.
+  Future<void> _pickMyListStyle() async {
+    final prefs = sl<NavPrefs>();
+    final selected = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: AppColors.surface,
+      constraints: const BoxConstraints(maxWidth: 640),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              margin: const EdgeInsets.only(top: 12, bottom: 12),
+              width: 36,
+              height: 4,
+              decoration: BoxDecoration(
+                color: AppColors.textTertiary,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const ListTile(
+              title: Text('My List style'),
+              subtitle: Text(
+                'Choose how your library is organized. Your saved titles and progress stay the same.',
+              ),
+            ),
+            const Divider(height: 1),
+            for (final option in const [
+              (
+                'classic',
+                'Classic',
+                'Switch between Streaming, Manga and Novel inside My List.',
+              ),
+              (
+                'new',
+                'New',
+                'My List follows Anime, Movie/TV, Manga or Novel selected in the dock.',
+              ),
+            ])
+              ListTile(
+                title: Text(option.$2),
+                subtitle: Text(option.$3),
+                trailing: prefs.myListStyle == option.$1
+                    ? Icon(Icons.check_rounded, color: AppColors.accent)
+                    : null,
+                onTap: () => Navigator.pop(ctx, option.$1),
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (selected == null) return;
+    await prefs.setMyListStyle(selected);
     if (mounted) setState(() {});
   }
 
@@ -1073,14 +1153,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
       keywords: 'storage space cache clear disk usage',
       onTap: () => _push(const StorageSettingsScreen()),
     ),
-    _SettingsEntry(
-      section: SettingsSection.downloads,
-      icon: Icons.downloading_outlined,
-      title: l10n.torrents,
-      subtitle: l10n.torrentsSubtitle,
-      keywords: 'torrent magnet streaming seed data wifi',
-      onTap: () => _push(const TorrentSettingsScreen()),
-    ),
+    // This setting controls Android's torrent host and mobile-data permission.
+    // Desktop uses direct video streams and has neither native capability.
+    if (Platform.isAndroid)
+      _SettingsEntry(
+        section: SettingsSection.downloads,
+        icon: Icons.downloading_outlined,
+        title: l10n.torrents,
+        subtitle: l10n.torrentsSubtitle,
+        keywords: 'torrent magnet streaming seed data wifi',
+        onTap: () => _push(const TorrentSettingsScreen()),
+      ),
     // Interface & notifications
     _SettingsEntry(
       section: SettingsSection.interface,
@@ -1148,12 +1231,39 @@ class _SettingsScreenState extends State<SettingsScreen> {
         section: SettingsSection.interface,
         group: 'Layout',
         icon: Icons.dashboard_customize_outlined,
-        title: l10n.navigationBar,
-        subtitle: l10n.navigationBarSubtitle,
+        title: 'Customize dock',
+        subtitle: 'Choose buttons, reorder them and set the starting page',
         keywords:
             'navigation bar tabs dock bottom reorder hide downloads '
             'history customise customize interface',
         onTap: () => _push(const NavTabsScreen()),
+      ),
+    if (!_isTv)
+      _SettingsEntry(
+        section: SettingsSection.interface,
+        group: 'Layout',
+        icon: Icons.view_list_rounded,
+        title: 'My List style',
+        subtitle: 'Classic tabs or follow the dock media selection',
+        keywords:
+            'library my list classic new style dock content anime manga movie novel',
+        trailing: _value(
+          sl<NavPrefs>().myListStyle == 'new' ? 'New' : 'Classic',
+        ),
+        onTap: _pickMyListStyle,
+      ),
+    if (_isTv)
+      _SettingsEntry(
+        section: SettingsSection.interface,
+        group: 'Layout',
+        icon: Icons.keyboard_alt_outlined,
+        title: 'Search style',
+        subtitle: 'Choose Classic or New for search',
+        keywords: 'tv search style keyboard classic new alphabet letters input',
+        trailing: _value(
+          sl<SearchPrefs>().tvSearchStyle == 'new' ? 'New' : 'Classic',
+        ),
+        onTap: _pickTvSearchStyle,
       ),
     _SettingsEntry(
       section: SettingsSection.interface,
@@ -1328,7 +1438,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     // PopScope owns system/TV Back (NavigatorPopHandler alone was unreliable
     // once the shell stood down on [shellBackIntercepted]).
     return PopScope(
-      canPop: false,
+      canPop: widget.returnToPlayer && _tvLeaves.isEmpty,
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) return;
         if (_tvLeaves.isNotEmpty) {
@@ -1371,7 +1481,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Widget _buildHub(List<_SettingsEntry> entries) {
     return Scaffold(
       backgroundColor: AppColors.bg,
-      appBar: widget.showBackButton ? settingsAppBar('Settings') : null,
+      appBar: widget.returnToPlayer
+          ? AppBar(
+              leading: BackButton(onPressed: () => Navigator.of(context).pop()),
+              title: const Text('Back to player'),
+            )
+          : widget.showBackButton
+          ? settingsAppBar('Settings')
+          : null,
       // bottom: false — the shell's floating dock overlays the content
       // (extendBody); a full SafeArea would clip the list at the dock's top
       // edge, leaving a dead band on both sides of the capsule.
@@ -1422,7 +1539,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
               // Phone: top level with no search → back leaves Settings.
               // TV: the outer PopScope around the nested Navigator owns Back
               // (leaves + sections); this one must not also fire cubit.back().
-              canPop: !_isTv && section == null && query.isEmpty,
+              canPop:
+                  !_isTv &&
+                  (widget.returnToPlayer || (section == null && query.isEmpty)),
               onPopInvokedWithResult: (didPop, _) {
                 if (didPop || _isTv) return;
                 if (section != null) {
@@ -1458,6 +1577,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       // Bottom: clear the floating dock (its height arrives as
                       // MediaQuery bottom padding thanks to extendBody).
                       padding: EdgeInsets.only(
+                        left: Platform.isWindows
+                            ? ((MediaQuery.sizeOf(context).width - 1200) / 2)
+                                  .clamp(0.0, double.infinity)
+                            : 0,
+                        right: Platform.isWindows
+                            ? ((MediaQuery.sizeOf(context).width - 1200) / 2)
+                                  .clamp(0.0, double.infinity)
+                            : 0,
                         bottom: 24 + MediaQuery.paddingOf(context).bottom,
                       ),
                       sliver: SliverList.list(children: children),

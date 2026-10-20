@@ -1,3 +1,4 @@
+import 'package:watch_app/core/ui/nav_prefs.dart';
 // ignore_for_file: invalid_use_of_protected_member
 
 import 'package:dio/dio.dart';
@@ -356,6 +357,8 @@ void main() {
     // SettingsScreen (rendered eagerly in the shared shell pages) reads
     // sl<PlaybackPrefs>(), which reads its own Hive box — open it first.
     await PlaybackPrefs.init();
+    await NavPrefs.init();
+    sl.registerSingleton<NavPrefs>(NavPrefs());
     // These cover the shell as it stands without the metadata mode, which is
     // on by default now that its Settings toggle is gone — so ask for off.
     await ZModePrefs.init();

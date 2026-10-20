@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:io';
 
 import 'package:app_links/app_links.dart';
 import 'package:crypto/crypto.dart';
@@ -11,6 +12,8 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
 
 import '../environment.dart';
+import '../desktop/desktop_oauth.dart';
+import '../logging/app_logger.dart';
 import '../models/media_item.dart';
 import '../models/provider_info.dart';
 import '../models/watch_status.dart';
@@ -39,16 +42,30 @@ import 'tracker.dart';
 /// is an official scope there — writing to a user's library is supported, not a
 /// workaround.
 class MangaBakaService extends ChangeNotifier implements Tracker {
-  MangaBakaService(this._dio) {
+  MangaBakaService(
+    this._dio, {
+    this.authorizationLauncher,
+    this.externalBrowserLauncher,
+  }) {
     // app_links has no tvOS impl; TV connects trackers via phone QR pairing.
     if (isAppleTv) return;
     _linkSub = _appLinks.uriLinkStream.listen(_onLink, onError: (_) {});
-    _appLinks.getInitialLink().then((uri) {
-      if (uri != null) _onLink(uri);
-    }).catchError((_) {});
+    _appLinks
+        .getInitialLink()
+        .then((uri) {
+          if (uri != null) _onLink(uri);
+        })
+        .catchError((_) {});
   }
 
   final Dio _dio;
+
+  /// Optional callback adapter used by controlled OAuth integration tests.
+  final Future<Uri?> Function(Uri authorization, Uri redirect)?
+  authorizationLauncher;
+
+  /// Browser-launch seam; callback delivery still uses the real app_links stream.
+  final Future<bool> Function(Uri authorization)? externalBrowserLauncher;
   final AppLinks _appLinks = AppLinks();
   StreamSubscription<Uri>? _linkSub;
   Completer<bool>? _pending;
@@ -56,6 +73,18 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
   /// The verifier for the consent currently in flight. Held in memory only —
   /// it is single-use and must not outlive the app, let alone reach disk.
   String? _verifier;
+  String? _oauthState;
+
+  /// Safe, user-facing connection failure; never contains codes or tokens.
+  String? lastConnectionError;
+  bool _exchanging = false;
+  bool _receivedCallback = false;
+  Future<bool>? _refreshing;
+
+  /// Records only lifecycle labels, never authorization URLs, codes or tokens.
+  void _traceConnection(String stage) {
+    AppLogger.instance.log('[mangabaka-auth] $stage');
+  }
 
   static const String boxName = 'mangabaka';
 
@@ -110,16 +139,21 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
 
   /// S256 challenge — the only method MangaBaka advertises. Base64url of the
   /// SHA-256 of the verifier's ASCII bytes, unpadded.
-  static String challengeFor(String verifier) =>
-      base64Url.encode(sha256.convert(ascii.encode(verifier)).bytes)
-          .replaceAll('=', '');
+  static String challengeFor(String verifier) => base64Url
+      .encode(sha256.convert(ascii.encode(verifier)).bytes)
+      .replaceAll('=', '');
 
   // ── connect / disconnect ─────────────────────────────────────────────────
 
   @override
   Future<bool> connect() async {
+    if (_pending != null) return _pending!.future;
+    lastConnectionError = null;
+    _receivedCallback = false;
+    _traceConnection('starting authorization');
     final verifier = newVerifier();
     _verifier = verifier;
+    _oauthState = newVerifier();
     final url = Uri.parse(
       '${Environment.mangabakaAuthorizeUrl}?response_type=code'
       '&client_id=${Environment.mangabakaClientId}'
@@ -128,19 +162,79 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
       '&code_challenge=${challengeFor(verifier)}'
       '&code_challenge_method=S256',
     );
-    _pending = Completer<bool>();
-    final ok = await launchUrl(url, mode: LaunchMode.externalApplication);
-    if (!ok) {
-      _pending = null;
+    final authorization = url.replace(
+      queryParameters: {...url.queryParameters, 'state': _oauthState!},
+    );
+    final pending = Completer<bool>();
+    _pending = pending;
+    // Older builds discarded expired access tokens without trying their saved
+    // refresh token. Recover that existing approval before opening a browser.
+    if (await _refreshSession()) {
+      await _fetchUserInfo();
+      await _fetchViewer();
+      notifyListeners();
+      _resolvePending(true);
       _verifier = null;
-      return false;
+      _oauthState = null;
+      return true;
+    }
+    if (authorizationLauncher != null) {
+      try {
+        final callback = await authorizationLauncher!(
+          authorization,
+          Uri.parse(Environment.mangabakaRedirectUri),
+        );
+        if (callback == null ||
+            !DesktopOAuth.isCallback(
+              callback,
+              Uri.parse(Environment.mangabakaRedirectUri),
+            )) {
+          _resolvePending(false);
+        } else {
+          await _handleRedirect(callback);
+        }
+        return await pending.future;
+      } catch (_) {
+        _resolvePending(false);
+        return false;
+      } finally {
+        _pending = null;
+        _verifier = null;
+        _oauthState = null;
+      }
     }
     try {
-      return await _pending!.future.timeout(const Duration(minutes: 3));
+      // Use the user's browser for website checks and account approval. The
+      // runner forwards the registered callback to this instance's PKCE flow.
+      if (Platform.isWindows) {
+        await DesktopOAuth.prepareBrowserCallback();
+        _traceConnection('Windows callback registered');
+      }
+      final ok =
+          await (externalBrowserLauncher?.call(authorization) ??
+              launchUrl(authorization, mode: LaunchMode.externalApplication));
+      if (!ok) {
+        lastConnectionError = 'The sign-in browser could not be opened.';
+        return false;
+      }
+      _traceConnection('browser opened; waiting for approval callback');
+      return await pending.future.timeout(const Duration(minutes: 3));
+    } on TimeoutException {
+      lastConnectionError = _receivedCallback
+          ? 'MangaBaka approval returned, but completing the connection timed out. Please retry.'
+          : 'No approval returned from the browser. After approving MangaBaka, allow the browser to open Zangetsu. Please retry.';
+      _traceConnection(
+        _receivedCallback ? 'completion timed out' : 'callback timed out',
+      );
+      return false;
     } catch (_) {
+      lastConnectionError ??=
+          'Sign-in did not finish. Return to Zangetsu after approving access and try again.';
+      return false;
+    } finally {
       _pending = null;
       _verifier = null;
-      return false;
+      _oauthState = null;
     }
   }
 
@@ -149,17 +243,46 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
         uri.host != Environment.mangabakaRedirectHost) {
       return;
     }
+    // Ignore old external-browser responses rather than cancelling a newer
+    // sign-in attempt that owns a different state/verifier pair.
+    if (_pending == null) {
+      _traceConnection('ignored callback without an active sign-in attempt');
+      return;
+    }
+    if (uri.queryParameters['state'] != _oauthState) {
+      _traceConnection('ignored callback from a different sign-in attempt');
+      return;
+    }
+    _receivedCallback = true;
+    _traceConnection('matching callback received');
     _handleRedirect(uri);
   }
 
   Future<void> _handleRedirect(Uri uri) async {
+    // app_links may deliver the initial callback through more than one event.
+    // A duplicate must not cancel the token exchange already in progress.
+    if (_exchanging) return;
+    // An old or unrelated browser callback must not exchange a code using the
+    // verifier from the user's current authorization attempt.
+    if (_oauthState != null && uri.queryParameters['state'] != _oauthState) {
+      lastConnectionError =
+          'The sign-in response did not match this attempt. Please reconnect.';
+      _resolvePending(false);
+      return;
+    }
     final code = uri.queryParameters['code'];
     final verifier = _verifier;
     _verifier = null;
     if (code == null || code.isEmpty || verifier == null) {
+      if (uri.queryParameters['error'] != 'access_denied') {
+        lastConnectionError =
+            'MangaBaka did not return an authorization code. Please reconnect.';
+      }
       _resolvePending(false);
       return;
     }
+    _exchanging = true;
+    _traceConnection('exchanging authorization code');
     try {
       final res = await _dio.post<dynamic>(
         Environment.mangabakaTokenUrl,
@@ -176,21 +299,38 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
         },
         options: Options(
           contentType: Headers.formUrlEncodedContentType,
+          sendTimeout: const Duration(seconds: 30),
+          receiveTimeout: const Duration(seconds: 30),
           validateStatus: (s) => s != null && s < 500,
         ),
       );
-      final stored = await _storeTokens(res.data);
-      await _nameFromIdToken(res.data);
-      await _fetchUserInfo();
-      if (!stored) {
+      _traceConnection('token endpoint HTTP ${res.statusCode ?? 'unknown'}');
+      if (res.statusCode != 200 || !await _storeTokens(res.data)) {
+        final error = res.data is Map ? res.data['error'] : null;
+        lastConnectionError = switch (error) {
+          'invalid_client' =>
+            'MangaBaka rejected the app registration. The OAuth client configuration must be corrected before connecting.',
+          'invalid_grant' =>
+            'MangaBaka rejected the expired or already-used approval. Please reconnect.',
+          _ =>
+            'MangaBaka could not complete sign-in (HTTP ${res.statusCode ?? 'unknown'}). Please retry.',
+        };
         _resolvePending(false);
         return;
       }
+      await _nameFromIdToken(res.data);
+      await _fetchUserInfo();
       await _fetchViewer();
       notifyListeners();
+      _traceConnection('connected');
       _resolvePending(true);
     } catch (_) {
+      _traceConnection('token exchange or local session storage failed');
+      lastConnectionError =
+          'The connection to MangaBaka failed while completing sign-in. Please retry.';
       _resolvePending(false);
+    } finally {
+      _exchanging = false;
     }
   }
 
@@ -255,12 +395,9 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
   /// has no avatar" was wrong — it was in the standard place all along.
   Future<void> _fetchUserInfo() async {
     try {
-      final res = await _dio.get<dynamic>(
+      final res = await _authenticated(
+        'GET',
         'https://mangabaka.org/auth/oauth2/userinfo',
-        options: Options(
-          headers: _headers,
-          validateStatus: (s) => s != null && s < 500,
-        ),
       );
       final d = res.data;
       if (d is! Map) return;
@@ -279,12 +416,9 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
 
   Future<void> _fetchViewer() async {
     try {
-      final res = await _dio.get<dynamic>(
+      final res = await _authenticated(
+        'GET',
         '${Environment.mangabakaApi}/v1/my/profile',
-        options: Options(
-          headers: _headers,
-          validateStatus: (s) => s != null && s < 500,
-        ),
       );
       final d = res.data;
       final user = (d is Map && d['data'] is Map) ? d['data'] as Map : d;
@@ -385,15 +519,11 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
   Future<List<TrackerListItem>> fetchList() async {
     if (!isConnected) return const [];
     try {
-      final res = await _dio.get<dynamic>(
+      final res = await _authenticated(
+        'GET',
         '${Environment.mangabakaApi}/v1/my/library',
-        options: Options(
-          headers: _headers,
-          validateStatus: (s) => s != null && s < 500,
-        ),
       );
       if (res.statusCode == 401) {
-        await _onUnauthorized();
         return const [];
       }
       final d = res.data;
@@ -494,12 +624,89 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
     return id is int ? id : int.tryParse('$id');
   }
 
-  /// A 401 means the token died (revoked, or a refresh we have not implemented
-  /// yet). Drop it so the UI offers Connect again rather than failing silently
-  /// on every call from here on.
-  Future<void> _onUnauthorized() async {
-    await _box.delete('accessToken');
-    notifyListeners();
+  /// Serializes token rotation: concurrent library reads must not reuse the
+  /// same one-time refresh token. Transient failures preserve the saved session.
+  Future<bool> _refreshSession() async {
+    if (_refreshing != null) return _refreshing!;
+    final operation = _refreshSessionNow();
+    _refreshing = operation;
+    try {
+      return await operation;
+    } finally {
+      if (identical(_refreshing, operation)) _refreshing = null;
+    }
+  }
+
+  /// Uses the provider's refresh grant without logging or exposing credentials.
+  Future<bool> _refreshSessionNow() async {
+    final refresh = _box.get('refreshToken') as String?;
+    if (refresh == null || refresh.isEmpty) return false;
+    try {
+      final response = await _dio.post<dynamic>(
+        Environment.mangabakaTokenUrl,
+        data: {
+          'grant_type': 'refresh_token',
+          'client_id': Environment.mangabakaClientId,
+          'refresh_token': refresh,
+        },
+        options: Options(
+          contentType: Headers.formUrlEncodedContentType,
+          receiveTimeout: const Duration(seconds: 30),
+          validateStatus: (status) => status != null && status < 600,
+        ),
+      );
+      // A disconnect or a newer session must win over an old in-flight refresh.
+      if (_box.get('refreshToken') != refresh) return false;
+      if (response.statusCode == 200 && await _storeTokens(response.data)) {
+        _traceConnection('saved session refreshed');
+        notifyListeners();
+        return true;
+      }
+      if (response.data is Map && response.data['error'] == 'invalid_grant') {
+        await _box.delete('accessToken');
+        await _box.delete('refreshToken');
+        await _box.delete('expiresAt');
+        notifyListeners();
+      }
+      _traceConnection(
+        'refresh endpoint HTTP ${response.statusCode ?? 'unknown'}',
+      );
+    } catch (_) {
+      _traceConnection('refresh request failed; saved session retained');
+    }
+    return false;
+  }
+
+  /// Retries an authenticated API operation once after renewing its token.
+  /// Public metadata and OAuth exchanges never pass through this helper.
+  Future<Response<dynamic>> _authenticated(
+    String method,
+    String url, {
+    dynamic data,
+  }) async {
+    final expires = _box.get('expiresAt');
+    if (expires is int &&
+        expires <= DateTime.now().millisecondsSinceEpoch + 30000) {
+      await _refreshSession();
+    }
+    Future<Response<dynamic>> send() => _dio.request<dynamic>(
+      url,
+      data: data,
+      options: Options(
+        method: method,
+        headers: _headers,
+        validateStatus: (status) => status != null && status < 500,
+      ),
+    );
+    final first = await send();
+    if (first.statusCode != 401) return first;
+    if (await _refreshSession()) return send();
+    // A temporary refresh outage must not erase a still-renewable approval.
+    if (_box.get('refreshToken') == null) {
+      await _box.delete('accessToken');
+      notifyListeners();
+    }
+    return first;
   }
 
   @override
@@ -522,12 +729,9 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
     );
     if (id == null) return null;
     try {
-      final res = await _dio.get<dynamic>(
+      final res = await _authenticated(
+        'GET',
         '${Environment.mangabakaApi}/v1/my/library/$id',
-        options: Options(
-          headers: _headers,
-          validateStatus: (s) => s != null && s < 500,
-        ),
       );
       // 404 here is not an error: it means "not in the library yet", which the
       // sheet renders as an empty entry rather than a failure.
@@ -548,7 +752,9 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
           : await _series(id);
       final seriesTitle = '${series?['title'] ?? ''}';
       if (seriesTitle.isEmpty) {
-        debugPrint('[mb] entry $id still has no title; keys=${row.keys.toList()}');
+        debugPrint(
+          '[mb] entry $id still has no title; keys=${row.keys.toList()}',
+        );
       }
       return TrackerEntry(
         trackerName: displayName,
@@ -692,25 +898,18 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
   Future<void> _patch(int seriesId, Map<String, dynamic> body) async {
     if (body.isEmpty || !isConnected) return;
     try {
-      final r = await _dio.patch<dynamic>(
+      final r = await _authenticated(
+        'PATCH',
         '${Environment.mangabakaApi}/v1/my/library/$seriesId',
         data: body,
-        options: Options(
-          headers: _headers,
-          validateStatus: (s) => s != null && s < 500,
-        ),
       );
-      if (r.statusCode == 401) await _onUnauthorized();
       if (r.statusCode != 404) return;
-      final add = await _dio.post<dynamic>(
+      final add = await _authenticated(
+        'POST',
         '${Environment.mangabakaApi}/v1/my/library/batch',
         data: [
           {'series_id': seriesId, ...body},
         ],
-        options: Options(
-          headers: _headers,
-          validateStatus: (s) => s != null && s < 500,
-        ),
       );
       debugPrint('[mb] add $seriesId -> ${add.statusCode}');
     } catch (_) {
@@ -720,8 +919,7 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
 
   /// Reading-only: MangaBaka has no anime library, so an anime write here
   /// would have nowhere to land. Gated in one place rather than in each write.
-  bool _canWrite(MediaKind kind) =>
-      isConnected && kind == MediaKind.manga;
+  bool _canWrite(MediaKind kind) => isConnected && kind == MediaKind.manga;
 
   // ── writes ───────────────────────────────────────────────────────────────
 
@@ -793,7 +991,11 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
     MediaKind kind = MediaKind.anime,
   }) async {
     if (!_canWrite(kind)) return;
-    final id = await _seriesIdFor(malId: malId, title: title, pinnedId: pinnedId);
+    final id = await _seriesIdFor(
+      malId: malId,
+      title: title,
+      pinnedId: pinnedId,
+    );
     if (id == null) return;
     // A null field is left unchanged (the interface says so), so only send
     // what actually changed.
@@ -815,15 +1017,16 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
     MediaKind kind = MediaKind.anime,
   }) async {
     if (!_canWrite(kind)) return;
-    final id = await _seriesIdFor(malId: malId, title: title, pinnedId: pinnedId);
+    final id = await _seriesIdFor(
+      malId: malId,
+      title: title,
+      pinnedId: pinnedId,
+    );
     if (id == null) return;
     try {
-      await _dio.delete<dynamic>(
+      await _authenticated(
+        'DELETE',
         '${Environment.mangabakaApi}/v1/my/library/$id',
-        options: Options(
-          headers: _headers,
-          validateStatus: (s) => s != null && s < 500,
-        ),
       );
     } catch (_) {}
   }

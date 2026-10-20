@@ -1,7 +1,6 @@
 // Tracker connections: AniList, MyAnimeList, Simkl, MangaBaka.
 part of 'settings_screen.dart';
 
-
 // ---------------------------------------------------------------------------
 // Connections (trackers)
 // ---------------------------------------------------------------------------
@@ -53,10 +52,7 @@ class _ConnectionsScreenState extends State<ConnectionsScreen> {
           ),
           Padding(
             padding: const EdgeInsets.fromLTRB(24, 8, 24, 0),
-            child: Text(
-              context.l10n.connectionsBlurb,
-              style: AppText.caption,
-            ),
+            child: Text(context.l10n.connectionsBlurb, style: AppText.caption),
           ),
         ],
       ),

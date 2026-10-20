@@ -11,6 +11,7 @@ import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
@@ -992,7 +993,7 @@ void main() {
       expect(find.byKey(chapterCover), findsNWidgets(2));
       expect(
         tester.getSize(find.byKey(chapterCover).first),
-        const Size(44, 62),
+        Platform.isWindows ? const Size(32, 44) : const Size(44, 62),
       );
 
       // No ▶ anywhere on a reading page — not in the row, and the hero button
@@ -1041,7 +1042,16 @@ void main() {
     expect(store.readShowIds, isNotEmpty, reason: 'row read some key');
     final rowKey = store.readShowIds.first;
 
-    await tester.longPress(find.byKey(chapterCover).first);
+    // Desktop chapter menus use the requested secondary mouse action.
+    if (Platform.isWindows) {
+      await tester.tap(
+        find.byKey(chapterCover).first,
+        buttons: kSecondaryMouseButton,
+        kind: PointerDeviceKind.mouse,
+      );
+    } else {
+      await tester.longPress(find.byKey(chapterCover).first);
+    }
     await tester.pumpAndSettle();
     await tester.tap(find.text('Mark as read'));
     await tester.pumpAndSettle();
@@ -1075,7 +1085,15 @@ void main() {
     await tester.pump();
     await tester.pump();
 
-    await tester.longPress(find.byKey(chapterCover).first);
+    if (Platform.isWindows) {
+      await tester.tap(
+        find.byKey(chapterCover).first,
+        buttons: kSecondaryMouseButton,
+        kind: PointerDeviceKind.mouse,
+      );
+    } else {
+      await tester.longPress(find.byKey(chapterCover).first);
+    }
     await tester.pumpAndSettle();
 
     expect(find.text('Mark as read'), findsOneWidget);

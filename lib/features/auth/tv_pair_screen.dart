@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
@@ -56,7 +57,9 @@ class _TvPairScreenState extends State<TvPairScreen> {
       _errMsg = null;
     });
     try {
-      final r = await _svc.startPairing('Android TV');
+      final r = await _svc.startPairing(
+        Platform.isWindows ? 'Windows PC' : 'Android TV',
+      );
       if (!mounted) return;
       setState(() {
         _code = r.code;
@@ -170,78 +173,86 @@ class _TvPairScreenState extends State<TvPairScreen> {
     );
   }
 
-  Widget _pairing() => Row(
-    mainAxisSize: MainAxisSize.min,
-    children: [
-      Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(16),
+  Widget _pairing() => SingleChildScrollView(
+    child: Wrap(
+      alignment: WrapAlignment.center,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      spacing: 52,
+      runSpacing: 24,
+      children: [
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: QrImageView(
+            // Deeplink so an installed phone app opens Pair a TV directly.
+            data: Platform.isWindows
+                ? PairLink.qrData(code: _code ?? '', nonce: _nonce)
+                : PairLink.deepLink(code: _code ?? '', nonce: _nonce),
+            size: 220,
+            gapless: true,
+          ),
         ),
-        child: QrImageView(
-          // Deeplink so an installed phone app opens Pair a TV directly.
-          data: PairLink.deepLink(code: _code ?? '', nonce: _nonce),
-          size: 220,
-          gapless: true,
-        ),
-      ),
-      const SizedBox(width: 52),
-      SizedBox(
-        width: 500,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-          Text(context.l10n.signInWithYourPhone, style: AppText.title),
-          const SizedBox(height: 14),
-          Text(
-            context
-                .l10n
-                .onTheZangetsuAppOnYourPhoneOpenNPairATVAndEnterThisCodeOrScanTheQR,
-            style: AppText.body.copyWith(
-              color: AppColors.textSecondary,
-              height: 1.5,
-            ),
-          ),
-          const SizedBox(height: 30),
-          Text(
-            context.l10n.code,
-            style: AppText.caption.copyWith(
-              letterSpacing: 3,
-              color: AppColors.textTertiary,
-            ),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            _spacedCode(),
-            style: AppText.title.copyWith(
-              fontSize: 46,
-              letterSpacing: 8,
-              fontWeight: FontWeight.w800,
-            ),
-          ),
-          const SizedBox(height: 14),
-          if (_phase == _Phase.signingIn)
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    color: AppColors.accent,
-                  ),
+        SizedBox(
+          width: (MediaQuery.sizeOf(context).width - 48).clamp(240.0, 500.0),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(context.l10n.signInWithYourPhone, style: AppText.title),
+              const SizedBox(height: 14),
+              Text(
+                Platform.isWindows
+                    ? 'Scan with your phone camera, open Zangetsu and approve this PC. Your linked accounts can transfer together.'
+                    : context
+                          .l10n
+                          .onTheZangetsuAppOnYourPhoneOpenNPairATVAndEnterThisCodeOrScanTheQR,
+                style: AppText.body.copyWith(
+                  color: AppColors.textSecondary,
+                  height: 1.5,
                 ),
-                const SizedBox(width: 10),
-                Text(context.l10n.signingIn, style: AppText.body),
-              ],
-            ),
-          ],
+              ),
+              const SizedBox(height: 30),
+              Text(
+                context.l10n.code,
+                style: AppText.caption.copyWith(
+                  letterSpacing: 3,
+                  color: AppColors.textTertiary,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                _spacedCode(),
+                style: AppText.title.copyWith(
+                  fontSize: 46,
+                  letterSpacing: 8,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 14),
+              if (_phase == _Phase.signingIn)
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: AppColors.accent,
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Text(context.l10n.signingIn, style: AppText.body),
+                  ],
+                ),
+            ],
+          ),
         ),
-      ),
-    ],
+      ],
+    ),
   );
 
   Widget _message() {

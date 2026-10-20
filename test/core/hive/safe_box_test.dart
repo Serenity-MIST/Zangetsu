@@ -101,14 +101,12 @@ void main() {
     expect(kept, hasLength(1)); // repeated failures can't fill the disk
   });
 
-  test('falls back to deleting when the file cannot be moved', () async {
+  test('preserves data when the recovery directory is unavailable', () async {
     await writeUnreadableBox('legacy');
     hiveBoxDir = null; // e.g. a platform where initHiveForApp never ran
 
-    final box = await openIgnoringOrphanError('legacy');
-
-    expect(box.isOpen, isTrue); // booting still beats keeping the bytes
-    expect(box.isEmpty, isTrue);
+    await expectLater(openIgnoringOrphanError('legacy'), throwsStateError);
+    expect(File('${dir.path}/legacy.hive').lengthSync(), greaterThan(0));
     expect(File('${dir.path}/legacy.hive.corrupt').existsSync(), isFalse);
   });
 

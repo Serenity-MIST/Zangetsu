@@ -36,7 +36,11 @@ class ZSourcePrefs {
   /// which case Auto Resolve is what actually plays every title of this kind.
   String? get(ZKind kind) {
     final v = _box.get(bucketOf(kind))?.trim();
-    return (v == null || v.isEmpty) ? null : v;
+    if (v == null || v.isEmpty) return null;
+    if (RegExp(r'^-?\d+$').hasMatch(v)) {
+      return '${kind == ZKind.manga ? 'mihon' : 'ani'}:$v';
+    }
+    return v;
   }
 
   Future<void> set(ZKind kind, String sourceId) =>
@@ -60,7 +64,11 @@ class ZSourcePrefs {
   /// into one.
   String? lastGood(ZKind kind) {
     final v = _box.get(_lastGoodKey(kind))?.trim();
-    return (v == null || v.isEmpty) ? null : v;
+    if (v == null || v.isEmpty) return null;
+    if (RegExp(r'^-?\d+$').hasMatch(v)) {
+      return '${kind == ZKind.manga ? 'mihon' : 'ani'}:$v';
+    }
+    return v;
   }
 
   Future<void> rememberLastGood(ZKind kind, String sourceId) =>

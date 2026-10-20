@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 
 import '../core/mode/content_mode.dart';
 import '../core/models/watch_status.dart';
@@ -12,21 +13,22 @@ import 'l10n.dart';
 /// Localized dock tab label (phone bottom bar).
 extension DockTabL10n on DockTab {
   String localizedLabel(BuildContext context) => switch (this) {
-        DockTab.home => context.l10n.home,
-        DockTab.myList => context.l10n.myList,
-        DockTab.downloads => context.l10n.downloads,
-        DockTab.history => context.l10n.history,
-        DockTab.sources => context.l10n.sources,
-        DockTab.profile => context.l10n.profile,
-      };
+    DockTab.home => context.l10n.home,
+    DockTab.myList => context.l10n.myList,
+    DockTab.downloads => context.l10n.downloads,
+    DockTab.history => context.l10n.history,
+    DockTab.sources => context.l10n.sources,
+    DockTab.search => context.l10n.search,
+    DockTab.profile => context.l10n.profile,
+  };
 }
 
 /// Localized search-results layout name.
 extension SearchLayoutL10n on SearchLayout {
   String localizedLabel(BuildContext context) => switch (this) {
-        SearchLayout.vertical => context.l10n.searchLayoutVertical,
-        SearchLayout.horizontal => context.l10n.searchLayoutHorizontal,
-      };
+    SearchLayout.vertical => context.l10n.searchLayoutVertical,
+    SearchLayout.horizontal => context.l10n.searchLayoutHorizontal,
+  };
 }
 
 /// Localized content-mode switcher label.
@@ -114,27 +116,27 @@ String settingsSectionSummary(AppLocalizations l10n, String section) =>
     };
 
 IconData settingsSectionIcon(String section) => switch (section) {
-      SettingsSection.account => Icons.person_outline_rounded,
-      SettingsSection.sources => Icons.dns_rounded,
-      SettingsSection.playback => Icons.play_circle_outline_rounded,
-      SettingsSection.reading => Icons.menu_book_outlined,
-      SettingsSection.history => Icons.history_rounded,
-      SettingsSection.downloads => Icons.download_outlined,
-      SettingsSection.interface => Icons.tune_rounded,
-      SettingsSection.notifications => Icons.notifications_none_rounded,
-      SettingsSection.advanced => Icons.build_outlined,
-      SettingsSection.about => Icons.info_outline_rounded,
-      _ => Icons.settings_outlined,
-    };
+  SettingsSection.account => Icons.person_outline_rounded,
+  SettingsSection.sources => Icons.dns_rounded,
+  SettingsSection.playback => Icons.play_circle_outline_rounded,
+  SettingsSection.reading => Icons.menu_book_outlined,
+  SettingsSection.history => Icons.history_rounded,
+  SettingsSection.downloads => Icons.download_outlined,
+  SettingsSection.interface => Icons.tune_rounded,
+  SettingsSection.notifications => Icons.notifications_none_rounded,
+  SettingsSection.advanced => Icons.build_outlined,
+  SettingsSection.about => Icons.info_outline_rounded,
+  _ => Icons.settings_outlined,
+};
 
 /// Maps [ThemeController.accentLabel] (English) to localized strings.
-String themeAccentLabel(AppLocalizations l10n) => switch (
-      ThemeController.accentLabel) {
-  'Wallpaper' => l10n.accentWallpaper,
-  'Default' => l10n.defaultLabel,
-  'Custom' => l10n.custom,
-  final preset => accentPresetLabel(l10n, preset),
-};
+String themeAccentLabel(AppLocalizations l10n) =>
+    switch (ThemeController.accentLabel) {
+      'Wallpaper' => l10n.accentWallpaper,
+      'Default' => l10n.defaultLabel,
+      'Custom' => l10n.custom,
+      final preset => accentPresetLabel(l10n, preset),
+    };
 
 String accentPresetLabel(AppLocalizations l10n, String englishName) =>
     switch (englishName) {
@@ -191,8 +193,7 @@ String watchStatusShortLabel(
     WatchStatus.planning ||
     WatchStatus.completed ||
     WatchStatus.paused ||
-    WatchStatus.dropped =>
-      watchStatusShortLabel(l10n, s, reading: false),
+    WatchStatus.dropped => watchStatusShortLabel(l10n, s, reading: false),
   };
 }
 
@@ -245,9 +246,11 @@ List<(String, String)> videoDecoderOptions(AppLocalizations l10n) => [
 
 List<(String, String)> videoRendererOptions(AppLocalizations l10n) => [
   ('auto', l10n.rendererAutoRecommended),
-  ('gpu', l10n.rendererGpuStandard),
-  ('gpu-next', l10n.rendererGpuNextExperimental),
-  ('mediacodec_embed', l10n.rendererMediacodecEmbed),
+  if (defaultTargetPlatform != TargetPlatform.windows) ...[
+    ('gpu', l10n.rendererGpuStandard),
+    ('gpu-next', l10n.rendererGpuNextExperimental),
+    ('mediacodec_embed', l10n.rendererMediacodecEmbed),
+  ],
 ];
 
 List<(String, String)> closeConfirmPickerOptions(AppLocalizations l10n) => [

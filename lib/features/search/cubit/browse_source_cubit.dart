@@ -3,6 +3,8 @@ import 'package:flutter_bloc/flutter_bloc.dart';
 import '../../../core/models/home_section.dart';
 import '../../../core/models/media_item.dart';
 import '../../../core/repository/catalogue_repository.dart';
+import '../../../core/error/exceptions.dart';
+import '../../../core/provider/cf_solve_needed.dart';
 
 class BrowseSourceState {
   const BrowseSourceState({
@@ -82,13 +84,25 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
   /// pays for the challenge solve before the real request even starts.
   final Duration timeout;
 
+  /// Native extensions throw a typed challenge instead of setting the JS
+  /// host flag. Preserve its exact URL so Browse offers verification too.
+  void _recordChallenge(Object error) {
+    if (error is CloudflareRequiredException) {
+      final host = Uri.tryParse(error.url)?.host;
+      if (host != null && host.isNotEmpty) {
+        CfSolveNeeded.needsSolve(host, error.url, sourceId: sourceId);
+      }
+    }
+  }
+
   Future<void> load() async {
     emit(const BrowseSourceState());
     try {
       final sections = await _repo.home(sourceId: sourceId).timeout(timeout);
       if (isClosed) return;
       emit(BrowseSourceState(sections: sections, loading: false));
-    } catch (_) {
+    } catch (error) {
+      _recordChallenge(error);
       if (isClosed) return;
       emit(const BrowseSourceState(loading: false, failed: true));
     }
@@ -121,7 +135,8 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
           searchResults: results,
         ),
       );
-    } catch (_) {
+    } catch (error) {
+      _recordChallenge(error);
       if (isClosed) return;
       emit(
         BrowseSourceState(
@@ -166,7 +181,8 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
           filtersJson: filtersJson,
         ),
       );
-    } catch (_) {
+    } catch (error) {
+      _recordChallenge(error);
       if (isClosed) return;
       emit(
         BrowseSourceState(

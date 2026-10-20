@@ -4,6 +4,7 @@ import 'package:get_it/get_it.dart';
 import '../di/injector.dart';
 import '../metadata/streaming_providers.dart';
 import '../mode/content_mode.dart';
+import '../models/provider_info.dart';
 import '../mode/content_mode_cubit.dart';
 import '../playback/playback_prefs.dart';
 import '../profiles/viewer_profile.dart';
@@ -97,7 +98,7 @@ Future<void> registerZangetsuMode(GetIt sl) async {
       matchStore: matchStore,
       sourcePrefs: sourcePrefs,
       health: sl<SourceHealthStore>(),
-      candidates: orderedCandidates,
+      candidates: automaticCandidates,
       browseKind: () =>
           browseKindFor(sl<ContentModeCubit>().state, ZModePrefs.streamKind),
     ),
@@ -146,6 +147,15 @@ List<({String id, String name})> languageNarrowedCandidates(
   return narrowed.isEmpty ? ordered : narrowed;
 }
 
+/// Reads source kind without making a stale/unloaded registry entry fatal.
+ProviderType _safeSourceType(String id) {
+  try {
+    return sourceTypeOf(id);
+  } catch (_) {
+    return ProviderType.anime;
+  }
+}
+
 List<({String id, String name})> candidatesForKind(
   SourceRepository repo,
   ZKind kind,
@@ -158,11 +168,15 @@ List<({String id, String name})> candidatesForKind(
   return switch (kind) {
     ZKind.manga => [
       for (final s in all)
-        if (s.id.startsWith('mihon:')) s,
+        if (s.id.startsWith('mihon:') ||
+            _safeSourceType(s.id) == ProviderType.manga)
+          s,
     ],
     ZKind.novel => [
       for (final s in all)
-        if (s.id.startsWith('lnr:')) s,
+        if (s.id.startsWith('lnr:') ||
+            _safeSourceType(s.id) == ProviderType.novel)
+          s,
     ],
     // Anime and movie/TV share one streaming pool. Which of the two a title
     // is has already been decided by the metadata catalogue; the source only
@@ -171,7 +185,11 @@ List<({String id, String name})> candidatesForKind(
     // is choosing by hand. The sweep gets it in [sweepOrder].
     _ => [
       for (final s in all)
-        if (!s.id.startsWith('mihon:') && !s.id.startsWith('lnr:')) s,
+        if (!s.id.startsWith('mihon:') &&
+            !s.id.startsWith('lnr:') &&
+            _safeSourceType(s.id) != ProviderType.manga &&
+            _safeSourceType(s.id) != ProviderType.novel)
+          s,
     ],
   };
 }
@@ -283,6 +301,20 @@ List<({String id, String name})> orderedCandidates(ZKind kind) {
 List<({String id, String name})> sweepList(ZKind kind) =>
     sweepCandidates(kind).take(sl<SourceOrderPrefs>().cap(kind)).toList();
 
+/// Excludes known anime-only providers from automatic live-action searches.
+/// Mixed and unclassified providers remain eligible; manual picks stay whole.
+List<({String id, String name})> automaticKindPool(
+  List<({String id, String name})> pool,
+  ZKind kind, {
+  required Set<String> anime,
+  required Set<String> movies,
+}) {
+  if (kind != ZKind.movie && kind != ZKind.tv) return pool;
+  return pool
+      .where((s) => !anime.contains(s.id) || movies.contains(s.id))
+      .toList();
+}
+
 /// [sweepList] without the cap: every source the sweep is willing to walk, in
 /// the order it would walk them.
 ///
@@ -292,8 +324,25 @@ List<({String id, String name})> sweepList(ZKind kind) =>
 /// whose runtime was never loaded — so the screen could put a source in its
 /// top ten that the sweep would never attempt, under a heading claiming it was
 /// used automatically. One function, one answer.
+/// Shares content eligibility between detail matching and playback fallbacks.
+List<({String id, String name})> automaticCandidates(ZKind kind) {
+  var eligible = orderedCandidates(kind);
+  try {
+    final buckets = categorizedSources();
+    eligible = automaticKindPool(
+      eligible,
+      kind,
+      anime: {for (final source in buckets.anime) source.id},
+      movies: {for (final source in buckets.movies) source.id},
+    );
+  } catch (_) {
+    // Registries may be unavailable during early boot; retain unknown sources.
+  }
+  return eligible;
+}
+
 List<({String id, String name})> sweepCandidates(ZKind kind) {
-  final narrowed = languageNarrowedCandidates(orderedCandidates(kind), {
+  final narrowed = languageNarrowedCandidates(automaticCandidates(kind), {
     for (final s in sl<SourceRepository>().loadedSources) s.id,
   });
   // Rank first, then put the sources the user placed by hand back on top.

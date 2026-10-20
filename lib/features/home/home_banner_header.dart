@@ -12,10 +12,12 @@ class HomeBannerHeader extends StatelessWidget {
     required this.hasHero,
     required this.bannerBuilder,
     required this.headerBuilder,
+    this.headerAboveBanner = false,
   });
 
   final ValueListenable<String> bannerStyle;
   final bool hasHero;
+  final bool headerAboveBanner;
   final Widget Function(String bannerId) bannerBuilder;
   final Widget Function(bool edgeBanner) headerBuilder;
 
@@ -26,6 +28,9 @@ class HomeBannerHeader extends StatelessWidget {
       final header = headerBuilder(bannerId == BannerStyle.edgeId);
       if (!hasHero) {
         return ColoredBox(color: AppColors.bg, child: header);
+      }
+      if (headerAboveBanner) {
+        return Column(children: [header, bannerBuilder(bannerId)]);
       }
       return Stack(
         children: [

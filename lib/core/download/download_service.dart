@@ -59,7 +59,9 @@ class DownloadService {
 
   /// Directory where the background isolate drops completion markers.
   static Future<Directory> resultsDir() async {
-    final docs = await getApplicationDocumentsDirectory();
+    final docs = Platform.isWindows
+        ? await getApplicationSupportDirectory()
+        : await getApplicationDocumentsDirectory();
     return Directory('${docs.path}/$sharedDir/$resultsDirName');
   }
 
@@ -98,7 +100,10 @@ void downloadServiceOnStart(ServiceInstance service) async {
 
   Future<void> setNotif(String title, String content) async {
     if (service is AndroidServiceInstance) {
-      await service.setForegroundNotificationInfo(title: title, content: content);
+      await service.setForegroundNotificationInfo(
+        title: title,
+        content: content,
+      );
     }
   }
 
@@ -123,7 +128,8 @@ void downloadServiceOnStart(ServiceInstance service) async {
       final quality = job['quality'] as String? ?? 'best';
       final label = job['label'] as String? ?? 'Episode';
       final showTitle = job['showTitle'] as String? ?? '';
-      final sharedSubDir = job['sharedSubDir'] as String? ?? DownloadService.sharedDir;
+      final sharedSubDir =
+          job['sharedSubDir'] as String? ?? DownloadService.sharedDir;
       final connections = job['connections'] as int?;
 
       await setNotif('Downloading $showTitle', '$label · 0%');
@@ -326,7 +332,9 @@ Future<void> _writeResult(
   String? sharedSubDir,
 }) async {
   try {
-    final docs = await getApplicationDocumentsDirectory();
+    final docs = Platform.isWindows
+        ? await getApplicationSupportDirectory()
+        : await getApplicationDocumentsDirectory();
     final dir = Directory(
       '${docs.path}/${DownloadService.sharedDir}/${DownloadService.resultsDirName}',
     );

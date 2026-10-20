@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'library_repair.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
 import 'package:watch_app/core/hive/hive_key.dart';
 import 'dart:convert';
@@ -275,6 +276,8 @@ class MyListStore {
     if (!Hive.isBoxOpen(syncMetaBox)) {
       await openBoxSafely(syncMetaBox);
     }
+    await openBoxSafely<Map>('my_list_link_repairs');
+    await repairLibraryBox(Hive.box<Map>(boxName));
     // An unreadable list box reopens EMPTY, but the pull throttle lives in
     // [syncMetaBox] and survives — so the next launch would see a fresh
     // timestamp, skip the pull, and leave the list empty until the next stale pull
@@ -293,10 +296,8 @@ class MyListStore {
 
   Box<Map> get _box => Hive.box<Map>(boxName);
 
-  String _key(MediaItem m, [String? profileId]) => profileScopedKey(
-    profileId ?? _profileId,
-    hiveKey('${m.sourceId}::${m.id}'),
-  );
+  String _key(MediaItem m, [String? profileId]) =>
+      profileScopedKey(profileId ?? _profileId, libraryStorageKey(m));
 
   bool contains(MediaItem m) => _box.containsKey(_key(m));
 
@@ -442,7 +443,55 @@ class MyListStore {
     await toggle(m);
   }
 
+  /// Repairs a saved link within its viewer profile, retaining original data
+  /// and progress before replacing the row or attempting cloud writes.
+  Future<MediaItem> repairLink(MediaItem before, MediaItem replacement) async {
+    final profileId = _profileId;
+    final oldKey = _key(before, profileId);
+    final fixed = repairedLibraryItem(
+      replacement.copyWith(
+        savedAtMs: before.savedAtMs,
+        savedFrom: replacement.savedFrom,
+      ),
+    );
+    if (!_box.containsKey(oldKey)) return fixed;
+    final backup = await openBoxSafely<Map>('my_list_repair_backup');
+    if (!backup.containsKey(oldKey))
+      await backup.put(oldKey, _box.get(oldKey)!);
+    await preserveRepairedLinkState(before, fixed, profileId: profileId);
+    final links = await openBoxSafely<Map>('my_list_link_repairs');
+    final newKey = _key(fixed, profileId);
+    await _box.put(newKey, fixed.toJson());
+    await links.put(
+      hiveKey('${before.sourceId}::${before.id}'),
+      fixed.toJson(),
+    );
+    if (oldKey != newKey) await _box.delete(oldKey);
+    revision.value++;
+    _markPending(newKey, profileId);
+    final uid = _currentUserId();
+    if (uid != null) {
+      try {
+        await _remote.upsert(_cloudRow(uid, fixed, profileId));
+        _clearPending(newKey, profileId);
+        if (before.sourceId != fixed.sourceId || before.id != fixed.id) {
+          await _remote.deleteRow(
+            uid,
+            before.sourceId,
+            before.id,
+            profileId: _remoteProfileId(profileId),
+          );
+        }
+      } catch (_) {
+        // Preserve the repaired row and retry its cloud write on reconnection.
+        _markPending(newKey, profileId);
+      }
+    }
+    return fixed;
+  }
+
   Future<void> toggle(MediaItem m) async {
+    m = repairedLibraryItem(m);
     final profileId = _profileId;
     final k = _key(m, profileId);
     final adding = !_box.containsKey(k);
@@ -658,6 +707,7 @@ class MyListStore {
     final profileId = forProfileId ?? _profileId;
     final remoteProfileId = _remoteProfileId(profileId);
     try {
+      await _retryLegacyRepairs(uid, profileId);
       final meta = Hive.box(syncMetaBox);
       final cursorKey = _cursorKey(uid, profileId);
       final cursor = meta.get(cursorKey) as int?;
@@ -741,7 +791,7 @@ class MyListStore {
     final pendingDeletes = pendingDeleteKeys(profileId);
     final cloudKeys = <String>{};
     for (final row in rows.values) {
-      cloudKeys.add(_keyFromIds(row['source_id'], row['item_id'], profileId));
+      cloudKeys.add(profileScopedKey(profileId, libraryCloudKey(row)));
       await _applyCloudRow(row, profileId, pendingDeletes);
     }
     if (!_seededFor(uid, profileId)) return;
@@ -769,7 +819,10 @@ class MyListStore {
       final sourceId = '${row?['source_id'] ?? change['source_id']}';
       final itemId = '${row?['item_id'] ?? change['item_id']}';
       if (change['deleted'] == true) {
-        final key = _keyFromIds(sourceId, itemId, profileId);
+        // A repair publishes a new identity before deleting the old one.
+        // Its old tombstone must delete only the old key, never follow the
+        // saved alias and erase the newly published replacement.
+        final key = profileScopedKey(profileId, hiveKey('$sourceId::$itemId'));
         if (!pendingAdds.contains(key)) {
           await _box.delete(key);
           _onStatusPulled?.call(key, null);
@@ -825,9 +878,45 @@ class MyListStore {
       anilistId: ids.anilistId,
       tmdbId: ids.tmdbId,
     );
+    item = repairedLibraryItem(item);
     final key = _key(item, profileId);
+    final localRaw = _box.get(key);
+    final local = localRaw == null ? null : _itemFromHive(localRaw);
+    if (local != null) {
+      item = item.copyWith(
+        savedFrom: item.savedFrom ?? local.savedFrom,
+        savedAtMs: item.savedAtMs ?? local.savedAtMs,
+      );
+    }
     await _box.put(key, item.toJson());
     _clearPending(key, profileId);
+    if (item.sourceId != sourceId || item.id != itemId) {
+      // Incremental sync can contain an old identity. Publish its replacement
+      // before deleting the old cloud row, retaining a profile-scoped backup.
+      final uid = _currentUserId();
+      if (uid != null) {
+        try {
+          final backup = await openBoxSafely<Map>(
+            'my_list_cloud_repair_backup',
+          );
+          final backupKey = '$uid::$profileId::$sourceId::$itemId';
+          if (!backup.containsKey(backupKey)) await backup.put(backupKey, row);
+          final replacement = _cloudRow(uid, item, profileId);
+          replacement['status'] ??= row['status'];
+          replacement['added_at'] = row['added_at'] ?? replacement['added_at'];
+          await _remote.upsert(replacement);
+          await _remote.deleteRow(
+            uid,
+            sourceId,
+            itemId,
+            profileId: _remoteProfileId(profileId),
+          );
+          await Hive.box(syncMetaBox).put('mylist_repair_done:$backupKey', true);
+        } catch (_) {
+          _markPending(key, profileId);
+        }
+      }
+    }
     final cloudStatus = row['status'] as String?;
     if (cloudStatus != null) {
       _onStatusPulled?.call(key, cloudStatus);
@@ -863,7 +952,38 @@ class MyListStore {
   }
 
   String _keyFromIds(Object? sourceId, Object? itemId, String profileId) =>
-      profileScopedKey(profileId, hiveKey('$sourceId::$itemId'));
+      profileScopedKey(profileId, repairedLibraryKey('$sourceId', '$itemId'));
+
+  /// Retry unfinished identity rewrites independently of the server cursor:
+  /// the original row may have no new version after a failed replacement.
+  Future<void> _retryLegacyRepairs(String uid, String profileId) async {
+    if (!Hive.isBoxOpen('my_list_cloud_repair_backup')) return;
+    final backup = Hive.box<Map>('my_list_cloud_repair_backup');
+    final meta = Hive.box(syncMetaBox);
+    for (final rawKey in backup.keys.toList()) {
+      final backupKey = '$rawKey';
+      if (!backupKey.startsWith('$uid::$profileId::') ||
+          meta.get('mylist_repair_done:$backupKey') == true) continue;
+      final row = backup.get(rawKey);
+      if (row == null) continue;
+      final key = profileScopedKey(profileId, libraryCloudKey(row));
+      final local = _box.get(key);
+      final item = local == null ? null : _itemFromHive(local);
+      if (item == null) continue;
+      try {
+        final replacement = _cloudRow(uid, item, profileId);
+        replacement['status'] ??= row['status'];
+        replacement['added_at'] = row['added_at'] ?? replacement['added_at'];
+        await _remote.upsert(replacement);
+        await _remote.deleteRow(uid, '${row['source_id']}', '${row['item_id']}',
+          profileId: _remoteProfileId(profileId));
+        _clearPending(key, profileId);
+        await meta.put('mylist_repair_done:$backupKey', true);
+      } catch (_) {
+        // A later pull retries; originals remain stored locally and remotely.
+      }
+    }
+  }
 
   Future<void> _pushStatusForProfile(MediaItem item, String profileId) async {
     final uid = _currentUserId();

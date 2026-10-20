@@ -1,3 +1,5 @@
+import 'dart:io' show Platform;
+
 import 'package:flutter/services.dart';
 
 /// One progress event for a torrent DOWNLOAD (offline save), distinct from the
@@ -37,10 +39,12 @@ class TorrentDownloadProgress {
 /// Dart client for the native torrent DOWNLOAD engine (offline save). Separate
 /// from [TorrentService] (streaming) — different channels, different engine.
 class TorrentDownloadService {
-  static const MethodChannel _method =
-      MethodChannel('com.spyou.watch_app/torrent_download');
-  static const EventChannel _events =
-      EventChannel('com.spyou.watch_app/torrent_download/events');
+  static const MethodChannel _method = MethodChannel(
+    'com.spyou.watch_app/torrent_download',
+  );
+  static const EventChannel _events = EventChannel(
+    'com.spyou.watch_app/torrent_download/events',
+  );
 
   /// Start (or queue) an offline download of [uri] (magnet/.torrent) under [id].
   /// [saveTreeUri] is the user's chosen SAF folder (null = app storage). Throws
@@ -50,19 +54,24 @@ class TorrentDownloadService {
     String uri, {
     String? saveTreeUri,
     required bool allowMobileData,
-  }) =>
-      _method.invokeMethod('enqueue', {
-        'id': id,
-        'uri': uri,
-        'saveTreeUri': saveTreeUri,
-        'allowMobileData': allowMobileData,
-      });
+  }) => _method.invokeMethod('enqueue', {
+    'id': id,
+    'uri': uri,
+    'saveTreeUri': saveTreeUri,
+    'allowMobileData': allowMobileData,
+  });
 
   Future<void> pause(String id) => _method.invokeMethod('pause', {'id': id});
   Future<void> resume(String id) => _method.invokeMethod('resume', {'id': id});
   Future<void> cancel(String id) => _method.invokeMethod('cancel', {'id': id});
 
-  Stream<TorrentDownloadProgress> events() => _events
-      .receiveBroadcastStream()
-      .map((x) => TorrentDownloadProgress.fromMap(x as Map));
+  Stream<TorrentDownloadProgress> events() {
+    // The Windows runner has no Android torrent-download channel.
+    if (Platform.isWindows) {
+      return const Stream<TorrentDownloadProgress>.empty();
+    }
+    return _events.receiveBroadcastStream().map(
+      (x) => TorrentDownloadProgress.fromMap(x as Map),
+    );
+  }
 }

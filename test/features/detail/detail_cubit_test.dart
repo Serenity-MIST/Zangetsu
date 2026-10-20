@@ -14,10 +14,12 @@ import 'dart:async';
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:watch_app/core/di/injector.dart';
+import 'package:watch_app/core/lnreader/novel_cloudflare.dart';
 import 'package:watch_app/core/metadata/episode_metadata_service.dart';
 import 'package:watch_app/core/metadata/metadata_enrichment.dart';
 import 'package:watch_app/core/models/episode.dart';
 import 'package:watch_app/core/models/media_detail.dart';
+import 'package:watch_app/core/models/media_item.dart';
 import 'package:watch_app/core/models/media_extras.dart';
 import 'package:watch_app/core/models/provider_info.dart';
 import 'package:watch_app/core/playback/title_prefs.dart';
@@ -250,6 +252,36 @@ void main() {
     await Future<void>.delayed(const Duration(milliseconds: 20));
     return cubit;
   }
+
+  test('incomplete source detail keeps the clicked card identity on load and refresh', () async {
+    const seed = MediaItem(
+      id: 'manga-id', title: 'Known Manga', url: '/manga-id',
+      type: ProviderType.manga, sourceId: 'mihon:1', cover: 'https://covers.example/one.jpg',
+      coverHeaders: {'Referer': 'https://source.example'},
+    );
+    final repo = _SwappingRepository(
+      MediaDetail(id: '', title: '', url: '', sourceId: '', type: ProviderType.manga, episodes: [_ep('c1')]),
+      const MediaDetail(id: 'fresh-id', title: 'Fresh title', url: '/fresh',
+          sourceId: 'mihon:1', type: ProviderType.manga, cover: 'https://other.example/cover.jpg'),
+    );
+    final cubit = DetailCubit(repo: repo, url: seed.url, prefs: _FakeTitlePrefs(), seedItem: seed);
+    // An unrelated novel's suppressed challenge must not block manga detail.
+    NovelCloudflare.needsSolve('https://novel.example/chapter');
+    await cubit.load();
+    expect(cubit.state.status, DetailStatus.success);
+    expect(cubit.state.detail!.title, seed.title);
+    expect(cubit.state.detail!.url, seed.url);
+    expect(cubit.state.detail!.cover, seed.cover);
+    expect(cubit.state.detail!.coverHeaders, seed.coverHeaders);
+    expect(cubit.state.detail!.episodes.single.id, 'c1');
+    await cubit.refresh();
+    expect(cubit.state.detail!.title, 'Fresh title');
+    expect(cubit.state.detail!.url, '/fresh');
+    expect(cubit.state.detail!.cover, 'https://other.example/cover.jpg');
+    // Never copy another host's authentication headers onto fresh artwork.
+    expect(cubit.state.detail!.coverHeaders, isNull);
+    await cubit.close();
+  });
 
   group('Cast and Relations do not queue behind the episode list', () {
     // They run off malId/tmdbId/title, all of which arrive with the catalogue

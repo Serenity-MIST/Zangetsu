@@ -73,8 +73,37 @@ class MatchStore {
 
   String _key(ZCanonical c, String sourceId) => '${c.key}@$sourceId';
 
-  SourceMatch? get(ZCanonical c, String sourceId) =>
-      SourceMatch.fromMap(_box.get(_key(c, sourceId)));
+  SourceMatch? get(ZCanonical c, String sourceId) {
+    var m = SourceMatch.fromMap(_box.get(_key(c, sourceId)));
+    if (m == null &&
+        (sourceId.startsWith('ani:') || sourceId.startsWith('mihon:'))) {
+      m = SourceMatch.fromMap(
+        _box.get(_key(c, sourceId.substring(sourceId.indexOf(':') + 1))),
+      );
+    }
+    if (m == null) return null;
+    // The key owns the provider: old extension results sometimes stored only
+    // the Android numeric id in their payload.
+    return SourceMatch(
+      sourceId: sourceId,
+      showUrl: m.showUrl,
+      showId: m.showId,
+      showTitle: m.showTitle,
+      pinned: m.pinned,
+    );
+  }
+
+  /// Restores legacy extension ID namespaces while retaining match/pin data.
+  SourceMatch? _repairMatch(ZCanonical c, SourceMatch? m) {
+    if (m == null || !RegExp(r'^-?\d+$').hasMatch(m.sourceId)) return m;
+    return SourceMatch(
+      sourceId: '${c.kind == ZKind.manga ? 'mihon' : 'ani'}:${m.sourceId}',
+      showUrl: m.showUrl,
+      showId: m.showId,
+      showTitle: m.showTitle,
+      pinned: m.pinned,
+    );
+  }
 
   /// A guess for [m.sourceId]. Does nothing if that source is already pinned
   /// for this title.
@@ -115,7 +144,7 @@ class MatchStore {
     for (final k in _box.keys.toList()) {
       if (k is! String || !k.startsWith(prefix)) continue;
       if (except != null && k == _key(c, except)) continue;
-      final m = SourceMatch.fromMap(_box.get(k));
+      final m = _repairMatch(c, SourceMatch.fromMap(_box.get(k)));
       if (m == null || !m.pinned) continue;
       await _box.put(k, {...m.toMap(), 'pinned': false});
     }
@@ -132,7 +161,7 @@ class MatchStore {
     final prefix = '${c.key}@';
     for (final k in _box.keys) {
       if (k is! String || !k.startsWith(prefix)) continue;
-      final m = SourceMatch.fromMap(_box.get(k));
+      final m = _repairMatch(c, SourceMatch.fromMap(_box.get(k)));
       if (m != null && m.pinned) return m;
     }
     return null;
@@ -156,7 +185,7 @@ class MatchStore {
     SourceMatch? any;
     for (final k in _box.keys) {
       if (k is! String || !k.startsWith(prefix)) continue;
-      final m = SourceMatch.fromMap(_box.get(k));
+      final m = _repairMatch(c, SourceMatch.fromMap(_box.get(k)));
       if (m == null) continue;
       if (m.pinned) return m;
       if (last != null && m.sourceId == last) played ??= m;

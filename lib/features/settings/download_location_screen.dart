@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:background_downloader/background_downloader.dart';
 import 'package:flutter/material.dart';
 
@@ -50,6 +51,9 @@ class _DownloadLocationScreenState extends State<DownloadLocationScreen> {
   }
 
   Future<void> _loadVolumes() async {
+    // Only Android exposes its storage-volume API. Windows uses the native
+    // directory picker and must not initialize download services to list it.
+    if (!Platform.isAndroid) return;
     final v = await sl<DownloadManager>().listDownloadVolumes();
     if (mounted) setState(() => _volumes = v);
   }
@@ -85,7 +89,9 @@ class _DownloadLocationScreenState extends State<DownloadLocationScreen> {
                         downloadDestinationLabel(
                           keepPrivate: prefs.keepPrivate,
                           locationLabel: prefs.locationLabel,
-                          publicFallback: context.l10n.downloadsZangetsu,
+                          publicFallback: Platform.isWindows
+                              ? 'Choose a folder before your first download'
+                              : context.l10n.downloadsZangetsu,
                         ),
                         style: AppText.body,
                       ),
@@ -109,12 +115,16 @@ class _DownloadLocationScreenState extends State<DownloadLocationScreen> {
                         ? Icons.sd_storage_rounded
                         : Icons.smartphone_rounded,
                     title: v.label,
-                    subtitle:
-                        v.removable ? context.l10n.removableDrive : context.l10n.onThisDevice,
+                    subtitle: v.removable
+                        ? context.l10n.removableDrive
+                        : context.l10n.onThisDevice,
                     iconAccent: current == v.path,
                     trailing: current == v.path
-                        ? Icon(Icons.check_rounded,
-                            color: AppColors.accent, size: 20)
+                        ? Icon(
+                            Icons.check_rounded,
+                            color: AppColors.accent,
+                            size: 20,
+                          )
                         : null,
                     onTap: () async {
                       await sl<DownloadPrefs>().setLocation(v.path, v.label);
@@ -131,6 +141,11 @@ class _DownloadLocationScreenState extends State<DownloadLocationScreen> {
                   icon: Icons.folder_open_outlined,
                   title: context.l10n.chooseFolder,
                   onTap: () async {
+                    if (Platform.isWindows) {
+                      await prefs.chooseDesktopFolder();
+                      if (mounted) setState(() {});
+                      return;
+                    }
                     final uri = await FileDownloader().uri.pickDirectory(
                       persistedUriPermission: true,
                     );
@@ -156,30 +171,32 @@ class _DownloadLocationScreenState extends State<DownloadLocationScreen> {
           // Its own section label, like every other group on this screen: without
           // one the toggle card butts straight against the folder card above and
           // reads as part of it. This is the gap that separates them.
-          SettingsSectionLabel(context.l10n.privacy),
-          SettingsCard(
-            children: [
-              SettingsTile(
-                icon: Icons.lock_outline_rounded,
-                title: context.l10n.keepDownloadsPrivate,
-                subtitle: context.l10n.keepDownloadsPrivateSubtitle,
-                subtitleMaxLines: null,
-                onTap: () async {
-                  await prefs.setKeepPrivate(!prefs.keepPrivate);
-                  if (mounted) setState(() {});
-                },
-                trailing: Switch.adaptive(
-                  value: prefs.keepPrivate,
-                  activeThumbColor: AppColors.accent,
-                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  onChanged: (v) async {
-                    await prefs.setKeepPrivate(v);
+          if (!Platform.isWindows) ...[
+            SettingsSectionLabel(context.l10n.privacy),
+            SettingsCard(
+              children: [
+                SettingsTile(
+                  icon: Icons.lock_outline_rounded,
+                  title: context.l10n.keepDownloadsPrivate,
+                  subtitle: context.l10n.keepDownloadsPrivateSubtitle,
+                  subtitleMaxLines: null,
+                  onTap: () async {
+                    await prefs.setKeepPrivate(!prefs.keepPrivate);
                     if (mounted) setState(() {});
                   },
+                  trailing: Switch.adaptive(
+                    value: prefs.keepPrivate,
+                    activeThumbColor: AppColors.accent,
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    onChanged: (v) async {
+                      await prefs.setKeepPrivate(v);
+                      if (mounted) setState(() {});
+                    },
+                  ),
                 ),
-              ),
-            ],
-          ),
+              ],
+            ),
+          ],
           Padding(
             padding: const EdgeInsets.fromLTRB(24, 8, 24, 0),
             child: Text(

@@ -1,3 +1,4 @@
+import 'subtitle_selection.dart';
 import 'dart:io';
 
 import 'package:dio/dio.dart';
@@ -47,7 +48,10 @@ class HlsDownloader {
     int? connections,
   }) async {
     // Segment-fetch parallelism for THIS download (clamped); defaults to 4.
-    final concurrency = (connections ?? _concurrency).clamp(1, _concurrency * 4);
+    final concurrency = (connections ?? _concurrency).clamp(
+      1,
+      _concurrency * 4,
+    );
     // 1. Resolve a master playlist down to a media (segment) playlist.
     final media = await _resolveMediaPlaylist(url, headers, preferredQuality);
     if (media == null) return 'playlist unreachable';
@@ -179,12 +183,22 @@ class HlsDownloader {
     String masterUrl,
     Map<String, String> headers, {
     bool Function()? canceled,
+    String? preferredLanguage,
   }) async {
     final out = <({String lang, String label, bool isDefault, String vtt})>[];
     try {
       final master = await _fetchText(masterUrl, headers);
       if (master == null) return out;
-      for (final track in parseHlsSubtitles(master, masterUrl)) {
+      final tracks = parseHlsSubtitles(master, masterUrl);
+      final selected = preferredLanguage == null
+          ? tracks
+          : downloadSubtitleSelection(
+              tracks,
+              preferredLanguage,
+              language: (track) => track.lang,
+              label: (track) => track.label,
+            );
+      for (final track in selected) {
         if (canceled?.call() ?? false) return out;
         final vtt = await _mergeRendition(track.url, headers, canceled);
         if (vtt == null) continue;
@@ -245,10 +259,7 @@ class HlsDownloader {
       if (line.isEmpty) continue;
       if (line.startsWith('#EXTINF:')) {
         pending =
-            double.tryParse(
-              line.substring(8).split(',').first.trim(),
-            ) ??
-            0.0;
+            double.tryParse(line.substring(8).split(',').first.trim()) ?? 0.0;
         continue;
       }
       if (line.startsWith('#')) continue;
@@ -283,7 +294,11 @@ class HlsDownloader {
     HlsVariant best = variants.first;
     var bestDelta = 1 << 30;
     for (final v in variants) {
-      final h = int.tryParse(RegExp(r'(\d{3,4})').firstMatch(v.quality)?.group(1) ?? '') ?? 0;
+      final h =
+          int.tryParse(
+            RegExp(r'(\d{3,4})').firstMatch(v.quality)?.group(1) ?? '',
+          ) ??
+          0;
       final d = (h - want).abs();
       if (d < bestDelta) {
         bestDelta = d;
@@ -301,7 +316,8 @@ class HlsDownloader {
       if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
         pl.mediaSequence = int.tryParse(line.split(':').last.trim()) ?? 0;
       } else if (line.startsWith('#EXT-X-KEY:')) {
-        final method = RegExp(r'METHOD=([^,]+)').firstMatch(line)?.group(1) ?? 'NONE';
+        final method =
+            RegExp(r'METHOD=([^,]+)').firstMatch(line)?.group(1) ?? 'NONE';
         if (method.toUpperCase().contains('AES')) {
           final uri = RegExp(r'URI="([^"]+)"').firstMatch(line)?.group(1);
           if (uri != null) pl.keyUrl = _resolveRef(uri, mediaUrl);
@@ -354,7 +370,10 @@ class HlsDownloader {
   ///
   /// A 4xx is not retried: the segment is gone or forbidden, and asking three
   /// times only makes the failure slower.
-  Future<Uint8List?> _fetchBytes(String url, Map<String, String> headers) async {
+  Future<Uint8List?> _fetchBytes(
+    String url,
+    Map<String, String> headers,
+  ) async {
     for (var attempt = 1; attempt <= _segmentAttempts; attempt++) {
       try {
         final r = await _dio.getUri<List<int>>(
@@ -399,9 +418,8 @@ class _MediaPlaylist {
 
 /// [hlsAesCbcDecrypt] shaped for [compute] — one argument, top-level, so it can
 /// cross an isolate boundary.
-Uint8List _decryptSegment(
-  ({Uint8List data, Uint8List key, Uint8List iv}) m,
-) => hlsAesCbcDecrypt(m.data, m.key, m.iv);
+Uint8List _decryptSegment(({Uint8List data, Uint8List key, Uint8List iv}) m) =>
+    hlsAesCbcDecrypt(m.data, m.key, m.iv);
 
 // ── Crypto helpers (top-level so they're unit-testable) ──────────────────────
 
@@ -672,9 +690,10 @@ MpegTsInspect mpegTsInspect(Uint8List data) {
     final pts = _mpegTsPts(bytes, payload + 9) / 90000.0;
     if (ptsSamples.length < 8) ptsSamples.add(pts);
     final streamId = bytes[payload + 3];
-    final isVideo = (streamId >= 0xE0 && streamId <= 0xEF) ||
-        videoPids.contains(pid);
-    final isAudio = (streamId >= 0xC0 && streamId <= 0xDF) ||
+    final isVideo =
+        (streamId >= 0xE0 && streamId <= 0xEF) || videoPids.contains(pid);
+    final isAudio =
+        (streamId >= 0xC0 && streamId <= 0xDF) ||
         streamId == 0xBD ||
         audioPids.contains(pid);
     if (isVideo) videoPts ??= pts;
@@ -692,7 +711,8 @@ MpegTsInspect mpegTsInspect(Uint8List data) {
 
 double? _mpegTsPcr(Uint8List b, int i) {
   if (i + 6 > b.length) return null;
-  final base = (b[i] << 25) |
+  final base =
+      (b[i] << 25) |
       (b[i + 1] << 17) |
       (b[i + 2] << 9) |
       (b[i + 3] << 1) |
@@ -765,9 +785,7 @@ int? _tsPacketSize(Uint8List bytes) {
   if (bytes.length >= 188 && bytes[0] == 0x47) return 188;
   final limit = bytes.length < 4096 ? bytes.length : 4096;
   for (var i = 0; i + 564 < limit; i++) {
-    if (bytes[i] == 0x47 &&
-        bytes[i + 188] == 0x47 &&
-        bytes[i + 376] == 0x47) {
+    if (bytes[i] == 0x47 && bytes[i + 188] == 0x47 && bytes[i + 376] == 0x47) {
       return 188;
     }
   }
@@ -908,10 +926,7 @@ String hlsPlaylistTagSummary(String playlist, {int max = 40}) {
   final tags = playlist
       .split('\n')
       .map((l) => l.trim())
-      .where(
-        (l) =>
-            l.startsWith('#') && !l.toUpperCase().startsWith('#EXTINF'),
-      )
+      .where((l) => l.startsWith('#') && !l.toUpperCase().startsWith('#EXTINF'))
       .take(max);
   return tags.join(' | ');
 }
@@ -973,7 +988,10 @@ double? hlsLeadingExtinfSkew(
     return s;
   }
 
-  double? uniqueLead({required List<double> hay, required List<double> needle}) {
+  double? uniqueLead({
+    required List<double> hay,
+    required List<double> needle,
+  }) {
     final n = needle.length;
     if (n < 8 || hay.length < n) return null;
     double? found;

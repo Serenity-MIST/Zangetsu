@@ -28,6 +28,9 @@ environment:
 # the latest version available on pub.dev. To see which dependencies have newer
 # versions available, run `flutter pub outdated`.
 dependencies:
+  cs3_engine:
+    path: packages/cs3_engine
+  path: ^1.9.1
   flutter:
     sdk: flutter
   flutter_localizations:
@@ -51,6 +54,10 @@ dependencies:
   # Local storage
   hive: ^2.2.3
   hive_flutter: ^1.1.0
+  path_provider_windows: ^2.3.0
+  shared_preferences_windows: ^2.4.1
+  shared_preferences_platform_interface: ^2.4.2
+  path_provider_platform_interface: ^2.1.2
   path_provider: ^2.1.5
   # Apple TV (tvOS) federated plugin implementations. path_provider does not
   # degrade gracefully (Hive.initFlutter fails hard without it).
@@ -87,6 +94,7 @@ dependencies:
   media_kit_libs_video: ^1.0.5
 
   file_picker: ^12.1.2
+  flutter_inappwebview: ^6.1.5
 
   # Image caching
   cached_network_image: ^3.4.1
@@ -169,6 +177,8 @@ dependencies:
   fluttertoast: ^10.0.0
   dynamic_color: ^2.1.0
 dev_dependencies:
+  # The settings inventory parses controls and callback wiring from Dart ASTs.
+  analyzer: ^10.0.1
   # Test-only: gives the EPUB tests a REAL XML parse, which catches what a
   # hand-rolled tag-balance check cannot (an unescaped '&', a bad attribute)
   # — exactly what a strict e-reader rejects the whole file over.
@@ -189,6 +199,10 @@ dev_dependencies:
 # monorepo, so every package points at its subdir path. Pinned to AnymeX's
 # proven commit. To revert: delete this whole block and `flutter pub get`.
 dependency_overrides:
+  # Fix Windows environment disposal targeting the factory's channel instead
+  # of the created WebView2 environment; required for verification retries.
+  flutter_inappwebview_windows:
+    path: third_party/flutter_inappwebview_windows
   # screen_brightness 2.1.4+ jumped to Kotlin 2.3.21 / AGP 8.13.2, which the
   # project's Kotlin 2.2.20 toolchain can't compile (the plugin's class fails to
   # link → GeneratedPluginRegistrant "cannot find symbol"). 2.1.3 is the last

@@ -1,3 +1,5 @@
+import '../desktop/desktop_cloudflare.dart';
+import '../desktop/desktop_flaresolverr.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show Platform;
@@ -115,9 +117,11 @@ class _JsHost {
   /// the app instead of just its own screen.
   static const Duration maxProviderCallTimeout = Duration(seconds: 25);
 
-  _JsHost({required this.dio}) {
+  _JsHost({required this.dio, this.clearanceSolver}) {
     _engine = JsEngine(onChannel: _onChannel, polling: isAppleTv);
   }
+
+  final Future<Map<String, dynamic>?> Function(String)? clearanceSolver;
 
   /// Everything the runtime asks Dart for. Deliberately all still on THIS
   /// isolate even when the engine is on its own: fetch needs Dio, the native
@@ -156,6 +160,7 @@ class _JsHost {
   // clearance cookie + matching User-Agent per host. Android-only; on platforms
   // without the handler the invoke throws and we fall back to a plain request.
   static const MethodChannel _cf = MethodChannel('zangetsu/cloudstream');
+
   /// The novel path's OkHttp lane — see [_retryOverNative].
   static const MethodChannel _novelHttp = MethodChannel('zangetsu/novel_http');
   final Map<String, String> _cfCookie = {}; // host -> cf_clearance cookie(s)
@@ -212,6 +217,7 @@ class _JsHost {
       _passiveDepth--;
     }
   }
+
   final Map<String, _ProviderHealth> _health = {};
 
   ProviderHealthStatus healthFor(String sourceId) =>
@@ -243,9 +249,7 @@ class _JsHost {
   }
 
   void removeProvider(String sourceId) {
-    _engine.post(
-      'delete globalThis.__providers[${jsonEncode(sourceId)}];',
-    );
+    _engine.post('delete globalThis.__providers[${jsonEncode(sourceId)}];');
   }
 
   /// Pushes [settings] into the JS runtime as `__settings[sourceId]`.
@@ -284,22 +288,22 @@ class _JsHost {
     bool Function()? abandoned,
   }) async {
     try {
-        final v = await _scheduler
-            .enqueue<String>(
-              sourceId,
-              method,
-              () => _runCall(sourceId, method, args, timeout),
-              lane: _laneNow(),
-              abandoned: abandoned,
-            )
-            // One call owns the shared engine, so a call that overruns holds
-            // every other source hostage. `maxProviderFetchTimeoutMs` bounds a
-            // single fetch, but a call is several fetches chained inside the
-            // provider, so the total could still reach ~30s (measured: a
-            // `fuckingfast.net` download ran 30306ms and 82 calls queued behind
-            // it, each then burning the full queue wait). Bound the whole call
-            // so one slow site costs its own search and nothing else.
-            .timeout(maxProviderCallTimeout);
+      final v = await _scheduler
+          .enqueue<String>(
+            sourceId,
+            method,
+            () => _runCall(sourceId, method, args, timeout),
+            lane: _laneNow(),
+            abandoned: abandoned,
+          )
+          // One call owns the shared engine, so a call that overruns holds
+          // every other source hostage. `maxProviderFetchTimeoutMs` bounds a
+          // single fetch, but a call is several fetches chained inside the
+          // provider, so the total could still reach ~30s (measured: a
+          // `fuckingfast.net` download ran 30306ms and 82 calls queued behind
+          // it, each then burning the full queue wait). Bound the whole call
+          // so one slow site costs its own search and nothing else.
+          .timeout(maxProviderCallTimeout);
       _health.remove(sourceId);
       return v;
     } on ProviderCallAbandoned {
@@ -528,7 +532,41 @@ class _JsHost {
       // OWNER-DISABLED 2026-10-03 (see above): nothing is ever attached now.
       // final sentClearance = _cfCookie.containsKey(host);
       debugPrint('[fetch] $method $url${wantCf ? ' (cf)' : ''}');
+      if (Platform.isWindows) {
+        _ensureCfRestored();
+        _applyCf(host, hdr);
+      }
       var resp = await _request(url, method, hdr, body, follow, tMs);
+      if (Platform.isWindows && _looksLikeCfChallenge(resp) &&
+          DesktopFlareSolverr.hasVerifiedUrl(url) &&
+          const ['GET', 'POST'].contains(method.toUpperCase())) {
+        // A clearance can be valid in WebView2 while the site's protection
+        // rejects Dio's separate connection. Replay only a manually verified
+        // host in that same profile; never open a surprise verification tab.
+        try {
+          final replay = await DesktopFlareSolverr.requestVerified({
+            'url': url, 'cmd': method.toUpperCase() == 'POST' ? 'request.post' : 'request.get',
+            'headers': hdr, 'postData': body is String ? body : jsonEncode(body),
+          });
+          final solution = replay['solution'];
+          if (solution is Map && replay['status'] == 'ok') {
+            resp = Response<dynamic>(requestOptions: RequestOptions(path: url),
+              data: solution['response'], statusCode: (solution['status'] as num?)?.toInt(),
+              headers: Headers.fromMap({
+                for (final entry in (solution['headers'] as Map? ?? {}).entries)
+                  '${entry.key}': ['${entry.value}'],
+              }));
+          }
+        } catch (_) {
+          // Preserve the original failure so the existing Verify UI remains
+          // available; a browser failure must never be presented as content.
+        }
+      }
+      if (Platform.isWindows && _looksLikeCfChallenge(resp)) {
+        _cfCookie.remove(host);
+        _cfStore.forget(host);
+        CfSolveNeeded.needsSolve(host, url, sourceId: srcId);
+      }
       // OWNER-DISABLED 2026-10-03 (see above): no blocked-lane retry, no
       // challenge solve + replay, no needs-solve recording. The raw response
       // goes straight to the provider.
@@ -619,7 +657,10 @@ class _JsHost {
     bool follow,
     int tMs,
   ) {
-    final key = '$method\u0000$url\u0000${body ?? ''}';
+    // Requests with different cookies, languages, or redirect policies are
+    // distinct. Sharing them could undo a fresh verification or mix sources.
+    final key = jsonEncode([method, url, '${body ?? ''}', follow,
+      for (final name in headers.keys.toList()..sort()) [name, headers[name]]]);
     final running = _inFlightFetches[key];
     if (running != null) return running;
     final started = _requestUnshared(url, method, headers, body, follow, tMs);
@@ -628,9 +669,11 @@ class _JsHost {
     // whenComplete awaits a returned Future — an arrow would await the very
     // future being completed and never finish.
     unawaited(
-      started.whenComplete(() {
-        _inFlightFetches.remove(key);
-      }).then<void>((_) {}, onError: (Object _) {}),
+      started
+          .whenComplete(() {
+            _inFlightFetches.remove(key);
+          })
+          .then<void>((_) {}, onError: (Object _) {}),
     );
     return started;
   }
@@ -655,8 +698,9 @@ class _JsHost {
     // nothing about how long a source the viewer chose gets. It only stops
     // unbounded and 30s requests holding everyone else hostage. A request
     // asking for less still gets less.
-    final ms =
-        tMs > 0 && tMs < maxProviderFetchTimeoutMs ? tMs : maxProviderFetchTimeoutMs;
+    final ms = tMs > 0 && tMs < maxProviderFetchTimeoutMs
+        ? tMs
+        : maxProviderFetchTimeoutMs;
     return dio.requestUri<dynamic>(
       Uri.parse(url),
       data: body,
@@ -719,16 +763,23 @@ class _JsHost {
       // a challenge it cannot pass leaves this await hanging for good. Every
       // fetch waiting on it hangs with it, which is what turned one stubborn
       // host into a screen that span forever with nothing to act on.
-      final res = await _cf
-          .invokeMapMethod<String, dynamic>('solveCloudflare', {'url': url})
-          .timeout(solveTimeout);
+      final res = clearanceSolver != null
+          ? await clearanceSolver!(url)
+          : Platform.isWindows
+          ? await DesktopCloudflare.solve(url)
+          : await _cf
+                .invokeMapMethod<String, dynamic>('solveCloudflare', {
+                  'url': url,
+                })
+                .timeout(solveTimeout);
       final cookie = res?['cookie'] as String?;
       final ua = res?['userAgent'] as String?;
-      if (cookie != null && cookie.isNotEmpty) {
-        _cfCookie[host] = cookie;
+      final browserVerified = Platform.isWindows && res?['verified'] == true;
+      if ((cookie != null && cookie.isNotEmpty) || browserVerified) {
+        _cfCookie[host] = cookie ?? '';
         _cfFailedAt.remove(host); // solved → clear any negative-cache mark
         if (ua != null && ua.isNotEmpty) _cfUa[host] = ua;
-        _cfStore.remember(host, cookie, ua); // reuse across restarts
+        _cfStore.remember(host, cookie ?? '', ua, browserVerified: browserVerified);
         CfSolveNeeded.clear(host); // whatever needed the solve can retry now
         debugPrint('[cf] solved $host (ua=${(ua ?? '').split(')').first})');
       } else {
@@ -823,8 +874,7 @@ class _JsHost {
         statusCode: status,
         data: res['body'] as String? ?? '',
         headers: Headers.fromMap({
-          for (final e in rawHeaders.entries)
-            '${e.key}': ['${e.value}'],
+          for (final e in rawHeaders.entries) '${e.key}': ['${e.value}'],
         }),
       );
     } catch (_) {
@@ -1040,10 +1090,15 @@ class JsProvider implements BaseProvider, ReadingProvider {
   }) async {
     // 30s: some providers enrich detail with extra metadata round-trips
     // (e.g. TMDB episode names/stills) on top of the page fetch.
-    final raw = await _call('getDetail', [
-      url,
-      {'category': category},
-    ], timeout: const Duration(seconds: 30), abandoned: abandoned);
+    final raw = await _call(
+      'getDetail',
+      [
+        url,
+        {'category': category},
+      ],
+      timeout: const Duration(seconds: 30),
+      abandoned: abandoned,
+    );
     final map = jsonDecode(raw) as Map<String, dynamic>;
     // Sozo Read manga/novel detail payloads carry the chapter list under
     // `chapters`; Zangetsu's MediaDetail reads `episodes` (Task E4 compat
@@ -1188,7 +1243,10 @@ class ProviderManager implements ProviderRuntimeLoader {
   static Future<T> inBackground<T>(Future<T> Function() body) =>
       runZoned(body, zoneValues: {backgroundKey: true});
 
-  ProviderManager({required Dio dio}) : _host = _JsHost(dio: dio);
+  ProviderManager({
+    required Dio dio,
+    Future<Map<String, dynamic>?> Function(String)? clearanceSolver,
+  }) : _host = _JsHost(dio: dio, clearanceSolver: clearanceSolver);
 
   final _JsHost _host;
 
@@ -1276,7 +1334,7 @@ class AniyomiManager extends ChangeNotifier {
 
   /// Overridable checker (test seam). Defaults to the real service fetch.
   Future<List<AniyomiUpdate>> Function(String url, Map<String, int> codes)?
-      checkerOverride;
+  checkerOverride;
 
   DateTime? _lastUpdateCheck;
   static const Duration _updatesTtl = Duration(minutes: 30);

@@ -98,7 +98,10 @@ class SourceSelectCubit extends Cubit<SourceSelectState> {
       // so anything else here would name a source the viewer never gets — and
       // the row's per-source actions, Cloudflare solve included, act on this
       // id, so naming the wrong one points them at the wrong site.
-      final played = store.lastPlayed(canonical);
+      final played = canonical.kind == ZKind.manga
+          ? matcher.lastReadingSource(canonical.kind) ??
+                store.lastPlayed(canonical)
+          : store.lastPlayed(canonical);
       final order = [
         ...sources.where((s) => s.id == played),
         ...sources.where((s) => s.id != played),

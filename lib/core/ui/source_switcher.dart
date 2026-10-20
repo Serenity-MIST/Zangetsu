@@ -215,7 +215,9 @@ SourceBuckets categorizedSources() {
     );
     if (p.providerType == ProviderType.anime) {
       anime.add(csRow);
-    } else {
+    }
+    // A mixed CloudStream provider belongs in both streaming groups.
+    if (p.supportsMovies) {
       movies.add(csRow);
     }
   }

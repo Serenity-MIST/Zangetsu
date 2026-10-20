@@ -5,6 +5,7 @@ import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../l10n/l10n.dart';
 import '../../core/tracker/tracker.dart';
+import '../../core/tracker/mangabaka_service.dart';
 import '../../core/ui/app_dialog.dart';
 import '../../core/ui/settings_widgets.dart';
 
@@ -34,7 +35,10 @@ class _TrackerSettingsScreenState extends State<TrackerSettingsScreen> {
         content: Text(
           ok
               ? context.l10n.connectedAs(_t.viewerName ?? '')
-              : context.l10n.trackerConnectionCanceled(_t.displayName),
+              : (_t is MangaBakaService
+                        ? (_t as MangaBakaService).lastConnectionError
+                        : null) ??
+                    context.l10n.trackerConnectionCanceled(_t.displayName),
         ),
       ),
     );
@@ -72,8 +76,12 @@ class _TrackerSettingsScreenState extends State<TrackerSettingsScreen> {
                   children: [
                     SettingsTile(
                       icon: Icons.link_rounded,
-                      title: _busy ? context.l10n.connectingEllipsis : context.l10n.connectTracker(_t.displayName),
-                      subtitle: _busy ? null : context.l10n.signInToLinkYourAccount,
+                      title: _busy
+                          ? context.l10n.connectingEllipsis
+                          : context.l10n.connectTracker(_t.displayName),
+                      subtitle: _busy
+                          ? null
+                          : context.l10n.signInToLinkYourAccount,
                       onTap: _busy ? null : _connect,
                       trailing: _busy
                           ? const SizedBox(
@@ -91,7 +99,9 @@ class _TrackerSettingsScreenState extends State<TrackerSettingsScreen> {
                     SettingsTile(
                       icon: Icons.sync_rounded,
                       title: context.l10n.autoSync,
-                      subtitle: context.l10n.updateTrackerAsYouWatch(_t.displayName),
+                      subtitle: context.l10n.updateTrackerAsYouWatch(
+                        _t.displayName,
+                      ),
                       trailing: Switch.adaptive(
                         value: _t.autoSync,
                         activeThumbColor: AppColors.accent,
@@ -114,12 +124,25 @@ class _TrackerSettingsScreenState extends State<TrackerSettingsScreen> {
               Padding(
                 padding: const EdgeInsets.fromLTRB(24, 8, 24, 0),
                 child: Text(
-                  'When you start an anime it’s marked Watching, each '
-                  'episode you finish updates the count, and a status you set on '
-                  'a title is pushed to ${_t.displayName}. Anime only.',
+                  _t is MangaBakaService
+                      ? 'Sync your manga and novel library, reading progress and status with MangaBaka.'
+                      : 'When you start an anime it’s marked Watching, each '
+                            'episode you finish updates the count, and a status you set on '
+                            'a title is pushed to ${_t.displayName}. Anime only.',
                   style: AppText.caption,
                 ),
               ),
+              // Keep failures readable after the temporary snackbar disappears
+              // or the user returns from the browser to this settings screen.
+              if (_t is MangaBakaService &&
+                  (_t as MangaBakaService).lastConnectionError != null)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 16, 24, 0),
+                  child: Text(
+                    (_t as MangaBakaService).lastConnectionError!,
+                    style: AppText.body.copyWith(color: AppColors.accent),
+                  ),
+                ),
             ],
           );
         },
@@ -155,14 +178,18 @@ class _TrackerSettingsScreenState extends State<TrackerSettingsScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  connected ? (_t.viewerName ?? _t.displayName) : _t.displayName,
+                  connected
+                      ? (_t.viewerName ?? _t.displayName)
+                      : _t.displayName,
                   style: AppText.headline.copyWith(fontWeight: FontWeight.w600),
                 ),
                 const SizedBox(height: 2),
                 Text(
                   connected ? 'Connected' : 'Not connected',
                   style: AppText.caption.copyWith(
-                    color: connected ? AppColors.accent : AppColors.textTertiary,
+                    color: connected
+                        ? AppColors.accent
+                        : AppColors.textTertiary,
                   ),
                 ),
               ],

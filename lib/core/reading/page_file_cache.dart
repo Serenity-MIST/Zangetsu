@@ -147,8 +147,18 @@ class PageFileCache {
     if (bytes == null || bytes.isEmpty) return null;
 
     await file.writeAsBytes(bytes, flush: true);
-    unawaited(trim());
+    unawaited(_trimBestEffort());
     return file;
+  }
+
+  /// Cache cleanup may race storage removal or shutdown after returning a page.
+  /// Such filesystem failures must not escape a detached cleanup future.
+  Future<void> _trimBestEffort() async {
+    try {
+      await trim();
+    } on FileSystemException {
+      // A later cache write retries cleanup when the directory is available.
+    }
   }
 
   Future<Directory> _resolveDir() async {

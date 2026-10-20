@@ -17,9 +17,7 @@ void main() {
   setUp(() async {
     dir = await Directory.systemTemp.createTemp('browse_list');
     Hive.init(dir.path);
-    await registerPickerDeps(
-      aniyomi: [aniSource(id: 1, name: 'HiAnime')],
-    );
+    await registerPickerDeps(aniyomi: [aniSource(id: 1, name: 'HiAnime')]);
   });
 
   tearDown(() async {
@@ -31,11 +29,13 @@ void main() {
 
   testWidgets('lists installed sources and reports the one tapped', (t) async {
     String? tappedId;
-    await t.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: BrowseSourcesList(onBrowse: (id, _) => tappedId = id),
+    await t.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: BrowseSourcesList(onBrowse: (id, _) => tappedId = id),
+        ),
       ),
-    ));
+    );
     await t.pumpAndSettle();
 
     expect(find.textContaining('HiAnime'), findsOneWidget);
@@ -43,6 +43,33 @@ void main() {
     await t.tap(find.textContaining('HiAnime'));
     await t.pumpAndSettle();
     expect(tappedId, 'ani:1');
+  });
+
+  testWidgets('a mixed CloudStream source has one combined browse row', (
+    t,
+  ) async {
+    final manager = sl<CloudStreamManager>();
+    manager.rebuildFromForTest([
+      {
+        'name': 'Mixed',
+        'lang': 'en',
+        'types': ['Anime', 'Movie'],
+        'hasMainPage': true,
+      },
+    ]);
+    await t.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: BrowseSourcesList(
+            kind: SourceListKind.streaming,
+            onBrowse: (_, _) {},
+          ),
+        ),
+      ),
+    );
+    await t.pumpAndSettle();
+    // Capability classification must not duplicate a provider in this tab.
+    expect(find.textContaining('Mixed'), findsOneWidget);
   });
 
   // This list is the Sources TAB, so the shell's floating dock is drawn over
@@ -78,10 +105,14 @@ void main() {
   // once and keep that answer, so a source that arrived later stayed invisible
   // until something forced a rebuild; switching tabs and back was the only way
   // to see it.
-  testWidgets('a source that arrives after the first build shows up', (t) async {
-    await t.pumpWidget(MaterialApp(
-      home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
-    ));
+  testWidgets('a source that arrives after the first build shows up', (
+    t,
+  ) async {
+    await t.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
+      ),
+    );
     await t.pumpAndSettle();
     expect(find.textContaining('AllAnime'), findsNothing);
 
@@ -95,9 +126,11 @@ void main() {
   testWidgets('says so when nothing is installed', (t) async {
     await sl.reset();
     await registerPickerDeps();
-    await t.pumpWidget(MaterialApp(
-      home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
-    ));
+    await t.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
+      ),
+    );
     await t.pumpAndSettle();
 
     expect(find.textContaining('HiAnime'), findsNothing);
@@ -112,9 +145,13 @@ void main() {
         aniSource(id: 2, name: 'AllAnime'),
       ],
     );
-    await t.pumpWidget(MaterialApp(
-      home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {}, query: 'hi')),
-    ));
+    await t.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: BrowseSourcesList(onBrowse: (_, _) {}, query: 'hi'),
+        ),
+      ),
+    );
     await t.pumpAndSettle();
 
     expect(find.textContaining('HiAnime'), findsOneWidget);
@@ -123,11 +160,13 @@ void main() {
 
   testWidgets('a query nothing matches shows the no-matches state, not '
       'the nothing-installed one', (t) async {
-    await t.pumpWidget(MaterialApp(
-      home: Scaffold(
-        body: BrowseSourcesList(onBrowse: (_, _) {}, query: 'zzz-nope'),
+    await t.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: BrowseSourcesList(onBrowse: (_, _) {}, query: 'zzz-nope'),
+        ),
       ),
-    ));
+    );
     await t.pumpAndSettle();
 
     expect(find.textContaining('HiAnime'), findsNothing);
@@ -136,9 +175,11 @@ void main() {
   });
 
   testWidgets('every row carries a source icon tile', (t) async {
-    await t.pumpWidget(MaterialApp(
-      home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
-    ));
+    await t.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
+      ),
+    );
     await t.pumpAndSettle();
 
     // This list and the picker show the same sources; a row here without a
@@ -147,18 +188,23 @@ void main() {
     expect(find.byType(SourceIconTile), findsWidgets);
   });
 
-  testWidgets('streaming is one list — no ANIME / MOVIES & SERIES headers',
-      (t) async {
+  testWidgets('streaming is one list — no ANIME / MOVIES & SERIES headers', (
+    t,
+  ) async {
     await disposePickerDeps();
     await sl.reset();
-    await registerPickerDeps(aniyomi: [
-      aniSource(id: 1, name: 'Zeta'),
-      aniSource(id: 2, name: 'Alpha'),
-    ]);
+    await registerPickerDeps(
+      aniyomi: [
+        aniSource(id: 1, name: 'Zeta'),
+        aniSource(id: 2, name: 'Alpha'),
+      ],
+    );
 
-    await t.pumpWidget(MaterialApp(
-      home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
-    ));
+    await t.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
+      ),
+    );
     await t.pumpAndSettle();
 
     // Splitting by manifest type filed the same kind of source under two
@@ -167,8 +213,9 @@ void main() {
     expect(find.text('MOVIES & SERIES'), findsNothing);
   });
 
-  testWidgets('rows are alphabetical by the source name, not the tag',
-      (t) async {
+  testWidgets('rows are alphabetical by the source name, not the tag', (
+    t,
+  ) async {
     await disposePickerDeps();
     await sl.reset();
     await registerPickerDeps(aniyomi: [aniSource(id: 1, name: 'Zeta')]);
@@ -185,9 +232,11 @@ void main() {
       },
     ]);
 
-    await t.pumpWidget(MaterialApp(
-      home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
-    ));
+    await t.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
+      ),
+    );
     await t.pumpAndSettle();
 
     final alpha = t.getTopLeft(find.text('CS · Alpha')).dy;
@@ -198,31 +247,36 @@ void main() {
   testWidgets('no A-Z rail on a short list', (t) async {
     await disposePickerDeps();
     await sl.reset();
-    await registerPickerDeps(
-      aniyomi: [aniSource(id: 1, name: 'Only One')],
-    );
+    await registerPickerDeps(aniyomi: [aniSource(id: 1, name: 'Only One')]);
 
-    await t.pumpWidget(MaterialApp(
-      home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
-    ));
+    await t.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
+      ),
+    );
     await t.pumpAndSettle();
 
     // A rail over three rows is clutter; the whole list is already on screen.
     expect(find.byKey(alphabetRailKey), findsNothing);
   });
 
-  testWidgets('a long list gets the A-Z rail, and tapping it scrolls',
-      (t) async {
+  testWidgets('a long list gets the A-Z rail, and tapping it scrolls', (
+    t,
+  ) async {
     await disposePickerDeps();
     await sl.reset();
-    await registerPickerDeps(aniyomi: [
-      for (var i = 0; i < 20; i++)
-        aniSource(id: i + 1, name: String.fromCharCode(65 + i)),
-    ]);
+    await registerPickerDeps(
+      aniyomi: [
+        for (var i = 0; i < 20; i++)
+          aniSource(id: i + 1, name: String.fromCharCode(65 + i)),
+      ],
+    );
 
-    await t.pumpWidget(MaterialApp(
-      home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
-    ));
+    await t.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
+      ),
+    );
     await t.pumpAndSettle();
 
     expect(find.byKey(alphabetRailKey), findsOneWidget);
@@ -239,8 +293,9 @@ void main() {
     expect(t.widget<Scrollable>(list).controller!.offset, greaterThan(0));
   });
 
-  testWidgets('a name starting with an emoji buckets under # at the TOP',
-      (t) async {
+  testWidgets('a name starting with an emoji buckets under # at the TOP', (
+    t,
+  ) async {
     await disposePickerDeps();
     await sl.reset();
     await registerPickerDeps(aniyomi: [aniSource(id: 1, name: 'Alpha')]);
@@ -253,9 +308,11 @@ void main() {
       },
     ]);
 
-    await t.pumpWidget(MaterialApp(
-      home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
-    ));
+    await t.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
+      ),
+    );
     await t.pumpAndSettle();
 
     // U+26A1 sorts ABOVE 'z', so a plain name-sort dropped this row at the
@@ -274,18 +331,23 @@ void main() {
     expect(sourceInitial(''), '#');
   });
 
-  testWidgets('rail letters get equal slots, not gaps stretched to fill',
-      (t) async {
+  testWidgets('rail letters get equal slots, not gaps stretched to fill', (
+    t,
+  ) async {
     await disposePickerDeps();
     await sl.reset();
-    await registerPickerDeps(aniyomi: [
-      for (var i = 0; i < 20; i++)
-        aniSource(id: i + 1, name: String.fromCharCode(65 + i)),
-    ]);
+    await registerPickerDeps(
+      aniyomi: [
+        for (var i = 0; i < 20; i++)
+          aniSource(id: i + 1, name: String.fromCharCode(65 + i)),
+      ],
+    );
 
-    await t.pumpWidget(MaterialApp(
-      home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
-    ));
+    await t.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
+      ),
+    );
     await t.pumpAndSettle();
 
     final railH = t.getSize(find.byKey(alphabetRailKey)).height;
@@ -302,18 +364,23 @@ void main() {
     expect((rail.center.dy - list.center.dy).abs(), lessThan(24));
   });
 
-  testWidgets('a finger on the rail shows a small letter preview beside it',
-      (t) async {
+  testWidgets('a finger on the rail shows a small letter preview beside it', (
+    t,
+  ) async {
     await disposePickerDeps();
     await sl.reset();
-    await registerPickerDeps(aniyomi: [
-      for (var i = 0; i < 20; i++)
-        aniSource(id: i + 1, name: String.fromCharCode(65 + i)),
-    ]);
+    await registerPickerDeps(
+      aniyomi: [
+        for (var i = 0; i < 20; i++)
+          aniSource(id: i + 1, name: String.fromCharCode(65 + i)),
+      ],
+    );
 
-    await t.pumpWidget(MaterialApp(
-      home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
-    ));
+    await t.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: BrowseSourcesList(onBrowse: (_, _) {})),
+      ),
+    );
     await t.pumpAndSettle();
 
     expect(find.byKey(railPreviewKey), findsNothing);

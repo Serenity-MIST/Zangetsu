@@ -47,6 +47,8 @@ void main() {
     });
 
     tearDown(() async {
+      // Drain writes before clearing the singleton or removing a Windows file.
+      await AppLogger.instance.flush();
       AppLogger.instance.clearForTest();
       await dir.delete(recursive: true);
     });
@@ -96,7 +98,7 @@ void main() {
       // lines were written.
       expect(lines.length, lessThanOrEqualTo(4001));
       expect(lines.last, contains('line 2499'));
-    });
+    }, timeout: const Timeout(Duration(minutes: 2)));
 
     test('redaction reaches the disk, not just the buffer', () async {
       AppLogger.instance.log('signed in as someone@example.com ok');

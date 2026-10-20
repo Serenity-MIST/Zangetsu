@@ -1,3 +1,4 @@
+import 'package:flutter/services.dart';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -21,11 +22,17 @@ void main() {
   setUp(() async {
     temp = await Directory.systemTemp.createTemp('poster_card_prefs');
     Hive.init(temp.path);
+    // Network-image previews need the cache plugin paths in widget tests.
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('plugins.flutter.io/path_provider'), (_) async => temp.path);
+
     await PlaybackPrefs.init();
     GetIt.I.registerSingleton<PlaybackPrefs>(PlaybackPrefs());
   });
 
   tearDown(() async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('plugins.flutter.io/path_provider'), null);
     await GetIt.I.reset();
     await Hive.close();
     await temp.delete(recursive: true);

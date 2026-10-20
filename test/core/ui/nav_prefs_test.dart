@@ -16,9 +16,13 @@ void main() {
   group('NavPrefs invariants', () {
     test('the pinned tab is added back when missing', () {
       final out = sanitized([DockTab.home, DockTab.downloads, DockTab.myList]);
-      expect(out, contains(DockTab.profile),
-          reason: 'Profile is the only route into Settings — losing it would '
-              'strand the user with no way to fix their own dock');
+      expect(
+        out,
+        contains(DockTab.profile),
+        reason:
+            'Profile is the only route into Settings — losing it would '
+            'strand the user with no way to fix their own dock',
+      );
     });
 
     test('duplicates are collapsed', () {
@@ -96,36 +100,39 @@ void main() {
       await dir.delete(recursive: true);
     });
 
-    test('a saved list naming the old Search tab drops just that entry', () async {
-      // What NavPrefs.defaultTabs used to ship as, back when it had 5 slots.
-      // The box key ('tabs') is the persisted format itself — see _tabsKey.
-      await Hive.box(NavPrefs.boxName).put('tabs', [
-        'home',
-        'schedule',
-        'search',
-        'myList',
-        'profile',
-      ]);
-      final out = NavPrefs().tabs;
+    test(
+      'a saved list restores Search and drops an unknown Schedule entry',
+      () async {
+        // What NavPrefs.defaultTabs used to ship as, back when it had 5 slots.
+        // The box key ('tabs') is the persisted format itself — see _tabsKey.
+        await Hive.box(
+          NavPrefs.boxName,
+        ).put('tabs', ['home', 'schedule', 'search', 'myList', 'profile']);
+        final out = NavPrefs().tabs;
 
-      expect(out, contains(DockTab.profile));
-      expect(out.length, greaterThanOrEqualTo(NavPrefs.minTabs));
-      // Downloads is in defaultTabs now, but this list was SAVED by the user
-      // and never had it — only the unknown 'search'/'schedule' entries drop.
-      expect(out, [
-        DockTab.home,
-        DockTab.myList,
-        DockTab.profile,
-      ]);
-    });
+        expect(out, contains(DockTab.profile));
+        expect(out.length, greaterThanOrEqualTo(NavPrefs.minTabs));
+        // Downloads is in defaultTabs now, but this list was SAVED by the user
+        // and never had it — only the unknown 'search'/'schedule' entries drop.
+        expect(out, [
+          DockTab.home,
+          DockTab.search,
+          DockTab.myList,
+          DockTab.profile,
+        ]);
+      },
+    );
 
-    test('a saved list that is mostly just Search falls back to default', () async {
-      // Below minTabs once the unknown 'search' entry is stripped.
-      await Hive.box(NavPrefs.boxName).put('tabs', ['search', 'profile']);
-      final out = NavPrefs().tabs;
+    test(
+      'a saved list that is mostly just Search falls back to default',
+      () async {
+        // Below minTabs once the unknown 'search' entry is stripped.
+        await Hive.box(NavPrefs.boxName).put('tabs', ['search', 'profile']);
+        final out = NavPrefs().tabs;
 
-      expect(out, NavPrefs.defaultTabs);
-    });
+        expect(out, NavPrefs.defaultTabs);
+      },
+    );
 
     test('with nothing chosen, the app opens on the leftmost tab', () {
       expect(NavPrefs().startTab, NavPrefs.defaultTabs.first);
@@ -134,6 +141,18 @@ void main() {
     test('keep-dock-expanded is off by default', () {
       expect(NavPrefs().isDefault, isTrue);
     });
+
+    test(
+      'My List style defaults to Classic and survives changes/restarts',
+      () async {
+        final prefs = NavPrefs();
+        expect(prefs.myListStyle, 'classic');
+        await prefs.setMyListStyle('new');
+        expect(NavPrefs().myListStyle, 'new');
+        await prefs.setMyListStyle('classic');
+        expect(NavPrefs().myListStyle, 'classic');
+      },
+    );
 
     test('a chosen landing tab survives a restart', () async {
       await NavPrefs().setStartTab(DockTab.myList);
@@ -194,8 +213,8 @@ void main() {
 
     // Task 17: Search is off the dock entirely, not just hidden by default —
     // there's no enum member left for it to offer.
-    test('Search is not a dock tab any more', () {
-      expect(DockTab.values.map((t) => t.name), isNot(contains('search')));
+    test('Search is a stable dock destination', () {
+      expect(DockTab.values.map((t) => t.name), contains('search'));
     });
   });
 }

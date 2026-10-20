@@ -1,7 +1,10 @@
+import '../../core/ui/nav_prefs.dart';
 import 'dart:async';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import '../../core/zmode/zmode_prefs.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
 import '../../core/tracker/tracker_item_url.dart';
@@ -145,7 +148,30 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
   /// the app's ContentMode, so you can see your manga list without switching
   /// the whole app into manga mode. Tracker screens ignore it — a tracker
   /// answers for one kind already.
-  ContentMode _kind = sl<ContentModeCubit>().state;
+  ContentMode _localKind = sl<ContentModeCubit>().state;
+
+  /// Enables desktop list preferences only on Windows.
+  bool get _desktop => defaultTargetPlatform == TargetPlatform.windows;
+
+  /// Whether this list should follow the dock rather than its local filter.
+  bool get _followDock =>
+      _desktop &&
+      sl.isRegistered<NavPrefs>() &&
+      sl<NavPrefs>().myListStyle == 'new';
+
+  /// Effective content filter, preserving Classic's independently chosen kind.
+  ContentMode get _kind =>
+      _followDock ? sl<ContentModeCubit>().state : _localKind;
+  StreamSubscription<ContentMode>? _modeChanges;
+
+  /// Drops a stale category restriction when navigation preferences change.
+  void _dockChanged() {
+    if (mounted)
+      setState(() {
+        _categoryFilter = null;
+      });
+  }
+
   bool _sortDesc = ListSortPrefs.descending;
   VoidCallback? _shuffleAction;
 
@@ -183,13 +209,23 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    // Cross-device My List freshness is handled by the app-wide foreground
-    // poll in main.dart (stale-gated). A 15s force-pull here doubled PostgREST
-    // traffic whenever this screen stayed mounted (including the TV branch).
+    if (sl.isRegistered<NavPrefs>()) sl<NavPrefs>().addListener(_dockChanged);
+    if (_desktop) {
+      _modeChanges = sl<ContentModeCubit>().stream.listen(
+        (_) => _dockChanged(),
+      );
+      ZModePrefs.revision.addListener(_dockChanged);
+    }
+    // Own My List is Hive; tracker chips cache a fetch. While this screen is
+    // mounted, keep both aligned with other devices — TV never backgrounds.
   }
 
   @override
   void dispose() {
+    if (sl.isRegistered<NavPrefs>())
+      sl<NavPrefs>().removeListener(_dockChanged);
+    _modeChanges?.cancel();
+    ZModePrefs.revision.removeListener(_dockChanged);
     WidgetsBinding.instance.removeObserver(this);
     _searchController.dispose();
     super.dispose();
@@ -227,7 +263,8 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
               children: [
                 _header(context),
                 if (_searching) _searchField(context),
-                if (widget.pinnedTracker == null) _kindTabs(context),
+                if (!_followDock && widget.pinnedTracker == null)
+                  _kindTabs(context),
                 Expanded(
                   child: tlState.isMyList
                       ? _myListBody(context)
@@ -826,7 +863,7 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
                         child: GestureDetector(
                           behavior: HitTestBehavior.opaque,
                           onTap: () => setState(() {
-                            _kind = k;
+                            _localKind = k;
                             _dropCategoryForeignTo(k);
                           }),
                           child: Center(
@@ -984,9 +1021,9 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
     final mode = widget.pinnedTracker == null
         ? _kind
         : (widget.pinnedKind ?? sl<ContentModeCubit>().state);
-    final modeEntries = entries
-        .where((e) => mode.matchesProvider(e.item.type))
-        .toList();
+    final modeEntries = _followDock
+        ? libraryEntriesForDock(entries, mode, ZModePrefs.streamKind)
+        : entries.where((e) => mode.matchesProvider(e.item.type)).toList();
 
     final presentStatuses = tabOrder
         .where((s) => modeEntries.any((e) => e.status == s))
@@ -1116,12 +1153,7 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
           ),
           physics: const AlwaysScrollableScrollPhysics(),
           cacheExtent: 800,
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: posterGridColumns(context),
-            childAspectRatio: posterGridAspect(context),
-            crossAxisSpacing: 12,
-            mainAxisSpacing: 16,
-          ),
+          gridDelegate: posterGridDelegate(context),
           itemCount: shown.length,
           itemBuilder: (context, i) {
             final entry = shown[i];

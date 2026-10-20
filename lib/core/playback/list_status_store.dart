@@ -1,6 +1,6 @@
 import 'package:flutter/foundation.dart';
+import 'library_repair.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
-import 'package:watch_app/core/hive/hive_key.dart';
 import 'package:hive/hive.dart';
 
 import '../models/media_item.dart';
@@ -31,7 +31,7 @@ class ListStatusStore {
   final ValueNotifier<int> revision = ValueNotifier<int>(0);
 
   String keyOf(MediaItem m) =>
-      profileScopedKey(_profileId, hiveKey('${m.sourceId}::${m.id}'));
+      profileScopedKey(_profileId, libraryStorageKey(m));
 
   WatchStatus? statusOf(MediaItem m) =>
       watchStatusFromName(_box.get(keyOf(m)) as String?);

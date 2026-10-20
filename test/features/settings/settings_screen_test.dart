@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:watch_app/core/ui/nav_prefs.dart';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -141,8 +142,10 @@ void main() {
     await LocaleController.init();
     await Hive.openBox(PlaybackPrefs.boxName);
     await ReaderPrefs.init();
+    await NavPrefs.init();
     await ViewerProfileStore.init();
     final sl = GetIt.instance;
+    sl.registerSingleton<NavPrefs>(NavPrefs());
     sl
       ..registerSingleton<AppMode>(AppMode(isTv: false))
       ..registerSingleton<SearchPrefs>(_StubSearchPrefs())

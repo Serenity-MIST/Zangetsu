@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import '../desktop/extension_runtime.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
 import 'package:watch_app/core/hive/source_icon_store.dart';
 import 'package:watch_app/core/lnreader/novel_cloudflare.dart';
@@ -211,7 +212,8 @@ void applySimklConventions(RequestOptions options) {
   options.headers['User-Agent'] = '$kAppName/$kAppVersion';
 }
 
-Future<void> initDependencies() async {
+Future<void> initDependencies({void Function(String)? onProgress}) async {
+  onProgress?.call('detecting device');
   // Detect device class first so every subsequent registration can gate on it.
   // Wrapped in try/catch: no native handler (tests, iOS, web) → phone behavior.
   // tvOS has no Android `isTv` channel; [isAppleTv] covers Apple TV.
@@ -226,6 +228,7 @@ Future<void> initDependencies() async {
   sl.registerSingleton<AppMode>(AppMode(isTv: isTv));
 
   await initHiveForApp();
+  onProgress?.call('opening local settings and library');
   if (isAppleTv) await AppImageCache.init();
   // Cache of the signed-in user so the logged-in UI appears INSTANTLY on boot
   // (AuthCubit reads it before the network session check). See AuthCubit.restore.
@@ -345,6 +348,8 @@ Future<void> initDependencies() async {
       currentProfileId: currentProfileId,
     ),
   );
+  await TitlePrefsStore.init();
+  sl.registerSingleton<TitlePrefsStore>(TitlePrefsStore());
   await MyListStore.init();
   sl.registerSingleton<MyListStore>(
     MyListStore(
@@ -356,8 +361,6 @@ Future<void> initDependencies() async {
           sl<ListStatusStore>().setStatusRaw(key, name),
     ),
   );
-  await TitlePrefsStore.init();
-  sl.registerSingleton<TitlePrefsStore>(TitlePrefsStore());
   await HomeCache.init();
   await PlaybackPrefs.init();
   sl.registerSingleton<PlaybackPrefs>(PlaybackPrefs());
@@ -466,6 +469,7 @@ Future<void> initDependencies() async {
 
   // Discord Rich Presence (opt-in; off until the user connects + enables it).
   await DiscordRpc.init();
+  onProgress?.call('initializing trackers');
   sl.registerSingleton<DiscordRpc>(DiscordRpc(dio));
   // Restore the saved token + reconnect now (before the UI), so presence resumes
   // promptly after a restart instead of looking disconnected.
@@ -569,6 +573,7 @@ Future<void> initDependencies() async {
   // startup. Sources register a moment after launch; a saved `cs:` active
   // source is restored via reapplySaved + a Home reload.
   await CloudStreamManager.init();
+  onProgress?.call('initializing source runtimes');
   final csManager = CloudStreamManager();
   sl.registerSingleton<CloudStreamManager>(csManager);
 
@@ -807,6 +812,7 @@ Future<void> initDependencies() async {
   // (miruro, uhdmovies, …) freeze the isolate for their timeout each.
   // Playback still loads a source on demand via ensureRuntimeLoaded.
   if (!isTv) {
+    onProgress?.call('loading enabled JavaScript sources');
     await loadProviders();
   } else {
     debugPrint(
@@ -827,6 +833,7 @@ Future<void> initDependencies() async {
   // This runs on a microtask so it never blocks or slows app startup. Any
   // failure is caught and logged; it must never propagate to the caller.
   Future.microtask(() async {
+    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable) return;
     try {
       if (!Hive.isBoxOpen(AniyomiExtensionService.installedBoxName)) {
         await openBoxSafely<dynamic>(AniyomiExtensionService.installedBoxName);
@@ -892,7 +899,7 @@ Future<void> initDependencies() async {
   //     picker's listing, and every data call in one place: on iOS nothing is
   //     ever loaded, so no MihonProvider is ever constructed.
   Future.microtask(() async {
-    if (!Platform.isAndroid) return; // Mihon extensions are Android-only (DEX)
+    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable) return;
     try {
       if (!Hive.isBoxOpen(MihonExtensionService.installedBoxName)) {
         await openBoxSafely<dynamic>(MihonExtensionService.installedBoxName);
@@ -964,6 +971,7 @@ Future<void> initDependencies() async {
   // Hive box and restores it on launch, validated against the providers that
   // actually loaded (so a removed/disabled source falls back to allanime).
   await ActiveSourceCubit.init();
+  onProgress?.call('restoring content mode');
   sl.registerSingleton<ActiveSourceCubit>(
     ActiveSourceCubit(
       box: Hive.box(ActiveSourceCubit.boxName),
@@ -1047,6 +1055,7 @@ Future<void> initDependencies() async {
   // Offline downloads (background_downloader). setup() restores persisted
   // records and starts listening for task progress/status updates.
   await DownloadManager.init();
+  onProgress?.call('initializing downloads');
   await DownloadService.initialize(); // configure the foreground-service host
   sl.registerSingleton<DownloadManager>(
     DownloadManager(sl<CatalogueRepository>(), sl<DownloadPrefs>())..setup(),

@@ -1,5 +1,7 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/rendering.dart';
 
 import '../app_mode.dart';
 import '../cache/app_image_cache.dart';
@@ -13,6 +15,7 @@ import '../aniyomi/aniyomi_image_provider.dart';
 import '../mihon/mihon_image_provider.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text.dart';
+import 'artwork_quality.dart';
 
 const _posterTextScrim = LinearGradient(
   begin: Alignment.bottomCenter,
@@ -224,6 +227,7 @@ bool posterTitleInside(BuildContext context, {required bool wide}) {
 
 class _PosterCardState extends State<PosterCard> {
   bool _pressed = false;
+  bool _hovered = false;
 
   @override
   void initState() {
@@ -266,18 +270,34 @@ class _PosterCardState extends State<PosterCard> {
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) => _buildCard(context, constraints),
+  );
+
+  /// Sizes decoding to the real card constraint, including desktop grids and
+  /// display scaling, instead of a caller's nominal phone-sized cell width.
+  Widget _buildCard(BuildContext context, BoxConstraints constraints) {
     final wide = posterLayout(context) == PosterCardLayout.wide;
     final titleInside = posterTitleInside(context, wide: wide);
-    final artUrl = wide && widget.wideImageUrl?.isNotEmpty == true
+    final selectedArtUrl = wide && widget.wideImageUrl?.isNotEmpty == true
         ? widget.wideImageUrl
         : widget.imageUrl;
-    final artHeaders = artUrl == widget.imageUrl ? widget.headers : null;
+    final artUrl =
+        selectedArtUrl != null &&
+            defaultTargetPlatform == TargetPlatform.windows
+        ? desktopArtworkUrl(selectedArtUrl)
+        : selectedArtUrl;
+    final artHeaders = selectedArtUrl == widget.imageUrl
+        ? widget.headers
+        : null;
     final artFit = BoxFit.cover;
     final dpr = MediaQuery.devicePixelRatioOf(context);
-    final memW = (widget.cellWidth * dpr).round();
-    final aniSrcId = artUrl == widget.imageUrl ? _aniSrcId : null;
-    final mihonSrcId = artUrl == widget.imageUrl ? _mihonSrcId : null;
+    final paintedWidth = constraints.hasBoundedWidth
+        ? constraints.maxWidth
+        : widget.cellWidth;
+    final memW = artworkDecodeWidth(paintedWidth, dpr, maximum: 2048);
+    final aniSrcId = selectedArtUrl == widget.imageUrl ? _aniSrcId : null;
+    final mihonSrcId = selectedArtUrl == widget.imageUrl ? _mihonSrcId : null;
     // Only wire the press-scale handlers when this card is actually tappable.
     // On TV the card is wrapped in a TvFocusable and passed onTap: null — if we
     // still attached onTapDown/Up/Cancel they'd claim the tap in the gesture
@@ -304,167 +324,183 @@ class _PosterCardState extends State<PosterCard> {
       ],
     );
     return RepaintBoundary(
-      child: GestureDetector(
-        onTap: widget.onTap,
-        onLongPress: widget.onLongPress,
-        onTapDown: interactive ? _handleTapDown : null,
-        onTapUp: interactive ? _handleTapUp : null,
-        onTapCancel: interactive ? _handleTapCancel : null,
-        child: AnimatedScale(
-          scale: _pressed ? 0.97 : 1.0,
-          duration: const Duration(milliseconds: 120),
-          curve: Curves.easeOut,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: ClipRSuperellipse(
-                  borderRadius: BorderRadius.circular(12),
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      if (artUrl == null)
-                        ColoredBox(color: AppColors.surface2)
-                      else if (aniSrcId != null || mihonSrcId != null)
-                        // Aniyomi/Mihon path: fetch bytes through the source's own
-                        // OkHttpClient (carries CF session cookies) instead of
-                        // going through CachedNetworkImage which can't pass CF.
-                        Image(
-                          // Resize to the cell's pixel width so a big cover
-                          // doesn't sit full-res in the image cache (matches the
-                          // memCacheWidth the non-native path already uses).
-                          image: ResizeImage(
-                            aniSrcId != null
-                                ? AniyomiImage(aniSrcId, artUrl)
-                                : MihonImage(mihonSrcId!, artUrl),
-                            width: memW,
+      child: MouseRegion(
+        cursor: interactive ? SystemMouseCursors.click : MouseCursor.defer,
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() => _hovered = false),
+        child: GestureDetector(
+          onTap: widget.onTap,
+          onLongPress: defaultTargetPlatform == TargetPlatform.windows
+              ? null
+              : widget.onLongPress,
+          onSecondaryTap: defaultTargetPlatform == TargetPlatform.windows
+              ? widget.onLongPress
+              : null,
+          onTapDown: interactive ? _handleTapDown : null,
+          onTapUp: interactive ? _handleTapUp : null,
+          onTapCancel: interactive ? _handleTapCancel : null,
+          child: AnimatedScale(
+            scale: _pressed
+                ? 0.97
+                : _hovered && defaultTargetPlatform == TargetPlatform.windows
+                ? 1.025
+                : 1.0,
+            duration: const Duration(milliseconds: 120),
+            curve: Curves.easeOut,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: ClipRSuperellipse(
+                    borderRadius: BorderRadius.circular(12),
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        if (artUrl == null)
+                          ColoredBox(color: AppColors.surface2)
+                        else if (aniSrcId != null || mihonSrcId != null)
+                          // Aniyomi/Mihon path: fetch bytes through the source's own
+                          // OkHttpClient (carries CF session cookies) instead of
+                          // going through CachedNetworkImage which can't pass CF.
+                          Image(
+                            // Resize to the cell's pixel width so a big cover
+                            // doesn't sit full-res in the image cache (matches the
+                            // memCacheWidth the non-native path already uses).
+                            image: ResizeImage(
+                              aniSrcId != null
+                                  ? AniyomiImage(aniSrcId, artUrl)
+                                  : MihonImage(mihonSrcId!, artUrl),
+                              width: memW,
+                            ),
+                            fit: artFit,
+                            frameBuilder: imageFadeIn,
+                            loadingBuilder: (_, child, progress) =>
+                                progress == null
+                                ? child
+                                : ColoredBox(color: AppColors.surface2),
+                            errorBuilder: (context, error, stackTrace) =>
+                                ColoredBox(color: AppColors.surface2),
+                          )
+                        else
+                          CachedNetworkImage(
+                            imageUrl: artUrl,
+                            cacheManager: AppImageCache.manager,
+                            httpHeaders: artHeaders,
+                            memCacheWidth: memW,
+                            fit: artFit,
+                            fadeInDuration:
+                                sl.isRegistered<AppMode>() && sl<AppMode>().isTv
+                                ? Duration.zero
+                                : const Duration(milliseconds: 180),
+                            placeholder: (context, url) =>
+                                ColoredBox(color: AppColors.surface2),
+                            errorWidget: (context, url, err) =>
+                                ColoredBox(color: AppColors.surface2),
                           ),
-                          fit: artFit,
-                          frameBuilder: imageFadeIn,
-                          loadingBuilder: (_, child, progress) =>
-                              progress == null
-                              ? child
-                              : ColoredBox(color: AppColors.surface2),
-                          errorBuilder: (context, error, stackTrace) =>
-                              ColoredBox(color: AppColors.surface2),
-                        )
-                      else
-                        CachedNetworkImage(
-                          imageUrl: artUrl,
-                          cacheManager: AppImageCache.manager,
-                          httpHeaders: artHeaders,
-                          memCacheWidth: memW,
-                          fit: artFit,
-                          fadeInDuration:
-                              sl.isRegistered<AppMode>() && sl<AppMode>().isTv
-                              ? Duration.zero
-                              : const Duration(milliseconds: 180),
-                          placeholder: (context, url) =>
-                              ColoredBox(color: AppColors.surface2),
-                          errorWidget: (context, url, err) =>
-                              ColoredBox(color: AppColors.surface2),
-                        ),
-                      if (titleInside || hasBottomBadges || hasRightBadges)
-                        const DecoratedBox(
-                          decoration: BoxDecoration(gradient: _posterTextScrim),
-                        ),
-                      if (widget.qualityBadge != null &&
-                          (prefs?.posterQualityBadge ?? true))
-                        Positioned(
-                          top: 6,
-                          right: 6,
-                          child: _PosterTag(widget.qualityBadge!),
-                        ),
-                      if (widget.scoreBadge != null &&
-                          widget.qualityBadge == null &&
-                          (prefs?.posterScoreBadge ?? true))
-                        Positioned(
-                          top: 6,
-                          right: 6,
-                          child: _ScoreTag(widget.scoreBadge!),
-                        ),
-                      if (widget.dubBadge != null &&
-                          (prefs?.posterAudioBadge ?? true))
-                        Positioned(
-                          top: 6,
-                          left: 6,
-                          child: _PosterTag(widget.dubBadge!),
-                        ),
-                      if (titleInside || hasBottomBadges || hasRightBadges)
-                        Positioned(
-                          left: 6,
-                          bottom: 6,
-                          right: 6,
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.end,
-                            children: [
-                              if (titleInside || hasBottomBadges)
-                                Expanded(
-                                  child: Column(
-                                    mainAxisSize: MainAxisSize.min,
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      if (hasBottomBadges) ...[
-                                        bottomBadges,
+                        if (titleInside || hasBottomBadges || hasRightBadges)
+                          const DecoratedBox(
+                            decoration: BoxDecoration(
+                              gradient: _posterTextScrim,
+                            ),
+                          ),
+                        if (widget.qualityBadge != null &&
+                            (prefs?.posterQualityBadge ?? true))
+                          Positioned(
+                            top: 6,
+                            right: 6,
+                            child: _PosterTag(widget.qualityBadge!),
+                          ),
+                        if (widget.scoreBadge != null &&
+                            widget.qualityBadge == null &&
+                            (prefs?.posterScoreBadge ?? true))
+                          Positioned(
+                            top: 6,
+                            right: 6,
+                            child: _ScoreTag(widget.scoreBadge!),
+                          ),
+                        if (widget.dubBadge != null &&
+                            (prefs?.posterAudioBadge ?? true))
+                          Positioned(
+                            top: 6,
+                            left: 6,
+                            child: _PosterTag(widget.dubBadge!),
+                          ),
+                        if (titleInside || hasBottomBadges || hasRightBadges)
+                          Positioned(
+                            left: 6,
+                            bottom: 6,
+                            right: 6,
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
+                                if (titleInside || hasBottomBadges)
+                                  Expanded(
+                                    child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        if (hasBottomBadges) ...[
+                                          bottomBadges,
+                                          if (titleInside &&
+                                              widget.title.isNotEmpty)
+                                            const SizedBox(height: 4),
+                                        ],
                                         if (titleInside &&
                                             widget.title.isNotEmpty)
-                                          const SizedBox(height: 4),
-                                      ],
-                                      if (titleInside &&
-                                          widget.title.isNotEmpty)
-                                        ExcludeSemantics(
-                                          excluding: !widget.showTitle,
-                                          child: PosterCardTitle(
-                                            title: widget.title,
-                                            logoItem: widget.logoItem,
-                                            width: widget.cellWidth - 12,
-                                            maxHeight: wide ? 34 : 54,
+                                          ExcludeSemantics(
+                                            excluding: !widget.showTitle,
+                                            child: PosterCardTitle(
+                                              title: widget.title,
+                                              logoItem: widget.logoItem,
+                                              width: widget.cellWidth - 12,
+                                              maxHeight: wide ? 34 : 54,
+                                            ),
                                           ),
-                                        ),
-                                    ],
-                                  ),
-                                )
-                              else
-                                const Spacer(),
-                              if (hasRightBadges) ...[
-                                if (titleInside || hasBottomBadges)
-                                  const SizedBox(width: 4),
-                                if (showGenre)
-                                  _PosterTag(
-                                    widget.genres.first,
-                                    maxWidth: widget.cellWidth * 0.3,
-                                  ),
-                                if (showGenre && showAdult)
-                                  const SizedBox(width: 3),
-                                if (showAdult) const _PosterTag('18+'),
+                                      ],
+                                    ),
+                                  )
+                                else
+                                  const Spacer(),
+                                if (hasRightBadges) ...[
+                                  if (titleInside || hasBottomBadges)
+                                    const SizedBox(width: 4),
+                                  if (showGenre)
+                                    _PosterTag(
+                                      widget.genres.first,
+                                      maxWidth: widget.cellWidth * 0.3,
+                                    ),
+                                  if (showGenre && showAdult)
+                                    const SizedBox(width: 3),
+                                  if (showAdult) const _PosterTag('18+'),
+                                ],
                               ],
-                            ],
+                            ),
                           ),
-                        ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
-              ),
-              if (widget.showTitle && !titleInside) ...[
-                const SizedBox(height: _kTitleGap),
-                // A FIXED two-line box, even for a one-line title. The image
-                // above is Expanded, so a shorter title used to hand it the
-                // leftover space and posters came out different heights across
-                // the same row. Pinning the text also pins the gap to whatever
-                // follows the row.
-                SizedBox(
-                  height: _titleBoxHeight,
-                  child: PosterCardTitle(
-                    title: widget.title,
-                    logoItem: widget.logoItem,
-                    width: widget.cellWidth,
-                    maxHeight: _titleBoxHeight,
-                    inside: false,
+                if (widget.showTitle && !titleInside) ...[
+                  const SizedBox(height: _kTitleGap),
+                  // A FIXED two-line box, even for a one-line title. The image
+                  // above is Expanded, so a shorter title used to hand it the
+                  // leftover space and posters came out different heights across
+                  // the same row. Pinning the text also pins the gap to whatever
+                  // follows the row.
+                  SizedBox(
+                    height: _titleBoxHeight,
+                    child: PosterCardTitle(
+                      title: widget.title,
+                      logoItem: widget.logoItem,
+                      width: widget.cellWidth,
+                      maxHeight: _titleBoxHeight,
+                      inside: false,
+                    ),
                   ),
-                ),
+                ],
               ],
-            ],
+            ),
           ),
         ),
       ),
@@ -674,6 +710,63 @@ class _ScoreTag extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Desktop columns use the available viewport, including a sidebar or sheet.
+/// The phone keeps its established three-column layout.
+SliverGridDelegate posterGridDelegate(BuildContext context) =>
+    defaultTargetPlatform == TargetPlatform.windows
+    ? DesktopPosterGridDelegate(
+        wide: posterLayout(context) == PosterCardLayout.wide,
+        titleInside: posterTitleInside(
+          context,
+          wide: posterLayout(context) == PosterCardLayout.wide,
+        ),
+        scale: posterCardScale(context),
+      )
+    : SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: posterGridColumns(context),
+        childAspectRatio: posterGridAspect(context),
+        crossAxisSpacing: 12,
+        mainAxisSpacing: 16,
+      );
+
+/// Fits more poster columns as desktop space grows, using poster-cell sizing
+/// so cover proportions and caption space remain consistent across widths.
+class DesktopPosterGridDelegate extends SliverGridDelegate {
+  const DesktopPosterGridDelegate({
+    this.wide = false,
+    this.titleInside = false,
+    this.scale = 1,
+  });
+  final bool wide;
+  final bool titleInside;
+  final double scale;
+  @override
+  SliverGridLayout getLayout(SliverConstraints constraints) {
+    const gap = 20.0;
+    final count =
+        ((constraints.crossAxisExtent + gap) / ((wide ? 300 : 210) * scale))
+            .ceil()
+            .clamp(1, 30);
+    final width = (constraints.crossAxisExtent - gap * (count - 1)) / count;
+    final height =
+        width / posterCellAspect(width, wide: wide, titleInside: titleInside);
+    return SliverGridRegularTileLayout(
+      crossAxisCount: count,
+      mainAxisStride: height + 28,
+      crossAxisStride: width + gap,
+      childMainAxisExtent: height,
+      childCrossAxisExtent: width,
+      reverseCrossAxis: axisDirectionIsReversed(constraints.crossAxisDirection),
+    );
+  }
+
+  @override
+  bool shouldRelayout(covariant DesktopPosterGridDelegate oldDelegate) =>
+      wide != oldDelegate.wide ||
+      titleInside != oldDelegate.titleInside ||
+      scale != oldDelegate.scale;
 }
 
 class _PosterTag extends StatelessWidget {

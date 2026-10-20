@@ -1,14 +1,12 @@
-// Reading does not sweep. A sweep is only safe where something can recover
-// from a bad pick — video re-resolves per episode at tap time, reading does
-// not: the matched source owns the chapter list outright. So reading picks a
-// source once and stays there, and a miss is reported as a miss rather than
-// quietly answered by whichever other source happens to have something.
+// Reading Auto Resolve prioritizes the last good source and validates chapters.
+// Manual pins remain fixed; an automatic miss can try another installed source.
 
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/models/media_item.dart';
+import 'package:watch_app/core/models/episode.dart';
 import 'package:watch_app/core/provider/cf_solve_needed.dart';
 import 'package:watch_app/core/models/provider_info.dart';
 import 'package:watch_app/core/repository/source_repository.dart';
@@ -22,10 +20,21 @@ class _Src implements SourceRepository {
   final Map<String, List<MediaItem>> bySource;
   final searched = <String>[];
 
+  /// Supplies the chapter validation required by reading Auto Resolve.
+  @override
+  Future<List<Episode>> episodes(
+    String url, {
+    String category = 'sub',
+    String? sourceId,
+  }) async => const [
+    Episode(id: '1', title: 'Chapter 1', url: 'https://chapter.test/1'),
+  ];
+
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   @override
   List<({String id, String name})> get pickableSources => loadedSources;
+
   /// Installed is not the same as "has results" — a source with nothing for
   /// this title is still installed, and still costs a search to find that out.
   @override
@@ -91,7 +100,9 @@ void main() {
   test('the first reading title sweeps, and that source is kept', () async {
     // Bootstrap: nothing is remembered on a fresh install, so it sweeps once
     // rather than leaving a new user staring at an empty page.
-    src = _Src({'mihon:asura': [_hit('mihon:asura', a)]});
+    src = _Src({
+      'mihon:asura': [_hit('mihon:asura', a)],
+    });
     await build().resolve(one, title: a);
 
     expect(src.searched, ['mihon:dex', 'mihon:asura']);
@@ -112,21 +123,22 @@ void main() {
     expect(src.searched, ['mihon:asura']);
   });
 
-  test('a title the reading source lacks is a miss, not another source',
-      () async {
-    // The honest answer. Reaching for MangaDex here would hand the reader a
-    // different numbering under the source name they picked.
-    src = _Src({
-      'mihon:asura': [_hit('mihon:asura', a)],
-      'mihon:dex': [_hit('mihon:dex', b)],
-    });
-    final m = build();
-    await m.resolve(one, title: a); // remembers asura
-    src.searched.clear();
+  test(
+    'an automatic reading miss falls through to another usable source',
+    () async {
+      // This is an automatic hint, not an explicit source choice.
+      src = _Src({
+        'mihon:asura': [_hit('mihon:asura', a)],
+        'mihon:dex': [_hit('mihon:dex', b)],
+      });
+      final m = build();
+      await m.resolve(one, title: a); // remembers asura
+      src.searched.clear();
 
-    expect(await m.resolve(two, title: b), isNull);
-    expect(src.searched, ['mihon:asura']);
-  });
+      expect((await m.resolve(two, title: b))?.sourceId, 'mihon:dex');
+      expect(src.searched, ['mihon:asura', 'mihon:dex']);
+    },
+  );
 
   group('novel keeps its own memory', () {
     const novel = ZCanonical(ZKind.novel, 'mal:9');
@@ -161,7 +173,9 @@ void main() {
     });
 
     test('novel stops sweeping too, once it has one', () async {
-      src = _Src({'lnr:one': [_hit('lnr:one', a), _hit('lnr:one', b)]});
+      src = _Src({
+        'lnr:one': [_hit('lnr:one', a), _hit('lnr:one', b)],
+      });
       final m = both();
       await m.resolve(novel, title: a);
       src.searched.clear();
@@ -173,22 +187,25 @@ void main() {
   });
 
   group('the row names what actually serves the chapters', () {
-    test('a reading title reads as its source, not "Auto Resolve"', () async {
-      // sourceForTitle is what the Detail row shows, what the Cloudflare
-      // shield acts on, and what "Wrong title?" compares against. Leaving the
-      // remembered source out of it labelled every manga "Auto Resolve" while
-      // a fixed source quietly served it.
-      src = _Src({'mihon:asura': [_hit('mihon:asura', a)]});
-      final m = build();
-      expect(m.sourceForTitle(one), isNull, reason: 'nothing chosen yet');
+    test(
+      'a remembered automatic manga source keeps the Auto Resolve label',
+      () async {
+        src = _Src({
+          'mihon:asura': [_hit('mihon:asura', a)],
+        });
+        final m = build();
+        expect(m.sourceForTitle(one), isNull, reason: 'nothing chosen yet');
 
-      await m.resolve(one, title: a);
+        await m.resolve(one, title: a);
 
-      expect(m.sourceForTitle(two), 'mihon:asura');
-    });
+        expect(m.sourceForTitle(two), isNull);
+      },
+    );
 
     test('video still reads as Auto Resolve', () async {
-      src = _Src({'mihon:asura': [_hit('mihon:asura', a)]});
+      src = _Src({
+        'mihon:asura': [_hit('mihon:asura', a)],
+      });
       final m = build();
       await m.resolve(anime, title: a);
 
@@ -200,7 +217,9 @@ void main() {
       // by normal use. Both sides still have to agree: the day video starts
       // remembering a source, that must be a deliberate change with its own
       // decision about the label, not one that happens silently here.
-      src = _Src({'mihon:asura': [_hit('mihon:asura', a)]});
+      src = _Src({
+        'mihon:asura': [_hit('mihon:asura', a)],
+      });
       await prefs.rememberLastGood(ZKind.anime, 'mihon:asura');
 
       expect(build().sourceForTitle(anime), isNull);
@@ -223,7 +242,9 @@ void main() {
   });
 
   test('picking Auto Resolve makes it sweep again', () async {
-    src = _Src({'mihon:asura': [_hit('mihon:asura', a)]});
+    src = _Src({
+      'mihon:asura': [_hit('mihon:asura', a)],
+    });
     final m = build();
     await m.resolve(one, title: a);
     expect(prefs.lastGood(ZKind.manga), 'mihon:asura');
@@ -271,7 +292,9 @@ void main() {
   });
 
   test('video still sweeps every time — it can recover per episode', () async {
-    src = _Src({'mihon:asura': [_hit('mihon:asura', a)]});
+    src = _Src({
+      'mihon:asura': [_hit('mihon:asura', a)],
+    });
     await build().resolve(anime, title: a);
 
     expect(prefs.lastGood(ZKind.anime), isNull);

@@ -6,10 +6,8 @@ import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
 import '../../core/tv/tv_focusable.dart';
 import '../../core/ui/app_toast.dart';
-import '../../core/mihon/mihon_extension_service.dart';
 import '../../core/models/media_item.dart';
 import '../../core/provider/cf_solve_needed.dart';
-import '../../core/provider/provider_manager.dart';
 import '../../core/repository/source_actions.dart' as source_actions;
 import '../../core/repository/source_repository.dart';
 import '../../core/theme/app_colors.dart';
@@ -40,6 +38,7 @@ class MatchLine extends StatefulWidget {
     required this.title,
     this.altTitle,
     this.malId,
+    this.compact = false,
     this.metadataAliases = const [],
   });
 
@@ -47,6 +46,7 @@ class MatchLine extends StatefulWidget {
   final String title;
   final String? altTitle;
   final int? malId;
+  final bool compact;
   final List<String> metadataAliases;
 
   @override
@@ -252,15 +252,8 @@ class _MatchLineState extends State<MatchLine> {
     final target =
         await sl<SourceRepository>().cfSolveTargetFor(id) ?? fallbackTarget;
     if (target.isEmpty) return;
-    if (isJs) {
-      await sl<ProviderManager>().solveCloudflareForHost(
-        Uri.parse(target).host,
-        target,
-      );
-    } else {
-      await MihonExtensionService.solveCloudflare(target);
-    }
-    if (!mounted) return;
+    final verified = await source_actions.verifySourceChallenge(id, target);
+    if (!mounted || !verified) return;
     await _cubit.load();
     if (mounted) _refreshAfterMatchChange();
   }
@@ -439,14 +432,20 @@ class _MatchLineState extends State<MatchLine> {
               // primary label stays left and the hint/arrow stay right.
               if (autoHint != null) ...[
                 const SizedBox(width: 8),
-                Text(
-                  '($autoHint)',
-                  style: AppText.button.copyWith(
-                    fontSize: (AppText.button.fontSize ?? 14) - 2,
-                    color: AppColors.textTertiary,
+                Flexible(
+                  // Fill the allotted space so short names cannot leave an
+                  // unused gap after the chevron inside the source button.
+                  fit: FlexFit.tight,
+                  child: Text(
+                    '($autoHint)',
+                    textAlign: TextAlign.end,
+                    style: AppText.button.copyWith(
+                      fontSize: (AppText.button.fontSize ?? 14) - 2,
+                      color: AppColors.textTertiary,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                   ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
                 ),
               ],
               const SizedBox(width: 4),
@@ -463,7 +462,7 @@ class _MatchLineState extends State<MatchLine> {
           // while Play and Download above it stay inset. TV lays the row out
           // itself and wants the full width.
           return Padding(
-            padding: _isTv
+            padding: _isTv || widget.compact
                 ? EdgeInsets.zero
                 : const EdgeInsets.fromLTRB(16, 10, 16, 0),
             child: Column(
@@ -501,7 +500,7 @@ class _MatchLineState extends State<MatchLine> {
                     borderRadius: BorderRadius.circular(8),
                     clipBehavior: Clip.antiAlias,
                     child: SizedBox(
-                      height: 52,
+                      height: widget.compact ? 40 : 52,
                       child: Row(
                         children: [
                           Expanded(

@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/download/download_manager.dart';
 import 'package:watch_app/core/download/download_record.dart';
+import 'package:watch_app/core/download/download_prefs.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
 import 'package:watch_app/core/models/episode.dart';
 import 'package:watch_app/core/models/video_source.dart';
@@ -51,6 +52,8 @@ void main() {
     hiveDir = await Directory.systemTemp.createTemp('download_delete_race');
     hiveBoxDir = hiveDir.path;
     Hive.init(hiveDir.path);
+    await DownloadPrefs.init();
+    await DownloadPrefs().setLocation(hiveDir.path, hiveDir.path);
     await DownloadManager.init();
     manager = DownloadManager(_EmptyCatalogue());
   });

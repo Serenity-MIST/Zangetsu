@@ -1041,6 +1041,7 @@ class _SeasonSheet extends StatelessWidget {
 // big anime stay navigable without endless scrolling. Selected chip is coral.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Horizontal episode ranges; Windows also accepts mouse dragging like Home rows.
 class _RangeChips extends StatelessWidget {
   const _RangeChips({
     required this.count,
@@ -1058,34 +1059,45 @@ class _RangeChips extends StatelessWidget {
   Widget build(BuildContext context) {
     return SizedBox(
       height: 42,
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-        itemCount: count,
-        separatorBuilder: (_, _) => const SizedBox(width: 8),
-        itemBuilder: (context, i) {
-          final sel = i == selected;
-          return Material(
-            color: sel ? AppColors.accent : AppColors.surface2,
-            borderRadius: BorderRadius.circular(9),
-            clipBehavior: Clip.antiAlias,
-            child: InkWell(
-              onTap: () => onSelect(i),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 14),
-                child: Center(
-                  child: Text(
-                    labelFor(i),
-                    style: AppText.caption.copyWith(
-                      color: sel ? Colors.white : AppColors.textSecondary,
-                      fontWeight: FontWeight.w700,
+      child: ScrollConfiguration(
+        behavior: Platform.isWindows
+            ? ScrollConfiguration.of(context).copyWith(
+                dragDevices: {
+                  ...ScrollConfiguration.of(context).dragDevices,
+                  PointerDeviceKind.mouse,
+                  PointerDeviceKind.trackpad,
+                },
+              )
+            : ScrollConfiguration.of(context),
+        child: ListView.separated(
+          scrollDirection: Axis.horizontal,
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          itemCount: count,
+          separatorBuilder: (_, _) => const SizedBox(width: 8),
+          itemBuilder: (context, i) {
+            final sel = i == selected;
+            return Material(
+              color: sel ? AppColors.accent : AppColors.surface2,
+              borderRadius: BorderRadius.circular(9),
+              clipBehavior: Clip.antiAlias,
+              child: InkWell(
+                onTap: () => onSelect(i),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                  child: Center(
+                    child: Text(
+                      labelFor(i),
+                      style: AppText.caption.copyWith(
+                        color: sel ? Colors.white : AppColors.textSecondary,
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
                   ),
                 ),
               ),
-            ),
-          );
-        },
+            );
+          },
+        ),
       ),
     );
   }
@@ -1155,7 +1167,8 @@ class _EpisodeGridTile extends StatelessWidget {
       clipBehavior: Clip.antiAlias,
       child: InkWell(
         onTap: onTap,
-        onLongPress: onLongPress,
+        onLongPress: Platform.isWindows ? null : onLongPress,
+        onSecondaryTap: Platform.isWindows ? onLongPress : null,
         child: Stack(
           children: [
             Center(
@@ -1325,17 +1338,23 @@ class _ChapterRow extends StatelessWidget {
 
     return InkWell(
       onTap: onTap,
-      onLongPress: onLongPress,
+      onLongPress: Platform.isWindows ? null : onLongPress,
+      onSecondaryTap: Platform.isWindows ? onLongPress : null,
       splashColor: AppColors.accentSoft,
       highlightColor: AppColors.surface,
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+        padding: EdgeInsets.fromLTRB(
+          16,
+          Platform.isWindows ? 5 : 8,
+          16,
+          Platform.isWindows ? 5 : 8,
+        ),
         child: Row(
           children: [
             SizedBox(
               key: coverKey,
-              width: 44,
-              height: 62,
+              width: Platform.isWindows ? 32 : 44,
+              height: Platform.isWindows ? 44 : 62,
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(8),
                 child: Opacity(
@@ -1370,7 +1389,7 @@ class _ChapterRow extends StatelessWidget {
                           : AppColors.textPrimary,
                       fontWeight: FontWeight.w600,
                     ),
-                    maxLines: 2,
+                    maxLines: Platform.isWindows ? 1 : 2,
                     overflow: TextOverflow.ellipsis,
                   ),
                   // Dropped entirely when the source gives us nothing to put
@@ -1518,7 +1537,8 @@ class _EpisodeRow extends StatelessWidget {
 
     return InkWell(
       onTap: onTap,
-      onLongPress: onLongPress,
+      onLongPress: Platform.isWindows ? null : onLongPress,
+      onSecondaryTap: Platform.isWindows ? onLongPress : null,
       splashColor: AppColors.accentSoft,
       highlightColor: AppColors.surface,
       child: Padding(

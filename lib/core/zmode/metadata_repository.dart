@@ -706,7 +706,9 @@ class MetadataRepository implements CatalogueRepository {
         // source the reader has never opened. Video never did this: it keeps
         // the page and raises Cloudflare at playback, where the user acted.
         final reading = _matcher.sourceForTitle(c);
-        final blocked = reading == null ? null : CfSolveNeeded.urlFor(reading);
+        final blocked = reading == null
+            ? _matcher.blockedForTitle(c)
+            : CfSolveNeeded.urlFor(reading);
         if (blocked != null) throw CloudflareRequiredException(blocked);
         AppLogger.instance.log(
           '[metadata] detail no source match ${sw.elapsedMilliseconds}ms',
@@ -719,7 +721,9 @@ class MetadataRepository implements CatalogueRepository {
         // it tries to read one.
         return d.copyWith(episodes: const <Episode>[]);
       }
-      final chapters = await _src.episodes(m.showUrl, sourceId: m.sourceId);
+      final chapters = c.kind == ZKind.manga
+          ? await _matcher.chaptersFor(c, m)
+          : await _src.episodes(m.showUrl, sourceId: m.sourceId);
       AppLogger.instance.log(
         '[metadata] detail matched ${m.sourceId} chapters=${chapters.length} '
         '${sw.elapsedMilliseconds}ms',

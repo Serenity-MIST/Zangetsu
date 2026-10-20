@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:io';
+import '../../core/desktop/desktop_player_input.dart';
+import '../../core/desktop/desktop_window.dart';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:dio/dio.dart';
@@ -342,28 +344,41 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // a position event arrives.
   Duration _duration = Duration.zero;
 
-  // User's preferred double-tap seek step (±5/10/15/30s), read once at session
-  // start. Backed by PlaybackPrefs.doubleTapSeconds.
-  final int _seekSeconds = sl<PlaybackPrefs>().doubleTapSeconds;
+  // Seek controls share the configured step (±5/10/15/30s).
+  /// Current seek step, read live so settings changes apply during playback.
+  int get _seekSeconds => sl<PlaybackPrefs>().doubleTapSeconds;
 
   // ── Brightness / volume swipe gestures ──────────────────────────────────
-  final bool _gesturesEnabled = sl<PlaybackPrefs>().gestureControls;
+  /// Touch volume/brightness gestures apply only outside the Windows player.
+  bool get _gesturesEnabled =>
+      !Platform.isWindows && sl<PlaybackPrefs>().gestureControls;
   // Horizontal drag-to-seek. Its own switch, not part of [_gesturesEnabled],
   // which only ever meant the vertical brightness/volume swipes.
-  final bool _swipeSeekEnabled = sl<PlaybackPrefs>().swipeSeek;
-  final bool _holdSpeedEnabled = sl<PlaybackPrefs>().holdSpeed;
-  final bool _skipIntroEnabled = sl<PlaybackPrefs>().skipIntro;
-  // Fields for the in-player info overlay (read once). Shown on demand via the
+  /// Enables configured touch swipe seeking while desktop uses mouse/keyboard.
+  bool get _swipeSeekEnabled =>
+      !Platform.isWindows && sl<PlaybackPrefs>().swipeSeek;
+
+  /// Limits touch hold-to-speed behaviour to the touch player.
+  bool get _holdSpeedEnabled =>
+      !Platform.isWindows && sl<PlaybackPrefs>().holdSpeed;
+
+  /// Reads the current intro-skip setting without recreating the player.
+  bool get _skipIntroEnabled => sl<PlaybackPrefs>().skipIntro;
+  // Fields for the in-player info overlay. Shown on demand via the
   // ⓘ button in the top bar, NOT auto with the controls.
-  final List<String> _infoFields = sl<PlaybackPrefs>().playerInfoFields;
+  /// Current field selection for the on-demand information overlay.
+  List<String> get _infoFields => sl<PlaybackPrefs>().playerInfoFields;
   bool _infoPanelOpen = false;
   bool _flashing = false; // brief white flash on screenshot capture
   // Always-on plain-text quality label (top-right), independent of the ⓘ panel.
-  final bool _alwaysShowQuality = sl<PlaybackPrefs>().alwaysShowQuality;
-  // MegaSkip — manual jump-forward button (Aniyomi-style). Read once at open
-  // (the player is recreated per session, like the other prefs above).
-  final bool _megaSkipEnabled = sl<PlaybackPrefs>().megaSkip;
-  final int _megaSkipSeconds = sl<PlaybackPrefs>().megaSkipSeconds;
+  /// Live setting for the quality label independent of the information panel.
+  bool get _alwaysShowQuality => sl<PlaybackPrefs>().alwaysShowQuality;
+  // MegaSkip — manual jump-forward button (Aniyomi-style).
+  /// Shows MegaSkip according to current preferences, including mid-play changes.
+  bool get _megaSkipEnabled => sl<PlaybackPrefs>().megaSkip;
+
+  /// Configured MegaSkip jump distance, read at interaction time.
+  int get _megaSkipSeconds => sl<PlaybackPrefs>().megaSkipSeconds;
   bool _megaFlash = false; // brief "+Ns" flash shown right after a MegaSkip tap
   Timer? _megaFlashTimer;
   bool _dragIsBrightness = false; // left half = brightness, right half = volume
@@ -1593,6 +1608,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // their midpoint pans; releasing a finger ends it (snapping back to fit when
   // near 1×). The video is scaled by [_zoom]/[_zoomPan] in build(). ──────────
   void _onPointerDown(PointerDownEvent e) {
+    if (Platform.isWindows) return;
     _pointers[e.pointer] = e.position;
     if (_pointers.length == 2 && !_locked) _startPinch();
   }
@@ -1676,6 +1692,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// and audio carrying on under a settings list reads as a bug. It resumes
   /// on return only if it was actually playing when you left.
   Future<void> _openSettings() async {
+    final previousSpeed = sl<PlaybackPrefs>().defaultSpeed;
     final wasPlaying = _c.player.state.playing;
     if (wasPlaying) _c.togglePlay();
     // Settings is built for portrait, but the player pins landscape and hides
@@ -1686,16 +1703,36 @@ class _PlayerScreenState extends State<PlayerScreen> {
     ]);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     if (!mounted) return;
-    await Navigator.of(
-      context,
-    ).push(MaterialPageRoute<void>(builder: (_) => const SettingsScreen()));
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (settingsContext) => CallbackShortcuts(
+          bindings: {
+            const SingleActivator(LogicalKeyboardKey.escape): () =>
+                Navigator.of(settingsContext).maybePop(),
+          },
+          child: const Focus(
+            autofocus: true,
+            child: SettingsScreen(returnToPlayer: true),
+          ),
+        ),
+      ),
+    );
     if (!mounted) return;
     // Back to whichever orientation you were watching in — not landscape by
     // default, or a portrait session would end up sideways after a settings trip.
     await SystemChrome.setPreferredOrientations(_orientationLock);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    await _c.applySavedPlaybackSettings();
+    if (!mounted) return;
+    if (sl<PlaybackPrefs>().defaultSpeed != previousSpeed) {
+      _c.setRate(sl<PlaybackPrefs>().defaultSpeed);
+    }
+    _syncWakelock();
     if (!mounted) return;
     if (wasPlaying && !_c.player.state.playing) _c.togglePlay();
+    setState(
+      () {},
+    ); // Re-read controls, gesture and skip preferences on return.
     _bumpControls();
   }
 
@@ -2531,495 +2568,667 @@ class _PlayerScreenState extends State<PlayerScreen> {
     // each Tooltip: the top bar's stock IconButtons build their own from the
     // `tooltip:` property, so per-widget styling would leave those on Material's
     // default grey while ours were dark. Theming the whole subtree catches both.
-    final scaffold = TooltipTheme(
-      data: TooltipThemeData(
-        decoration: BoxDecoration(
-          // Same family as the control chips, just opaque enough to stay
-          // readable over a bright frame — 0.3 like the bars would vanish.
-          color: Colors.black.withValues(alpha: 0.82),
-          borderRadius: BorderRadius.circular(10),
-        ),
-        textStyle: AppText.caption.copyWith(
-          color: Colors.white,
-          fontSize: 12.5,
-          fontWeight: FontWeight.w600,
-          height: 1.2,
-        ),
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-        margin: const EdgeInsets.symmetric(horizontal: 12),
+    final scaffold = DesktopPlayerInput(
+      hideCursor: !_controlsVisible,
+      seekSeconds: sl<PlaybackPrefs>().tvSeekSeconds,
+      onPlayPause: () {
+        _bumpControls();
+        _c.togglePlay();
+      },
+      onSeek: (seconds) => _c.seekBy(Duration(seconds: seconds)),
+      onVolume: (delta) => _c.player.setVolume(
+        (_c.player.state.volume + delta).clamp(0.0, 100.0),
       ),
-      child: Scaffold(
-        backgroundColor: Colors.black,
-        body: BlocConsumer<PlayerCubit, PlayerState>(
-          bloc: _c,
-          // Nothing ever played: this episode is a dead end, so say so in a
-          // dialog and hand the viewer back where they came from rather than
-          // leaving them on a black screen they have to press Back on. A
-          // failure PARTWAY through keeps the in-place error below — they are
-          // already watching something, and yanking them out would lose it.
-          listener: (context, state) {
-            if (state.error != null && !_c.everStarted) {
-              _handleDeadEnd(state.error!);
-            }
-          },
-          builder: (context, state) {
-            // Inside the PiP window: render ONLY the video — no overlay, no
-            // gestures, no controls. The same controller keeps the texture live.
-            if (_inPip) {
-              return Center(
-                child: Video(
-                  controller: _c.videoController,
-                  controls: NoVideoControls,
-                  fit: BoxFit.contain,
-                ),
-              );
-            }
-            if (state.loadingSources) {
-              return _loadingBackdropBody(
-                'Finding the best source…',
-                thumb: _c.currentEpisode.thumbnail,
-              );
-            }
-            // Torrent source buffering: "Finding peers…" / "Buffering N%".
-            if (state.torrentPhase != null) {
-              return _loadingBackdropBody(
-                state.torrentPhase!,
-                thumb: _c.currentEpisode.thumbnail,
-              );
-            }
-            if (state.error != null) {
-              return Center(
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 32),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(
-                        Icons.error_outline,
-                        size: 40,
-                        color: AppColors.textTertiary,
-                      ),
-                      const SizedBox(height: 12),
-                      // First line is the headline, the rest is what actually
-                      // happened. Kept as one string in the state and split here
-                      // so the controller stays free of presentation — and so a
-                      // message with no second line still renders fine.
-                      Text(
-                        state.error!.split('\n').first,
-                        style: AppText.title.copyWith(fontSize: 17),
-                        textAlign: TextAlign.center,
-                      ),
-                      if (state.error!.contains('\n')) ...[
-                        const SizedBox(height: 6),
+      onMute: () => _c.player.setVolume(_c.player.state.volume == 0 ? 100 : 0),
+      onBack: () => Navigator.of(context).maybePop(),
+      child: TooltipTheme(
+        data: TooltipThemeData(
+          decoration: BoxDecoration(
+            // Same family as the control chips, just opaque enough to stay
+            // readable over a bright frame — 0.3 like the bars would vanish.
+            color: Colors.black.withValues(alpha: 0.82),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          textStyle: AppText.caption.copyWith(
+            color: Colors.white,
+            fontSize: 12.5,
+            fontWeight: FontWeight.w600,
+            height: 1.2,
+          ),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          margin: const EdgeInsets.symmetric(horizontal: 12),
+        ),
+        child: Scaffold(
+          backgroundColor: Colors.black,
+          body: BlocConsumer<PlayerCubit, PlayerState>(
+            bloc: _c,
+            // Nothing ever played: this episode is a dead end, so say so in a
+            // dialog and hand the viewer back where they came from rather than
+            // leaving them on a black screen they have to press Back on. A
+            // failure PARTWAY through keeps the in-place error below — they are
+            // already watching something, and yanking them out would lose it.
+            listener: (context, state) {
+              if (state.error != null && !_c.everStarted) {
+                _handleDeadEnd(state.error!);
+              }
+            },
+            builder: (context, state) {
+              // Inside the PiP window: render ONLY the video — no overlay, no
+              // gestures, no controls. The same controller keeps the texture live.
+              if (_inPip) {
+                return Center(
+                  child: Video(
+                    controller: _c.videoController,
+                    controls: NoVideoControls,
+                    fit: BoxFit.contain,
+                  ),
+                );
+              }
+              if (state.loadingSources) {
+                return _loadingBackdropBody(
+                  'Finding the best source…',
+                  thumb: _c.currentEpisode.thumbnail,
+                );
+              }
+              // Torrent source buffering: "Finding peers…" / "Buffering N%".
+              if (state.torrentPhase != null) {
+                return _loadingBackdropBody(
+                  state.torrentPhase!,
+                  thumb: _c.currentEpisode.thumbnail,
+                );
+              }
+              if (state.error != null) {
+                return Center(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 32),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.error_outline,
+                          size: 40,
+                          color: AppColors.textTertiary,
+                        ),
+                        const SizedBox(height: 12),
+                        // First line is the headline, the rest is what actually
+                        // happened. Kept as one string in the state and split here
+                        // so the controller stays free of presentation — and so a
+                        // message with no second line still renders fine.
                         Text(
-                          state.error!.split('\n').skip(1).join('\n'),
-                          style: AppText.body.copyWith(
-                            color: AppColors.textSecondary,
-                          ),
+                          state.error!.split('\n').first,
+                          style: AppText.title.copyWith(fontSize: 17),
                           textAlign: TextAlign.center,
                         ),
-                      ],
-                      const SizedBox(height: 16),
-                      TextButton(
-                        onPressed: () => _c.openEpisode(state.currentIndex),
-                        child: Text(
-                          'Try again',
-                          style: AppText.body.copyWith(color: AppColors.accent),
+                        if (state.error!.contains('\n')) ...[
+                          const SizedBox(height: 6),
+                          Text(
+                            state.error!.split('\n').skip(1).join('\n'),
+                            style: AppText.body.copyWith(
+                              color: AppColors.textSecondary,
+                            ),
+                            textAlign: TextAlign.center,
+                          ),
+                        ],
+                        const SizedBox(height: 16),
+                        TextButton(
+                          onPressed: () => _c.openEpisode(state.currentIndex),
+                          child: Text(
+                            'Try again',
+                            style: AppText.body.copyWith(
+                              color: AppColors.accent,
+                            ),
+                          ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
-                ),
-              );
-            }
-            // Reset any pinch-zoom when the episode changes.
-            if (_zoomIndex != state.currentIndex) {
-              _zoomIndex = state.currentIndex;
-              _zoom = 1.0;
-              _zoomPan = Offset.zero;
-            }
-            // Passive Listener tracks raw pointers for pinch-to-zoom so it never
-            // competes with the 1-finger gesture detector inside the Stack.
-            return Listener(
-              onPointerDown: _onPointerDown,
-              onPointerMove: _onPointerMove,
-              onPointerUp: _onPointerUp,
-              onPointerCancel: _onPointerUp,
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  // 1. The video. NoVideoControls disables media_kit's built-in
-                  // controls (which include their own buffering spinner + gestures)
-                  // so ONLY our custom Netflix overlay shows — fixes the duplicate
-                  // spinner / double controls.
-                  Center(
-                    child: ValueListenableBuilder<int>(
-                      valueListenable: _c.subtitleStyleRev,
-                      builder: (context, _, _) => Transform.translate(
-                        // Pinch-zoom: scale about centre, then pan. Overflow is
-                        // clipped by the Stack so a zoomed frame crops to screen.
-                        offset: _zoomPan,
-                        child: Transform.scale(
-                          scale: _zoom,
-                          child: Video(
-                            controller: _c.videoController,
-                            controls: NoVideoControls,
-                            fit: _fits[_fitIndex].$1,
-                            subtitleViewConfiguration: _subtitleConfig(),
+                );
+              }
+              // Reset any pinch-zoom when the episode changes.
+              if (_zoomIndex != state.currentIndex) {
+                _zoomIndex = state.currentIndex;
+                _zoom = 1.0;
+                _zoomPan = Offset.zero;
+              }
+              // Passive Listener tracks raw pointers for pinch-to-zoom so it never
+              // competes with the 1-finger gesture detector inside the Stack.
+              return Listener(
+                onPointerDown: _onPointerDown,
+                onPointerHover: Platform.isWindows
+                    ? (_) => _bumpControls()
+                    : null,
+                onPointerMove: _onPointerMove,
+                onPointerUp: _onPointerUp,
+                onPointerCancel: _onPointerUp,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    // 1. The video. NoVideoControls disables media_kit's built-in
+                    // controls (which include their own buffering spinner + gestures)
+                    // so ONLY our custom Netflix overlay shows — fixes the duplicate
+                    // spinner / double controls.
+                    Center(
+                      child: ValueListenableBuilder<int>(
+                        valueListenable: _c.subtitleStyleRev,
+                        builder: (context, _, _) => Transform.translate(
+                          // Pinch-zoom: scale about centre, then pan. Overflow is
+                          // clipped by the Stack so a zoomed frame crops to screen.
+                          offset: _zoomPan,
+                          child: Transform.scale(
+                            scale: _zoom,
+                            child: Video(
+                              controller: _c.videoController,
+                              controls: NoVideoControls,
+                              fit: _fits[_fitIndex].$1,
+                              subtitleViewConfiguration: _subtitleConfig(),
+                            ),
                           ),
                         ),
                       ),
                     ),
-                  ),
 
-                  // 1b. Poster-on-start: cover the black surface with the episode's
-                  // poster until the first frame decodes, then fade it out. width
-                  // emits non-null/>0 once dimensions are known (≈ first frame), and
-                  // resets per new media so the poster re-shows each episode.
-                  Positioned.fill(
-                    child: StreamBuilder<int?>(
-                      stream: _c.player.stream.width,
-                      initialData: _c.player.state.width,
+                    // 1b. Poster-on-start: cover the black surface with the episode's
+                    // poster until the first frame decodes, then fade it out. width
+                    // emits non-null/>0 once dimensions are known (≈ first frame), and
+                    // resets per new media so the poster re-shows each episode.
+                    Positioned.fill(
+                      child: StreamBuilder<int?>(
+                        stream: _c.player.stream.width,
+                        initialData: _c.player.state.width,
+                        builder: (context, snap) {
+                          final hasFrame = (snap.data ?? 0) > 0;
+                          final img =
+                              (_c.currentEpisode.thumbnail?.trim().isNotEmpty ??
+                                  false)
+                              ? _c.currentEpisode.thumbnail!.trim()
+                              : (widget.cover ?? '');
+                          return IgnorePointer(
+                            child: AnimatedOpacity(
+                              opacity: hasFrame || img.isEmpty ? 0 : 1,
+                              duration: const Duration(milliseconds: 350),
+                              child: img.isEmpty
+                                  ? const ColoredBox(color: Colors.black)
+                                  : Stack(
+                                      fit: StackFit.expand,
+                                      children: [
+                                        CachedNetworkImage(
+                                          imageUrl: img,
+                                          httpHeaders: widget.coverHeaders,
+                                          fit: BoxFit.cover,
+                                          errorWidget: (c, u, e) =>
+                                              const ColoredBox(
+                                                color: Colors.black,
+                                              ),
+                                        ),
+                                        // subtle scrim so it reads as a player background
+                                        const DecoratedBox(
+                                          decoration: BoxDecoration(
+                                            color: Color(0x33000000),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+
+                    // 2. Input layer — D-pad on TV; touch gestures on phone.
+                    // On TV: PlayerTvControls owns the Focus/key-handler + bottom bar.
+                    // On phone: existing gesture surface (unchanged).
+                    if (sl<AppMode>().isTv)
+                      Positioned.fill(
+                        child: PlayerTvControls(
+                          onTogglePlay: _c.togglePlay,
+                          onSeekBy: _c.seekBy,
+                          onSpeed: _openSpeedSheet,
+                          onAudioSubs: _openAudioSubsSheet,
+                          onQuality: _openQualitySheet,
+                          showQuality:
+                              state.qualities.isNotEmpty ||
+                              _c.mediaVideoTracks.length > 1,
+                          onSources: _openSourceSheet,
+                          onFit: _cycleFit,
+                          onNext: _c.hasPlayableNext
+                              ? () => _c.playNext()
+                              : null,
+                          onBack: () => Navigator.of(context).maybePop(),
+                          playingStream: _c.player.stream.playing,
+                          initialPlaying: _c.player.state.playing,
+                          barVisible: _tvBarVisible,
+                          onBarChange: (v) => setState(() => _tvBarVisible = v),
+                          positionStream: _c.player.stream.position,
+                          durationStream: _c.player.stream.duration,
+                          initialPosition: _c.player.state.position,
+                          initialDuration: _c.player.state.duration,
+                          skipInfoFor: (pos) {
+                            for (final iv in _c.currentSkips) {
+                              if (pos >= iv.start &&
+                                  pos < iv.end - const Duration(seconds: 1)) {
+                                return (
+                                  label: isRecapSkip(iv.type)
+                                      ? 'Skip recap'
+                                      : iv.type == 'ed'
+                                      ? 'Skip ending'
+                                      : 'Skip opening',
+                                  onSkip: () => _c.seekTo(iv.end),
+                                );
+                              }
+                            }
+                            return null;
+                          },
+                        ),
+                      )
+                    else if (_locked)
+                      // Locked: a single tap reveals the unlock button, nothing else.
+                      Positioned.fill(
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: _toggleControls,
+                        ),
+                      )
+                    else
+                      // Phone: drags + long-press live on a bottom layer; taps live on
+                      // three zones stacked ABOVE it. Keeping tap off the drag detector
+                      // is the fix — a tap no longer competes with (and loses to) a pan
+                      // in the gesture arena, so show/hide is instant and reliable. The
+                      // centre zone is tap-only (instant toggle); the side zones add
+                      // double-tap-to-seek. Vertical = brightness/volume, horizontal =
+                      // scrub, long-press = 2× speed.
+                      Positioned.fill(
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            // Drag + long-press layer (opaque, no tap handler).
+                            //
+                            // Inset from the top and bottom rather than filling
+                            // the screen. Opaque means this claims a swipe before
+                            // the system sees it, and filling the screen turned a
+                            // pull-down from the top edge into a brightness or
+                            // volume drag instead of the notification shade, with
+                            // the picture dimming to nothing on the way. Same at
+                            // the bottom against the home bar.
+                            //
+                            // Leaving those two bands uncovered is the only thing
+                            // that works: by the time [_onVDragStart] could turn
+                            // the touch down, this recognizer has already won the
+                            // gesture arena and the swipe is eaten either way.
+                            //
+                            // Taps are untouched. They are their own translucent
+                            // layer below this one, still covering the whole
+                            // screen, so show/hide and double-tap seek still work
+                            // right up to the edges.
+                            Positioned(
+                              left: 0,
+                              right: 0,
+                              top: _kEdgeBand,
+                              bottom: _bottomBand(context),
+                              child: GestureDetector(
+                                behavior: HitTestBehavior.opaque,
+                                onLongPressStart: _holdSpeedEnabled
+                                    ? (_) {
+                                        _rateBeforeHold =
+                                            rateToRestoreAfterHold(
+                                              _c.player.state.rate,
+                                            );
+                                        _c.setRate(2.0);
+                                        setState(() => _holding = true);
+                                      }
+                                    : null,
+                                onLongPressEnd: _holdSpeedEnabled
+                                    ? (_) {
+                                        _c.setRate(_rateBeforeHold);
+                                        setState(() => _holding = false);
+                                      }
+                                    : null,
+                                onVerticalDragStart: _gesturesEnabled
+                                    ? _onVDragStart
+                                    : null,
+                                onVerticalDragUpdate: _gesturesEnabled
+                                    ? _onVDragUpdate
+                                    : null,
+                                onVerticalDragEnd: _gesturesEnabled
+                                    ? _onVDragEnd
+                                    : null,
+                                // Nulled rather than no-op'd when the setting is off:
+                                // a live recognizer still joins the gesture arena and
+                                // would swallow any tap that drifted sideways, so the
+                                // controls would stop toggling on a slightly sloppy tap.
+                                onHorizontalDragStart: _swipeSeekEnabled
+                                    ? _onHDragStart
+                                    : null,
+                                onHorizontalDragUpdate: _swipeSeekEnabled
+                                    ? _onHDragUpdate
+                                    : null,
+                                onHorizontalDragEnd: _swipeSeekEnabled
+                                    ? _onHDragEnd
+                                    : null,
+                              ),
+                            ),
+                            // Tap zones — translucent so drags still reach the layer
+                            // below. Thirds match the old seek trigger areas. The
+                            // SizedBox.expand gives each zone a full-height hit area.
+                            // All three carry a bare onTap (no double-tap recognizer,
+                            // which would hold the arena and stall every single tap by
+                            // 300ms); _tapZone sorts toggle from seek itself.
+                            if (Platform.isWindows)
+                              Positioned.fill(
+                                child: GestureDetector(
+                                  behavior: HitTestBehavior.translucent,
+                                  onTap: _c.togglePlay,
+                                  onDoubleTap: DesktopWindow.toggleFullscreen,
+                                  onSecondaryTap: _openSettings,
+                                ),
+                              )
+                            else
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: GestureDetector(
+                                      behavior: HitTestBehavior.translucent,
+                                      onTap: () => _tapZone(-1),
+                                      child: const SizedBox.expand(),
+                                    ),
+                                  ),
+                                  Expanded(
+                                    child: GestureDetector(
+                                      behavior: HitTestBehavior.translucent,
+                                      onTap: () => _tapZone(0),
+                                      child: const SizedBox.expand(),
+                                    ),
+                                  ),
+                                  Expanded(
+                                    child: GestureDetector(
+                                      behavior: HitTestBehavior.translucent,
+                                      onTap: () => _tapZone(1),
+                                      child: const SizedBox.expand(),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                          ],
+                        ),
+                      ),
+
+                    // 3. Buffering spinner when controls are hidden. Faded in/out
+                    // (not hard-popped) so a quick stall doesn't flash the spinner.
+                    StreamBuilder<bool>(
+                      stream: _c.player.stream.buffering,
                       builder: (context, snap) {
-                        final hasFrame = (snap.data ?? 0) > 0;
-                        final img =
-                            (_c.currentEpisode.thumbnail?.trim().isNotEmpty ??
-                                false)
-                            ? _c.currentEpisode.thumbnail!.trim()
-                            : (widget.cover ?? '');
+                        final show = (snap.data ?? false) && !_controlsVisible;
                         return IgnorePointer(
                           child: AnimatedOpacity(
-                            opacity: hasFrame || img.isEmpty ? 0 : 1,
-                            duration: const Duration(milliseconds: 350),
-                            child: img.isEmpty
-                                ? const ColoredBox(color: Colors.black)
-                                : Stack(
-                                    fit: StackFit.expand,
-                                    children: [
-                                      CachedNetworkImage(
-                                        imageUrl: img,
-                                        httpHeaders: widget.coverHeaders,
-                                        fit: BoxFit.cover,
-                                        errorWidget: (c, u, e) =>
-                                            const ColoredBox(
-                                              color: Colors.black,
-                                            ),
-                                      ),
-                                      // subtle scrim so it reads as a player background
-                                      const DecoratedBox(
-                                        decoration: BoxDecoration(
-                                          color: Color(0x33000000),
-                                        ),
-                                      ),
-                                    ],
+                            opacity: show ? 1 : 0,
+                            duration: const Duration(milliseconds: 150),
+                            // The spinner is kept mounted (so it can fade), but a
+                            // CircularProgressIndicator spins forever via a repeating
+                            // ticker — which scheduled a Flutter frame every vsync and
+                            // pinned the whole player at 60fps even while invisible and
+                            // the video sat idle. TickerMode freezes it unless it's
+                            // actually showing, letting the panel fall to the video's
+                            // real rate. The AnimatedOpacity's own ticker is outside
+                            // this, so the fade still plays.
+                            child: TickerMode(
+                              enabled: show,
+                              child: Center(
+                                child: SizedBox(
+                                  width: 36,
+                                  height: 36,
+                                  child: CircularProgressIndicator(
+                                    color: AppColors.accent,
+                                    strokeWidth: 2.5,
                                   ),
+                                ),
+                              ),
+                            ),
                           ),
                         );
                       },
                     ),
-                  ),
 
-                  // 2. Input layer — D-pad on TV; touch gestures on phone.
-                  // On TV: PlayerTvControls owns the Focus/key-handler + bottom bar.
-                  // On phone: existing gesture surface (unchanged).
-                  if (sl<AppMode>().isTv)
-                    Positioned.fill(
-                      child: PlayerTvControls(
-                        onTogglePlay: _c.togglePlay,
-                        onSeekBy: _c.seekBy,
-                        onSpeed: _openSpeedSheet,
-                        onAudioSubs: _openAudioSubsSheet,
-                        onQuality: _openQualitySheet,
-                        showQuality:
-                            state.qualities.isNotEmpty ||
-                            _c.mediaVideoTracks.length > 1,
-                        onSources: _openSourceSheet,
-                        onFit: _cycleFit,
-                        onNext: _c.hasPlayableNext ? () => _c.playNext() : null,
-                        onBack: () => Navigator.of(context).maybePop(),
-                        playingStream: _c.player.stream.playing,
-                        initialPlaying: _c.player.state.playing,
-                        barVisible: _tvBarVisible,
-                        onBarChange: (v) => setState(() => _tvBarVisible = v),
-                        positionStream: _c.player.stream.position,
-                        durationStream: _c.player.stream.duration,
-                        initialPosition: _c.player.state.position,
-                        initialDuration: _c.player.state.duration,
-                        skipInfoFor: (pos) {
-                          for (final iv in _c.currentSkips) {
-                            if (pos >= iv.start &&
-                                pos < iv.end - const Duration(seconds: 1)) {
-                              return (
-                                label: isRecapSkip(iv.type)
-                                    ? 'Skip recap'
-                                    : iv.type == 'ed'
-                                    ? 'Skip ending'
-                                    : 'Skip opening',
-                                onSkip: () => _c.seekTo(iv.end),
-                              );
-                            }
-                          }
-                          return null;
-                        },
-                      ),
-                    )
-                  else if (_locked)
-                    // Locked: a single tap reveals the unlock button, nothing else.
-                    Positioned.fill(
-                      child: GestureDetector(
-                        behavior: HitTestBehavior.opaque,
-                        onTap: _toggleControls,
-                      ),
-                    )
-                  else
-                    // Phone: drags + long-press live on a bottom layer; taps live on
-                    // three zones stacked ABOVE it. Keeping tap off the drag detector
-                    // is the fix — a tap no longer competes with (and loses to) a pan
-                    // in the gesture arena, so show/hide is instant and reliable. The
-                    // centre zone is tap-only (instant toggle); the side zones add
-                    // double-tap-to-seek. Vertical = brightness/volume, horizontal =
-                    // scrub, long-press = 2× speed.
-                    Positioned.fill(
-                      child: Stack(
-                        fit: StackFit.expand,
-                        children: [
-                          // Drag + long-press layer (opaque, no tap handler).
-                          //
-                          // Inset from the top and bottom rather than filling
-                          // the screen. Opaque means this claims a swipe before
-                          // the system sees it, and filling the screen turned a
-                          // pull-down from the top edge into a brightness or
-                          // volume drag instead of the notification shade, with
-                          // the picture dimming to nothing on the way. Same at
-                          // the bottom against the home bar.
-                          //
-                          // Leaving those two bands uncovered is the only thing
-                          // that works: by the time [_onVDragStart] could turn
-                          // the touch down, this recognizer has already won the
-                          // gesture arena and the swipe is eaten either way.
-                          //
-                          // Taps are untouched. They are their own translucent
-                          // layer below this one, still covering the whole
-                          // screen, so show/hide and double-tap seek still work
-                          // right up to the edges.
-                          Positioned(
-                            left: 0,
-                            right: 0,
-                            top: _kEdgeBand,
-                            bottom: _bottomBand(context),
-                            child: GestureDetector(
-                              behavior: HitTestBehavior.opaque,
-                              onLongPressStart: _holdSpeedEnabled
-                                  ? (_) {
-                                      _rateBeforeHold = rateToRestoreAfterHold(
-                                        _c.player.state.rate,
-                                      );
-                                      _c.setRate(2.0);
-                                      setState(() => _holding = true);
-                                    }
-                                  : null,
-                              onLongPressEnd: _holdSpeedEnabled
-                                  ? (_) {
-                                      _c.setRate(_rateBeforeHold);
-                                      setState(() => _holding = false);
-                                    }
-                                  : null,
-                              onVerticalDragStart: _onVDragStart,
-                              onVerticalDragUpdate: _onVDragUpdate,
-                              onVerticalDragEnd: _onVDragEnd,
-                              // Nulled rather than no-op'd when the setting is off:
-                              // a live recognizer still joins the gesture arena and
-                              // would swallow any tap that drifted sideways, so the
-                              // controls would stop toggling on a slightly sloppy tap.
-                              onHorizontalDragStart: _swipeSeekEnabled
-                                  ? _onHDragStart
-                                  : null,
-                              onHorizontalDragUpdate: _swipeSeekEnabled
-                                  ? _onHDragUpdate
-                                  : null,
-                              onHorizontalDragEnd: _swipeSeekEnabled
-                                  ? _onHDragEnd
-                                  : null,
+                    // 3b. Transient status toast (e.g. auto-failover "Switching
+                    // server…" when a started source stalls), pinned near the top.
+                    ValueListenableBuilder<String?>(
+                      valueListenable: _c.toast,
+                      builder: (context, msg, _) {
+                        if (msg == null) return const SizedBox.shrink();
+                        return Positioned(
+                          top: 16,
+                          left: 0,
+                          right: 0,
+                          child: IgnorePointer(
+                            child: Center(
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 14,
+                                  vertical: 8,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.black.withValues(alpha: 0.8),
+                                  borderRadius: BorderRadius.circular(20),
+                                ),
+                                child: Text(
+                                  msg,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
                             ),
                           ),
-                          // Tap zones — translucent so drags still reach the layer
-                          // below. Thirds match the old seek trigger areas. The
-                          // SizedBox.expand gives each zone a full-height hit area.
-                          // All three carry a bare onTap (no double-tap recognizer,
-                          // which would hold the arena and stall every single tap by
-                          // 300ms); _tapZone sorts toggle from seek itself.
-                          Row(
-                            children: [
-                              Expanded(
-                                child: GestureDetector(
-                                  behavior: HitTestBehavior.translucent,
-                                  onTap: () => _tapZone(-1),
-                                  child: const SizedBox.expand(),
-                                ),
-                              ),
-                              Expanded(
-                                child: GestureDetector(
-                                  behavior: HitTestBehavior.translucent,
-                                  onTap: () => _tapZone(0),
-                                  child: const SizedBox.expand(),
-                                ),
-                              ),
-                              Expanded(
-                                child: GestureDetector(
-                                  behavior: HitTestBehavior.translucent,
-                                  onTap: () => _tapZone(1),
-                                  child: const SizedBox.expand(),
-                                ),
-                              ),
-                            ],
+                        );
+                      },
+                    ),
+
+                    // 4. Double-tap seek indicator: an edge gradient
+                    // wash on the tapped side + an icon disc + the running total,
+                    // sliding/fading in. Re-keyed per tap so it replays each time.
+                    if (_seekSide != 0)
+                      _SeekIndicator(
+                        key: ValueKey(_seekTick),
+                        side: _seekSide,
+                        accumSeconds: _seekAccum,
+                      ),
+
+                    // 4b. Brightness / volume HUD (MX/CloudStream-style) while swiping —
+                    // a side-rail bar pinned to the half being swiped; fades out on
+                    // release (auto-hide).
+                    IgnorePointer(
+                      child: AnimatedOpacity(
+                        opacity: _hudVisible ? 1 : 0,
+                        duration: Duration(
+                          milliseconds: _hudVisible ? 120 : 260,
+                        ),
+                        curve: Curves.easeOut,
+                        child: Align(
+                          // Show the indicator on the OPPOSITE side to the swiping
+                          // finger, so your hand doesn't cover it: brightness (left
+                          // swipe) → right rail; volume (right swipe) → left rail.
+                          alignment: _hudIsBrightness
+                              ? const Alignment(
+                                  0.88,
+                                  0.0,
+                                ) // brightness → RIGHT rail
+                              : const Alignment(
+                                  -0.88,
+                                  0.0,
+                                ), // volume → LEFT rail
+                          child: _AdjustHud(
+                            value: _hudValue,
+                            isBrightness: _hudIsBrightness,
                           ),
-                        ],
+                        ),
                       ),
                     ),
 
-                  // 3. Buffering spinner when controls are hidden. Faded in/out
-                  // (not hard-popped) so a quick stall doesn't flash the spinner.
-                  StreamBuilder<bool>(
-                    stream: _c.player.stream.buffering,
-                    builder: (context, snap) {
-                      final show = (snap.data ?? false) && !_controlsVisible;
-                      return IgnorePointer(
-                        child: AnimatedOpacity(
-                          opacity: show ? 1 : 0,
-                          duration: const Duration(milliseconds: 150),
-                          // The spinner is kept mounted (so it can fade), but a
-                          // CircularProgressIndicator spins forever via a repeating
-                          // ticker — which scheduled a Flutter frame every vsync and
-                          // pinned the whole player at 60fps even while invisible and
-                          // the video sat idle. TickerMode freezes it unless it's
-                          // actually showing, letting the panel fall to the video's
-                          // real rate. The AnimatedOpacity's own ticker is outside
-                          // this, so the fade still plays.
-                          child: TickerMode(
-                            enabled: show,
-                            child: Center(
-                              child: SizedBox(
-                                width: 36,
-                                height: 36,
-                                child: CircularProgressIndicator(
-                                  color: AppColors.accent,
-                                  strokeWidth: 2.5,
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-
-                  // 3b. Transient status toast (e.g. auto-failover "Switching
-                  // server…" when a started source stalls), pinned near the top.
-                  ValueListenableBuilder<String?>(
-                    valueListenable: _c.toast,
-                    builder: (context, msg, _) {
-                      if (msg == null) return const SizedBox.shrink();
-                      return Positioned(
-                        top: 16,
+                    // 5. 2x-hold chip (top-center). Same translucent-black chip as
+                    // the bottom bar rather than the old opaque surface2 block with
+                    // accent text. Carried a little more alpha than those, though:
+                    // holding for 2x doesn't raise the controls, so this sits on raw
+                    // video with no scrim under it to help legibility.
+                    if (_holding)
+                      Positioned(
+                        top: 12,
                         left: 0,
                         right: 0,
-                        child: IgnorePointer(
-                          child: Center(
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 14,
-                                vertical: 8,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.black.withValues(alpha: 0.8),
-                                borderRadius: BorderRadius.circular(20),
-                              ),
-                              child: Text(
-                                msg,
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w600,
-                                ),
+                        child: Center(
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.5),
+                              borderRadius: BorderRadius.circular(13),
+                            ),
+                            child: Padding(
+                              padding: const EdgeInsets.fromLTRB(10, 6, 12, 6),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Icon(
+                                    Icons.fast_forward_rounded,
+                                    color: Colors.white,
+                                    size: 18,
+                                  ),
+                                  const SizedBox(width: 5),
+                                  Text(
+                                    '2×',
+                                    style: AppText.caption.copyWith(
+                                      color: Colors.white,
+                                      fontSize: 13.5,
+                                      fontWeight: FontWeight.w600,
+                                      height: 1.1,
+                                      letterSpacing: 0.3,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
                           ),
                         ),
-                      );
-                    },
-                  ),
-
-                  // 4. Double-tap seek indicator: an edge gradient
-                  // wash on the tapped side + an icon disc + the running total,
-                  // sliding/fading in. Re-keyed per tap so it replays each time.
-                  if (_seekSide != 0)
-                    _SeekIndicator(
-                      key: ValueKey(_seekTick),
-                      side: _seekSide,
-                      accumSeconds: _seekAccum,
-                    ),
-
-                  // 4b. Brightness / volume HUD (MX/CloudStream-style) while swiping —
-                  // a side-rail bar pinned to the half being swiped; fades out on
-                  // release (auto-hide).
-                  IgnorePointer(
-                    child: AnimatedOpacity(
-                      opacity: _hudVisible ? 1 : 0,
-                      duration: Duration(milliseconds: _hudVisible ? 120 : 260),
-                      curve: Curves.easeOut,
-                      child: Align(
-                        // Show the indicator on the OPPOSITE side to the swiping
-                        // finger, so your hand doesn't cover it: brightness (left
-                        // swipe) → right rail; volume (right swipe) → left rail.
-                        alignment: _hudIsBrightness
-                            ? const Alignment(
-                                0.88,
-                                0.0,
-                              ) // brightness → RIGHT rail
-                            : const Alignment(-0.88, 0.0), // volume → LEFT rail
-                        child: _AdjustHud(
-                          value: _hudValue,
-                          isBrightness: _hudIsBrightness,
-                        ),
                       ),
-                    ),
-                  ),
 
-                  // 5. 2x-hold chip (top-center). Same translucent-black chip as
-                  // the bottom bar rather than the old opaque surface2 block with
-                  // accent text. Carried a little more alpha than those, though:
-                  // holding for 2x doesn't raise the controls, so this sits on raw
-                  // video with no scrim under it to help legibility.
-                  if (_holding)
-                    Positioned(
-                      top: 12,
-                      left: 0,
-                      right: 0,
-                      child: Center(
+                    // 4c. Horizontal drag-to-seek time bubble.
+                    if (_hSeeking)
+                      Center(
                         child: DecoratedBox(
                           decoration: BoxDecoration(
-                            color: Colors.black.withValues(alpha: 0.5),
-                            borderRadius: BorderRadius.circular(13),
+                            color: Colors.black.withValues(alpha: 0.62),
+                            borderRadius: BorderRadius.circular(14),
                           ),
                           child: Padding(
-                            padding: const EdgeInsets.fromLTRB(10, 6, 12, 6),
-                            child: Row(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 18,
+                              vertical: 10,
+                            ),
+                            child: Text(
+                              '${_fmtDur(_hSeekTarget)} / ${_fmtDur(_duration)}',
+                              style: AppText.headline.copyWith(
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+
+                    // 6. Controls overlay (phone only — TV uses PlayerTvControls above).
+                    if (!sl<AppMode>().isTv && !_locked)
+                      AnimatedOpacity(
+                        opacity: _controlsVisible ? 1 : 0,
+                        // Snappy pop-in, gentle fade-out; eased so it reads as fast.
+                        duration: Duration(
+                          milliseconds: _controlsVisible ? 160 : 240,
+                        ),
+                        curve: Curves.easeOutCubic,
+                        child: IgnorePointer(
+                          ignoring: !_controlsVisible,
+                          child: _ControlsOverlay(
+                            controller: _c,
+                            state: state,
+                            visible: _controlsVisible,
+                            showTitle: widget.showTitle,
+                            duration: _duration,
+                            zoomLabel: _fits[_fitIndex].$2,
+                            onDurationChanged: (d) {
+                              if (mounted && d != _duration) {
+                                setState(() => _duration = d);
+                              }
+                            },
+                            onInteract: _bumpControls,
+                            onRotate: _toggleOrientation,
+                            portraitMode: _portraitMode,
+                            onBack: () => Navigator.of(context).maybePop(),
+                            onSpeed: _openSpeedSheet,
+                            onAudioSubs: _openAudioSubsSheet,
+                            onQuality: _openQualitySheet,
+                            onSources: _openSourceSheet,
+                            onLock: _toggleLock,
+                            onSettings: _openSettings,
+                            barConfig: _barConfig,
+                            onZoom: _cycleFit,
+                            onPip: _pipSupported ? _enterPip : null,
+                            onSleep: _openSleepSheet,
+                            sleepActive: _sleepActive,
+                            decoderLabel: _shortDecoder(_c.decoderMode),
+                            onDecoder: _openDecoderSheet,
+                            onEpisodes: _c.episodes.length > 1
+                                ? _openEpisodesPanel
+                                : null,
+                            onPrev: _c.state.currentIndex > 0
+                                ? () {
+                                    _c.playPrevious();
+                                    _bumpControls();
+                                  }
+                                : null,
+                            megaSkipEnabled: _megaSkipEnabled,
+                            megaSkipSeconds: _megaSkipSeconds,
+                            onMegaSkip: _megaSkip,
+                            onChat: (_room.room != null)
+                                ? () => setState(() => _chatOpen = !_chatOpen)
+                                : null,
+                            onInfo: _infoFields.isEmpty
+                                ? null
+                                : () {
+                                    setState(
+                                      () => _infoPanelOpen = !_infoPanelOpen,
+                                    );
+                                    _bumpControls();
+                                  },
+                            infoOpen: _infoPanelOpen,
+                            showQuality: _alwaysShowQuality,
+                            onScreenshot: _captureScreenshot,
+                            onEnhance: _openEnhanceSheet,
+                            enhanceActive:
+                                sl<PlaybackPrefs>().videoShaderStyle != 'off',
+                            onColorProfile: _openColorProfileSheet,
+                          ),
+                        ),
+                      )
+                    else if (!sl<AppMode>()
+                        .isTv) // phone locked: show unlock button
+                      AnimatedOpacity(
+                        opacity: _controlsVisible ? 1 : 0,
+                        duration: Duration(
+                          milliseconds: _controlsVisible ? 160 : 240,
+                        ),
+                        curve: Curves.easeOutCubic,
+                        child: IgnorePointer(
+                          ignoring: !_controlsVisible,
+                          child: Center(
+                            child: Column(
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                const Icon(
-                                  Icons.fast_forward_rounded,
-                                  color: Colors.white,
-                                  size: 18,
+                                _RoundIconButton(
+                                  icon: Icons.lock_rounded,
+                                  onTap: _toggleLock,
+                                  semanticLabel: 'Unlock controls',
                                 ),
-                                const SizedBox(width: 5),
+                                const SizedBox(height: 8),
                                 Text(
-                                  '2×',
+                                  'Tap to unlock',
                                   style: AppText.caption.copyWith(
                                     color: Colors.white,
-                                    fontSize: 13.5,
                                     fontWeight: FontWeight.w600,
-                                    height: 1.1,
-                                    letterSpacing: 0.3,
                                   ),
                                 ),
                               ],
@@ -3027,284 +3236,157 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           ),
                         ),
                       ),
+
+                    // 6b. Player info overlay ("stats for nerds") — the fields the
+                    // user ticked in Settings, toggled by the ⓘ button (top-left,
+                    // below the top bar). Persists until toggled off.
+                    if (!sl<AppMode>().isTv &&
+                        !_locked &&
+                        _infoPanelOpen &&
+                        _infoFields.isNotEmpty)
+                      Positioned(
+                        left: 16,
+                        top: MediaQuery.of(context).padding.top + 58,
+                        child: IgnorePointer(
+                          child: _InfoOverlay(
+                            controller: _c,
+                            fields: _infoFields,
+                          ),
+                        ),
+                      ),
+
+                    // 6b-iii. Camera flash on screenshot capture.
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: AnimatedOpacity(
+                          opacity: _flashing ? 0.85 : 0,
+                          duration: const Duration(milliseconds: 110),
+                          child: const ColoredBox(color: Colors.white),
+                        ),
+                      ),
                     ),
 
-                  // 4c. Horizontal drag-to-seek time bubble.
-                  if (_hSeeking)
-                    Center(
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.62),
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 18,
-                            vertical: 10,
-                          ),
-                          child: Text(
-                            '${_fmtDur(_hSeekTarget)} / ${_fmtDur(_duration)}',
-                            style: AppText.headline.copyWith(
-                              color: Colors.white,
+                    // 6c. Skip button — accurate AniSkip OP/ED intervals (anime) when
+                    // detected. Independent of the controls (stays visible like
+                    // Netflix). No blind/hardcoded fallback — the manual jump-forward
+                    // is MegaSkip (6c-ii) below.
+                    if (!_locked && !_upNext && !sl<AppMode>().isTv)
+                      StreamBuilder<Duration>(
+                        stream: _positionBySecond,
+                        builder: (context, snap) {
+                          final btn = _skipButtonFor(
+                            snap.data ?? Duration.zero,
+                          );
+                          if (btn == null) return const SizedBox.shrink();
+                          // Sit low (Netflix-style) while watching; slide up above the
+                          // seek bar when the controls are showing so they never clash.
+                          return AnimatedAlign(
+                            duration: const Duration(milliseconds: 220),
+                            curve: Curves.easeOut,
+                            alignment: Alignment(
+                              0.94,
+                              _controlsVisible ? 0.4 : 0.74,
+                            ),
+                            child: btn,
+                          );
+                        },
+                      ),
+
+                    // 6c-ii. MegaSkip lives in the control bar (above the seek bar)
+                    // inside _ControlsOverlay — see its `megaSkip*` params below.
+
+                    // 6c-iii. Brief centered "+Ns" flash right after a MegaSkip tap.
+                    if (_megaFlash)
+                      IgnorePointer(
+                        child: Center(
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 20,
+                              vertical: 12,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.7),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(
+                                  Icons.keyboard_double_arrow_right_rounded,
+                                  color: Colors.white,
+                                  size: 22,
+                                ),
+                                const SizedBox(width: 6),
+                                Text(
+                                  '+${_megaSkipSeconds}s',
+                                  style: AppText.headline.copyWith(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
                         ),
                       ),
-                    ),
 
-                  // 6. Controls overlay (phone only — TV uses PlayerTvControls above).
-                  if (!sl<AppMode>().isTv && !_locked)
-                    AnimatedOpacity(
-                      opacity: _controlsVisible ? 1 : 0,
-                      // Snappy pop-in, gentle fade-out; eased so it reads as fast.
-                      duration: Duration(
-                        milliseconds: _controlsVisible ? 160 : 240,
-                      ),
-                      curve: Curves.easeOutCubic,
-                      child: IgnorePointer(
-                        ignoring: !_controlsVisible,
-                        child: _ControlsOverlay(
-                          controller: _c,
-                          state: state,
-                          visible: _controlsVisible,
-                          showTitle: widget.showTitle,
-                          duration: _duration,
-                          zoomLabel: _fits[_fitIndex].$2,
-                          onDurationChanged: (d) {
-                            if (mounted && d != _duration) {
-                              setState(() => _duration = d);
-                            }
-                          },
-                          onInteract: _bumpControls,
-                          onRotate: _toggleOrientation,
-                          portraitMode: _portraitMode,
-                          onBack: () => Navigator.of(context).maybePop(),
-                          onSpeed: _openSpeedSheet,
-                          onAudioSubs: _openAudioSubsSheet,
-                          onQuality: _openQualitySheet,
-                          onSources: _openSourceSheet,
-                          onLock: _toggleLock,
-                          onSettings: _openSettings,
-                          barConfig: _barConfig,
-                          onZoom: _cycleFit,
-                          onPip: _pipSupported ? _enterPip : null,
-                          onSleep: _openSleepSheet,
-                          sleepActive: _sleepActive,
-                          decoderLabel: _shortDecoder(_c.decoderMode),
-                          onDecoder: _openDecoderSheet,
-                          onEpisodes: _c.episodes.length > 1
-                              ? _openEpisodesPanel
-                              : null,
-                          onPrev: _c.state.currentIndex > 0
-                              ? () {
-                                  _c.playPrevious();
-                                  _bumpControls();
-                                }
-                              : null,
-                          megaSkipEnabled: _megaSkipEnabled,
-                          megaSkipSeconds: _megaSkipSeconds,
-                          onMegaSkip: _megaSkip,
-                          onChat: (_room.room != null)
-                              ? () => setState(() => _chatOpen = !_chatOpen)
-                              : null,
-                          onInfo: _infoFields.isEmpty
-                              ? null
-                              : () {
-                                  setState(
-                                    () => _infoPanelOpen = !_infoPanelOpen,
-                                  );
-                                  _bumpControls();
-                                },
-                          infoOpen: _infoPanelOpen,
-                          showQuality: _alwaysShowQuality,
-                          onScreenshot: _captureScreenshot,
-                          onEnhance: _openEnhanceSheet,
-                          enhanceActive:
-                              sl<PlaybackPrefs>().videoShaderStyle != 'off',
-                          onColorProfile: _openColorProfileSheet,
-                        ),
-                      ),
-                    )
-                  else if (!sl<AppMode>()
-                      .isTv) // phone locked: show unlock button
-                    AnimatedOpacity(
-                      opacity: _controlsVisible ? 1 : 0,
-                      duration: Duration(
-                        milliseconds: _controlsVisible ? 160 : 240,
-                      ),
-                      curve: Curves.easeOutCubic,
-                      child: IgnorePointer(
-                        ignoring: !_controlsVisible,
-                        child: Center(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              _RoundIconButton(
-                                icon: Icons.lock_rounded,
-                                onTap: _toggleLock,
-                                semanticLabel: 'Unlock controls',
-                              ),
-                              const SizedBox(height: 8),
-                              Text(
-                                'Tap to unlock',
-                                style: AppText.caption.copyWith(
-                                  color: Colors.white,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ],
+                    // 6d. Outro "Next Episode" pill — lets the user jump ahead near
+                    // the end of the episode before the auto "Up next" card appears.
+                    // Only when controls are hidden — the control bar already has a
+                    // Next button, and this pill would overlap the bottom seek bar.
+                    if (!_locked && !_upNext && !_controlsVisible)
+                      _buildOutroNextButton(),
+
+                    // 7. Up-next card (auto-advance countdown).
+                    if (_upNext) _buildUpNextCard(),
+
+                    // 8. In-room chat panel — slides in from the right when _chatOpen.
+                    // Gated on an active room; collapsed when leaving.
+                    if (_room.room != null && _chatOpen)
+                      Positioned(
+                        top: 0,
+                        bottom: 0,
+                        right: 0,
+                        child: SafeArea(
+                          left: false,
+                          right: false,
+                          child: RoomChatPanel(
+                            controller: _room,
+                            onClose: () => setState(() => _chatOpen = false),
                           ),
                         ),
                       ),
-                    ),
 
-                  // 6b. Player info overlay ("stats for nerds") — the fields the
-                  // user ticked in Settings, toggled by the ⓘ button (top-left,
-                  // below the top bar). Persists until toggled off.
-                  if (!sl<AppMode>().isTv &&
-                      !_locked &&
-                      _infoPanelOpen &&
-                      _infoFields.isNotEmpty)
-                    Positioned(
-                      left: 16,
-                      top: MediaQuery.of(context).padding.top + 58,
-                      child: IgnorePointer(
-                        child: _InfoOverlay(
-                          controller: _c,
-                          fields: _infoFields,
-                        ),
-                      ),
-                    ),
-
-                  // 6b-iii. Camera flash on screenshot capture.
-                  Positioned.fill(
-                    child: IgnorePointer(
-                      child: AnimatedOpacity(
-                        opacity: _flashing ? 0.85 : 0,
-                        duration: const Duration(milliseconds: 110),
-                        child: const ColoredBox(color: Colors.white),
-                      ),
-                    ),
-                  ),
-
-                  // 6c. Skip button — accurate AniSkip OP/ED intervals (anime) when
-                  // detected. Independent of the controls (stays visible like
-                  // Netflix). No blind/hardcoded fallback — the manual jump-forward
-                  // is MegaSkip (6c-ii) below.
-                  if (!_locked && !_upNext && !sl<AppMode>().isTv)
-                    StreamBuilder<Duration>(
-                      stream: _positionBySecond,
-                      builder: (context, snap) {
-                        final btn = _skipButtonFor(snap.data ?? Duration.zero);
-                        if (btn == null) return const SizedBox.shrink();
-                        // Sit low (Netflix-style) while watching; slide up above the
-                        // seek bar when the controls are showing so they never clash.
-                        return AnimatedAlign(
-                          duration: const Duration(milliseconds: 220),
-                          curve: Curves.easeOut,
-                          alignment: Alignment(
-                            0.94,
-                            _controlsVisible ? 0.4 : 0.74,
+                    // 9. Cast remote panel — replaces the normal gesture + controls
+                    // layer while a Chromecast session is active. Consumes all taps so
+                    // the gesture layer underneath is inert during casting.
+                    AnimatedBuilder(
+                      animation: sl<CastController>(),
+                      builder: (context, _) {
+                        final castCtrl = sl<CastController>();
+                        if (castCtrl.state != CastState.connected) {
+                          return const SizedBox.shrink();
+                        }
+                        return Positioned.fill(
+                          child: _CastRemotePanel(
+                            deviceName: castCtrl.deviceName ?? 'TV',
+                            showTitle: widget.showTitle,
+                            cover: widget.cover,
+                            loadError: castCtrl.loadError,
+                            onBack: () => Navigator.of(context).maybePop(),
+                            onStop: () => castCtrl.stop(),
+                            onSources: _openSourceSheet,
+                            onAudioSubs: () =>
+                                _openAudioSubsSheet(castMode: true),
                           ),
-                          child: btn,
                         );
                       },
                     ),
-
-                  // 6c-ii. MegaSkip lives in the control bar (above the seek bar)
-                  // inside _ControlsOverlay — see its `megaSkip*` params below.
-
-                  // 6c-iii. Brief centered "+Ns" flash right after a MegaSkip tap.
-                  if (_megaFlash)
-                    IgnorePointer(
-                      child: Center(
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 20,
-                            vertical: 12,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.black.withValues(alpha: 0.7),
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Icon(
-                                Icons.keyboard_double_arrow_right_rounded,
-                                color: Colors.white,
-                                size: 22,
-                              ),
-                              const SizedBox(width: 6),
-                              Text(
-                                '+${_megaSkipSeconds}s',
-                                style: AppText.headline.copyWith(
-                                  color: Colors.white,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-
-                  // 6d. Outro "Next Episode" pill — lets the user jump ahead near
-                  // the end of the episode before the auto "Up next" card appears.
-                  // Only when controls are hidden — the control bar already has a
-                  // Next button, and this pill would overlap the bottom seek bar.
-                  if (!_locked && !_upNext && !_controlsVisible)
-                    _buildOutroNextButton(),
-
-                  // 7. Up-next card (auto-advance countdown).
-                  if (_upNext) _buildUpNextCard(),
-
-                  // 8. In-room chat panel — slides in from the right when _chatOpen.
-                  // Gated on an active room; collapsed when leaving.
-                  if (_room.room != null && _chatOpen)
-                    Positioned(
-                      top: 0,
-                      bottom: 0,
-                      right: 0,
-                      child: SafeArea(
-                        left: false,
-                        right: false,
-                        child: RoomChatPanel(
-                          controller: _room,
-                          onClose: () => setState(() => _chatOpen = false),
-                        ),
-                      ),
-                    ),
-
-                  // 9. Cast remote panel — replaces the normal gesture + controls
-                  // layer while a Chromecast session is active. Consumes all taps so
-                  // the gesture layer underneath is inert during casting.
-                  AnimatedBuilder(
-                    animation: sl<CastController>(),
-                    builder: (context, _) {
-                      final castCtrl = sl<CastController>();
-                      if (castCtrl.state != CastState.connected) {
-                        return const SizedBox.shrink();
-                      }
-                      return Positioned.fill(
-                        child: _CastRemotePanel(
-                          deviceName: castCtrl.deviceName ?? 'TV',
-                          showTitle: widget.showTitle,
-                          cover: widget.cover,
-                          loadError: castCtrl.loadError,
-                          onBack: () => Navigator.of(context).maybePop(),
-                          onStop: () => castCtrl.stop(),
-                          onSources: _openSourceSheet,
-                          onAudioSubs: () =>
-                              _openAudioSubsSheet(castMode: true),
-                        ),
-                      );
-                    },
-                  ),
-                ],
-              ),
-            );
-          },
+                  ],
+                ),
+              );
+            },
+          ),
         ),
       ),
     );

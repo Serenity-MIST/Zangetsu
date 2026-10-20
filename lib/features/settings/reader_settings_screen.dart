@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 
@@ -386,7 +387,9 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
                 current: prefs.colorFilter,
                 onPicked: prefs.setColorFilter,
               ),
-              _pickerRow(
+              // Desktop windows resize freely; phone orientation locks have no
+              // Windows implementation and must not appear as working controls.
+              if (!Platform.isWindows) _pickerRow(
                 icon: Icons.screen_rotation_outlined,
                 title: context.l10n.orientationLock,
                 options: _orientationOptions,

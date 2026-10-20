@@ -141,12 +141,17 @@ class BrowseSourcesList extends StatelessWidget {
     // One list per tab, not one per manifest type. Streaming used to split
     // into ANIME and MOVIES & SERIES, which put the same source two headers
     // apart depending on what it declares and made the A-Z rail meaningless.
-    final all = <({String id, String label, String? repo, String? icon})>[
-      if (showStreaming) ...b.anime.where(matches),
-      if (showStreaming) ...b.movies.where(matches),
-      if (showManga) ...b.manga.where(matches),
-      if (showNovel) ...b.novel.where(matches),
-    ]..sort((x, y) => _sortKey(x.label).compareTo(_sortKey(y.label)));
+    // Mixed providers belong to both capability buckets, but this combined
+    // browse list must show each installed source only once.
+    final seenIds = <String>{};
+    final all =
+        <({String id, String label, String? repo, String? icon})>[
+            if (showStreaming) ...b.anime.where(matches),
+            if (showStreaming) ...b.movies.where(matches),
+            if (showManga) ...b.manga.where(matches),
+            if (showNovel) ...b.novel.where(matches),
+          ].where((row) => seenIds.add(row.id)).toList()
+          ..sort((x, y) => _sortKey(x.label).compareTo(_sortKey(y.label)));
 
     // Pinned keeps its own group at the top, in pin order: that list is the
     // user's own arrangement, so it is the one thing alphabetical order must
@@ -372,7 +377,10 @@ class _SourceListViewState extends State<_SourceListView> {
         // swell somewhere to go, but a swollen letter floats over the list for
         // the moment it is swollen — padding the list out for it left a strip
         // of dead space beside every chevron, permanently.
-        Padding(padding: const EdgeInsetsDirectional.only(end: 24), child: list),
+        Padding(
+          padding: const EdgeInsetsDirectional.only(end: 24),
+          child: list,
+        ),
         Positioned(
           top: _railInset,
           bottom: bottomInset,

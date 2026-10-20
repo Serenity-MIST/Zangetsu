@@ -48,6 +48,7 @@ class TvFocusable extends StatefulWidget {
     required this.onTap,
     this.onLongPress,
     this.waitForKeyUp = false,
+    this.requireKeyDown = false,
     this.autofocus = false,
     this.scale = 1.08,
     this.focusLabel,
@@ -57,7 +58,10 @@ class TvFocusable extends StatefulWidget {
     this.semanticLabel,
     this.isButton = true,
     this.borderRadius = 10,
-  }) : assert(child != null || builder != null, 'TvFocusable needs either child or builder');
+  }) : assert(
+         child != null || builder != null,
+         'TvFocusable needs either child or builder',
+       );
 
   /// Optional external focus node, so a parent can programmatically move focus
   /// here (e.g. land on the current page's nav item when entering the rail).
@@ -80,6 +84,11 @@ class TvFocusable extends StatefulWidget {
   /// [onTap] pushes a screen that autofocuses another [TvFocusable] — otherwise
   /// KeyDown opens the route and KeyUp activates the new first item.
   final bool waitForKeyUp;
+
+  /// Accept a remote release only if this control received the press as well.
+  /// Use for controls that gain focus while the opening OK is still held.
+  /// Touch and accessibility clicks remain independent of remote key state.
+  final bool requireKeyDown;
 
   final bool autofocus;
   final double scale;
@@ -154,7 +163,8 @@ class _TvFocusableState extends State<TvFocusable> {
     if (!okKeys.contains(event.logicalKey)) return KeyEventResult.ignored;
 
     final longPress = widget.onLongPress;
-    final waitForUp = longPress != null || widget.waitForKeyUp;
+    final waitForUp =
+        longPress != null || widget.waitForKeyUp || widget.requireKeyDown;
 
     if (event is KeyDownEvent) {
       if (!waitForUp) {
@@ -184,8 +194,11 @@ class _TvFocusableState extends State<TvFocusable> {
     }
 
     if (event is KeyUpEvent) {
+      final receivedPress = _okHeld;
       _okHeld = false;
       _cancelLongPressTimer();
+      if (widget.requireKeyDown && !receivedPress)
+        return KeyEventResult.handled;
       if (!_longPressFired) _activate();
       return KeyEventResult.handled;
     }
@@ -211,7 +224,9 @@ class _TvFocusableState extends State<TvFocusable> {
             bottom: 6,
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 120),
-              padding: _focused ? const EdgeInsets.symmetric(horizontal: 8, vertical: 3) : EdgeInsets.zero,
+              padding: _focused
+                  ? const EdgeInsets.symmetric(horizontal: 8, vertical: 3)
+                  : EdgeInsets.zero,
               decoration: BoxDecoration(
                 color: _focused ? Colors.white : Colors.transparent,
                 borderRadius: BorderRadius.circular(6),
@@ -223,7 +238,9 @@ class _TvFocusableState extends State<TvFocusable> {
                 style: AppText.caption.copyWith(
                   color: _focused ? Colors.black : Colors.white,
                   fontWeight: FontWeight.w600,
-                  shadows: _focused ? null : const [Shadow(color: Colors.black, blurRadius: 4)],
+                  shadows: _focused
+                      ? null
+                      : const [Shadow(color: Colors.black, blurRadius: 4)],
                 ),
               ),
             ),
@@ -241,18 +258,30 @@ class _TvFocusableState extends State<TvFocusable> {
         // Premium neutral focus: a clean WHITE outline + a faint white fill and
         // a soft black shadow (no accent tint) — consistent with the float
         // variant used by posters.
-        final bool useForeground = widget.foregroundHighlight || widget.scale == 1.0;
+        final bool useForeground =
+            widget.foregroundHighlight || widget.scale == 1.0;
         box = AnimatedScale(
           scale: _focused ? widget.scale : 1.0,
           duration: const Duration(milliseconds: 120),
           child: DecoratedBox(
-            position: useForeground ? DecorationPosition.foreground : DecorationPosition.background,
+            position: useForeground
+                ? DecorationPosition.foreground
+                : DecorationPosition.background,
             decoration: BoxDecoration(
               color: _focused ? Colors.white.withValues(alpha: 0.08) : null,
-              border: Border.all(color: _focused ? Colors.white : Colors.transparent, width: 2.5),
+              border: Border.all(
+                color: _focused ? Colors.white : Colors.transparent,
+                width: 2.5,
+              ),
               borderRadius: BorderRadius.circular(widget.borderRadius),
               boxShadow: _focused
-                  ? [BoxShadow(color: Colors.black.withValues(alpha: 0.5), blurRadius: 14, offset: const Offset(0, 6))]
+                  ? [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.5),
+                        blurRadius: 14,
+                        offset: const Offset(0, 6),
+                      ),
+                    ]
                   : null,
             ),
             child: inner,
@@ -272,7 +301,13 @@ class _TvFocusableState extends State<TvFocusable> {
               color: _focused ? Colors.white : Colors.transparent,
               borderRadius: BorderRadius.circular(14),
               boxShadow: _focused && pillScale > 1.0
-                  ? [BoxShadow(color: Colors.black.withValues(alpha: 0.35), blurRadius: 22, offset: const Offset(0, 8))]
+                  ? [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.35),
+                        blurRadius: 22,
+                        offset: const Offset(0, 8),
+                      ),
+                    ]
                   : null,
             ),
             child: inner,
@@ -294,8 +329,13 @@ class _TvFocusableState extends State<TvFocusable> {
                     child: DecoratedBox(
                       decoration: BoxDecoration(
                         color: AppColors.accent.withValues(alpha: 0.10),
-                        border: Border.all(color: AppColors.accent.withValues(alpha: 0.55), width: 2),
-                        borderRadius: BorderRadius.circular(widget.borderRadius),
+                        border: Border.all(
+                          color: AppColors.accent.withValues(alpha: 0.55),
+                          width: 2,
+                        ),
+                        borderRadius: BorderRadius.circular(
+                          widget.borderRadius,
+                        ),
                       ),
                     ),
                   ),
@@ -369,7 +409,11 @@ class _TvFocusableState extends State<TvFocusable> {
           onFocusChange: (f) {
             setState(() => _focused = f);
             if (f) {
-              Scrollable.ensureVisible(context, alignment: 0.5, duration: const Duration(milliseconds: 200));
+              Scrollable.ensureVisible(
+                context,
+                alignment: 0.5,
+                duration: const Duration(milliseconds: 200),
+              );
             } else {
               _okHeld = false;
               _cancelLongPressTimer();

@@ -1,7 +1,6 @@
 // Credits line, description block, icon actions and the tab-bar header.
 part of 'detail_screen.dart';
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Muted credit line: "Starring: a, b, c… more" / "Creators: …" / "Genres: …".
 // The label is slightly dimmer than the value, matching Netflix's hierarchy.
@@ -48,7 +47,7 @@ class _CreditLine extends StatelessWidget {
               ),
           ],
         ),
-        maxLines: 2,
+        maxLines: Platform.isWindows ? 1 : 2,
         overflow: TextOverflow.ellipsis,
       ),
     );
@@ -85,7 +84,7 @@ class _Description extends StatelessWidget {
           Text(
             text,
             style: AppText.body,
-            maxLines: 3,
+            maxLines: Platform.isWindows ? 2 : 3,
             overflow: TextOverflow.ellipsis,
           ),
           const SizedBox(height: 6),
@@ -126,6 +125,42 @@ class _IconAction extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final color = active ? AppColors.accent : AppColors.textPrimary;
+    if (Platform.isWindows) {
+      return Tooltip(
+        message: tooltip,
+        child: Material(
+          color: active
+              ? AppColors.accent.withValues(alpha: 0.1)
+              : AppColors.surface2,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(10),
+            side: BorderSide(
+              color: active
+                  ? AppColors.accent.withValues(alpha: 0.25)
+                  : AppColors.hairline,
+            ),
+          ),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(10),
+            onTap: onTap,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(icon, size: 17, color: color),
+                  const SizedBox(width: 6),
+                  Text(
+                    label,
+                    style: AppText.caption.copyWith(color: color, fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
     return Tooltip(
       message: tooltip,
       child: InkResponse(
@@ -152,6 +187,20 @@ class _IconAction extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Wraps compact desktop actions while retaining evenly spaced mobile actions.
+class _DetailActionRow extends StatelessWidget {
+  const _DetailActionRow({required this.children});
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) => Platform.isWindows
+      ? Wrap(spacing: 8, runSpacing: 8, children: children)
+      : Row(
+          mainAxisAlignment: MainAxisAlignment.spaceAround,
+          children: children,
+        );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

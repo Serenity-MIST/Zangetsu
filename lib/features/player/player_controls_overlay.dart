@@ -305,6 +305,12 @@ class _ControlsOverlay extends StatelessWidget {
       case 'fit':
         return (_fitIcon(zoomLabel), 'Aspect ratio · $zoomLabel', onZoom);
       case 'rotate':
+        if (Platform.isWindows)
+          return (
+            Icons.fullscreen_rounded,
+            'Fullscreen · F / F11',
+            DesktopWindow.toggleFullscreen,
+          );
         return (
           Icons.screen_rotation_rounded,
           portraitMode ? 'Landscape' : 'Portrait',
@@ -508,7 +514,9 @@ class _ControlsOverlay extends StatelessWidget {
                                 builder: (context, _, _) =>
                                     c.isFillerAt(state.currentIndex)
                                     ? const Padding(
-                                        padding: EdgeInsetsDirectional.only(start: 8),
+                                        padding: EdgeInsetsDirectional.only(
+                                          start: 8,
+                                        ),
                                         // No colour passed: TagBadge falls back
                                         // to the app accent, so the badge
                                         // follows the user's theme colour.
@@ -555,14 +563,15 @@ class _ControlsOverlay extends StatelessWidget {
                   // copy up here just split the same action across two places.
                   // Lock stays: it's the one control you want reachable without
                   // looking down at the bar you're about to hide.
-                  IconButton(
-                    icon: const Icon(
-                      Icons.lock_open_rounded,
-                      color: Colors.white,
+                  if (!Platform.isWindows)
+                    IconButton(
+                      icon: const Icon(
+                        Icons.lock_open_rounded,
+                        color: Colors.white,
+                      ),
+                      tooltip: context.l10n.lockControls,
+                      onPressed: onLock,
                     ),
-                    tooltip: context.l10n.lockControls,
-                    onPressed: onLock,
-                  ),
                   IconButton(
                     icon: const Icon(
                       Icons.settings_rounded,
@@ -724,6 +733,57 @@ class _ControlsOverlay extends StatelessWidget {
                         // move it.
                         final left = _barButtons(context, barConfig.left);
                         final right = _barButtons(context, barConfig.right);
+                        if (Platform.isWindows) {
+                          left.insert(
+                            0,
+                            SizedBox(
+                              width: 148,
+                              child: StreamBuilder<double>(
+                                stream: c.player.stream.volume,
+                                initialData: c.player.state.volume,
+                                builder: (context, snapshot) => Row(
+                                  children: [
+                                    const Tooltip(
+                                      message: 'Volume · ↑ / ↓   M to mute',
+                                      child: Icon(
+                                        Icons.volume_up_rounded,
+                                        color: Colors.white,
+                                        size: 20,
+                                      ),
+                                    ),
+                                    Expanded(
+                                      child: Slider(
+                                        value: (snapshot.data ?? 100).clamp(
+                                          0.0,
+                                          100.0,
+                                        ),
+                                        max: 100,
+                                        onChanged: (value) {
+                                          c.player.setVolume(value);
+                                          onInteract();
+                                        },
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          );
+                          right.add(
+                            Tooltip(
+                              message:
+                                  'Space / K: play or pause\nJ / L or ← / →: seek 10s\nShift + ← / →: seek 60s\n↑ / ↓: volume • M: mute\nF / F11: fullscreen\nDouble-click: fullscreen\nRight-click: settings\nMouse back: return • mouse forward: seek\nMiddle-click: play or pause',
+                              child: const SizedBox(
+                                width: 48,
+                                height: 48,
+                                child: Icon(
+                                  Icons.keyboard_rounded,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          );
+                        }
                         // Buttons are a uniform 48 (12 padding + 24 icon + 12)
                         // and each group adds 8 of its own, so the width the bar
                         // wants is arithmetic rather than something to measure.
@@ -732,7 +792,9 @@ class _ControlsOverlay extends StatelessWidget {
                         double groupWidth(int n) =>
                             n == 0 ? 0 : n * buttonWidth + groupPadding;
                         final wanted =
-                            groupWidth(left.length) + groupWidth(right.length);
+                            groupWidth(left.length) +
+                            groupWidth(right.length) +
+                            (Platform.isWindows ? 100 : 0);
 
                         if (wanted <= constraints.maxWidth) {
                           return Row(

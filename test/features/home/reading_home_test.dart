@@ -25,6 +25,8 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
+import 'package:watch_app/core/ui/animation_prefs.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
@@ -121,11 +123,14 @@ void main() {
     // unconditionally (list-animation gating) — needed even though nothing
     // in these tests is TV-specific.
     setUp(() async {
+      // Test callback wiring independently from deferred visibility reveals.
+      AnimationPrefs.listAnimations = false;
       await sl.reset();
       sl.registerSingleton<AppMode>(const AppMode(isTv: false));
     });
 
     tearDown(() async {
+      AnimationPrefs.listAnimations = true;
       await sl.reset();
     });
 
@@ -188,7 +193,15 @@ void main() {
         await tester.tap(find.text('Anime Show'));
         expect(resumed?.showId, 'show1');
 
-        await tester.longPress(find.text('Anime Show'));
+        if (Platform.isWindows) {
+          await tester.tap(
+            find.text('Anime Show'),
+            buttons: kSecondaryMouseButton,
+            kind: PointerDeviceKind.mouse,
+          );
+        } else {
+          await tester.longPress(find.text('Anime Show'));
+        }
         expect(longPressed?.showId, 'show1');
       },
     );

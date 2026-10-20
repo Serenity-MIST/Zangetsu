@@ -3,6 +3,8 @@ import 'dart:math' as math;
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+
 import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:fluttertoast/fluttertoast.dart';
@@ -268,24 +270,45 @@ class _RootShellState extends State<RootShell>
   /// One page per visible tab, in the same order the dock draws them, so the
   /// [IndexedStack] index is just the tab's position in that list.
   ///
-  /// Search is no longer a phone dock tab (it's a Home header icon now), so
-  /// this never places `shared[1]`. The Profile dock item opens Settings.
-  List<Widget> _pagesFor(List<DockTab> tabs, String profileId) {
-    final shared = buildShellPages(null, homeIsActive: _tab == DockTab.home);
+  /// [buildShellPages] stays the shared Home/Search/My List/Settings set that
+  /// the TV rail also builds from — untouched, so TV is unaffected. Search is
+  /// no longer a phone dock tab (it's a Home header icon now), so this never
+  /// places `shared[1]` — it's still built, just unused here, the same way
+  /// Settings only ever takes `shared.last`.
+  final Map<DockTab, Widget> _mountedPages = {};
+  String? _mountedProfileId;
+
+  /// Constructs a destination on its first visit; the shell retains that page
+  /// afterward so tab switches preserve navigation and avoid repeated startup.
+  Widget _createPage(DockTab tab) => switch (tab) {
+    DockTab.home => buildShellPages(null)[0],
+    DockTab.search => const SearchScreen(showBack: false),
+    DockTab.myList => buildShellPages(null)[2],
+    DockTab.profile => buildShellPages(null).last,
+    DockTab.downloads => const DownloadsScreen(showBack: false),
+    DockTab.history => const HistoryScreen(showBack: false),
+    DockTab.sources => const BrowseSourcesScreen(),
+  };
+  List<Widget> _pagesFor(List<DockTab> tabs) {
+    final profileId = sl.isRegistered<ViewerProfileStore>()
+        ? sl<ViewerProfileStore>().activeId
+        : 'default';
+    // Retain lazy tabs within a profile, but discard their cached state when
+    // changing viewers so one profile never sees another profile's library.
+    if (_mountedProfileId != profileId) {
+      _mountedPages.clear();
+      _mountedProfileId = profileId;
+    }
+    _mountedPages.putIfAbsent(_tab, () => _createPage(_tab));
+    if (_mountedPages.containsKey(DockTab.home)) {
+      _mountedPages[DockTab.home] = HomeScreen(isTabActive: _tab == DockTab.home);
+    }
     return [
-      for (final t in tabs)
-        KeyedSubtree(
-          key: ValueKey('$profileId:${t.name}'),
-          child: switch (t) {
-            DockTab.home => shared[0],
-            DockTab.myList => shared[2],
-            DockTab.profile => shared[3], // Settings
-            // Both normally get pushed with a back button; as tabs they own the
-            // whole screen, so their own back affordance is suppressed.
-            DockTab.downloads => const DownloadsScreen(showBack: false),
-            DockTab.history => const HistoryScreen(showBack: false),
-            DockTab.sources => const BrowseSourcesScreen(),
-          },
+      for (final tab in tabs)
+        TickerMode(
+          key: ValueKey('$profileId:${tab.name}'),
+          enabled: tab == _tab,
+          child: _mountedPages[tab] ?? const SizedBox.shrink(),
         ),
     ];
   }
@@ -320,49 +343,54 @@ class _RootShellState extends State<RootShell>
           // Content runs under the floating dock (screens keep their own bottom
           // padding so the last row scrolls clear of it).
           extendBody: true,
-          body: NotificationListener<ScrollNotification>(
-            // One place, so no screen has to know the dock exists. Returns
-            // false throughout — it reads the scroll, never eats it.
-            onNotification: (notification) => DockScrollCollapse.onNotification(
-              notification,
-              enabled: !_keepDockExpanded,
-            ),
-            child: Builder(
-              builder: (context) {
-                final visible = _visibleTabs();
-                final active = visible.indexOf(_tab);
-                return AnimatedBuilder(
-                  animation: _switch,
-                  builder: (context, child) {
-                    final v = _switch.value;
-                    // Incoming tab fades in from 0.4 and slides up 20px. Never blanks.
-                    return Opacity(
-                      opacity: 0.4 + 0.6 * v,
-                      child: Transform.translate(
-                        offset: Offset(0, (1 - v) * 20),
-                        child: child,
-                      ),
-                    );
-                  },
-                  // RepaintBoundary → the page is a single cached layer the transition
-                  // just composites (opacity + translate), so no repaint per frame.
-                  child: RepaintBoundary(
-                    child: IndexedStack(
-                      // indexOf can be -1 for one frame if the mode flipped before
-                      // the listener ran; clamp rather than throw.
-                      index: active < 0 ? 0 : active,
-                      children: _pagesFor(
-                        visible,
-                        sl.isRegistered<ViewerProfileStore>()
-                            ? sl<ViewerProfileStore>().activeId
-                            : 'default',
+          body: deferContent
+              ? const SizedBox.expand()
+              : Row(
+                  children: [
+                    Expanded(
+                      key: const ValueKey('shell-content'),
+                      child: NotificationListener<ScrollNotification>(
+                        // One place, so no screen has to know the dock exists. Returns
+                        // false throughout — it reads the scroll, never eats it.
+                        onNotification: (notification) =>
+                            DockScrollCollapse.onNotification(
+                              notification,
+                              enabled: !_keepDockExpanded,
+                            ),
+                        child: Builder(
+                          builder: (context) {
+                            final visible = _visibleTabs();
+                            final active = visible.indexOf(_tab);
+                            return AnimatedBuilder(
+                              animation: _switch,
+                              builder: (context, child) {
+                                final v = _switch.value;
+                                // Incoming tab fades in from 0.4 and slides up 20px. Never blanks.
+                                return Opacity(
+                                  opacity: 0.4 + 0.6 * v,
+                                  child: Transform.translate(
+                                    offset: Offset(0, (1 - v) * 20),
+                                    child: child,
+                                  ),
+                                );
+                              },
+                              // RepaintBoundary → the page is a single cached layer the transition
+                              // just composites (opacity + translate), so no repaint per frame.
+                              child: RepaintBoundary(
+                                child: IndexedStack(
+                                  // indexOf can be -1 for one frame if the mode flipped before
+                                  // the listener ran; clamp rather than throw.
+                                  index: active < 0 ? 0 : active,
+                                  children: _pagesFor(visible),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
                       ),
                     ),
-                  ),
-                );
-              },
-            ),
-          ),
+                  ],
+                ),
           bottomNavigationBar: ValueListenableBuilder<bool>(
             valueListenable: dockHiddenBySection,
             builder: (context, sectionOpen, _) {
@@ -384,9 +412,7 @@ class _RootShellState extends State<RootShell>
                             setState(() => _modeBarOpen = false);
                             await ZModePrefs.setStreamKind(k);
                             await sl<ContentModeCubit>().setMode(m);
-                            if (m != ContentMode.anime) {
-                              sl<HomeCubit>().load(reset: true);
-                            }
+                            sl<HomeCubit>().load(reset: true);
                           },
                         ),
                       ),
@@ -397,6 +423,7 @@ class _RootShellState extends State<RootShell>
                   // MediaQuery bottom padding whether or not it is on screen.
                   // Sliding alone left an open Settings section reserving a
                   // dock's worth of space for a dock that wasn't there.
+
                   TweenAnimationBuilder<double>(
                     tween: Tween<double>(begin: 1, end: hide ? 0 : 1),
                     duration: const Duration(milliseconds: 240),
@@ -440,7 +467,10 @@ class _RootShellState extends State<RootShell>
                         child: ValueListenableBuilder<bool>(
                           valueListenable: dockCollapsedByScroll,
                           builder: (context, collapsed, child) => _FloatingDock(
-                            collapsed: collapsed && !_keepDockExpanded,
+                            collapsed:
+                                defaultTargetPlatform == TargetPlatform.windows
+                                ? false
+                                : collapsed && !_keepDockExpanded,
                             tabs: _visibleTabs(),
                             active: _tab,
                             onSelected: _onTabSelected,
@@ -630,11 +660,18 @@ class _FloatingDock extends StatelessWidget {
     // Never past the open inset — on a screen too narrow to shrink into, the
     // dock simply stays where it is rather than growing.
     final shutSide = math.max(16.0, (width - shutWidth) / 2);
-    final side = 16 + (shutSide - 16) * t;
+    final side = defaultTargetPlatform == TargetPlatform.windows
+        ? math.max(
+            16.0,
+            (width - math.min(420.0, tabs.length * 60.0 + 60.0)) / 2,
+          )
+        : 16 + (shutSide - 16) * t;
     final labels = 1 - t;
     final fab = _fabOpen - (_fabOpen - _fabShut) * t;
     // 9 open, 4 closed — the room the taller tap box needs, given back.
-    final pillPad = 9 - 5 * t;
+    final pillPad = defaultTargetPlatform == TargetPlatform.windows
+        ? 4.0
+        : 9 - 5 * t;
     return Padding(
       padding: EdgeInsets.fromLTRB(side, 0, side, bottomInset + 12),
       child: FakeFrost(
@@ -672,6 +709,7 @@ class _FloatingDock extends StatelessWidget {
   DockTab.downloads => (Icons.download_outlined, Icons.download_rounded),
   DockTab.history => (Icons.history_outlined, Icons.history_rounded),
   DockTab.sources => (Icons.extension_outlined, Icons.extension_rounded),
+  DockTab.search => (Icons.search_rounded, Icons.search_rounded),
   _ => null,
 };
 

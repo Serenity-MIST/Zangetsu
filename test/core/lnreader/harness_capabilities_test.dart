@@ -23,7 +23,7 @@ void main() {
 
   String eval(String js) {
     final r = rt.evaluate(js);
-    expect(r.isError, isFalse, reason: js);
+    expect(r.isError, isFalse, reason: '${r.stringResult}\n$js');
     return r.stringResult;
   }
 
@@ -126,5 +126,32 @@ void main() {
       """),
       '{"ok":true}',
     );
+  });
+
+  test('AES-GCM matches the zero-key NIST vector without BigInt', () {
+    expect(eval('''
+      Array.from(__aesGcm(new Uint8Array(16), new Uint8Array(12))
+        .encrypt(new Uint8Array(16)))
+        .map(function(b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+    '''), '0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf');
+  });
+
+  test('uint64 length encoding preserves high words and byte order', () {
+    expect(eval('''
+      var lengthBytes = new Uint8Array(16);
+      var lengthView = new DataView(lengthBytes.buffer);
+      __lnSetUint64(lengthView, 0, 4294967297, false);
+      __lnSetUint64(lengthView, 8, 4294967298, true);
+      Array.from(lengthBytes).join(',');
+    '''), '0,0,0,1,0,0,0,1,2,0,0,0,1,0,0,0');
+  });
+
+  test('AES-GCM supports nonstandard nonce lengths and authenticated data', () {
+    // Independent expected output from Node's native crypto implementation.
+    expect(eval('''
+      Array.from(__aesGcm(new Uint8Array(16), new Uint8Array(8),
+        new TextEncoder().encode('reader')).encrypt(new Uint8Array(16)))
+        .map(function(b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+    '''), '7d70bb45c218c8c98b2635f5eef09ce9b355125038db4045d45404e20ed26f28');
   });
 }

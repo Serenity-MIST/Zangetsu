@@ -51,10 +51,14 @@ const List<(String, String)> kPlayerInfoFields = [
 /// Pure so the "auto changes nothing" guarantee is testable.
 String? resolveVideoOutput({
   required bool isTv,
+  bool isWindows = false,
   required String choice,
   required String shaderStyle,
 }) {
   if (isTv) return null;
+  // Windows embeds mpv through its render API. gpu/gpu-next instead create
+  // a separate native window, bypassing Flutter's controls and subtitles.
+  if (isWindows) return 'libmpv';
   if (choice != 'auto') return choice;
   return shaderStyle != 'off' ? 'gpu-next' : null;
 }
@@ -461,8 +465,9 @@ class PlaybackPrefs {
   /// devices whose GPU driver can't run that renderer the video is black while
   /// audio and controls work fine, and no source or decoder change helps —
   /// this is the only knob that does. TV is unaffected (it doesn't use mpv).
-  String get videoOutput =>
-      _box.get('videoOutput', defaultValue: 'auto') as String;
+  String get videoOutput => Platform.isWindows
+      ? 'auto'
+      : _box.get('videoOutput', defaultValue: 'auto') as String;
   Future<void> setVideoOutput(String value) => _box.put('videoOutput', value);
 
   /// The mpv `hwdec` property value for the current [videoDecoder] choice, for
@@ -522,8 +527,12 @@ class PlaybackPrefs {
   static const List<String> bufferPresets = ['low', 'default', 'high', 'max'];
 
   /// Forward+back demuxer buffer SIZE preset: 'low' | 'default' | 'high'.
-  String get videoBufferSize =>
-      _box.get('videoBufferSize', defaultValue: 'default') as String;
+  String get videoBufferSize {
+    final value =
+        _box.get('videoBufferSize', defaultValue: 'default') as String;
+    return value == 'max' ? 'high' : value;
+  }
+
   Future<void> setVideoBufferSize(String value) =>
       _box.put('videoBufferSize', value);
 
@@ -550,7 +559,8 @@ class PlaybackPrefs {
       case 'low':
         return '32MiB';
       case 'high':
-      case 'max': // length-only preset; if it ever lands here, don't shrink
+        return '512MiB';
+      case 'max':
         return '512MiB';
       default:
         return '128MiB';
@@ -614,6 +624,7 @@ class PlaybackPrefs {
       case 'low':
         return 32 * 1024 * 1024;
       case 'high':
+        return 512 * 1024 * 1024;
       case 'max':
         return 512 * 1024 * 1024;
       default:

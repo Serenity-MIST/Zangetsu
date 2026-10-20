@@ -46,7 +46,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.spyou.watch_app"
+        applicationId = "com.spyou.watch_app.localtv"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode

@@ -13,7 +13,7 @@ import 'dart:typed_data';
 /// `mihonapp/tachiyomix`) and carries the identical data to `index.json`, but
 /// is ~13x smaller on the wire — so we prefer it and fall back to JSON.
 ///
-/// Only the fields we actually consume are read; everything else (icon/jar URLs,
+/// Only the fields we actually consume are read; everything else (
 /// badge, signing key, mirror URLs, …) is skipped by wire type, which is also
 /// how forward-compatible unknown fields are handled.
 ///
@@ -28,8 +28,8 @@ List<Map<String, dynamic>> decodeMihonPbIndex(List<int> input) {
   // us already-inflated bytes, so only decompress when the magic is present.
   final Uint8List bytes =
       (input.length >= 2 && input[0] == 0x1f && input[1] == 0x8b)
-          ? Uint8List.fromList(gzip.decode(input))
-          : Uint8List.fromList(input);
+      ? Uint8List.fromList(gzip.decode(input))
+      : Uint8List.fromList(input);
 
   // NetworkExtensionStore { … ExtensionList extensionList = 101; … }
   final store = _PbReader(bytes);
@@ -73,6 +73,7 @@ Map<String, dynamic> _decodeExtension(Uint8List bytes) {
   int contentWarning = 0;
   String apkUrl = '';
   String iconUrl = '';
+  String jarUrl = '';
   final sources = <Map<String, dynamic>>[];
   while (!r.isAtEnd) {
     final tag = r.readVarint();
@@ -98,6 +99,7 @@ Map<String, dynamic> _decodeExtension(Uint8List bytes) {
           final res = _decodeResources(r.readLengthDelimited());
           apkUrl = res.apk;
           iconUrl = res.icon;
+          jarUrl = res.jar;
         } else {
           r.skip(wire);
         }
@@ -141,16 +143,17 @@ Map<String, dynamic> _decodeExtension(Uint8List bytes) {
     'versionCode': versionCode,
     // enum: 3 == CONTENT_WARNING_NSFW; downstream only checks that one flag.
     'contentWarning': contentWarning == 3 ? 'CONTENT_WARNING_NSFW' : '',
-    'resources': {'apkUrl': apkUrl, 'iconUrl': iconUrl},
+    'resources': {'apkUrl': apkUrl, 'iconUrl': iconUrl, 'jarUrl': jarUrl},
     'sources': sources,
   };
 }
 
-/// Resources { apkUrl=1 iconUrl=2 jarUrl=501 } — we read the APK and the icon.
-({String apk, String icon}) _decodeResources(Uint8List bytes) {
+/// Resources { apkUrl=1 iconUrl=2 jarUrl=501 }.
+({String apk, String icon, String jar}) _decodeResources(Uint8List bytes) {
   final r = _PbReader(bytes);
   String apkUrl = '';
   String iconUrl = '';
+  String jarUrl = '';
   while (!r.isAtEnd) {
     final tag = r.readVarint();
     final field = tag >> 3;
@@ -159,11 +162,13 @@ Map<String, dynamic> _decodeExtension(Uint8List bytes) {
       apkUrl = r.readString();
     } else if (field == 2 && wire == 2) {
       iconUrl = r.readString();
+    } else if (field == 501 && wire == 2) {
+      jarUrl = r.readString();
     } else {
       r.skip(wire);
     }
   }
-  return (apk: apkUrl, icon: iconUrl);
+  return (apk: apkUrl, icon: iconUrl, jar: jarUrl);
 }
 
 /// Source { id=1 name=2 language=3 homeUrl=4 mirrorUrls=5 message=7 }.

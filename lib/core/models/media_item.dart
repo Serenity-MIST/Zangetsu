@@ -144,6 +144,9 @@ class MediaItem extends Equatable {
   Map<String, dynamic> toJson() => _$MediaItemToJson(this);
 
   MediaItem copyWith({
+    String? id,
+    String? url,
+    ProviderType? type,
     String? sourceId,
     int? subCount,
     int? dubCount,
@@ -154,14 +157,14 @@ class MediaItem extends Equatable {
     String? savedFrom,
     int? savedAtMs,
   }) => MediaItem(
-    id: id,
+    id: id ?? this.id,
     title: title,
     englishTitle: englishTitle,
     cover: cover,
     coverHeaders: coverHeaders,
     banner: banner,
-    url: url,
-    type: type,
+    url: url ?? this.url,
+    type: type ?? this.type,
     sourceId: sourceId ?? this.sourceId,
     quality: quality,
     dubBadge: dubBadge,
@@ -334,6 +337,12 @@ MediaItem? bestTitleMatch(
     for (final m in results) {
       if (m.malId != null && m.malId == wantedMalId) return m;
     }
+  }
+  // Prefer exact season/part identities before permissive alias matching.
+  for (final m in results) {
+    if (titleIdentityMatches(m, wanted) ||
+        (altTitle != null && titleIdentityMatches(m, altTitle)) ||
+        metadataAliases.any((alias) => titleIdentityMatches(m, alias))) return m;
   }
   for (final m in results) {
     if (titleMatches(

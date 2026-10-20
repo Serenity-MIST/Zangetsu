@@ -770,12 +770,7 @@ class _CardGridSkeleton extends StatelessWidget {
       child: GridView.builder(
         padding: const EdgeInsets.fromLTRB(16, 20, 16, 40),
         physics: const NeverScrollableScrollPhysics(),
-        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: posterGridColumns(context),
-          childAspectRatio: wide ? 0.95 : 0.47,
-          crossAxisSpacing: 12,
-          mainAxisSpacing: 16,
-        ),
+        gridDelegate: posterGridDelegate(context),
         // Enough to fill the fold and no more — rows nobody can see still
         // cost a frame to lay out.
         itemCount: 9,

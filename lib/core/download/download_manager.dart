@@ -1,3 +1,5 @@
+import 'subtitle_selection.dart';
+import '../playback/playback_prefs.dart';
 import 'dart:async';
 import 'package:watch_app/core/hive/safe_box.dart';
 import 'dart:convert';
@@ -36,10 +38,12 @@ import 'video_destination.dart';
 /// `downloads` box so the library survives restarts. A [ChangeNotifier] so the
 /// UI can rebuild live. See docs/downloads-feature.md.
 class DownloadManager extends ChangeNotifier {
-  DownloadManager(this._repo,
-      [DownloadPrefs? downloadPrefs, TorrentDownloadService? torrentSvc])
-      : _downloadPrefs = downloadPrefs ?? DownloadPrefs(),
-        _torrentSvc = torrentSvc ?? TorrentDownloadService();
+  DownloadManager(
+    this._repo, [
+    DownloadPrefs? downloadPrefs,
+    TorrentDownloadService? torrentSvc,
+  ]) : _downloadPrefs = downloadPrefs ?? DownloadPrefs(),
+       _torrentSvc = torrentSvc ?? TorrentDownloadService();
 
   /// The ROUTER, not the source repository.
   ///
@@ -146,10 +150,12 @@ class DownloadManager extends ChangeNotifier {
         level: 'E',
       );
       if (await _tryNext(rec)) return;
-      _put(rec.copyWith(
-        status: DownloadStatus.failed,
-        error: () => "Couldn't start download",
-      ));
+      _put(
+        rec.copyWith(
+          status: DownloadStatus.failed,
+          error: () => "Couldn't start download",
+        ),
+      );
       notifyListeners();
     });
     _listenBackgroundService();
@@ -246,10 +252,7 @@ class DownloadManager extends ChangeNotifier {
           level: 'E',
         );
         if (await _tryNext(rec)) return; // fell back to another mirror
-        _put(rec.copyWith(
-          status: DownloadStatus.failed,
-          error: () => err,
-        ));
+        _put(rec.copyWith(status: DownloadStatus.failed, error: () => err));
         notifyListeners();
       });
     } catch (_) {
@@ -271,17 +274,21 @@ class DownloadManager extends ChangeNotifier {
           _candidates.remove(p.id);
           await _markDone(rec, p.filePath);
         case 'failed':
-          _put(rec.copyWith(
-            status: DownloadStatus.failed,
-            error: () => p.error ?? 'Torrent download failed',
-          ));
+          _put(
+            rec.copyWith(
+              status: DownloadStatus.failed,
+              error: () => p.error ?? 'Torrent download failed',
+            ),
+          );
         case 'paused':
           _put(rec.copyWith(status: DownloadStatus.paused));
         default: // queued | downloading | copying — keep it "downloading"
-          _put(rec.copyWith(
-            status: DownloadStatus.downloading,
-            progress: p.progress,
-          ));
+          _put(
+            rec.copyWith(
+              status: DownloadStatus.downloading,
+              progress: p.progress,
+            ),
+          );
       }
       notifyListeners();
     });
@@ -325,10 +332,9 @@ class DownloadManager extends ChangeNotifier {
                 '${rec.showTitle} · ${rec.episodeTitle}: $err',
                 level: 'E',
               );
-              _put(rec.copyWith(
-                status: DownloadStatus.failed,
-                error: () => err,
-              ));
+              _put(
+                rec.copyWith(status: DownloadStatus.failed, error: () => err),
+              );
             }
           }
         } catch (_) {}
@@ -386,7 +392,8 @@ class DownloadManager extends ChangeNotifier {
   // ── Reads ────────────────────────────────────────────────────────────────
 
   List<DownloadRecord> get all =>
-      _records.values.toList()..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+      _records.values.toList()
+        ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
 
   /// Records grouped by show, newest show first.
   Map<String, List<DownloadRecord>> get byShow {
@@ -471,6 +478,7 @@ class DownloadManager extends ChangeNotifier {
     required int nowMs,
     int? malId,
   }) async {
+    if (!await _downloadPrefs.ensureDesktopFolder()) return;
     // Best-effort notification permission so the progress notification shows.
     try {
       await Permission.notification.request();
@@ -530,6 +538,7 @@ class DownloadManager extends ChangeNotifier {
     int? malId,
     List<VideoSource> fallbacks = const [],
   }) async {
+    if (!await _downloadPrefs.ensureDesktopFolder()) return;
     try {
       await Permission.notification.request();
     } catch (_) {}
@@ -576,7 +585,10 @@ class DownloadManager extends ChangeNotifier {
     _put(rec.copyWith(status: DownloadStatus.resolving));
     notifyListeners();
     try {
-      final sources = await _repo.sources(rec.episodeUrl, sourceId: rec.sourceId);
+      final sources = await _repo.sources(
+        rec.episodeUrl,
+        sourceId: rec.sourceId,
+      );
       if (_isCanceled(rec.id)) return; // canceled while resolving
       final ranked = _ranked(sources, rec.quality, category: rec.category);
       if (ranked.isEmpty) {
@@ -601,10 +613,15 @@ class DownloadManager extends ChangeNotifier {
       await _enqueueTaskFor(rec, ranked.first);
     } catch (e) {
       if (_isCanceled(rec.id)) return;
-      AppLogger.instance
-          .log('download resolve failed (${rec.showTitle}): $e', level: 'E');
+      AppLogger.instance.log(
+        'download resolve failed (${rec.showTitle}): $e',
+        level: 'E',
+      );
       _put(
-        rec.copyWith(status: DownloadStatus.failed, error: () => 'Resolve failed'),
+        rec.copyWith(
+          status: DownloadStatus.failed,
+          error: () => 'Resolve failed',
+        ),
       );
       notifyListeners();
     }
@@ -643,9 +660,11 @@ class DownloadManager extends ChangeNotifier {
   /// whose streams are all manifests instead of settling on it. One sweep, not
   /// one sweep per rejected source — that was quadratic and froze the app.
   Future<bool> _tryAnotherSource(DownloadRecord rec) async {
-    if (!ZmodeIds.isZ(rec.episodeUrl)) return false; // only the catalogue sweeps
+    if (!ZmodeIds.isZ(rec.episodeUrl))
+      return false; // only the catalogue sweeps
     if (!GetIt.I.isRegistered<MetadataRepository>()) return false;
-    if (_sweeping.contains(rec.id)) return false; // already looking for this one
+    if (_sweeping.contains(rec.id))
+      return false; // already looking for this one
     _sweeping.add(rec.id);
     try {
       final next = await GetIt.I<MetadataRepository>().sourcesWhere(
@@ -711,10 +730,12 @@ class DownloadManager extends ChangeNotifier {
     // A picked SAF folder (content://) streams straight into that tree, which
     // would put the file in public storage. keepPrivate overrides that: stream
     // to app-docs like the default, and never move it out.
-    final safUri = videoDestination(
-      keepPrivate: _downloadPrefs.keepPrivate,
-      locationUri: _downloadPrefs.locationUri,
-    ) == VideoDestination.safTree
+    final safUri =
+        videoDestination(
+              keepPrivate: _downloadPrefs.keepPrivate,
+              locationUri: _downloadPrefs.locationUri,
+            ) ==
+            VideoDestination.safTree
         ? _downloadPrefs.locationUri
         : null;
     final DownloadTask task = safUri != null
@@ -736,8 +757,12 @@ class DownloadManager extends ChangeNotifier {
             url: source.url,
             filename: filename,
             headers: headers,
-            directory: '$_sharedDir/${_safe(rec.showTitle)}',
-            baseDirectory: BaseDirectory.applicationDocuments,
+            directory: Platform.isWindows
+                ? '${_downloadPrefs.locationUri}/Videos/${_safe(rec.showTitle)}'
+                : '$_sharedDir/${_safe(rec.showTitle)}',
+            baseDirectory: Platform.isWindows
+                ? BaseDirectory.root
+                : BaseDirectory.applicationDocuments,
             updates: Updates.statusAndProgress,
             retries: 5,
             allowPause: true,
@@ -761,7 +786,9 @@ class DownloadManager extends ChangeNotifier {
     notifyListeners();
     HlsDownloadJournal? journal;
     try {
-      final docs = await getApplicationDocumentsDirectory();
+      final docs = Platform.isWindows
+          ? await getApplicationSupportDirectory()
+          : await getApplicationDocumentsDirectory();
       final safeShow = _safe(rec.showTitle);
       final dir = Directory('${docs.path}/$_sharedDir/$safeShow');
       await dir.create(recursive: true);
@@ -772,9 +799,45 @@ class DownloadManager extends ChangeNotifier {
           '${dir.path}/${safeShow}_E${rec.episodeNumber?.toInt() ?? ''}'
           '_${_safe(rec.quality)}.ts';
 
+      if (Platform.isWindows) {
+        final folder = Directory(
+          '${_downloadPrefs.locationUri}/Videos/$safeShow',
+        );
+        await folder.create(recursive: true);
+        final destination = '${folder.path}/${outputPath.split('/').last}';
+        var lastProgressUpdate = 0;
+        final failure = await HlsDownloader(_dio).download(
+          url: source.url,
+          headers: source.headers ?? {},
+          outputPath: destination,
+          preferredQuality: rec.quality,
+          connections: _downloadPrefs.connectionsPerDownload,
+          canceled: () => _isCanceled(rec.id),
+          onProgress: (progress) {
+            final now = DateTime.now().millisecondsSinceEpoch;
+            if (progress < 1 && now - lastProgressUpdate < 250) return;
+            lastProgressUpdate = now;
+            _put(
+              rec.copyWith(
+                status: DownloadStatus.downloading,
+                progress: progress,
+              ),
+            );
+            notifyListeners();
+          },
+        );
+        if (_isCanceled(rec.id)) return;
+        if (failure != null) throw StateError(failure);
+        await _markDone(rec, destination);
+        notifyListeners();
+        return;
+      }
+
       // Background HLS isolate needs flutter_background_service (Android/iOS only).
       if (isAppleTv) {
-        throw UnsupportedError('Background HLS downloads are not available on Apple TV');
+        throw UnsupportedError(
+          'Background HLS downloads are not available on Apple TV',
+        );
       }
 
       final job = <String, dynamic>{
@@ -818,8 +881,9 @@ class DownloadManager extends ChangeNotifier {
   }
 
   /// Native TS→MP4 remux channel (Android only). See MainActivity + TsRemuxer.
-  static const MethodChannel _downloadChannel =
-      MethodChannel('zangetsu/download');
+  static const MethodChannel _downloadChannel = MethodChannel(
+    'zangetsu/download',
+  );
 
   /// Remux the concatenated-TS file at [input] into a real MP4 at [output] via
   /// the native MediaMuxer (stream-copy). Returns true on success; false on
@@ -828,10 +892,10 @@ class DownloadManager extends ChangeNotifier {
     if (!Platform.isAndroid) return false;
     try {
       final ok = await _downloadChannel
-          .invokeMethod<bool>(
-            'remuxTsToMp4',
-            {'input': input, 'output': output},
-          )
+          .invokeMethod<bool>('remuxTsToMp4', {
+            'input': input,
+            'output': output,
+          })
           // MediaMuxer can sit forever on a stream it cannot parse, and a
           // native call that never returns is not an error — nothing throws,
           // the await simply never completes and the download is stuck at
@@ -853,11 +917,12 @@ class DownloadManager extends ChangeNotifier {
   /// app-specific external path stored as the download location. Android only;
   /// empty elsewhere.
   Future<List<({String path, String label, bool removable})>>
-      listDownloadVolumes() async {
+  listDownloadVolumes() async {
     if (!Platform.isAndroid) return const [];
     try {
-      final raw = await _downloadChannel
-          .invokeMethod<List<dynamic>>('listDownloadVolumes');
+      final raw = await _downloadChannel.invokeMethod<List<dynamic>>(
+        'listDownloadVolumes',
+      );
       if (raw == null) return const [];
       return raw.map((e) {
         final m = (e as Map).cast<String, dynamic>();
@@ -899,7 +964,8 @@ class DownloadManager extends ChangeNotifier {
       try {
         final destDir = Directory('$customUri/$dir');
         await destDir.create(recursive: true);
-        final mp4 = '${destDir.path}/${_withExt(tsPath.split('/').last, 'mp4')}';
+        final mp4 =
+            '${destDir.path}/${_withExt(tsPath.split('/').last, 'mp4')}';
         if (await _remuxToMp4(tsPath, mp4)) {
           try {
             await File(tsPath).delete();
@@ -922,7 +988,9 @@ class DownloadManager extends ChangeNotifier {
     if (Platform.isAndroid) {
       final mp4 = _withExt(tsPath, 'mp4');
       final remuxed = mp4 != tsPath && await _remuxToMp4(tsPath, mp4);
-      debugPrint('[dl] HLS finalize: ${remuxed ? 'remuxed to mp4' : 'kept .ts'}');
+      debugPrint(
+        '[dl] HLS finalize: ${remuxed ? 'remuxed to mp4' : 'kept .ts'}',
+      );
       if (remuxed) {
         publish = mp4;
         try {
@@ -932,8 +1000,11 @@ class DownloadManager extends ChangeNotifier {
       // Remux failed on an odd stream → keep the honestly-labelled .ts.
     }
     if (dest == VideoDestination.safTree) {
-      final moved =
-          await _moveIntoTree(publish, customUri!, publish.split('/').last);
+      final moved = await _moveIntoTree(
+        publish,
+        customUri!,
+        publish.split('/').last,
+      );
       return moved ?? publish;
     }
     if (dest != VideoDestination.publicDownloads) {
@@ -996,20 +1067,39 @@ class DownloadManager extends ChangeNotifier {
   /// Best-effort: stored in private app storage, idempotent (skips if already
   /// saved), and any failure just leaves the download without sidecar subs.
   Future<void> _fetchSubtitles(DownloadRecord rec, VideoSource source) async {
+    final configured = GetIt.I.isRegistered<PlaybackPrefs>()
+        ? GetIt.I<PlaybackPrefs>().subtitlePreference
+        : '';
+    final language = configured.isEmpty
+        ? PlatformDispatcher.instance.locale.languageCode
+        : configured;
+    if (language == 'off') return;
     final fromHls = _isHls(source);
     if (source.subtitles.isEmpty && !fromHls) return;
     final live = _records[rec.id];
     if (live == null || live.status == DownloadStatus.canceled) return;
-    if (live.subtitles.isNotEmpty) return; // already saved (e.g. a retry mirror)
+    if (live.subtitles.isNotEmpty)
+      return; // already saved (e.g. a retry mirror)
     try {
-      final docs = await getApplicationDocumentsDirectory();
+      final docs = Platform.isWindows
+          ? await getApplicationSupportDirectory()
+          : await getApplicationDocumentsDirectory();
       final safeShow = _safe(rec.showTitle);
-      final dir = Directory('${docs.path}/$_sharedDir/$safeShow/subs');
+      final dir = Platform.isWindows
+          ? Directory(
+              '${_downloadPrefs.locationUri}/Videos/$safeShow/Subtitles',
+            )
+          : Directory('${docs.path}/$_sharedDir/$safeShow/subs');
       await dir.create(recursive: true);
       final epTag = 'E${rec.episodeNumber?.toInt() ?? ''}';
       final saved = <OfflineSubtitle>[];
       var idx = 0;
-      for (final sub in source.subtitles) {
+      for (final sub in downloadSubtitleSelection(
+        source.subtitles,
+        language,
+        language: (sub) => sub.lang,
+        label: (sub) => sub.label ?? '',
+      )) {
         idx++;
         try {
           final path =
@@ -1033,15 +1123,18 @@ class DownloadManager extends ChangeNotifier {
               isDefault: sub.isDefault,
             ),
           );
-        } catch (_) {/* skip this track */}
+        } catch (_) {
+          /* skip this track */
+        }
       }
       // HLS renditions, merged into one .vtt each. After the sidecars so an
       // explicitly advertised track wins when a stream offers both.
-      if (fromHls) {
+      if (fromHls && saved.isEmpty) {
         final seen = saved.map((s) => '${s.lang}|${s.label}').toSet();
         final tracks = await HlsDownloader(_dio).fetchSubtitleTracks(
           source.url,
           source.headers ?? const {},
+          preferredLanguage: language,
           canceled: () => _records[rec.id]?.status == DownloadStatus.canceled,
         );
         for (final t in tracks) {
@@ -1058,7 +1151,9 @@ class DownloadManager extends ChangeNotifier {
                 isDefault: t.isDefault,
               ),
             );
-          } catch (_) {/* skip this track */}
+          } catch (_) {
+            /* skip this track */
+          }
         }
       }
       if (saved.isEmpty) return;
@@ -1078,7 +1173,9 @@ class DownloadManager extends ChangeNotifier {
       if (updated.status == DownloadStatus.done) {
         await _publishExternalSubtitles(updated);
       }
-    } catch (_) {/* no subtitles offline — non-fatal */}
+    } catch (_) {
+      /* no subtitles offline — non-fatal */
+    }
   }
 
   /// Publish a public copy of saved subtitles so file-browser-launched players
@@ -1335,14 +1432,18 @@ class DownloadManager extends ChangeNotifier {
     }
     _mp4Queue.removeTasksWithIds([rec.id]); // drop it if still waiting in line
     try {
-      await _fileDownloader.cancelTaskWithId(rec.id); // direct-file task (if enqueued/running)
+      await _fileDownloader.cancelTaskWithId(
+        rec.id,
+      ); // direct-file task (if enqueued/running)
     } catch (_) {}
     if (!isAppleTv) {
       try {
         await (await DownloadService.jobJournal()).remove(rec.id);
       } catch (_) {}
       try {
-        DownloadService.instance.invoke('cancel', {'id': rec.id}); // HLS job (if any)
+        DownloadService.instance.invoke('cancel', {
+          'id': rec.id,
+        }); // HLS job (if any)
       } catch (_) {}
     }
     _tasks.remove(rec.id);
@@ -1376,7 +1477,9 @@ class DownloadManager extends ChangeNotifier {
         await (await DownloadService.jobJournal()).remove(rec.id);
       } catch (_) {}
       try {
-        DownloadService.instance.invoke('cancel', {'id': rec.id}); // stop HLS job
+        DownloadService.instance.invoke('cancel', {
+          'id': rec.id,
+        }); // stop HLS job
       } catch (_) {}
     }
     _tasks.remove(rec.id);
@@ -1636,7 +1739,8 @@ class DownloadManager extends ChangeNotifier {
         _put(
           rec.copyWith(
             status: DownloadStatus.failed,
-            error: () => "This source can't be downloaded (stream-only / DASH) — "
+            error: () =>
+                "This source can't be downloaded (stream-only / DASH) — "
                 'try a different server',
           ),
         );
@@ -1660,7 +1764,8 @@ class DownloadManager extends ChangeNotifier {
           _put(
             rec.copyWith(
               status: DownloadStatus.failed,
-              error: () => 'That server returned a web page, not a video — '
+              error: () =>
+                  'That server returned a web page, not a video — '
                   'try a different server',
             ),
           );
@@ -1673,7 +1778,9 @@ class DownloadManager extends ChangeNotifier {
         keepPrivate: _downloadPrefs.keepPrivate,
         locationUri: _downloadPrefs.locationUri,
       );
-      if (dest == VideoDestination.detectedVolume) {
+      if (Platform.isWindows) {
+        path = await task.filePath();
+      } else if (dest == VideoDestination.detectedVolume) {
         // Detected drive (USB/SSD/SD): move the file onto that volume.
         path = await _moveToVolume(
           await task.filePath(),
@@ -1852,7 +1959,9 @@ class DownloadManager extends ChangeNotifier {
       s.container == SourceContainer.torrent;
 
   Future<void> _startTorrentDownload(
-      DownloadRecord rec, VideoSource source) async {
+    DownloadRecord rec,
+    VideoSource source,
+  ) async {
     _put(rec.copyWith(isTorrent: true, status: DownloadStatus.downloading));
     notifyListeners();
     try {
@@ -1868,14 +1977,18 @@ class DownloadManager extends ChangeNotifier {
     } catch (e) {
       if (_isCanceled(rec.id)) return;
       final wifi = e is PlatformException && e.code == 'wifi_only';
-      AppLogger.instance
-          .log('torrent download start failed (${rec.showTitle}): $e', level: 'E');
-      _put(rec.copyWith(
-        status: DownloadStatus.failed,
-        error: () => wifi
-            ? 'Torrents are set to Wi-Fi only (Settings › Torrents).'
-            : 'Torrent download failed to start.',
-      ));
+      AppLogger.instance.log(
+        'torrent download start failed (${rec.showTitle}): $e',
+        level: 'E',
+      );
+      _put(
+        rec.copyWith(
+          status: DownloadStatus.failed,
+          error: () => wifi
+              ? 'Torrents are set to Wi-Fi only (Settings › Torrents).'
+              : 'Torrent download failed to start.',
+        ),
+      );
       notifyListeners();
     }
   }
@@ -1903,8 +2016,9 @@ class DownloadManager extends ChangeNotifier {
       list.sort((a, b) => _height(b).compareTo(_height(a)));
       return list;
     }
-    final want =
-        int.tryParse(RegExp(r'(\d{3,4})').firstMatch(quality)?.group(1) ?? '');
+    final want = int.tryParse(
+      RegExp(r'(\d{3,4})').firstMatch(quality)?.group(1) ?? '',
+    );
     if (want == null) {
       list.sort((a, b) => _height(b).compareTo(_height(a)));
       return list;

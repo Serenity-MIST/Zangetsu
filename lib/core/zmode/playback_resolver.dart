@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
@@ -169,10 +170,16 @@ class PlaybackResolver {
     /// Likewise for [relaxedPerSourceBudget].
     Duration? relaxedBudget,
 
+    /// Desktop companions resolve off the UI thread and may collect links for
+    /// sixty seconds. Kept injectable for bounded transport regression tests.
+    Duration? companionBudget,
+
     /// Counts a play against the source that served it. Optional — see
     /// [_scores].
     SourceScoreStore? scores,
   }) : _budget = perSourceBudget ?? defaultPerSourceBudget,
+       _companionBudget =
+           companionBudget ?? perSourceBudget ?? const Duration(seconds: 75),
        _chosenBudget = chosenBudget ?? chosenSourceBudget,
        _relaxedBudget =
            relaxedBudget ?? perSourceBudget ?? relaxedPerSourceBudget,
@@ -238,6 +245,7 @@ class PlaybackResolver {
   /// Everywhere else, see [relaxedPerSourceBudget].
   static const Duration defaultPerSourceBudget = Duration(seconds: 8);
   final Duration _budget;
+  final Duration _companionBudget;
 
   /// What an un-chosen source gets where the wait costs no frames.
   ///
@@ -289,6 +297,15 @@ class PlaybackResolver {
   /// rather than the old 8s. Where it is not free, the tight budget applies to
   /// everything, chosen or not — exactly as before.
   Duration _budgetFor(String sourceId, Set<String> chosen) {
+    // The desktop CS3 engine collects mirrors for up to 60s. Applying the
+    // in-process QuickJS 8s limit discarded valid replies and poisoned the
+    // provider's health before extraction had finished.
+    if (Platform.isWindows && sourceId.startsWith('cs:')) {
+      return _companionBudget;
+    }
+    if (_isNativeSource(sourceId) && !sourceId.startsWith('lnr:')) {
+      return chosen.contains(sourceId) ? _chosenBudget : _relaxedBudget;
+    }
     if (!JsEngine.runsOffUiIsolate) return _budget;
     return chosen.contains(sourceId) ? _chosenBudget : _relaxedBudget;
   }
@@ -1576,10 +1593,14 @@ class PlaybackResolver {
 
   List<String> _orderedCandidates(ZCanonical c) {
     final all = _candidates(c.kind);
-    if (all.isEmpty) return const [];
-
     final ids = all.map((s) => s.id).toList();
     final pinned = _matcher.pinnedSource(c);
+    // Automatic content filtering must not erase a source picked by hand.
+    // An uninstalled pin stays excluded rather than resurrecting a dead source.
+    if (pinned != null && !ids.contains(pinned) && _sources.hasSource(pinned)) {
+      ids.insert(0, pinned);
+    }
+    if (ids.isEmpty) return const [];
     final last = _store.lastPlayed(c);
     final preferred = _prefs.get(c.kind);
 

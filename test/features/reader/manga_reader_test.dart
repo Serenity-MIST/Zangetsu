@@ -666,6 +666,18 @@ Future<void> settle(WidgetTester tester) async {
   }
 }
 
+/// Allows real cache writes to finish without assuming a fixed disk latency.
+/// A bounded wait still fails a stalled translation instead of hiding it.
+Future<void> settleIoUntil(WidgetTester tester, bool Function() ready) async {
+  for (var retry = 0; retry < 100 && !ready(); retry++) {
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 20)),
+    );
+    await tester.pump();
+  }
+  await settle(tester);
+}
+
 /// [settle], but past the reader's automatic retry wait as well — otherwise a
 /// test sees the moment between the two attempts and reads it as a failure.
 Future<void> settleThroughRetry(WidgetTester tester) async {
@@ -929,6 +941,15 @@ void main() {
         await tester.pumpWidget(const SizedBox());
         await Future<void>.delayed(const Duration(milliseconds: 50));
       });
+      // The image-cache dependency schedules its own ten-second cleanup.
+      // Let it fire after detaching the reader, rather than leaking a fake
+      // timer into the next widget test's invariant check.
+      for (var turn = 0; turn < 3; turn++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 30)),
+        );
+        await tester.pump(const Duration(seconds: 11));
+      }
     }
 
     testWidgets('a chapter with no pages says so instead of going black', (
@@ -2596,6 +2617,10 @@ void main() {
       );
       await settle(tester);
       expect(find.text('translated text'), findsOneWidget);
+      await settleIoUntil(
+        tester,
+        () => platform.recognizeCalls == 3 && onlineTranslationCalls == 3,
+      );
       expect(platform.recognizeCalls, 3);
       expect(onlineTranslationCalls, 3);
       expect(find.byTooltip('Turn translation off'), findsOneWidget);
@@ -2696,6 +2721,7 @@ void main() {
       );
       await settle(tester);
 
+      await settleIoUntil(tester, () => platform.recognizeCalls == 3);
       expect(platform.recognizeCalls, 3);
       expect(platform.recognizedFilePaths, pagePaths);
       expect(find.text('translated text'), findsOneWidget);

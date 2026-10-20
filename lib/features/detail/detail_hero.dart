@@ -12,10 +12,14 @@ class _Hero extends StatelessWidget {
     required this.coverHeaders,
     required this.hasCover,
     this.trailerId,
+    this.title = '',
+    this.onTitleTap,
     this.collapsed = false,
     this.onTapFullscreen,
   });
 
+  final String title;
+  final VoidCallback? onTitleTap;
   final String coverUrl;
   final Map<String, String>? coverHeaders;
   final bool hasCover;
@@ -48,7 +52,7 @@ class _Hero extends StatelessWidget {
               : MihonImage(int.parse(mihonSrcId!), coverUrl),
           width: 800,
         ),
-        fit: BoxFit.cover,
+        fit: Platform.isWindows ? BoxFit.contain : BoxFit.cover,
         loadingBuilder: (_, child, progress) =>
             progress == null ? child : ColoredBox(color: AppColors.surface2),
         errorBuilder: (context, error, stackTrace) =>
@@ -58,7 +62,7 @@ class _Hero extends StatelessWidget {
     return CachedNetworkImage(
       imageUrl: coverUrl,
       httpHeaders: coverHeaders,
-      fit: BoxFit.cover,
+      fit: Platform.isWindows ? BoxFit.contain : BoxFit.cover,
       memCacheWidth: 800,
       placeholder: (c, u) => ColoredBox(color: AppColors.surface2),
       errorWidget: (c, u, e) => ColoredBox(color: AppColors.surface2),
@@ -68,6 +72,24 @@ class _Hero extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final id = trailerId;
+    if (Platform.isWindows) {
+      // The desktop card is exclusively media. Title/metadata are rendered
+      // beneath it by the detail page instead of narrowing the trailer.
+      return ClipRRect(
+        borderRadius: const BorderRadius.vertical(bottom: Radius.circular(12)),
+        child: ColoredBox(
+          color: AppColors.surface2,
+          child: id != null && id.isNotEmpty
+              ? _HeroTrailer(
+                  videoId: id,
+                  collapsed: collapsed,
+                  onTapFullscreen: onTapFullscreen,
+                  placeholder: _coverBackdrop(),
+                )
+              : _coverBackdrop(),
+        ),
+      );
+    }
     return Stack(
       fit: StackFit.expand,
       children: [
@@ -450,6 +472,8 @@ class _HeroTrailerState extends State<_HeroTrailer> with RouteAware {
                 child: Video(
                   controller: controller,
                   controls: NoVideoControls,
+                  // Fill the entire trailer card, cropping excess edges rather
+                  // than reserving empty bands around a contained video.
                   fit: BoxFit.cover,
                   fill: Colors.transparent,
                 ),
@@ -579,16 +603,24 @@ class _PlayButton extends StatelessWidget {
           borderRadius: BorderRadius.circular(8),
           onTap: onPressed,
           child: SizedBox(
-            height: 52,
+            height: Platform.isWindows ? 40 : 52,
             width: double.infinity,
             child: Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                Icon(icon, color: Colors.black, size: 26),
+                Icon(
+                  icon,
+                  color: Colors.black,
+                  size: Platform.isWindows ? 20 : 26,
+                ),
                 const SizedBox(width: 8),
-                Text(
-                  label,
-                  style: AppText.button.copyWith(color: Colors.black),
+                Flexible(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: AppText.button.copyWith(color: Colors.black),
+                  ),
                 ),
               ],
             ),
@@ -630,7 +662,7 @@ class _DownloadButton extends StatelessWidget {
           borderRadius: BorderRadius.circular(8),
           onTap: onPressed,
           child: SizedBox(
-            height: 52,
+            height: Platform.isWindows ? 40 : 52,
             width: double.infinity,
             child: Row(
               mainAxisAlignment: MainAxisAlignment.center,
@@ -641,9 +673,13 @@ class _DownloadButton extends StatelessWidget {
                   size: 24,
                 ),
                 const SizedBox(width: 8),
-                Text(
-                  label,
-                  style: AppText.button.copyWith(color: Colors.white),
+                Flexible(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: AppText.button.copyWith(color: Colors.white),
+                  ),
                 ),
               ],
             ),

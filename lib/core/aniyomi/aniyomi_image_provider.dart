@@ -1,3 +1,4 @@
+import '../desktop/extension_runtime.dart';
 /*
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,7 +35,7 @@ import 'package:flutter/services.dart';
 
 import '../cache/app_image_cache.dart';
 
-const MethodChannel _kAniChannel = MethodChannel('zangetsu/aniyomi');
+const ExtensionChannel _kAniChannel = ExtensionChannel('zangetsu/aniyomi');
 
 /// [ImageProvider] that fetches image bytes via the native Aniyomi OkHttpClient.
 ///
@@ -58,7 +59,10 @@ class AniyomiImage extends ImageProvider<AniyomiImage> {
   /// Flutter 3.7+ modern decode path: [ImageDecoderCallback] receives an
   /// [ui.ImmutableBuffer] built from the raw bytes returned by the native side.
   @override
-  ImageStreamCompleter loadImage(AniyomiImage key, ImageDecoderCallback decode) {
+  ImageStreamCompleter loadImage(
+    AniyomiImage key,
+    ImageDecoderCallback decode,
+  ) {
     return OneFrameImageStreamCompleter(_loadAsync(key, decode));
   }
 
@@ -75,8 +79,9 @@ class AniyomiImage extends ImageProvider<AniyomiImage> {
         'AniyomiImage: native getImage returned empty bytes for ${key.url}',
       );
     }
-    final ui.ImmutableBuffer buffer =
-        await ui.ImmutableBuffer.fromUint8List(bytes);
+    final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(
+      bytes,
+    );
     final ui.Codec codec = await decode(buffer);
     final ui.FrameInfo frame = await codec.getNextFrame();
     return ImageInfo(image: frame.image);
@@ -86,9 +91,7 @@ class AniyomiImage extends ImageProvider<AniyomiImage> {
 
   @override
   bool operator ==(Object other) =>
-      other is AniyomiImage &&
-      sourceId == other.sourceId &&
-      url == other.url;
+      other is AniyomiImage && sourceId == other.sourceId && url == other.url;
 
   @override
   int get hashCode => Object.hash(sourceId, url);

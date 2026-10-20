@@ -1,4 +1,7 @@
 import 'package:hive/hive.dart';
+import 'dart:io';
+import '../desktop/desktop_storage.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
 
 /// Whether a stored download path is a SAF content:// URI (vs a plain file
@@ -12,17 +15,48 @@ String downloadDestinationLabel({
   required bool keepPrivate,
   required String? locationLabel,
   required String publicFallback,
-}) =>
-    keepPrivate ? 'Private (app storage)' : (locationLabel ?? publicFallback);
+}) => keepPrivate ? 'Private (app storage)' : (locationLabel ?? publicFallback);
 
 /// Persists the user's chosen download folder (a SAF tree URI) for MP4
 /// downloads. Null = the default Downloads/Zangetsu location.
 class DownloadPrefs {
+  static Future<bool>? _folderPick;
+
+  /// Saves a desktop download directory chosen in-app; cancellation is false.
+  Future<bool> chooseDesktopFolder() async {
+    final path = await FilePicker.getDirectoryPath(
+      dialogTitle: 'Choose where Zangetsu saves downloads',
+    );
+    if (path == null) return false;
+    await Directory(path).create(recursive: true);
+    await setLocation(path, path);
+    await setKeepPrivate(false);
+    return true;
+  }
+
+  /// Joins concurrent folder prompts when Windows lacks a usable filesystem path.
+  Future<bool> ensureDesktopFolder() async {
+    if (!Platform.isWindows ||
+        (locationUri?.isNotEmpty == true && !isUriPath(locationUri!)))
+      return true;
+    return await (_folderPick ??= chooseDesktopFolder().whenComplete(
+      () => _folderPick = null,
+    ));
+  }
+
   static const String boxName = 'download_prefs';
 
   static Future<void> init() async {
     if (!Hive.isBoxOpen(boxName)) {
       await openBoxSafely(boxName);
+      if (Platform.isWindows &&
+          DesktopStorage.root != null &&
+          Hive.box(boxName).get('storageRoot') != DesktopStorage.root) {
+        final path = '${DesktopStorage.root}/Downloads';
+        await Hive.box(boxName).put('locationUri', path);
+        await Hive.box(boxName).put('locationLabel', path);
+        await Hive.box(boxName).put('storageRoot', DesktopStorage.root);
+      }
     }
   }
 
@@ -51,7 +85,8 @@ class DownloadPrefs {
   /// Off by default: files in the private directory are invisible to every
   /// file manager and are deleted when the app is uninstalled.
   bool get keepPrivate =>
-      _box.get('keepPrivate', defaultValue: false) as bool;
+      !Platform.isWindows &&
+      (_box.get('keepPrivate', defaultValue: false) as bool);
 
   Future<void> setKeepPrivate(bool value) => _box.put('keepPrivate', value);
 
@@ -71,8 +106,8 @@ class DownloadPrefs {
       _box.put('parallel', n.clamp(parallelMin, parallelMax));
 
   /// How many segment connections a single HLS download uses. Default 4.
-  int get connectionsPerDownload =>
-      (_box.get('connections') as int? ?? 4).clamp(connectionsMin, connectionsMax);
+  int get connectionsPerDownload => (_box.get('connections') as int? ?? 4)
+      .clamp(connectionsMin, connectionsMax);
 
   Future<void> setConnectionsPerDownload(int n) =>
       _box.put('connections', n.clamp(connectionsMin, connectionsMax));

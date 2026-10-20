@@ -1,3 +1,4 @@
+import 'dart:io';
 // Shared chrome widgets for both readers (manga + novel) — restyles the
 // top/bottom bars and settings sheets to match the player's own polish (see
 // _SheetSurface/_SheetSectionHeader and the top/bottom control scrims in
@@ -117,6 +118,9 @@ Widget readerBarButton(
 }) {
   return IconButton(
     icon: Icon(icon, color: enabled ? color : color.withValues(alpha: 0.3)),
+    visualDensity: Platform.isWindows
+        ? VisualDensity.compact
+        : VisualDensity.standard,
     onPressed: enabled ? onTap : null,
   );
 }
@@ -205,8 +209,8 @@ class ReaderPillIconButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final button = SizedBox(
-      width: size,
-      height: size,
+      width: Platform.isWindows ? 42 : size,
+      height: Platform.isWindows ? 42 : size,
       child: ReaderPillSurface(
         radius: size / 2,
         onTap: onTap,
@@ -260,9 +264,11 @@ class ReaderTitlePill extends StatelessWidget {
         // Still inside a Flexible, so a screen too narrow for this plus the two
         // buttons clamps it down instead of overflowing.
         child: SizedBox(
-          width: MediaQuery.sizeOf(context).width * 0.52,
+          width: Platform.isWindows
+              ? 420
+              : MediaQuery.sizeOf(context).width * 0.52,
           child: SizedBox(
-            height: kReaderPillHeight,
+            height: Platform.isWindows ? 42 : kReaderPillHeight,
             child: ReaderPillSurface(
               radius: kReaderPillHeight / 2,
               onTap: onTap,

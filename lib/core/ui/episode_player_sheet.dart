@@ -1,3 +1,5 @@
+import 'dart:io';
+import 'frosted_sheet.dart';
 import 'package:flutter/material.dart';
 
 import '../models/video_source.dart';
@@ -84,109 +86,117 @@ Future<EpisodeAction?> showEpisodeActionSheet(
   // already gets, for the same reason.
   return showModalBottomSheet<EpisodeAction>(
     context: context,
-    backgroundColor: AppColors.surface,
+    backgroundColor: Platform.isWindows
+        ? Colors.transparent
+        : AppColors.surface,
     shape: const RoundedRectangleBorder(
       borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
     ),
     isScrollControlled: true,
-    builder: (sheetContext) => SafeArea(
-      child: ConstrainedBox(
-        // Not full height: the list is short, and keeping the episode list
-        // visible behind it is what makes this read as a menu.
-        constraints: BoxConstraints(
-          maxHeight: MediaQuery.sizeOf(sheetContext).height * 0.7,
-        ),
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const SizedBox(height: 10),
-              Container(
-                width: 36,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: AppColors.hairline,
-                  borderRadius: BorderRadius.circular(2),
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
-                child: Align(
-                  alignment: AlignmentDirectional.centerStart,
-                  child: Text(
-                    episodeLabel,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: AppText.headline,
+    builder: (sheetContext) => _sheetSurface(
+      SafeArea(
+        child: ConstrainedBox(
+          // Not full height: the list is short, and keeping the episode list
+          // visible behind it is what makes this read as a menu.
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.sizeOf(sheetContext).height * 0.7,
+          ),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const SizedBox(height: 10),
+                Container(
+                  width: 36,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: AppColors.hairline,
+                    borderRadius: BorderRadius.circular(2),
                   ),
                 ),
-              ),
-              if (!reading) ...[
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
+                  child: Align(
+                    alignment: AlignmentDirectional.centerStart,
+                    child: Text(
+                      episodeLabel,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: AppText.headline,
+                    ),
+                  ),
+                ),
+                if (!reading) ...[
+                  _PlayerRow(
+                    icon: Icons.play_circle_outline_rounded,
+                    label: 'Play with…',
+                    trailingText: currentPlayerLabel,
+                    onTap: () =>
+                        Navigator.pop(sheetContext, EpisodeAction.pickPlayer),
+                  ),
+                  _PlayerRow(
+                    icon: Icons.swap_horiz_rounded,
+                    label: 'Play mirror',
+                    subtitle: 'Choose the source before it starts',
+                    onTap: () =>
+                        Navigator.pop(sheetContext, EpisodeAction.playMirror),
+                  ),
+                ],
+                // Streaming only, like the two rows above it: reading gets the
+                // marking rows and nothing else.
+                if (canSurveySources && !reading)
+                  _PlayerRow(
+                    icon: Icons.travel_explore_rounded,
+                    label: 'Where to watch',
+                    subtitle: 'See which of your sources has this episode',
+                    onTap: () =>
+                        Navigator.pop(sheetContext, EpisodeAction.whereToWatch),
+                  ),
+                if (!reading)
+                  _PlayerRow(
+                    icon: Icons.refresh_rounded,
+                    label: 'Reload links',
+                    subtitle: 'Fetch fresh streams if playback keeps failing',
+                    onTap: () =>
+                        Navigator.pop(sheetContext, EpisodeAction.reloadLinks),
+                  ),
+                Divider(height: 1, color: AppColors.hairline),
                 _PlayerRow(
-                  icon: Icons.play_circle_outline_rounded,
-                  label: 'Play with…',
-                  trailingText: currentPlayerLabel,
+                  icon: isWatched
+                      ? Icons.remove_done_rounded
+                      : Icons.check_circle_outline_rounded,
+                  label: reading
+                      ? (isWatched ? 'Mark as unread' : 'Mark as read')
+                      : (isWatched ? 'Mark as unwatched' : 'Mark as watched'),
+                  subtitle: tracksToServices
+                      ? 'Also updates your connected trackers'
+                      : null,
                   onTap: () =>
-                      Navigator.pop(sheetContext, EpisodeAction.pickPlayer),
+                      Navigator.pop(sheetContext, EpisodeAction.toggleWatched),
                 ),
                 _PlayerRow(
-                  icon: Icons.swap_horiz_rounded,
-                  label: 'Play mirror',
-                  subtitle: 'Choose the source before it starts',
-                  onTap: () =>
-                      Navigator.pop(sheetContext, EpisodeAction.playMirror),
+                  icon: Icons.done_all_rounded,
+                  label: reading
+                      ? 'Mark this and all above as read'
+                      : 'Mark this and all above as watched',
+                  onTap: () => Navigator.pop(
+                    sheetContext,
+                    EpisodeAction.markAboveWatched,
+                  ),
                 ),
+                if (reading && canOpenInBrowser)
+                  _PlayerRow(
+                    icon: Icons.public_rounded,
+                    label: 'Open in browser',
+                    subtitle: "Read it on the source's own site",
+                    onTap: () => Navigator.pop(
+                      sheetContext,
+                      EpisodeAction.openInBrowser,
+                    ),
+                  ),
+                const SizedBox(height: 8),
               ],
-              // Streaming only, like the two rows above it: reading gets the
-              // marking rows and nothing else.
-              if (canSurveySources && !reading)
-                _PlayerRow(
-                  icon: Icons.travel_explore_rounded,
-                  label: 'Where to watch',
-                  subtitle: 'See which of your sources has this episode',
-                  onTap: () =>
-                      Navigator.pop(sheetContext, EpisodeAction.whereToWatch),
-                ),
-              if (!reading)
-                _PlayerRow(
-                  icon: Icons.refresh_rounded,
-                  label: 'Reload links',
-                  subtitle: 'Fetch fresh streams if playback keeps failing',
-                  onTap: () =>
-                      Navigator.pop(sheetContext, EpisodeAction.reloadLinks),
-                ),
-              Divider(height: 1, color: AppColors.hairline),
-              _PlayerRow(
-                icon: isWatched
-                    ? Icons.remove_done_rounded
-                    : Icons.check_circle_outline_rounded,
-                label: reading
-                    ? (isWatched ? 'Mark as unread' : 'Mark as read')
-                    : (isWatched ? 'Mark as unwatched' : 'Mark as watched'),
-                subtitle: tracksToServices
-                    ? 'Also updates your connected trackers'
-                    : null,
-                onTap: () =>
-                    Navigator.pop(sheetContext, EpisodeAction.toggleWatched),
-              ),
-              _PlayerRow(
-                icon: Icons.done_all_rounded,
-                label: reading
-                    ? 'Mark this and all above as read'
-                    : 'Mark this and all above as watched',
-                onTap: () =>
-                    Navigator.pop(sheetContext, EpisodeAction.markAboveWatched),
-              ),
-              if (reading && canOpenInBrowser)
-                _PlayerRow(
-                  icon: Icons.public_rounded,
-                  label: 'Open in browser',
-                  subtitle: "Read it on the source's own site",
-                  onTap: () =>
-                      Navigator.pop(sheetContext, EpisodeAction.openInBrowser),
-                ),
-              const SizedBox(height: 8),
-            ],
+            ),
           ),
         ),
       ),
@@ -212,116 +222,123 @@ Future<PlayerChoice?> showEpisodePlayerSheet(
 
   return showModalBottomSheet<PlayerChoice>(
     context: context,
-    backgroundColor: AppColors.surface,
+    backgroundColor: Platform.isWindows
+        ? Colors.transparent
+        : AppColors.surface,
     shape: const RoundedRectangleBorder(
       borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
     ),
     // The list is short, but a device with several players installed plus a
     // long episode title shouldn't push the last row off-screen.
     isScrollControlled: true,
-    builder: (sheetContext) => SafeArea(
-      child: ConstrainedBox(
-        constraints: BoxConstraints(
-          maxHeight: MediaQuery.sizeOf(sheetContext).height * 0.7,
-        ),
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const SizedBox(height: 10),
-              Container(
-                width: 36,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: AppColors.hairline,
-                  borderRadius: BorderRadius.circular(2),
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 14, 20, 2),
-                child: Align(
-                  alignment: AlignmentDirectional.centerStart,
-                  child: Text('Play this episode with', style: AppText.headline),
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
-                child: Align(
-                  alignment: AlignmentDirectional.centerStart,
-                  child: Text(
-                    episodeLabel,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: AppText.caption.copyWith(
-                      color: AppColors.textSecondary,
-                    ),
+    builder: (sheetContext) => _sheetSurface(
+      SafeArea(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.sizeOf(sheetContext).height * 0.7,
+          ),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const SizedBox(height: 10),
+                Container(
+                  width: 36,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: AppColors.hairline,
+                    borderRadius: BorderRadius.circular(2),
                   ),
                 ),
-              ),
-              _PlayerRow(
-                icon: Icons.play_circle_outline_rounded,
-                label: 'Built-in player',
-                isDefault: defaultPackage.isEmpty,
-                onTap: () => Navigator.pop(
-                  sheetContext,
-                  (package: '', label: 'Built-in player'),
-                ),
-              ),
-              for (final p in installed.where((p) => p.known))
-                _PlayerRow(
-                  icon: Icons.open_in_new_rounded,
-                  label: p.label,
-                  isDefault: defaultPackage == p.package,
-                  onTap: () => Navigator.pop(
-                    sheetContext,
-                    (package: p.package, label: p.label),
-                  ),
-                ),
-              // Everything else on the device that answers a video intent. They
-              // play — header-gated streams too, via the local proxy — but we
-              // don't know which intent extras they read, so external subtitles
-              // and the resume position may be ignored. Under their own heading
-              // because some are galleries or browsers rather than players at
-              // all, hence "apps", not "players".
-              if (installed.any((p) => !p.known)) ...[
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(20, 12, 20, 6),
+                  padding: const EdgeInsets.fromLTRB(20, 14, 20, 2),
                   child: Align(
                     alignment: AlignmentDirectional.centerStart,
                     child: Text(
-                      'Other apps',
+                      'Play this episode with',
+                      style: AppText.headline,
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
+                  child: Align(
+                    alignment: AlignmentDirectional.centerStart,
+                    child: Text(
+                      episodeLabel,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: AppText.caption.copyWith(
                         color: AppColors.textSecondary,
                       ),
                     ),
                   ),
                 ),
-                for (final p in installed.where((p) => !p.known))
+                _PlayerRow(
+                  icon: Icons.play_circle_outline_rounded,
+                  label: 'Built-in player',
+                  isDefault: defaultPackage.isEmpty,
+                  onTap: () => Navigator.pop(sheetContext, (
+                    package: '',
+                    label: 'Built-in player',
+                  )),
+                ),
+                for (final p in installed.where((p) => p.known))
                   _PlayerRow(
                     icon: Icons.open_in_new_rounded,
                     label: p.label,
                     isDefault: defaultPackage == p.package,
-                    onTap: () => Navigator.pop(
-                      sheetContext,
-                      (package: p.package, label: p.label),
+                    onTap: () => Navigator.pop(sheetContext, (
+                      package: p.package,
+                      label: p.label,
+                    )),
+                  ),
+                // Everything else on the device that answers a video intent. They
+                // play — header-gated streams too, via the local proxy — but we
+                // don't know which intent extras they read, so external subtitles
+                // and the resume position may be ignored. Under their own heading
+                // because some are galleries or browsers rather than players at
+                // all, hence "apps", not "players".
+                if (installed.any((p) => !p.known)) ...[
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 12, 20, 6),
+                    child: Align(
+                      alignment: AlignmentDirectional.centerStart,
+                      child: Text(
+                        'Other apps',
+                        style: AppText.caption.copyWith(
+                          color: AppColors.textSecondary,
+                        ),
+                      ),
                     ),
                   ),
+                  for (final p in installed.where((p) => !p.known))
+                    _PlayerRow(
+                      icon: Icons.open_in_new_rounded,
+                      label: p.label,
+                      isDefault: defaultPackage == p.package,
+                      onTap: () => Navigator.pop(sheetContext, (
+                        package: p.package,
+                        label: p.label,
+                      )),
+                    ),
+                ],
+                // Opening an empty sheet on long-press reads as a broken gesture,
+                // so say why there's only one row rather than showing nothing.
+                if (installed.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 4, 20, 16),
+                    child: Text(
+                      'No other video apps installed. VLC, MX Player and '
+                      'Just Player all show up here once installed.',
+                      style: AppText.caption.copyWith(
+                        color: AppColors.textSecondary,
+                      ),
+                    ),
+                  ),
+                const SizedBox(height: 8),
               ],
-              // Opening an empty sheet on long-press reads as a broken gesture,
-              // so say why there's only one row rather than showing nothing.
-              if (installed.isEmpty)
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(20, 4, 20, 16),
-                  child: Text(
-                    'No other video apps installed. VLC, MX Player and '
-                    'Just Player all show up here once installed.',
-                    style: AppText.caption.copyWith(
-                      color: AppColors.textSecondary,
-                    ),
-                  ),
-                ),
-              const SizedBox(height: 8),
-            ],
+            ),
           ),
         ),
       ),
@@ -342,69 +359,73 @@ Future<VideoSource?> showMirrorSheet(
   final kinds = availableKinds(sources);
   return showModalBottomSheet<VideoSource>(
     context: context,
-    backgroundColor: AppColors.surface,
+    backgroundColor: Platform.isWindows
+        ? Colors.transparent
+        : AppColors.surface,
     shape: const RoundedRectangleBorder(
       borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
     ),
     isScrollControlled: true,
-    builder: (sheetContext) => SafeArea(
-      child: ConstrainedBox(
-        constraints: BoxConstraints(
-          maxHeight: MediaQuery.sizeOf(sheetContext).height * 0.75,
-        ),
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const SizedBox(height: 10),
-              Container(
-                width: 36,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: AppColors.hairline,
-                  borderRadius: BorderRadius.circular(2),
+    builder: (sheetContext) => _sheetSurface(
+      SafeArea(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.sizeOf(sheetContext).height * 0.75,
+          ),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const SizedBox(height: 10),
+                Container(
+                  width: 36,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: AppColors.hairline,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
                 ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 14, 20, 2),
-                child: Align(
-                  alignment: AlignmentDirectional.centerStart,
-                  child: Text('Play mirror', style: AppText.headline),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 14, 20, 2),
+                  child: Align(
+                    alignment: AlignmentDirectional.centerStart,
+                    child: Text('Play mirror', style: AppText.headline),
+                  ),
                 ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
-                child: Align(
-                  alignment: AlignmentDirectional.centerStart,
-                  child: Text(
-                    episodeLabel,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: AppText.caption.copyWith(
-                      color: AppColors.textSecondary,
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
+                  child: Align(
+                    alignment: AlignmentDirectional.centerStart,
+                    child: Text(
+                      episodeLabel,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: AppText.caption.copyWith(
+                        color: AppColors.textSecondary,
+                      ),
                     ),
                   ),
                 ),
-              ),
-              for (final k in kinds)
-                for (final s in sortByQuality(sourcesForKind(sources, k)))
-                  _PlayerRow(
-                    icon: Icons.play_arrow_rounded,
-                    // Same shape the player's own Sources sheet uses: the
-                    // provider's mirror name when it has one, otherwise the
-                    // audio kind — and never a stray "UNKNOWN •" for sources
-                    // that don't declare sub/dub.
-                    label: s.label?.trim().isNotEmpty == true
-                        ? s.label!.trim()
-                        : '${k != AudioKind.unknown ? '${k.name.toUpperCase()} • ' : ''}'
-                              '${s.quality ?? s.container.name.toUpperCase()}',
-                    subtitle: s.label?.trim().isNotEmpty == true
-                        ? s.quality
-                        : null,
-                    onTap: () => Navigator.pop(sheetContext, s),
-                  ),
-              const SizedBox(height: 8),
-            ],
+                for (final k in kinds)
+                  for (final s in sortByQuality(sourcesForKind(sources, k)))
+                    _PlayerRow(
+                      icon: Icons.play_arrow_rounded,
+                      // Same shape the player's own Sources sheet uses: the
+                      // provider's mirror name when it has one, otherwise the
+                      // audio kind — and never a stray "UNKNOWN •" for sources
+                      // that don't declare sub/dub.
+                      label: s.label?.trim().isNotEmpty == true
+                          ? s.label!.trim()
+                          : '${k != AudioKind.unknown ? '${k.name.toUpperCase()} • ' : ''}'
+                                '${s.quality ?? s.container.name.toUpperCase()}',
+                      subtitle: s.label?.trim().isNotEmpty == true
+                          ? s.quality
+                          : null,
+                      onTap: () => Navigator.pop(sheetContext, s),
+                    ),
+                const SizedBox(height: 8),
+              ],
+            ),
           ),
         ),
       ),
@@ -454,3 +475,7 @@ class _PlayerRow extends StatelessWidget {
     );
   }
 }
+
+/// Applies the desktop translucent sheet surface without altering mobile sheets.
+Widget _sheetSurface(Widget child) =>
+    Platform.isWindows ? FrostedSheet(child: child) : child;

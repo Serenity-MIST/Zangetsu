@@ -32,11 +32,11 @@ void main() {
     expect(isUriPath('/storage/emulated/0/Download/x.mp4'), isFalse);
   });
 
-  test('keepPrivate defaults to false and round-trips', () async {
+  test('keepPrivate is mobile-only and desktop uses the chosen folder', () async {
     final p = DownloadPrefs();
     expect(p.keepPrivate, isFalse);
     await p.setKeepPrivate(true);
-    expect(p.keepPrivate, isTrue);
+    expect(p.keepPrivate, !Platform.isWindows);
     await p.setKeepPrivate(false);
     expect(p.keepPrivate, isFalse);
   });

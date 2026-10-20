@@ -17,6 +17,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:get_it/get_it.dart';
@@ -35,38 +36,37 @@ MihonProvider _prov({
   String pkg = 'p.manga',
   String name = 'MangaSrc',
   String lang = 'en',
-}) =>
-    MihonProvider(
-      info: MihonSourceInfo(
-        id: id,
-        name: name,
-        lang: lang,
-        baseUrl: '',
-        pkg: pkg,
-        nsfw: false,
-        version: '1.0',
-        versionCode: 1,
-      ),
-    );
+}) => MihonProvider(
+  info: MihonSourceInfo(
+    id: id,
+    name: name,
+    lang: lang,
+    baseUrl: '',
+    pkg: pkg,
+    nsfw: false,
+    version: '1.0',
+    versionCode: 1,
+  ),
+);
 
 MihonUpdate _upd() => MihonUpdate(
-      pkg: 'p.manga',
-      name: 'MangaSrc',
-      installedCode: 1,
-      availableCode: 2,
-      availableVersion: '2.0',
-      entry: AniyomiRepoEntry(
-        name: 'MangaSrc',
-        pkg: 'p.manga',
-        apk: 'x.apk',
-        lang: 'en',
-        version: '2.0',
-        code: 2,
-        nsfw: false,
-        sources: const [],
-        repoBaseUrl: 'https://r/x',
-      ),
-    );
+  pkg: 'p.manga',
+  name: 'MangaSrc',
+  installedCode: 1,
+  availableCode: 2,
+  availableVersion: '2.0',
+  entry: AniyomiRepoEntry(
+    name: 'MangaSrc',
+    pkg: 'p.manga',
+    apk: 'x.apk',
+    lang: 'en',
+    version: '2.0',
+    code: 2,
+    nsfw: false,
+    sources: const [],
+    repoBaseUrl: 'https://r/x',
+  ),
+);
 
 void main() {
   final sl = GetIt.instance;
@@ -75,8 +75,9 @@ void main() {
     late Directory tempDir;
 
     setUpAll(() async {
-      tempDir =
-          await Directory.systemTemp.createTemp('mihon_sources_screen_test_');
+      tempDir = await Directory.systemTemp.createTemp(
+        'mihon_sources_screen_test_',
+      );
       Hive.init(tempDir.path);
       await Hive.openBox<String>(kMihonReposBoxName);
       await Hive.openBox<dynamic>(MihonExtensionService.installedBoxName);
@@ -88,12 +89,27 @@ void main() {
     });
 
     setUp(() async {
+      // Source-setting discovery is unrelated to this screen's file/list
+      // contracts; answer it without launching a real native extension.
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(const MethodChannel('zangetsu/mihon'), (
+            call,
+          ) async {
+            return call.method == 'hasSourceSettings' ? false : null;
+          });
       await Hive.box<String>(kMihonReposBoxName).clear();
       await Hive.box<dynamic>(MihonExtensionService.installedBoxName).clear();
       sl.registerSingleton<MihonManager>(MihonManager());
     });
 
-    tearDown(() async => sl.reset());
+    tearDown(() async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('zangetsu/mihon'),
+            null,
+          );
+      await sl.reset();
+    });
 
     Future<void> pump(WidgetTester tester) async {
       await tester.pumpWidget(
@@ -112,8 +128,9 @@ void main() {
       await tester.pump();
     }
 
-    testWidgets('titles the screen Mihon with Installed/Repositories tabs',
-        (tester) async {
+    testWidgets('titles the screen Mihon with Installed/Repositories tabs', (
+      tester,
+    ) async {
       await pump(tester);
 
       expect(find.text('Mihon'), findsOneWidget);
@@ -121,15 +138,15 @@ void main() {
       expect(find.text('Repositories'), findsOneWidget);
     });
 
-    testWidgets('shows the manga-specific empty state when nothing installed',
-        (tester) async {
+    testWidgets('shows the manga-specific empty state when nothing installed', (
+      tester,
+    ) async {
       await pump(tester);
 
       expect(find.text('No Mihon sources installed.'), findsOneWidget);
     });
 
-    testWidgets(
-        'lists a registered source with mihon vocabulary and lets you '
+    testWidgets('lists a registered source with mihon vocabulary and lets you '
         'set it active', (tester) async {
       sl<MihonManager>().register(_prov());
       await pump(tester);
@@ -143,16 +160,38 @@ void main() {
       expect(find.text('Active source: MangaSrc'), findsOneWidget);
     });
 
-    testWidgets('uninstall removes the source from MihonManager',
-        (tester) async {
+    testWidgets('uninstall removes the source from MihonManager', (
+      tester,
+    ) async {
+      // Uninstall requires an installed file, not just a synthetic registry
+      // row: keep the APK ownership fixture inside this test's temp folder.
+      final apk = File('${tempDir.path}/p.manga.apk');
+      await tester.runAsync(() async {
+        await apk.writeAsBytes([0]);
+        await Hive.box<dynamic>(
+          MihonExtensionService.installedBoxName,
+        ).put('p.manga', apk.path);
+      });
       sl<MihonManager>().register(_prov());
       await pump(tester);
       expect(sl<MihonManager>().all, hasLength(1));
 
-      await tester.tap(find.byIcon(Icons.delete_outline_rounded));
-      await tester.pumpAndSettle();
-      // Confirm dialog.
-      await tester.tap(find.text('Uninstall').last);
+      // Start the entire asynchronous handler in the real I/O zone. Starting
+      // its dialog in fakeAsync can leave Hive's write queue attached to the
+      // old test's clock even after the visible uninstall has completed.
+      await tester.runAsync(() async {
+        await tester.tap(find.byIcon(Icons.delete_outline_rounded));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Uninstall').last);
+        for (
+          var retry = 0;
+          retry < 40 && sl<MihonManager>().all.isNotEmpty;
+          retry++
+        ) {
+          await tester.pump();
+          await Future<void>.delayed(const Duration(milliseconds: 25));
+        }
+      });
       await tester.pumpAndSettle();
 
       expect(sl<MihonManager>().all, isEmpty);
@@ -160,18 +199,19 @@ void main() {
     });
 
     testWidgets(
-        'Repositories tab shows the manga-specific empty state with no repos',
-        (tester) async {
-      await pump(tester);
+      'Repositories tab shows the manga-specific empty state with no repos',
+      (tester) async {
+        await pump(tester);
 
-      await tester.tap(find.text('Repositories'));
-      // The tab swipe is a plain (non-network, non-spinner) animation here —
-      // repoUrls is empty, so MihonRepoTab renders a static EmptyState with
-      // nothing in flight. Safe to fully settle.
-      await tester.pumpAndSettle();
+        await tester.tap(find.text('Repositories'));
+        // The tab swipe is a plain (non-network, non-spinner) animation here —
+        // repoUrls is empty, so MihonRepoTab renders a static EmptyState with
+        // nothing in flight. Safe to fully settle.
+        await tester.pumpAndSettle();
 
-      expect(find.textContaining('No Mihon repos added yet'), findsOneWidget);
-    });
+        expect(find.textContaining('No Mihon repos added yet'), findsOneWidget);
+      },
+    );
 
     testWidgets('the FAB opens the Mihon add-repo dialog', (tester) async {
       await pump(tester);
@@ -188,29 +228,37 @@ void main() {
   // ── Update button (debug seam), mirrors ani_source_row_update_test.dart ──
   group('debugMihonSourceRow', () {
     Widget host(Widget child) => MaterialApp(
-          home: BlocProvider(
-            create: (_) => ActiveSourceCubit(),
-            child: Scaffold(body: child),
-          ),
-        );
+      home: BlocProvider(
+        create: (_) => ActiveSourceCubit(),
+        child: Scaffold(body: child),
+      ),
+    );
 
     testWidgets('no Update button when there is no update', (t) async {
-      await t.pumpWidget(host(debugMihonSourceRow(
-        source: _prov(),
-        activeId: 'mihon:1',
-        updateLookupFn: (_) => null,
-      )));
+      await t.pumpWidget(
+        host(
+          debugMihonSourceRow(
+            source: _prov(),
+            activeId: 'mihon:1',
+            updateLookupFn: (_) => null,
+          ),
+        ),
+      );
       expect(find.textContaining('Update'), findsNothing);
     });
 
     testWidgets('shows Update button and applies on tap', (t) async {
       var applied = false;
-      await t.pumpWidget(host(debugMihonSourceRow(
-        source: _prov(),
-        activeId: 'mihon:1',
-        updateLookupFn: (pkg) => pkg == 'p.manga' ? _upd() : null,
-        applyUpdateFn: (u) async => applied = true,
-      )));
+      await t.pumpWidget(
+        host(
+          debugMihonSourceRow(
+            source: _prov(),
+            activeId: 'mihon:1',
+            updateLookupFn: (pkg) => pkg == 'p.manga' ? _upd() : null,
+            applyUpdateFn: (u) async => applied = true,
+          ),
+        ),
+      );
       expect(find.text('Update → v2.0'), findsOneWidget);
       await t.tap(find.text('Update → v2.0'));
       await t.pump();

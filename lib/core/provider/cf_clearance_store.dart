@@ -48,11 +48,13 @@ class CfClearanceStore {
       final m = Map<String, dynamic>.from(raw);
       final cookie = m['cookie'] as String?;
       final ts = (m['ts'] as num?)?.toInt();
-      if (cookie == null || cookie.isEmpty || ts == null) {
+      if (cookie == null ||
+          (cookie.isEmpty && m['browserVerified'] != true) ||
+          ts == null) {
         box.delete(key);
         continue;
       }
-      if (now - ts > maxAge.inMilliseconds) {
+      if (now < ts || now - ts >= maxAge.inMilliseconds) {
         box.delete(key); // too old to trust — re-solve next time it's needed
         continue;
       }
@@ -62,12 +64,29 @@ class CfClearanceStore {
   }
 
   /// Persist a freshly-solved clearance for [host].
-  void remember(String host, String cookie, String? ua) {
+  void remember(
+    String host,
+    String cookie,
+    String? ua, {
+    bool browserVerified = false,
+  }) {
     _box?.put(host, {
       'cookie': cookie,
       if (ua != null && ua.isNotEmpty) 'ua': ua,
       'ts': DateTime.now().millisecondsSinceEpoch,
+      if (browserVerified) 'browserVerified': true,
     });
+  }
+
+  /// A fresh, manually verified browser profile can remain usable even when
+  /// the website never issues a cf_clearance cookie to its visitors.
+  bool browserVerifiedFor(String host) {
+    final raw = _box?.get(host);
+    if (raw is! Map || raw['browserVerified'] != true || raw['ts'] is! num)
+      return false;
+    final age =
+        DateTime.now().millisecondsSinceEpoch - (raw['ts'] as num).toInt();
+    return age >= 0 && age < maxAge.inMilliseconds;
   }
 
   /// Drop a clearance that turned out to be stale (got challenged on reuse).

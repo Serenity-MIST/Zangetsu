@@ -14,6 +14,7 @@ import '../../../core/metadata/metadata_enrichment.dart';
 import '../../../core/models/episode.dart';
 import '../../../core/models/episode_title.dart';
 import '../../../core/models/media_detail.dart';
+import '../../../core/models/media_item.dart';
 import '../../../core/models/media_extras.dart';
 import '../../../core/models/provider_info.dart';
 import '../../../core/playback/playback_prefs.dart';
@@ -140,6 +141,7 @@ class DetailCubit extends Cubit<DetailState> {
     TitlePrefsStore? prefs,
     int? seedMalId,
     ProviderType? seedType,
+    this.seedItem,
     this.prefer,
   }) : _repo = repo,
        _url = url,
@@ -171,6 +173,25 @@ class DetailCubit extends Cubit<DetailState> {
   }
 
   final CatalogueRepository _repo;
+
+  /// Retains the clicked card's identity when an extension returns chapters
+  /// with incomplete detail fields (for example after a metadata-only error).
+  final MediaItem? seedItem;
+
+  /// Fill only missing identity/artwork; a source's fresh nonempty values win.
+  MediaDetail _retainSeed(MediaDetail detail) {
+    final seed = seedItem;
+    if (seed == null) return detail;
+    final missingCover = detail.cover?.trim().isEmpty ?? true;
+    return detail.copyWith(
+      id: detail.id.trim().isEmpty ? seed.id : detail.id,
+      title: detail.title.trim().isEmpty ? seed.title : detail.title,
+      url: detail.url.trim().isEmpty ? seed.url : detail.url,
+      sourceId: detail.sourceId.isEmpty ? seed.sourceId : detail.sourceId,
+      cover: missingCover ? seed.cover : detail.cover,
+      coverHeaders: missingCover ? seed.coverHeaders : detail.coverHeaders,
+    );
+  }
 
   /// Read this title from a specific metadata catalogue — set when it was
   /// opened from a tracker that has one, so an AniList library entry opens
@@ -262,7 +283,7 @@ class DetailCubit extends Cubit<DetailState> {
           );
           emit(state.copyWith(
             status: DetailStatus.success,
-            detail: partial,
+            detail: _retainSeed(partial),
             episodesLoading: !_zmVideoDetail,
           ));
           // Cast and Relations run off malId/tmdbId/title, all of which are
@@ -286,7 +307,8 @@ class DetailCubit extends Cubit<DetailState> {
       // Pick the URL up from the same latch Home reads — only when nothing
       // useful actually came back, so a genuinely empty (if odd) title never
       // gets mistaken for a block.
-      final latched = detail.title.isEmpty ? NovelCloudflare.pendingUrl : null;
+      final latched = detail.type == ProviderType.novel && detail.title.isEmpty
+          ? NovelCloudflare.pendingUrl : null;
       if (latched != null) {
         _log('load cloudflare latched ${sw.elapsedMilliseconds}ms', level: 'W');
         emit(state.copyWith(
@@ -303,7 +325,7 @@ class DetailCubit extends Cubit<DetailState> {
       );
       // Keep AniZip/TMDB episode names that already painted on the catalogue
       // partial — the matched source's "Episode N" list must not wipe them.
-      final carried = detail.copyWith(
+      final carried = _retainSeed(detail).copyWith(
         episodes: carryEpisodeDisplayMeta(
           state.detail?.episodes,
           detail.episodes,
@@ -400,14 +422,15 @@ class DetailCubit extends Cubit<DetailState> {
       if (isClosed) return;
       // Same novel-latch fallback as load() — a swallowed fetch failure
       // surfaces as an empty detail, not an exception.
-      final latched = fresh.title.isEmpty ? NovelCloudflare.pendingUrl : null;
+      final latched = fresh.type == ProviderType.novel && fresh.title.isEmpty
+          ? NovelCloudflare.pendingUrl : null;
       if (latched != null) {
         _log('refresh cloudflare latched ${sw.elapsedMilliseconds}ms', level: 'W');
         emit(state.copyWith(cloudflareUrl: latched, episodesLoading: false));
         return;
       }
       NovelCloudflare.clear();
-      final merged = fresh.copyWith(
+      final merged = _retainSeed(fresh).copyWith(
         malId: fresh.malId ?? previous?.malId,
         tmdbId: fresh.tmdbId ?? previous?.tmdbId,
         episodes: carryEpisodeDisplayMeta(

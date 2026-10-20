@@ -1,4 +1,5 @@
 import 'dart:io';
+import '../../core/desktop/extension_runtime.dart';
 
 import 'package:flutter/material.dart';
 import '../../core/ui/settings_widgets.dart';
@@ -89,11 +90,12 @@ class _HubPhoneView extends StatelessWidget {
 
   Widget _body(BuildContext context) {
     final zangetsuCount = sl<ProviderRegistry>().getAll().length;
-    final showCs = Platform.isAndroid;
-    final showAniyomi = Platform.isAndroid;
+    final showCs = Platform.isAndroid || Platform.isWindows;
+    final showAniyomi =
+        Platform.isAndroid || DesktopExtensionRuntime.isAvailable;
     // Mihon (manga extensions) boot-loads the same way Aniyomi does — the
     // load step is Android-only (M7) — so the row is gated identically.
-    final showMihon = Platform.isAndroid;
+    final showMihon = Platform.isAndroid || DesktopExtensionRuntime.isAvailable;
     // LNReader (novel sources) is a JS provider, same as Zangetsu — no
     // platform gate needed. Gated on registration instead, so a minimal-GetIt
     // test that never registers LnReaderManager doesn't crash reading it,
@@ -540,7 +542,7 @@ class _HubTvViewState extends State<_HubTvView> {
 
   Widget _body(BuildContext context) {
     final zangetsuCount = sl<ProviderRegistry>().getAll().length;
-    final showCs = Platform.isAndroid;
+    final showCs = Platform.isAndroid || Platform.isWindows;
     final showAniyomi = Platform.isAndroid;
     var autofocusAssigned = false;
 

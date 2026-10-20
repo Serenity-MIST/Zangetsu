@@ -660,7 +660,9 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
               // Escape hatch for black video with working audio — see
               // _rendererOptions. Takes effect on the next player open (mpv
               // can't swap its video output on a live player).
-              if (!sl<AppMode>().isTv)
+              // Windows fixes output to its embedded surface so renderer
+              // changes cannot create an uncontrolled external mpv window.
+              if (!sl<AppMode>().isTv && !Platform.isWindows)
                 SettingsTile(
                   icon: Icons.display_settings_outlined,
                   title: context.l10n.videoRenderer,
@@ -890,7 +892,8 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
                     if (mounted) setState(() {});
                   },
                 ),
-              if(_prefs.seekButtons)
+              // Desktop shortcuts use this duration even without seek buttons.
+              if(_prefs.seekButtons || Platform.isWindows)
                 SettingsTile(
                   icon: Icons.timer_outlined,
                   title: context.l10n.seekButtonDuration,
@@ -974,8 +977,8 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
             ],
           ),
 
-          // ── Gestures (touch-only — hidden on TV) ────────────────────────
-          if (!sl<AppMode>().isTv) ...[
+          // Touch gestures have no desktop effect; Windows uses keyboard/mouse.
+          if (!sl<AppMode>().isTv && !Platform.isWindows) ...[
             SettingsSectionLabel(context.l10n.sectionGestures),
             SettingsCard(
               children: [

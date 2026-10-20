@@ -102,16 +102,25 @@ class _AboutSettingsScreenState extends State<AboutSettingsScreen> {
               ),
               SettingsTile(
                 icon: Icons.system_update_rounded,
-                title: context.l10n.checkForUpdates,
-                subtitle: context.l10n.checkForUpdatesSubtitle,
+                title: Platform.isWindows ? 'View source updates' : context.l10n.checkForUpdates,
+                subtitle: Platform.isWindows
+                    ? 'Windows builds are updated from the project source.'
+                    : context.l10n.checkForUpdatesSubtitle,
                 onTap: () {
+                  // Upstream's installer flow downloads Android APKs. Opening
+                  // source history is useful on PC; reporting "up to date" is not.
+                  if (Platform.isWindows) {
+                    _open('$_githubUrl/commits/main');
+                    return;
+                  }
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(content: Text(context.l10n.checkingForUpdates)),
                   );
                   maybeShowUpdateDialog(context, manual: true);
                 },
               ),
-              SettingsTile(
+              // Beta opt-in controls APK updates and has no desktop effect.
+              if (!Platform.isWindows) SettingsTile(
                 icon: Icons.science_outlined,
                 title: context.l10n.betaUpdates,
                 subtitle: context.l10n.betaUpdatesSubtitle,

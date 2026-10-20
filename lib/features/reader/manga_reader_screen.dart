@@ -1,3 +1,5 @@
+import '../../core/desktop/extension_runtime.dart';
+import 'package:flutter/services.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
@@ -152,6 +154,8 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
 
   bool _loading = true;
   String? _error;
+  String? _cloudflareUrl;
+  int _pageRetry = 0;
 
   /// Every page currently in the strip — which, once you read past the end of
   /// a chapter, spans MORE THAN ONE chapter. [_slots] says which.
@@ -420,6 +424,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     setState(() {
       _loading = true;
       _error = null;
+      _cloudflareUrl = null;
     });
     try {
       final pages = await _fetchPages();
@@ -460,6 +465,13 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       _preload(start, pages);
       _restoreControllerPositions(start, pages.length);
       _detectWebtoon();
+    } on CloudflareRequiredException catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _cloudflareUrl = error.url;
+        _error = 'Complete source verification to load this chapter.';
+        _loading = false;
+      });
     } catch (_) {
       if (!mounted) return;
       setState(() {
@@ -485,10 +497,9 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   Future<List<PageImage>> _fetchPages() async {
     for (var attempt = 1; attempt <= _loadAttempts; attempt++) {
       try {
-        final pages = await sl<SourceRepository>().pages(
-          _chapter.url,
-          sourceId: widget.sourceId,
-        );
+        final pages = await sl<SourceRepository>()
+            .pages(_chapter.url, sourceId: widget.sourceId)
+            .timeout(const Duration(seconds: 35));
         if (pages.isNotEmpty || attempt == _loadAttempts) return pages;
         // An empty list from a chapter that plainly has pages is the same
         // transient failure wearing a different hat — worth one more go.
@@ -576,7 +587,11 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// it picks up an orientation/window change for free.
   int _decodeWidth(BuildContext context) {
     final mq = MediaQuery.of(context);
-    return readerDecodeWidth((mq.size.width * mq.devicePixelRatio).round());
+    return readerDecodeWidth(
+      ((Platform.isWindows ? math.min(mq.size.width, 1040) : mq.size.width) *
+              mq.devicePixelRatio)
+          .round(),
+    );
   }
 
   /// Decode width for a page in the WEBTOON strip — see [webtoonZoomHeadroom].
@@ -588,7 +603,10 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// gesture for the same frames.
   int _webtoonDecodeWidth(BuildContext context) {
     final mq = MediaQuery.of(context);
-    final device = (mq.size.width * mq.devicePixelRatio).round();
+    final device =
+        ((Platform.isWindows ? math.min(mq.size.width, 1040) : mq.size.width) *
+                mq.devicePixelRatio)
+            .round();
     return readerDecodeWidth(
       device,
       zoomHeadroom: webtoonZoomHeadroom(_wZooming ? 1.0 : _wScale),
@@ -1842,6 +1860,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       _chapterAspect = null;
       _measuredFirstPage = false;
       _error = null;
+      _cloudflareUrl = null;
       _looksLikeWebtoon = null;
       _warmedNext = false;
       _pageIndex = 0;
@@ -2073,7 +2092,17 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       backgroundColor: readerBgColor(prefs.mangaBackground),
       body: Stack(
         children: [
-          Positioned.fill(child: _buildBody(prefs)),
+          Positioned.fill(
+            child: Platform.isWindows
+                ? Align(
+                    alignment: Alignment.topCenter,
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 1040),
+                      child: _buildBody(prefs),
+                    ),
+                  )
+                : _buildBody(prefs),
+          ),
           // Both bars stay in the tree at all times now (an AnimatedOpacity
           // fade instead of the old conditional if (_chromeVisible) build) so
           // the fade can actually animate — see the IgnorePointer below for
@@ -2827,6 +2856,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
               _withPageTranslation(
                 _drawnLocally(page)
                     ? Image(
+                        key: ValueKey('page-$index-$_pageRetry'),
                         image: _pageProvider(page, width),
                         fit: fit,
                         // Same gap as the strip had: nothing at all while
@@ -2838,10 +2868,8 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                             child: _shimmerSlot(context, label: '${index + 1}'),
                           );
                         },
-                        errorBuilder: (_, _, _) => const Icon(
-                          Icons.broken_image_outlined,
-                          color: Colors.white24,
-                        ),
+                        errorBuilder: (_, error, _) =>
+                            _failedPage(page, index, width, error),
                       )
                     : CachedNetworkImage(
                         imageUrl: page.url,
@@ -3021,6 +3049,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     final width = _webtoonDecodeWidth(context);
     return _drawnLocally(page)
         ? Image(
+            key: ValueKey('strip-$index-$_pageRetry'),
             image: _pageProvider(page, width),
             width: double.infinity,
             fit: _verticalBoxFit(_effectiveFit(sl<ReaderPrefs>())),
@@ -3050,10 +3079,8 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                 child: child,
               );
             },
-            errorBuilder: (_, _, _) => const SizedBox(
-              height: 200,
-              child: Icon(Icons.broken_image_outlined, color: Colors.white24),
-            ),
+            errorBuilder: (_, error, _) =>
+                _failedPage(page, index, width, error),
           )
         : CachedNetworkImage(
             imageUrl: page.url,
@@ -3406,6 +3433,42 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     );
   }
 
+  /// Keeps a failed image recoverable with page retry and source verification
+  /// instead of leaving the reader on an unbounded loading indicator.
+  Widget _failedPage(PageImage page, int index, int width, Object error) =>
+      SizedBox(
+        height: 180,
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('Page ${index + 1} could not load'),
+              if (Platform.isWindows &&
+                  error is PlatformException &&
+                  error.code == 'CLOUDFLARE')
+                TextButton(
+                  onPressed: () async {
+                    await DesktopExtensionRuntime.instance.invoke(
+                      'mihon',
+                      'solveCloudflare',
+                      {'url': error.details},
+                    );
+                    await _pageProvider(page, width).evict();
+                    if (mounted) setState(() => _pageRetry++);
+                  },
+                  child: const Text('Verify source'),
+                ),
+              TextButton(
+                onPressed: () async {
+                  await _pageProvider(page, width).evict();
+                  if (mounted) setState(() => _pageRetry++);
+                },
+                child: const Text('Retry page'),
+              ),
+            ],
+          ),
+        ),
+      );
   Widget _buildError() => _buildMessage(_error!);
 
   /// Icon, message, and a Retry that re-runs [_load]. Shared by the failure
@@ -3430,6 +3493,19 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 16),
+            if (_cloudflareUrl != null && Platform.isWindows)
+              TextButton.icon(
+                icon: const Icon(Icons.verified_user_outlined),
+                label: const Text('Verify source'),
+                onPressed: () async {
+                  await DesktopExtensionRuntime.instance.invoke(
+                    'mihon',
+                    'solveCloudflare',
+                    {'url': _cloudflareUrl},
+                  );
+                  if (mounted) await _load();
+                },
+              ),
             // Retry alone was a dead end: when a chapter won't render, the
             // thing you actually want is the page on the source's own site.
             Row(
@@ -3486,8 +3562,12 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     // working exactly as before.
     return Positioned(
       top: 0,
-      left: 0,
-      right: 0,
+      left: Platform.isWindows
+          ? math.max(12.0, (MediaQuery.sizeOf(context).width - 760) / 2)
+          : 0,
+      right: Platform.isWindows
+          ? math.max(12.0, (MediaQuery.sizeOf(context).width - 760) / 2)
+          : 0,
       child: IgnorePointer(
         ignoring: !_chromeVisible,
         child: AnimatedOpacity(
@@ -3550,8 +3630,12 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     final hasNext = _nextIndex != null;
     // Same IgnorePointer-while-hidden reasoning as _buildTopBar.
     return Positioned(
-      left: 0,
-      right: 0,
+      left: Platform.isWindows
+          ? math.max(12.0, (MediaQuery.sizeOf(context).width - 600) / 2)
+          : 0,
+      right: Platform.isWindows
+          ? math.max(12.0, (MediaQuery.sizeOf(context).width - 600) / 2)
+          : 0,
       bottom: 0,
       child: IgnorePointer(
         ignoring: !_chromeVisible,
@@ -4285,7 +4369,9 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                               _openAutoScrollSheet();
                             },
                           ),
-                          readerSheetRow(
+                          // Hardware rocker interception is an Android-only
+                          // channel; PC readers use the keyboard page bindings.
+                          if (Platform.isAndroid) readerSheetRow(
                             icon: Icons.volume_up_rounded,
                             label: context.l10n.volumeKeysTurnPages,
                             trailing: Switch(
@@ -4300,7 +4386,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                           // Only worth showing once the keys actually do
                           // something — a lone "invert" switch above a feature
                           // that's off reads as broken.
-                          if (prefs.volumeKeyPaging)
+                          if (Platform.isAndroid && prefs.volumeKeyPaging)
                             readerSheetRow(
                               icon: Icons.swap_vert_rounded,
                               label: context.l10n.invertVolumeKeys,

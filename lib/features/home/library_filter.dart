@@ -1,4 +1,7 @@
 import 'dart:math';
+import '../../core/mode/content_mode.dart';
+import '../../core/models/provider_info.dart';
+import '../../core/zmode/zmode_prefs.dart';
 
 import '../../core/models/watch_status.dart';
 import 'cubit/my_list_cubit.dart';
@@ -40,3 +43,21 @@ List<MyListEntry> filterLibraryEntries(
         e,
   ];
 }
+
+/// Filters New-style My List by dock media, separating anime from movie/TV
+/// within Streaming without changing the underlying saved entries.
+List<MyListEntry> libraryEntriesForDock(
+  List<MyListEntry> entries,
+  ContentMode mode,
+  StreamKind kind,
+) => entries
+    .where(
+      (e) =>
+          mode.matchesProvider(e.item.type) &&
+          (mode != ContentMode.anime ||
+              e.item.type ==
+                  (kind == StreamKind.movie
+                      ? ProviderType.movie
+                      : ProviderType.anime)),
+    )
+    .toList();

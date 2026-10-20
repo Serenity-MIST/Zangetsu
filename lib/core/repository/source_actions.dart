@@ -1,4 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'dart:io';
+import '../desktop/desktop_cloudflare.dart';
+import '../provider/provider_manager.dart';
 import '../../features/sources/source_prefs_screen.dart';
 import '../models/source_pref.dart';
 
@@ -9,6 +13,30 @@ import '../provider/cloudstream_provider.dart';
 import '../zmode/zmode_ids.dart';
 import 'source_repository.dart';
 import '../../features/sources/source_settings_screen.dart';
+
+/// Sends manual verification to the source's actual transport. Desktop CS3
+/// shares WebView2 clearances directly; Android's native extensions retain
+/// their existing shared cookie manager and JavaScript uses ProviderManager.
+/// Returns false for a dismissed browser; callers retry only after completion.
+Future<bool> verifySourceChallenge(String id, String url) async {
+  if (Platform.isWindows && id.startsWith('cs:')) {
+    final session = await DesktopCloudflare.solve(url);
+    return session?['verified'] == true;
+  } else if (!['ani:', 'mihon:', 'cs:', 'lnr:'].any(id.startsWith)) {
+    return sl<ProviderManager>().solveCloudflareForHost(
+      Uri.parse(url).host,
+      url,
+    );
+  } else {
+    try {
+      await MihonExtensionService.solveCloudflare(url);
+      return true;
+    } on PlatformException catch (error) {
+      if (error.code == 'CANCELLED') return false;
+      rethrow;
+    }
+  }
+}
 
 /// Whether [id] has its own settings screen to open. Aniyomi (`ani:`) and
 /// Mihon (`mihon:`) report this at runtime through their extension
@@ -160,6 +188,12 @@ String? webViewUrlFor(String sourceId) {
 Future<void> openSourceWebView(String sourceId) async {
   final url = webViewUrlFor(sourceId);
   if (url == null) return;
+  // CloudStream owns a separate JVM. Its browser session is shared through the
+  // desktop clearance store, not by importing cookies into the Mihon engine.
+  if (Platform.isWindows && sourceId.startsWith('cs:')) {
+    await DesktopCloudflare.solve(url, requireClearance: false);
+    return;
+  }
   await MihonExtensionService.openSourceWebView(
     url,
     title: sl<SourceRepository>().displayName(sourceId),

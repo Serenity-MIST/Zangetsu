@@ -1,3 +1,6 @@
+import 'package:watch_app/core/metadata/episode_metadata_service.dart';
+import 'package:watch_app/core/zmode/metadata_repository.dart';
+import 'package:watch_app/core/zmode/zmode_ids.dart';
 // Task 18 Part B: MatchLine moved from below the synopsis into the actions
 // column, right under Play/Download. Harness mirrors
 // reading_detail_routing_test.dart's lightweight GetIt stubs (no Hive boxes
@@ -24,6 +27,7 @@ import 'package:watch_app/core/models/media_item.dart';
 import 'package:watch_app/core/models/provider_info.dart';
 import 'package:watch_app/core/models/watch_status.dart';
 import 'package:watch_app/core/playback/list_status_store.dart';
+import 'package:watch_app/core/playback/filler_service.dart';
 import 'package:watch_app/core/playback/my_list.dart';
 import 'package:watch_app/core/playback/playback_prefs.dart';
 import 'package:watch_app/core/playback/resume_store.dart';
@@ -47,6 +51,16 @@ import 'package:watch_app/features/detail/detail_screen.dart';
 import 'package:watch_app/features/detail/wrong_title_sheet.dart';
 
 // ── Minimal stubs — same shapes as reading_detail_routing_test.dart ────────
+
+/// Supplies the catalogue label used by canonical detail actions.
+class _MetadataLabel implements MetadataRepository {
+  @override
+  String nameForKind(ZKind kind) => 'AniList';
+  @override
+  String displayName(String sourceId) => 'AniList';
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
 
 class _StubSourceRepository implements SourceRepository {
   _StubSourceRepository(
@@ -293,6 +307,9 @@ void main() {
   });
 
   setUp(() async {
+    // Canonical MAL ids are now recovered from the URL; keep this layout
+    // fixture independent of the unrelated live Jikan enrichment request.
+    FillerService.instance.debugSeedCache(5114, const {});
     TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(
           const MethodChannel('plugins.flutter.io/path_provider'),
@@ -310,11 +327,14 @@ void main() {
     sl.registerSingleton<TitlePrefsStore>(_FakeTitlePrefs());
     sl.registerSingleton<PlaybackPrefs>(_FakePlaybackPrefs());
     sl.registerSingleton<TrailerService>(_FakeTrailerService());
+    sl.registerSingleton<EpisodeMetadataService>(EpisodeMetadataService(Dio()));
+    sl.registerSingleton<MetadataRepository>(_MetadataLabel());
     sl.registerSingleton<TrackerHub>(TrackerHub(const []));
 
     tempDir = await Directory.systemTemp.createTemp('detail_zmode_test');
     Hive.init(tempDir.path);
     await ReaderPrefs.init();
+    await ReadHistory.init();
     sl.registerSingleton<ReaderPrefs>(ReaderPrefs());
     await ChapterDownloadStore.init();
     sl.registerSingleton<ChapterDownloadStore>(ChapterDownloadStore());
@@ -369,7 +389,9 @@ void main() {
       ),
     );
 
-    tester.view.physicalSize = const Size(800, 2400);
+    // Exercise the narrow layout: wide desktop actions intentionally place
+    // the selector beside Play/Download rather than beneath them.
+    tester.view.physicalSize = const Size(600, 2400);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
 
@@ -387,7 +409,7 @@ void main() {
 
       final matchY = tester.getTopLeft(find.byType(MatchLine)).dy;
       final downloadY = tester
-          .getTopLeft(find.byIcon(Icons.file_download_outlined).first)
+          .getTopLeft(find.textContaining('Download').first)
           .dy;
       final synopsisY = tester
           .getTopLeft(find.textContaining('A synopsis long enough'))
@@ -440,6 +462,10 @@ void main() {
     expect(source.searchQueries, isEmpty);
 
     detailGate.complete();
+    // Real metadata enrichment can complete on an I/O event after the gate.
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 40)),
+    );
     await tester.pump();
     await tester.pump();
     await tester.pump();

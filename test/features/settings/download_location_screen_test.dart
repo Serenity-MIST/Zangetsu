@@ -31,7 +31,9 @@ void main() {
     await tester.pump();
 
     expect(find.text('Choose folder…'), findsOneWidget);
-    expect(find.text('Downloads › Zangetsu'), findsOneWidget);
+    expect(find.text(Platform.isWindows
+        ? 'Choose a folder before your first download'
+        : 'Downloads › Zangetsu'), findsOneWidget);
   });
 
   group('folderLabelFromUri', () {
