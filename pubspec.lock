@@ -312,6 +312,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.0.2"
+  cue:
+    dependency: "direct main"
+    description:
+      name: cue
+      sha256: "9ac27b4649f752af9946bb07f59ee1f05dcec4d2cbec47a5753174615fda2ea3"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.4.0"
   cupertino_icons:
     dependency: "direct main"
     description:

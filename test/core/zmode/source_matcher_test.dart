@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -79,6 +80,25 @@ class _FakeSources implements SourceRepository {
     final r = bySource[sourceId];
     if (r == null) throw StateError('dead');
     return r;
+  }
+}
+
+class _GatedFakeSources extends _FakeSources {
+  _GatedFakeSources(this.started, this.gate)
+    : super({}, candidates: {'allanime', 'hianime'});
+
+  final Completer<void> started;
+  final Completer<List<MediaItem>> gate;
+
+  @override
+  Future<List<MediaItem>> search(
+    String query, {
+    String category = 'sub',
+    String? sourceId,
+  }) async {
+    searched.add(sourceId!);
+    if (!started.isCompleted) started.complete();
+    return gate.future;
   }
 }
 
@@ -285,6 +305,47 @@ void main() {
   });
 
   group('resolve', () {
+    test(
+      'a second caller observes progress from the shared in-flight sweep',
+      () async {
+        final started = Completer<void>();
+        final gate = Completer<List<MediaItem>>();
+        final repo = _GatedFakeSources(started, gate);
+        final m = SourceMatcher(
+          sources: repo,
+          store: store,
+          prefs: prefs,
+          candidates: (_) => two,
+        );
+
+        final original = m.resolve(
+          fma,
+          title: 'Fullmetal Alchemist: Brotherhood',
+        );
+        await started.future;
+
+        final progress = <({String sourceName, int current, int total})>[];
+        final observer = m.resolve(
+          fma,
+          title: 'Fullmetal Alchemist: Brotherhood',
+          onProgress: (sourceName, current, total) => progress.add((
+            sourceName: sourceName,
+            current: current,
+            total: total,
+          )),
+        );
+
+        expect(progress, [(sourceName: 'AllAnime', current: 1, total: 2)]);
+        gate.complete(const []);
+        expect(await original, isNull);
+        expect(await observer, isNull);
+        expect(progress, [
+          (sourceName: 'AllAnime', current: 1, total: 2),
+          (sourceName: 'HiAnime', current: 2, total: 2),
+        ]);
+      },
+    );
+
     test('with no stored pick, the first candidate is the source', () async {
       final repo = _FakeSources({
         'allanime': [_hit('allanime', 'Fullmetal Alchemist Brotherhood')],
@@ -608,8 +669,6 @@ void main() {
     });
   });
 
-
-
   group('no negative miss cache', () {
     // Every candidate answers, none of them with this title.
     _FakeSources noneHaveIt() => _FakeSources({
@@ -619,7 +678,12 @@ void main() {
 
     test('a source that said no is asked again on the next resolve', () async {
       final repo = noneHaveIt();
-      final m = SourceMatcher(sources: repo, store: store, prefs: prefs, candidates: (_) => two);
+      final m = SourceMatcher(
+        sources: repo,
+        store: store,
+        prefs: prefs,
+        candidates: (_) => two,
+      );
 
       expect(await m.resolve(fma, title: 'Fullmetal Alchemist'), isNull);
       expect(repo.searched, ['allanime', 'hianime']);
@@ -635,7 +699,12 @@ void main() {
         'allanime': [_hit('allanime', 'Fullmetal Alchemist')],
         'hianime': [_hit('hianime', 'Another Thing')],
       });
-      final m = SourceMatcher(sources: repo, store: store, prefs: prefs, candidates: (_) => two);
+      final m = SourceMatcher(
+        sources: repo,
+        store: store,
+        prefs: prefs,
+        candidates: (_) => two,
+      );
 
       final first = await m.resolve(fma, title: 'Fullmetal Alchemist');
       expect(first?.sourceId, 'allanime');
@@ -644,8 +713,11 @@ void main() {
       repo.searched.clear();
       final second = await m.resolve(fma, title: 'Fullmetal Alchemist');
       expect(second?.sourceId, 'allanime');
-      expect(repo.searched, isEmpty,
-          reason: 'cached / auto-resolve winner must still short-circuit');
+      expect(
+        repo.searched,
+        isEmpty,
+        reason: 'cached / auto-resolve winner must still short-circuit',
+      );
     });
   });
   group('abandoned sweep', () {

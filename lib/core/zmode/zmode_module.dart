@@ -315,15 +315,6 @@ List<({String id, String name})> automaticKindPool(
       .toList();
 }
 
-/// [sweepList] without the cap: every source the sweep is willing to walk, in
-/// the order it would walk them.
-///
-/// Split out so the Source Priority screen can render the SAME list the sweep
-/// uses instead of building its own. It used to rank a wider pool — one that
-/// still holds sources the language filter narrows out and, on TV, sources
-/// whose runtime was never loaded — so the screen could put a source in its
-/// top ten that the sweep would never attempt, under a heading claiming it was
-/// used automatically. One function, one answer.
 /// Shares content eligibility between detail matching and playback fallbacks.
 List<({String id, String name})> automaticCandidates(ZKind kind) {
   var eligible = orderedCandidates(kind);
@@ -341,6 +332,8 @@ List<({String id, String name})> automaticCandidates(ZKind kind) {
   return eligible;
 }
 
+/// Uncapped, ranked Auto Resolve candidates for the Source Priority screen.
+/// Applying the configured cap later keeps this order identical to playback.
 List<({String id, String name})> sweepCandidates(ZKind kind) {
   final narrowed = languageNarrowedCandidates(automaticCandidates(kind), {
     for (final s in sl<SourceRepository>().loadedSources) s.id,

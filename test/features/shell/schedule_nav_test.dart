@@ -30,6 +30,7 @@ import 'package:watch_app/core/playback/search_source_prefs.dart';
 import 'package:watch_app/core/profiles/profile_shell_scope.dart';
 import 'package:watch_app/core/profiles/viewer_profile.dart';
 import 'package:watch_app/features/profiles/viewer_profiles_screen.dart';
+import 'package:watch_app/features/profiles/viewer_profile_home_screen.dart';
 import 'package:watch_app/core/provider/cloudstream_provider.dart';
 import 'package:watch_app/core/provider/provider_manager.dart';
 import 'package:watch_app/core/provider/provider_registry.dart';
@@ -137,6 +138,10 @@ class _FakeSearchHistory implements SearchHistory {
 }
 
 class _FakeSearchPrefs extends ChangeNotifier implements SearchPrefs {
+  /// Shell tests use the standard TV search layout without opening real prefs.
+  @override
+  String get tvSearchStyle => 'classic';
+
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
@@ -457,6 +462,21 @@ void main() {
 
     expect(dockLabel('Schedule'), findsNothing);
     expect(dockLabel('Sources'), findsOneWidget);
+  });
+
+  testWidgets('the phone Profile tab opens the viewer overview', (
+    tester,
+  ) async {
+    sl.registerSingleton<AppMode>(const AppMode(isTv: false));
+    await tester.pumpWidget(wrap(const RootShell()));
+    await tester.pumpAndSettle();
+
+    await tester.tap(dockLabel('Profile'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(ViewerProfileHomeScreen), findsOneWidget);
+    expect(find.byTooltip('Profile menu'), findsOneWidget);
+    expect(find.text('About'), findsNothing);
   });
 
   testWidgets('profile launch gate hides the entire phone shell', (
@@ -821,6 +841,9 @@ class _TestViewerProfileStore extends ViewerProfileStore {
 
   @override
   List<ViewerProfile> get profiles => List.unmodifiable(_profiles);
+
+  @override
+  List<ViewerProfile> get recoverableProfiles => const [];
 
   @override
   bool get askOnLaunch => true;

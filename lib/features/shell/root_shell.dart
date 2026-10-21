@@ -30,6 +30,7 @@ import '../../core/ui/frosted_surface.dart';
 import '../downloads/downloads_screen.dart';
 import '../history/history_screen.dart';
 import '../profiles/viewer_profiles_screen.dart';
+import '../profiles/viewer_profile_home_screen.dart';
 import '../auth/auth_cubit.dart';
 import '../home/cubit/home_cubit.dart';
 import '../home/home_screen.dart';
@@ -42,7 +43,7 @@ import '../../core/ui/dock_visibility.dart';
 import 'root_shell_tv.dart';
 
 /// Shared pages for [RootShell] (phone bottom nav) and [RootShellTv] (TV left
-/// rail). Settings stays at index 3 for both shells.
+/// rail). TV uses Settings at index 3; phone uses its viewer overview instead.
 ///
 /// [searchFocusSignal] is bumped each time the Search rail item is
 /// (re)selected on TV so the embedded search screen can auto-focus its
@@ -267,14 +268,8 @@ class _RootShellState extends State<RootShell>
     );
   }
 
-  /// One page per visible tab, in the same order the dock draws them, so the
-  /// [IndexedStack] index is just the tab's position in that list.
-  ///
-  /// [buildShellPages] stays the shared Home/Search/My List/Settings set that
-  /// the TV rail also builds from — untouched, so TV is unaffected. Search is
-  /// no longer a phone dock tab (it's a Home header icon now), so this never
-  /// places `shared[1]` — it's still built, just unused here, the same way
-  /// Settings only ever takes `shared.last`.
+  /// Retains visited dock destinations within the active viewer profile.
+  /// The viewer overview links to settings; TV keeps its separate settings rail.
   final Map<DockTab, Widget> _mountedPages = {};
   String? _mountedProfileId;
 
@@ -284,7 +279,7 @@ class _RootShellState extends State<RootShell>
     DockTab.home => buildShellPages(null)[0],
     DockTab.search => const SearchScreen(showBack: false),
     DockTab.myList => buildShellPages(null)[2],
-    DockTab.profile => buildShellPages(null).last,
+    DockTab.profile => const ViewerProfileHomeScreen(),
     DockTab.downloads => const DownloadsScreen(showBack: false),
     DockTab.history => const HistoryScreen(showBack: false),
     DockTab.sources => const BrowseSourcesScreen(),
@@ -301,7 +296,9 @@ class _RootShellState extends State<RootShell>
     }
     _mountedPages.putIfAbsent(_tab, () => _createPage(_tab));
     if (_mountedPages.containsKey(DockTab.home)) {
-      _mountedPages[DockTab.home] = HomeScreen(isTabActive: _tab == DockTab.home);
+      _mountedPages[DockTab.home] = HomeScreen(
+        isTabActive: _tab == DockTab.home,
+      );
     }
     return [
       for (final tab in tabs)
@@ -395,7 +392,7 @@ class _RootShellState extends State<RootShell>
             valueListenable: dockHiddenBySection,
             builder: (context, sectionOpen, _) {
               // Slide the dock away only when a Settings section is open AND the
-              // Profile (Settings) tab is showing — every other tab keeps its dock.
+              // Profile tab is showing — every other tab keeps its dock.
               final hide = sectionOpen && _tab == DockTab.profile;
               return Column(
                 mainAxisSize: MainAxisSize.min,
