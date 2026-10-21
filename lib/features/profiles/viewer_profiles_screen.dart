@@ -244,7 +244,7 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
     final restore = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: Text('${profile.name} is on this phone only'),
+        title: Text('${profile.name} is on this device only'),
         content: const Text(
           'This profile is missing from cloud sync. It may have been created offline or deleted on another device. Restore it only if you want it on all your devices. Its local data is safe either way.',
         ),

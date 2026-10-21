@@ -96,9 +96,15 @@ class ReadEntry {
 
   /// Same finished rule as [ReadStore]: total == 1000 is the novel
   /// scroll-permille convention (>=950 counts as done); otherwise last
-  /// page/chapter (manga).
-  bool get finished =>
-      total > 0 && (total == 1000 ? pos >= 950 : pos >= total - 1);
+  /// page/chapter (manga, including its 95% variable-height scroll tolerance).
+  bool get finished {
+    if (total <= 0) return false;
+    if (total == 1000) return pos >= 950;
+    // Match ReadStore: variable-height webtoon pages can estimate slightly
+    // short of the literal final index even at the chapter's visible end.
+    final last = total - 1;
+    return pos >= last || pos >= last * 0.95;
+  }
 
   /// Reconstructs the internal native-image marker (`x-mihon-src` / `x-ani-src`)
   /// from the stored [sourceId], so Continue-Reading covers on a Cloudflare-gated

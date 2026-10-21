@@ -134,12 +134,20 @@ class _CastTab extends StatelessWidget {
       shrinkWrap: nested,
       physics: nested ? const NeverScrollableScrollPhysics() : null,
       padding: padding,
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 3,
-        mainAxisSpacing: 16,
-        crossAxisSpacing: 12,
-        childAspectRatio: 0.66,
-      ),
+      // Cap faces by the actual detail-pane width, not three phone columns.
+      gridDelegate: Platform.isWindows
+          ? const SliverGridDelegateWithMaxCrossAxisExtent(
+              maxCrossAxisExtent: 160,
+              mainAxisSpacing: 16,
+              crossAxisSpacing: 12,
+              childAspectRatio: 0.66,
+            )
+          : const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 3,
+              mainAxisSpacing: 16,
+              crossAxisSpacing: 12,
+              childAspectRatio: 0.66,
+            ),
       itemCount: members.length,
       itemBuilder: (_, i) {
         final m = members[i];

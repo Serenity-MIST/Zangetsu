@@ -70,6 +70,26 @@ void main() {
     expect(prefs.excluded(ZKind.anime), {'b'});
   });
 
+  test('unpin all cannot resurrect migrated video pins after reopening', () async {
+    final box = Hive.box<List>(SourceOrderPrefs.boxName);
+    await box.putAll({
+      'anime': ['old-anime'],
+      'movie': ['old-movie'],
+      'anime:off': ['blocked'],
+    });
+    await prefs.set(ZKind.anime, ['new-pin']);
+    await prefs.setCap(ZKind.anime, 17);
+    await prefs.set(ZKind.manga, ['reader-pin']);
+    await prefs.clear(ZKind.movie);
+    await box.close();
+    prefs = await SourceOrderPrefs.open();
+    expect(prefs.get(ZKind.anime), isEmpty);
+    expect(prefs.get(ZKind.tv), isEmpty);
+    expect(prefs.excluded(ZKind.movie), {'blocked'});
+    expect(prefs.cap(ZKind.tv), 17);
+    expect(prefs.get(ZKind.manga), ['reader-pin']);
+  });
+
   test('reset clears both', () async {
     await prefs.set(ZKind.anime, ['a', 'b']);
     await prefs.exclude(ZKind.anime, 'b');

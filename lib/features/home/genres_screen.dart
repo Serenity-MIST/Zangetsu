@@ -4,6 +4,7 @@ import 'package:dio/dio.dart';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 
 import '../../core/di/injector.dart';
 import '../../core/mode/content_mode_cubit.dart';
@@ -194,15 +195,20 @@ class _GenresScreenState extends State<GenresScreen> {
       body: GridView.builder(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 40),
         itemCount: genres.length,
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 2,
-          mainAxisSpacing: 10,
-          crossAxisSpacing: 10,
-          // Wide and short: a genre is one or two words, and taller tiles just
-          // push the back half of the list below the fold. "Mahou Shoujo" is
-          // the longest label and still sits on one line at this height.
-          childAspectRatio: 2.9,
-        ),
+        // Genres stay short, readable tiles instead of two enormous banners.
+        gridDelegate: defaultTargetPlatform == TargetPlatform.windows
+            ? const SliverGridDelegateWithMaxCrossAxisExtent(
+                maxCrossAxisExtent: 300,
+                mainAxisSpacing: 10,
+                crossAxisSpacing: 10,
+                childAspectRatio: 2.9,
+              )
+            : const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 2,
+                mainAxisSpacing: 10,
+                crossAxisSpacing: 10,
+                childAspectRatio: 2.9,
+              ),
         itemBuilder: (_, i) {
           final g = genres[i];
           return _GenreTile(genre: g, kind: kind, art: art[g]);

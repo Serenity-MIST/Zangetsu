@@ -57,6 +57,7 @@
 //   plugin, tracked-repo or not, so there's nothing "orphaned" left to
 //   special-case.
 import 'dart:io';
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -91,6 +92,7 @@ const _catalog = <LnReaderPluginMeta>[
 ];
 
 class _FakeLnrService extends LnReaderExtensionService {
+  Completer<void>? installGate;
   _FakeLnrService() : super(httpGet: (_) async => '');
   final Map<String, LnReaderPluginMeta> _installed = {};
 
@@ -106,7 +108,11 @@ class _FakeLnrService extends LnReaderExtensionService {
   }
 
   @override
-  Future<void> install(LnReaderPluginMeta meta) async => _installed[meta.id] = meta;
+  Future<void> install(LnReaderPluginMeta meta) async {
+    await installGate?.future;
+    _installed[meta.id] = meta;
+  }
+
   @override
   List<LnReaderPluginMeta> installed() => _installed.values.toList();
   @override
@@ -122,10 +128,12 @@ class _FakeLnrService extends LnReaderExtensionService {
 class _SpyLnReaderManager extends LnReaderManager {
   _SpyLnReaderManager({required super.service, required super.fetch});
   final List<String> uninstallCalls = [];
+  Completer<void>? uninstallGate;
 
   @override
   Future<void> uninstall(String pluginId) async {
     uninstallCalls.add(pluginId);
+    await uninstallGate?.future;
     await super.uninstall(pluginId);
   }
 }
@@ -156,8 +164,9 @@ void main() {
   // plain `lnreader_repos` Box<String> ever touches it); cleared between
   // tests via box.clear(), same convention `mihon_repo_tab_test.dart` uses.
   setUpAll(() async {
-    tempDir =
-        await Directory.systemTemp.createTemp('lnreader_sources_screen_test_');
+    tempDir = await Directory.systemTemp.createTemp(
+      'lnreader_sources_screen_test_',
+    );
     Hive.init(tempDir.path);
     await Hive.openBox<String>(kLnReaderReposBoxName);
   });
@@ -227,36 +236,82 @@ void main() {
     await tester.pump(const Duration(milliseconds: 150));
   }
 
+  // Exercise both completion paths after the entire settings route is disposed.
+  for (final fails in [false, true]) {
+    testWidgets('install finishes after leaving sources (fails=$fails)', (
+      tester,
+    ) async {
+      service.catalogs[_repoUrl] = _catalog;
+      service.installGate = Completer<void>();
+      await seedRepo(tester, _repoUrl);
+      await loadScreen(tester);
+      await tapTab(tester, 'Repositories');
+      await tester.tap(find.widgetWithText(FilledButton, 'Install').first);
+      await tester.pump();
+      await tester.pumpWidget(const MaterialApp(home: SizedBox()));
+      if (fails) {
+        service.installGate!.completeError(StateError('Install failed'));
+      } else {
+        service.installGate!.complete();
+      }
+      await settle(tester);
+      expect(tester.takeException(), isNull);
+      expect(service.installed().any((meta) => meta.id == 'plugin-a'), !fails);
+    });
+  }
+  for (final fails in [false, true]) {
+    testWidgets('remove finishes after leaving sources (fails=$fails)', (
+      tester,
+    ) async {
+      await service.install(_catalog.first);
+      manager.uninstallGate = Completer<void>();
+      await loadScreen(tester);
+      await tester.tap(find.byIcon(Icons.delete_outline_rounded));
+      await tester.pump();
+      await tester.pumpWidget(const MaterialApp(home: SizedBox()));
+      if (fails) {
+        manager.uninstallGate!.completeError(StateError('Remove failed'));
+      } else {
+        manager.uninstallGate!.complete();
+      }
+      await settle(tester);
+      expect(tester.takeException(), isNull);
+      expect(service.installed().any((meta) => meta.id == 'plugin-a'), fails);
+    });
+  }
   group('LnReaderSourcesScreen — Installed tab', () {
-    testWidgets('shows the empty state when nothing is installed',
-        (tester) async {
+    testWidgets('shows the empty state when nothing is installed', (
+      tester,
+    ) async {
       await loadScreen(tester);
 
       expect(find.text('No sources installed yet.'), findsOneWidget);
     });
 
     testWidgets(
-        'lists an installed plugin with Remove, routing through LnReaderManager',
-        (tester) async {
-      await service.install(_catalog[0]);
-      await loadScreen(tester);
+      'lists an installed plugin with Remove, routing through LnReaderManager',
+      (tester) async {
+        await service.install(_catalog[0]);
+        await loadScreen(tester);
 
-      expect(find.text('Plugin A'), findsOneWidget);
-      expect(find.byIcon(Icons.delete_outline_rounded), findsOneWidget);
+        expect(find.text('Plugin A'), findsOneWidget);
+        expect(find.byIcon(Icons.delete_outline_rounded), findsOneWidget);
 
-      await tester.tap(find.byIcon(Icons.delete_outline_rounded));
-      await settle(tester);
+        await tester.tap(find.byIcon(Icons.delete_outline_rounded));
+        await settle(tester);
 
-      expect(manager.uninstallCalls, ['plugin-a']);
-      expect(service.installed(), isEmpty);
-      expect(find.text('No sources installed yet.'), findsOneWidget);
-      await drainSnackBars(tester);
-    });
+        expect(manager.uninstallCalls, ['plugin-a']);
+        expect(service.installed(), isEmpty);
+        expect(find.text('No sources installed yet.'), findsOneWidget);
+        await drainSnackBars(tester);
+      },
+    );
   });
 
   group('LnReaderSourcesScreen — Repositories tab, no repos', () {
-    testWidgets('shows the empty state and the Add-repository FAB',
-        (tester) async {
+    testWidgets('shows the empty state and the Add-repository FAB', (
+      tester,
+    ) async {
       await loadScreen(tester);
       await tapTab(tester, 'Repositories');
 
@@ -266,8 +321,9 @@ void main() {
   });
 
   group('LnReaderSourcesScreen — Repositories tab, with a repo', () {
-    testWidgets("lists a tracked repo's catalog entries with Install",
-        (tester) async {
+    testWidgets("lists a tracked repo's catalog entries with Install", (
+      tester,
+    ) async {
       service.catalogs[_repoUrl] = _catalog;
       await seedRepo(tester, _repoUrl);
       await loadScreen(tester);
@@ -282,35 +338,41 @@ void main() {
     });
 
     testWidgets(
-        'tapping Install installs the plugin, flips the row to Remove, and '
-        'Remove routes back through LnReaderManager', (tester) async {
-      service.catalogs[_repoUrl] = _catalog;
-      await seedRepo(tester, _repoUrl);
-      await loadScreen(tester);
-      await tapTab(tester, 'Repositories');
-      expect(service.installed(), isEmpty);
+      'tapping Install installs the plugin, flips the row to Remove, and '
+      'Remove routes back through LnReaderManager',
+      (tester) async {
+        service.catalogs[_repoUrl] = _catalog;
+        await seedRepo(tester, _repoUrl);
+        await loadScreen(tester);
+        await tapTab(tester, 'Repositories');
+        expect(service.installed(), isEmpty);
 
-      await tester.tap(find.widgetWithText(FilledButton, 'Install').first);
-      await settle(tester);
+        await tester.tap(find.widgetWithText(FilledButton, 'Install').first);
+        await settle(tester);
 
-      expect(service.installed().map((m) => m.id), contains('plugin-a'));
-      // In a repo's catalog an installed source flips to an "Uninstall" text
-      // button (not the Installed tab's trash icon), matching Mihon's repo tab.
-      expect(find.widgetWithText(OutlinedButton, 'Uninstall'), findsOneWidget);
-      expect(find.text('Install'), findsOneWidget);
-      await drainSnackBars(tester);
+        expect(service.installed().map((m) => m.id), contains('plugin-a'));
+        // In a repo's catalog an installed source flips to an "Uninstall" text
+        // button (not the Installed tab's trash icon), matching Mihon's repo tab.
+        expect(
+          find.widgetWithText(OutlinedButton, 'Uninstall'),
+          findsOneWidget,
+        );
+        expect(find.text('Install'), findsOneWidget);
+        await drainSnackBars(tester);
 
-      await tester.tap(find.widgetWithText(OutlinedButton, 'Uninstall'));
-      await settle(tester);
+        await tester.tap(find.widgetWithText(OutlinedButton, 'Uninstall'));
+        await settle(tester);
 
-      expect(manager.uninstallCalls, ['plugin-a']);
-      expect(service.installed(), isEmpty);
-      expect(find.text('Install'), findsNWidgets(2));
-      await drainSnackBars(tester);
-    });
+        expect(manager.uninstallCalls, ['plugin-a']);
+        expect(service.installed(), isEmpty);
+        expect(find.text('Install'), findsNWidgets(2));
+        await drainSnackBars(tester);
+      },
+    );
 
-    testWidgets('a search query filters the list down to matching rows',
-        (tester) async {
+    testWidgets('a search query filters the list down to matching rows', (
+      tester,
+    ) async {
       service.catalogs[_repoUrl] = _catalog;
       await seedRepo(tester, _repoUrl);
       await loadScreen(tester);
@@ -325,8 +387,9 @@ void main() {
       expect(find.text('en · a.test'), findsNothing); // Plugin A row filtered
     });
 
-    testWidgets('the language filter hides sources of unselected languages',
-        (tester) async {
+    testWidgets('the language filter hides sources of unselected languages', (
+      tester,
+    ) async {
       service.catalogs[_repoUrl] = _catalog;
       await seedRepo(tester, _repoUrl);
       await sl<NovelLangPrefs>().setEnabled({'en'}); // Indonesian off
@@ -337,17 +400,19 @@ void main() {
       expect(find.text('id · b.test'), findsNothing); // Indonesian hidden
     });
 
-    testWidgets('a repo that fails to fetch shows a failure message, not a crash',
-        (tester) async {
-      service.errorUrls.add(_repoUrl);
-      await seedRepo(tester, _repoUrl);
-      await loadScreen(tester);
-      await tapTab(tester, 'Repositories');
+    testWidgets(
+      'a repo that fails to fetch shows a failure message, not a crash',
+      (tester) async {
+        service.errorUrls.add(_repoUrl);
+        await seedRepo(tester, _repoUrl);
+        await loadScreen(tester);
+        await tapTab(tester, 'Repositories');
 
-      // The repo header's caption also reads "Failed to load" (no colon) —
-      // match the colon-suffixed detail line so this stays unambiguous.
-      expect(find.textContaining('Failed to load:'), findsOneWidget);
-    });
+        // The repo header's caption also reads "Failed to load" (no colon) —
+        // match the colon-suffixed detail line so this stays unambiguous.
+        expect(find.textContaining('Failed to load:'), findsOneWidget);
+      },
+    );
   });
 
   group('LnReaderSourcesScreen — managing repos', () {
@@ -372,24 +437,27 @@ void main() {
     // What the returned URL actually does once `_addRepo` persists and
     // reloads it is covered separately by "lists a tracked repo's catalog
     // entries with Install" above, seeded directly via [seedRepo].
-    testWidgets('typing a URL and tapping Add pops the dialog with that URL',
-        (tester) async {
+    testWidgets('typing a URL and tapping Add pops the dialog with that URL', (
+      tester,
+    ) async {
       String? result;
-      await tester.pumpWidget(MaterialApp(
-        home: Scaffold(
-          body: Builder(
-            builder: (ctx) => ElevatedButton(
-              onPressed: () async {
-                result = await showDialog<String>(
-                  context: ctx,
-                  builder: (_) => const LnReaderAddRepoDialog(),
-                );
-              },
-              child: const Text('Open'),
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Builder(
+              builder: (ctx) => ElevatedButton(
+                onPressed: () async {
+                  result = await showDialog<String>(
+                    context: ctx,
+                    builder: (_) => const LnReaderAddRepoDialog(),
+                  );
+                },
+                child: const Text('Open'),
+              ),
             ),
           ),
         ),
-      ));
+      );
 
       await tester.tap(find.text('Open'));
       await tester.pumpAndSettle();
@@ -402,57 +470,64 @@ void main() {
     });
 
     testWidgets(
-        'removing a repo drops it from the box; an already-installed plugin '
-        'from it stays installed and shows up under the Installed tab',
-        (tester) async {
-      service.catalogs[_repoUrl] = _catalog;
-      await seedRepo(tester, _repoUrl);
-      await loadScreen(tester);
-      await tapTab(tester, 'Repositories');
-      await tester.tap(find.widgetWithText(FilledButton, 'Install').first);
-      await settle(tester);
-      await drainSnackBars(tester);
+      'removing a repo drops it from the box; an already-installed plugin '
+      'from it stays installed and shows up under the Installed tab',
+      (tester) async {
+        service.catalogs[_repoUrl] = _catalog;
+        await seedRepo(tester, _repoUrl);
+        await loadScreen(tester);
+        await tapTab(tester, 'Repositories');
+        await tester.tap(find.widgetWithText(FilledButton, 'Install').first);
+        await settle(tester);
+        await drainSnackBars(tester);
 
-      // Confirm-dialog wiring: the 3-dot menu's "Remove repository" item
-      // surfaces the "Remove repo?" confirmation. Dismiss with Cancel rather
-      // than tapping through to its own Remove button — that routes to the
-      // screen's own `_removeRepo`, the same real-Hive-write-from-a-tap-
-      // handler hazard the file header describes, confirmed for this exact
-      // dialog by direct repro (both a `runAsync`-wrapped tap+pump and a
-      // `runAsync`-wrapped tap+`Future.delayed`, the pattern
-      // `mode_switcher_test.dart` uses for a simpler fire-and-forget write,
-      // still deadlock `Hive.close()` once a dialog route is in the mix).
-      // The resulting persistence step is driven directly below instead, the
-      // same way [seedRepo] does the add.
-      await tester.tap(find.byIcon(Icons.more_vert));
-      await settle(tester);
-      await tester.pump(const Duration(milliseconds: 300)); // popup route open
-      await tester.tap(find.text('Remove repository'));
-      await settle(tester);
-      await tester.pump(const Duration(milliseconds: 300)); // dialog route open
-      expect(find.text('Remove repo?'), findsOneWidget);
-      await tester.tap(find.text('Cancel'));
-      await settle(tester);
+        // Confirm-dialog wiring: the 3-dot menu's "Remove repository" item
+        // surfaces the "Remove repo?" confirmation. Dismiss with Cancel rather
+        // than tapping through to its own Remove button — that routes to the
+        // screen's own `_removeRepo`, the same real-Hive-write-from-a-tap-
+        // handler hazard the file header describes, confirmed for this exact
+        // dialog by direct repro (both a `runAsync`-wrapped tap+pump and a
+        // `runAsync`-wrapped tap+`Future.delayed`, the pattern
+        // `mode_switcher_test.dart` uses for a simpler fire-and-forget write,
+        // still deadlock `Hive.close()` once a dialog route is in the mix).
+        // The resulting persistence step is driven directly below instead, the
+        // same way [seedRepo] does the add.
+        await tester.tap(find.byIcon(Icons.more_vert));
+        await settle(tester);
+        await tester.pump(
+          const Duration(milliseconds: 300),
+        ); // popup route open
+        await tester.tap(find.text('Remove repository'));
+        await settle(tester);
+        await tester.pump(
+          const Duration(milliseconds: 300),
+        ); // dialog route open
+        expect(find.text('Remove repo?'), findsOneWidget);
+        await tester.tap(find.text('Cancel'));
+        await settle(tester);
 
-      await tester.runAsync(() => Hive.box<String>(kLnReaderReposBoxName).clear());
-      // Force an actual unmount before remounting: pumping the identical
-      // MaterialApp(home: LnReaderSourcesScreen()) tree a second time keeps
-      // the same State (Flutter reconciles rather than rebuilding), so
-      // `_load()` never re-runs and the screen keeps showing the pre-clear
-      // catalog. A throwaway widget in between forces a real dispose+
-      // initState cycle, same as `_load(refresh: true)` reacting to a real
-      // repo removal would.
-      await tester.pumpWidget(const SizedBox.shrink());
-      await loadScreen(tester);
-      await tapTab(tester, 'Repositories');
+        await tester.runAsync(
+          () => Hive.box<String>(kLnReaderReposBoxName).clear(),
+        );
+        // Force an actual unmount before remounting: pumping the identical
+        // MaterialApp(home: LnReaderSourcesScreen()) tree a second time keeps
+        // the same State (Flutter reconciles rather than rebuilding), so
+        // `_load()` never re-runs and the screen keeps showing the pre-clear
+        // catalog. A throwaway widget in between forces a real dispose+
+        // initState cycle, same as `_load(refresh: true)` reacting to a real
+        // repo removal would.
+        await tester.pumpWidget(const SizedBox.shrink());
+        await loadScreen(tester);
+        await tapTab(tester, 'Repositories');
 
-      expect(Hive.box<String>(kLnReaderReposBoxName).values, isEmpty);
-      expect(service.installed().map((m) => m.id), contains('plugin-a'));
-      expect(find.textContaining('No repositories added'), findsOneWidget);
+        expect(Hive.box<String>(kLnReaderReposBoxName).values, isEmpty);
+        expect(service.installed().map((m) => m.id), contains('plugin-a'));
+        expect(find.textContaining('No repositories added'), findsOneWidget);
 
-      await tapTab(tester, 'Installed');
-      expect(find.text('Plugin A'), findsOneWidget);
-      expect(find.byIcon(Icons.delete_outline_rounded), findsOneWidget);
-    });
+        await tapTab(tester, 'Installed');
+        expect(find.text('Plugin A'), findsOneWidget);
+        expect(find.byIcon(Icons.delete_outline_rounded), findsOneWidget);
+      },
+    );
   });
 }

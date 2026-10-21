@@ -727,6 +727,29 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
             ),
           ],
 
+          // Desktop embeds its own player, but its bar arrangement remains
+          // editable. Do not gate this destination with Android app handoff.
+          if (Platform.isWindows) ...[
+            SettingsSectionLabel(context.l10n.sectionPlayer),
+            SettingsCard(
+              children: [
+                SettingsTile(
+                  icon: Icons.tune_rounded,
+                  title: context.l10n.playerControls,
+                  subtitle: context.l10n.reorderOrHideTheButtonsOnThePlayerBar,
+                  onTap: () async {
+                    await Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => const PlayerControlsScreen(),
+                      ),
+                    );
+                    if (mounted) setState(() {});
+                  },
+                ),
+              ],
+            ),
+          ],
+
           // ── Playback behaviour ──────────────────────────────────────────
           SettingsSectionLabel(context.l10n.playback),
           SettingsCard(

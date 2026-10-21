@@ -86,10 +86,7 @@ class _MihonAddRepoDialogState extends State<MihonAddRepoDialog> {
               ),
             ),
             const SizedBox(height: 10),
-            Text(
-              context.l10n.pasteRepoBaseUrlMihon,
-              style: AppText.caption,
-            ),
+            Text(context.l10n.pasteRepoBaseUrlMihon, style: AppText.caption),
           ],
         ),
       ),
@@ -137,7 +134,7 @@ class _MihonAddRepoDialogState extends State<MihonAddRepoDialog> {
 /// Structural twin of `AniyomiRepoTab`
 /// (`lib/features/sources/aniyomi_repo_tab.dart`) — deliberately duplicated
 /// rather than shared (spec Decision 3).
-class MihonRepoTab extends StatelessWidget {
+class MihonRepoTab extends StatefulWidget {
   const MihonRepoTab({
     super.key,
     required this.repoUrls,
@@ -161,6 +158,22 @@ class MihonRepoTab extends StatelessWidget {
   final bool Function(String pkg)? installedPkgsFn;
 
   @override
+  State<MihonRepoTab> createState() => _MihonRepoTabState();
+}
+
+/// Retains a refresh revision so pulling refresh really refetches each repo.
+class _MihonRepoTabState extends State<MihonRepoTab> {
+  int _revision = 0;
+  List<String> get repoUrls => widget.repoUrls;
+  void Function(String) get onRemoveRepo => widget.onRemoveRepo;
+  String get query => widget.query;
+  Future<List<AniyomiRepoEntry>> Function(String)? get fetchIndexFn =>
+      widget.fetchIndexFn;
+  Future<void> Function(AniyomiRepoEntry)? get installFn => widget.installFn;
+  Future<void> Function(String)? get uninstallFn => widget.uninstallFn;
+  bool Function(String)? get installedPkgsFn => widget.installedPkgsFn;
+
+  @override
   Widget build(BuildContext context) {
     if (repoUrls.isEmpty) {
       return EmptyState(
@@ -171,11 +184,12 @@ class MihonRepoTab extends StatelessWidget {
     return RefreshIndicator(
       color: AppColors.accent,
       backgroundColor: AppColors.surface,
-      onRefresh: () async {},
+      onRefresh: () async => setState(() => _revision++),
       child: ListView.builder(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
         itemCount: repoUrls.length,
         itemBuilder: (_, i) => _MihonRepoSection(
+          key: ValueKey('${repoUrls[i]}:$_revision'),
           url: repoUrls[i],
           onRemove: () => onRemoveRepo(repoUrls[i]),
           query: query,
@@ -195,6 +209,7 @@ class MihonRepoTab extends StatelessWidget {
 
 class _MihonRepoSection extends StatefulWidget {
   const _MihonRepoSection({
+    super.key,
     required this.url,
     required this.onRemove,
     this.query = '',
@@ -238,8 +253,9 @@ class _MihonRepoSectionState extends State<_MihonRepoSection> {
   /// Null in widget tests that don't register it — the language filter is then
   /// simply off (every entry shows), so those tests keep asserting on the full
   /// list. In the app it's always registered.
-  final MangaLangPrefs? _langPrefs =
-      sl.isRegistered<MangaLangPrefs>() ? sl<MangaLangPrefs>() : null;
+  final MangaLangPrefs? _langPrefs = sl.isRegistered<MangaLangPrefs>()
+      ? sl<MangaLangPrefs>()
+      : null;
 
   /// Null when [MihonManager] isn't DI-registered (e.g. a widget test that
   /// builds this section directly without going through the app's injector).
@@ -320,7 +336,8 @@ class _MihonRepoSectionState extends State<_MihonRepoSection> {
     final ok = await AppDialog.confirm(
       context,
       title: context.l10n.removeRepo,
-      message: context.l10n.alreadyInstalledExtensionsStay +
+      message:
+          context.l10n.alreadyInstalledExtensionsStay +
           context.l10n.youCanAddRepoBackLater,
       confirmLabel: context.l10n.removeDownloadTooltip,
       destructive: true,
@@ -346,8 +363,8 @@ class _MihonRepoSectionState extends State<_MihonRepoSection> {
               list.isEmpty
                   ? context.l10n.alreadyUpToDate
                   : list.length == 1
-                      ? context.l10n.oneUpdate
-                      : context.l10n.nUpdates(list.length),
+                  ? context.l10n.oneUpdate
+                  : context.l10n.nUpdates(list.length),
             ),
           ),
         );
@@ -404,7 +421,11 @@ class _MihonRepoSectionState extends State<_MihonRepoSection> {
     messenger
       ..clearSnackBars()
       ..showSnackBar(
-        SnackBar(content: Text(context.l10n.updatedSourcesCount(done, done == 1 ? '' : 's'))),
+        SnackBar(
+          content: Text(
+            context.l10n.updatedSourcesCount(done, done == 1 ? '' : 's'),
+          ),
+        ),
       );
   }
 
@@ -684,7 +705,8 @@ class _MihonRepoSectionState extends State<_MihonRepoSection> {
                 installed: _isInstalled(entry.pkg),
                 installFn: widget.installFn,
                 uninstallFn: widget.uninstallFn,
-                onInstalled: () => setState(() => _installedPkgs.add(entry.pkg)),
+                onInstalled: () =>
+                    setState(() => _installedPkgs.add(entry.pkg)),
                 onUninstalled: () =>
                     setState(() => _installedPkgs.remove(entry.pkg)),
               ),
@@ -764,7 +786,9 @@ class _MihonExtensionRowState extends State<_MihonExtensionRow> {
       widget.onInstalled();
       messenger
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(content: Text(l10n.installedName(_entry.name))));
+        ..showSnackBar(
+          SnackBar(content: Text(l10n.installedName(_entry.name))),
+        );
     } catch (e) {
       messenger
         ..clearSnackBars()
@@ -795,11 +819,15 @@ class _MihonExtensionRowState extends State<_MihonExtensionRow> {
       widget.onUninstalled();
       messenger
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(content: Text(context.l10n.uninstalledName(_entry.name))));
+        ..showSnackBar(
+          SnackBar(content: Text(context.l10n.uninstalledName(_entry.name))),
+        );
     } catch (e) {
       messenger
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(content: Text(context.l10n.uninstallFailed('$e'))));
+        ..showSnackBar(
+          SnackBar(content: Text(context.l10n.uninstallFailed('$e'))),
+        );
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -822,7 +850,9 @@ class _MihonExtensionRowState extends State<_MihonExtensionRow> {
       );
     }
     if (failure != null) {
-      debugPrint('[mihon] repo-tab uninstall ${_entry.pkg}: $failure');
+      // A locked APK can survive cleanup on Windows. Reporting success would
+      // promise removal even though the next launch can load it again.
+      throw StateError(failure);
     }
   }
 

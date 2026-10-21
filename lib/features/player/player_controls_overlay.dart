@@ -772,7 +772,7 @@ class _ControlsOverlay extends StatelessWidget {
                           right.add(
                             Tooltip(
                               message:
-                                  'Space / K: play or pause\nJ / L or ← / →: seek 10s\nShift + ← / →: seek 60s\n↑ / ↓: volume • M: mute\nF / F11: fullscreen\nDouble-click: fullscreen\nRight-click: settings\nMouse back: return • mouse forward: seek\nMiddle-click: play or pause',
+                                  'Space / K: play or pause\nJ / L or ← / →: seek ${sl<PlaybackPrefs>().tvSeekSeconds}s\nShift + ← / →: seek 60s\n↑ / ↓: volume • M: mute\nF / F11: fullscreen\nDouble-click: fullscreen\nRight-click: settings\nMouse back: return • mouse forward: seek\nMiddle-click: play or pause',
                               child: const SizedBox(
                                 width: 48,
                                 height: 48,

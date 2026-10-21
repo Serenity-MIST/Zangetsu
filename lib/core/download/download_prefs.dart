@@ -49,13 +49,15 @@ class DownloadPrefs {
   static Future<void> init() async {
     if (!Hive.isBoxOpen(boxName)) {
       await openBoxSafely(boxName);
-      if (Platform.isWindows &&
-          DesktopStorage.root != null &&
-          Hive.box(boxName).get('storageRoot') != DesktopStorage.root) {
-        final path = '${DesktopStorage.root}/Downloads';
-        await Hive.box(boxName).put('locationUri', path);
-        await Hive.box(boxName).put('locationLabel', path);
-        await Hive.box(boxName).put('storageRoot', DesktopStorage.root);
+      if (Platform.isWindows && DesktopStorage.downloadsRoot != null) {
+        final box = Hive.box(boxName);
+        // Application-data upgrades must never reset an explicit download path.
+        final existing = box.get('locationUri') as String?;
+        if (existing == null || existing.isEmpty || isUriPath(existing)) {
+          final path = DesktopStorage.downloadsRoot!;
+          await box.put('locationUri', path);
+          await box.put('locationLabel', path);
+        }
       }
     }
   }

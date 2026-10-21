@@ -3858,6 +3858,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
       builder: (_) => ReaderAutoScrollSheet(
+        desktop: _desktopReader,
         running: _autoScroll.running.value,
         speed: prefs.autoScrollSpeed,
         showButton: prefs.autoScrollButton,

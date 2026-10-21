@@ -1,4 +1,5 @@
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -23,16 +24,22 @@ void main() {
     temp = await Directory.systemTemp.createTemp('poster_card_prefs');
     Hive.init(temp.path);
     // Network-image previews need the cache plugin paths in widget tests.
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
-      const MethodChannel('plugins.flutter.io/path_provider'), (_) async => temp.path);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('plugins.flutter.io/path_provider'),
+          (_) async => temp.path,
+        );
 
     await PlaybackPrefs.init();
     GetIt.I.registerSingleton<PlaybackPrefs>(PlaybackPrefs());
   });
 
   tearDown(() async {
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
-      const MethodChannel('plugins.flutter.io/path_provider'), null);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('plugins.flutter.io/path_provider'),
+          null,
+        );
     await GetIt.I.reset();
     await Hive.close();
     await temp.delete(recursive: true);
@@ -754,4 +761,49 @@ void main() {
     expect(find.text('Title placement'), findsOneWidget);
     expect(find.text('Title artwork'), findsOneWidget);
   });
+  testWidgets(
+    'Windows browse grids stay compact at every tested window width and card size',
+    (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      try {
+        for (final layout in PosterCardLayout.values) {
+          for (final size in PosterCardSize.values) {
+            await tester.runAsync(() async {
+              await PlaybackPrefs().setPosterCardLayout(layout);
+              await PlaybackPrefs().setPosterPortraitSize(size);
+              await PlaybackPrefs().setPosterLandscapeSize(size);
+            });
+            for (final width in [480.0, 800.0, 1266.0, 1920.0, 2560.0]) {
+              tester.view.physicalSize = Size(width, 900);
+              tester.view.devicePixelRatio = 1;
+              late double cellWidth;
+              late double rowWidth;
+              await tester.pumpWidget(
+                MaterialApp(
+                  home: Builder(
+                    builder: (context) {
+                      cellWidth = posterGridCellWidth(context);
+                      rowWidth = posterRowWidth(context);
+                      return const SizedBox();
+                    },
+                  ),
+                ),
+              );
+              expect(
+                cellWidth,
+                lessThanOrEqualTo(rowWidth + 0.1),
+                reason: '$layout $size $width',
+              );
+              expect(cellWidth, greaterThan(60));
+            }
+          }
+        }
+      } finally {
+        await tester.pumpWidget(const SizedBox());
+        debugDefaultTargetPlatformOverride = null;
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      }
+    },
+  );
 }

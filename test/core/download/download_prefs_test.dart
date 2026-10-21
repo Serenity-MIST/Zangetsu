@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'package:hive/hive.dart';
+import 'package:watch_app/core/desktop/desktop_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:watch_app/core/download/download_prefs.dart';
 
@@ -32,12 +33,36 @@ void main() {
     expect(isUriPath('/storage/emulated/0/Download/x.mp4'), isFalse);
   });
 
-  test('keepPrivate is mobile-only and desktop uses the chosen folder', () async {
-    final p = DownloadPrefs();
-    expect(p.keepPrivate, isFalse);
-    await p.setKeepPrivate(true);
-    expect(p.keepPrivate, !Platform.isWindows);
-    await p.setKeepPrivate(false);
-    expect(p.keepPrivate, isFalse);
-  });
+  test(
+    'keepPrivate is mobile-only and desktop uses the chosen folder',
+    () async {
+      final p = DownloadPrefs();
+      expect(p.keepPrivate, isFalse);
+      await p.setKeepPrivate(true);
+      expect(p.keepPrivate, !Platform.isWindows);
+      await p.setKeepPrivate(false);
+      expect(p.keepPrivate, isFalse);
+    },
+  );
+  test(
+    'AppData migration preserves the existing explicit download folder',
+    () async {
+      if (!Platform.isWindows) return;
+      await DownloadPrefs().setLocation('D:/MyDownloads', 'My downloads');
+      await Hive.box(
+        DownloadPrefs.boxName,
+      ).put('storageRoot', 'old-selected-root');
+      await Hive.close();
+      DesktopStorage.root = '${dir.path}/system';
+      DesktopStorage.downloadsRoot = '${dir.path}/default-downloads';
+      try {
+        await DownloadPrefs.init();
+        expect(DownloadPrefs().locationUri, 'D:/MyDownloads');
+        expect(DownloadPrefs().locationLabel, 'My downloads');
+      } finally {
+        DesktopStorage.root = null;
+        DesktopStorage.downloadsRoot = null;
+      }
+    },
+  );
 }

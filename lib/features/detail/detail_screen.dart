@@ -88,6 +88,7 @@ import '../../core/provider/provider_registry.dart';
 import '../../core/reading/chapter_nav.dart';
 import '../../core/reading/read_history.dart';
 import '../../core/reading/read_store.dart';
+import '../../core/reading/reading_resume.dart';
 import '../../core/logging/app_logger.dart';
 import '../../core/repository/catalogue_repository.dart';
 import '../../core/repository/source_actions.dart' as source_actions;
@@ -725,6 +726,9 @@ class _DetailViewState extends State<_DetailView>
   DateTime? _nextAiringAt;
   bool _trackerFetchStarted = false;
 
+  /// The main reading CTA can await the initial tracker chapter lookup.
+  Future<void>? _trackerProgressLookup;
+
   /// Fetch the connected tracker's episode progress once, so episodes already
   /// watched on AniList/MAL/Simkl grey out even if never played in-app.
   /// Best-effort and additive — a null result changes nothing on screen.
@@ -739,7 +743,7 @@ class _DetailViewState extends State<_DetailView>
     final pins = sl<TrackerBindingStore>().get(
       TrackerBindingStore.keyOf(widget.item.sourceId, widget.item.url),
     );
-    hub
+    _trackerProgressLookup = hub
         .fetchEntry(
           malId: detail.malId ?? widget.item.malId,
           title: (isAnime || reading) ? detail.title : null,
@@ -775,6 +779,9 @@ class _DetailViewState extends State<_DetailView>
             _nextAiringEpisode = ep;
             _nextAiringAt = at;
           });
+        })
+        .catchError((Object _) {
+          // Tracker outages must leave local/cloud resume available.
         });
   }
 
@@ -1309,6 +1316,10 @@ class _DetailViewState extends State<_DetailView>
     /// A mirror picked from the long-press menu, opened instead of the
     /// adaptive default. One-shot — the cubit clears it after this episode.
     VideoSource? initialSource,
+
+    /// The main Read/Continue action rechecks cloud progress before choosing a
+    /// chapter. Explicit chapter-row taps must keep the viewer's chosen chapter.
+    bool resumeReading = false,
   }) async {
     // A finished download of this exact episode plays from disk — no sweep,
     // no links, no waiting. Exact keys first, then the source episode URL,
@@ -1354,6 +1365,26 @@ class _DetailViewState extends State<_DetailView>
     //
     // Every play path funnels through this method, so this one check covers
     // the row tap, the grid tile, the Play button and resume.
+
+    // Opening something other than where they left off? Offer to look at it
+    // without moving their place. Asked here, before the reading/video split,
+    // so all three kinds behave the same. Dismissing means "never mind" —
+    // neither answer is assumed, and nothing opens.
+    final reading =
+        detail.type == ProviderType.novel ||
+        detail.type == ProviderType.manga ||
+        widget.item.type == ProviderType.novel ||
+        widget.item.type == ProviderType.manga;
+    final readingSourceId = _readingSourceId(detail);
+    if (reading) {
+      await _loadCloudReadHistory(readingSourceId);
+      if (resumeReading) await _trackerProgressLookup;
+      if (!mounted) return;
+    }
+    final resume = reading
+        ? _readResumeIndex(episodes, sourceId: readingSourceId)
+        : (index: _resumeIndex(episodes), hasResume: _hasVideoResume(episodes));
+    if (reading && resumeReading) index = resume.index;
     if (index >= 0 && index < episodes.length && !episodes[index].available) {
       final sweep = await showEpisodeUnavailable(
         context,
@@ -1370,24 +1401,6 @@ class _DetailViewState extends State<_DetailView>
       if (!await _sweepForEpisode(episodes[index])) return;
       if (!mounted) return;
     }
-
-    // Opening something other than where they left off? Offer to look at it
-    // without moving their place. Asked here, before the reading/video split,
-    // so all three kinds behave the same. Dismissing means "never mind" —
-    // neither answer is assumed, and nothing opens.
-    final reading =
-        detail.type == ProviderType.novel ||
-        detail.type == ProviderType.manga ||
-        widget.item.type == ProviderType.novel ||
-        widget.item.type == ProviderType.manga;
-    final readingSourceId = _readingSourceId(detail);
-    if (reading) {
-      await _loadCloudReadHistory(readingSourceId);
-      if (!mounted) return;
-    }
-    final resume = reading
-        ? _readResumeIndex(episodes, sourceId: readingSourceId)
-        : (index: _resumeIndex(episodes), hasResume: _hasVideoResume(episodes));
     var peek = false;
     if (shouldAskBeforeJump(
       resumeIndex: resume.index,
@@ -1421,7 +1434,7 @@ class _DetailViewState extends State<_DetailView>
         _myList.add(widget.item);
         _listStatus.setStatus(widget.item, WatchStatus.watching);
       }
-      _openReader(episodes, index, detail, peek: peek);
+      await _openReader(episodes, index, detail, peek: peek);
       return;
     }
 
@@ -1562,16 +1575,45 @@ class _DetailViewState extends State<_DetailView>
     if (mounted) setState(() {});
   }
 
-  void _openReader(
+  Future<void> _openReader(
     List<Episode> chapters,
     int index,
     MediaDetail detail, {
     bool peek = false,
-  }) {
+  }) async {
     final readingType =
         (detail.type == ProviderType.novel || detail.type == ProviderType.manga)
         ? detail.type
         : widget.item.type;
+    // Cloud history syncs the last chapter position, while ReadStore is local.
+    // Bridge it once before opening the reader, using this provider's chapter
+    // ID. Never overwrite an existing local mark or save a look-ahead preview.
+    final sourceId = _readingSourceId(detail);
+    final entry = _readingHistoryEntry(sourceId);
+    final positions = sl<ReadStore>();
+    if (!peek &&
+        entry != null &&
+        !entry.finished &&
+        entry.total > 0 &&
+        index >= 0 &&
+        index < chapters.length &&
+        readingHistoryChapter(chapters, entry) == index &&
+        (positions.get(sourceId, widget.item.id, chapters[index].id) == null ||
+            entry.updatedMs >
+                positions.updatedMs(
+                  sourceId,
+                  widget.item.id,
+                  chapters[index].id,
+                ))) {
+      await positions.save(
+        sourceId,
+        widget.item.id,
+        chapters[index].id,
+        pos: entry.pos.clamp(0, entry.total),
+        total: entry.total,
+      );
+      if (!mounted) return;
+    }
     switch (readingType) {
       case ProviderType.novel:
         Navigator.of(context)
@@ -1726,6 +1768,21 @@ class _DetailViewState extends State<_DetailView>
   String _readingSourceId(MediaDetail detail) =>
       detail.sourceId.isNotEmpty ? detail.sourceId : widget.item.sourceId;
 
+  /// Source-specific chapter IDs may change, but a canonical title ID does not.
+  /// Use the newest matching history across sources only for canonical titles;
+  /// plain provider IDs must never collide with another source's title.
+  ReadEntry? _readingHistoryEntry(String sourceId) {
+    final history = sl<ReadHistory>();
+    final exact = history.get(sourceId, widget.item.id);
+    if (!RegExp(r'^(?:al|mal):\d+$').hasMatch(widget.item.id)) return exact;
+    return readingHistoryForTitle(
+      history.all(),
+      sourceId: sourceId,
+      showId: widget.item.id,
+      type: widget.item.type,
+    );
+  }
+
   ({int index, bool hasResume}) _readResumeIndex(
     List<Episode> chapters, {
     required String sourceId,
@@ -1738,7 +1795,22 @@ class _DetailViewState extends State<_DetailView>
         highestMarked = j;
       }
     }
+    final entry = _readingHistoryEntry(sourceId);
+    final synced = readingHistoryTarget(chapters, entry: entry);
     if (highestMarked != null) {
+      // A local mark from yesterday must not hide progress synced from the
+      // phone today. Manual "mark read" actions also carry a timestamp, so a
+      // newer deliberate local change still wins. Legacy marks use zero.
+      if (entry != null &&
+          synced.hasResume &&
+          entry.updatedMs >
+              store.updatedMs(
+                sourceId,
+                widget.item.id,
+                chapters[highestMarked].id,
+              )) {
+        return synced;
+      }
       if (!store.finished(
         sourceId,
         widget.item.id,
@@ -1754,18 +1826,11 @@ class _DetailViewState extends State<_DetailView>
           highestMarked;
       return (index: next, hasResume: true);
     }
-    final entry = sl<ReadHistory>().get(sourceId, widget.item.id);
-    if (entry != null) {
-      var idx = chapters.indexWhere((c) => c.id == entry.chapterId);
-      if (idx < 0) idx = chapters.indexWhere((c) => c.url == entry.chapterUrl);
-      if (idx >= 0) {
-        if (entry.finished) {
-          idx = adjacentChapterIndex(chapters, idx, step: 1) ?? idx;
-        }
-        return (index: idx, hasResume: true);
-      }
-    }
-    return (index: 0, hasResume: false);
+    return readingHistoryTarget(
+      chapters,
+      entry: entry,
+      completedChapters: _trackerProgress,
+    );
   }
 
   Future<ReadEntry?> _loadCloudReadHistory(String sourceId) {
@@ -2412,7 +2477,13 @@ class _DetailViewState extends State<_DetailView>
                         : Icons.play_arrow_rounded,
                     onPressed: eps.isEmpty
                         ? null
-                        : () => _openPlayer(eps, resumeIdx, detail, category),
+                        : () => _openPlayer(
+                            eps,
+                            resumeIdx,
+                            detail,
+                            category,
+                            resumeReading: isReading,
+                          ),
                   ),
                   download: isReading
                       ? null
@@ -2456,7 +2527,13 @@ class _DetailViewState extends State<_DetailView>
                           ? Icons.menu_book_rounded
                           : Icons.play_arrow_rounded,
                       onPressed: eps.isNotEmpty
-                          ? () => _openPlayer(eps, resumeIdx, detail, category)
+                          ? () => _openPlayer(
+                              eps,
+                              resumeIdx,
+                              detail,
+                              category,
+                              resumeReading: isReading,
+                            )
                           : null,
                     ),
                   ),

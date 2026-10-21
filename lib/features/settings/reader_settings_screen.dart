@@ -222,7 +222,14 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
         ),
       );
     } on Object {
-      if (mounted) showAppToast(context, context.l10n.mangaTranslationError);
+      if (mounted) {
+        showAppToast(
+          context,
+          Platform.isWindows
+              ? 'Page translation needs an OCR engine, which is not available on Windows yet.'
+              : context.l10n.mangaTranslationError,
+        );
+      }
     }
   }
 
@@ -389,13 +396,14 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
               ),
               // Desktop windows resize freely; phone orientation locks have no
               // Windows implementation and must not appear as working controls.
-              if (!Platform.isWindows) _pickerRow(
-                icon: Icons.screen_rotation_outlined,
-                title: context.l10n.orientationLock,
-                options: _orientationOptions,
-                current: prefs.orientation,
-                onPicked: prefs.setOrientation,
-              ),
+              if (!Platform.isWindows)
+                _pickerRow(
+                  icon: Icons.screen_rotation_outlined,
+                  title: context.l10n.orientationLock,
+                  options: _orientationOptions,
+                  current: prefs.orientation,
+                  onPicked: prefs.setOrientation,
+                ),
               _toggleRow(
                 icon: Icons.vertical_split_rounded,
                 title: context.l10n.doublePageLandscape,
@@ -447,6 +455,9 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
               SettingsTile(
                 icon: Icons.translate_rounded,
                 title: context.l10n.mangaTranslationSettings,
+                subtitle: Platform.isWindows
+                    ? 'Page OCR is not available on Windows yet'
+                    : null,
                 onTap: _openMangaTranslationSettings,
               ),
               SettingsTile(
@@ -457,21 +468,25 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
               ),
             ],
           ),
-          SettingsSectionLabel(context.l10n.gestures),
-          SettingsCard(
-            children: [
-              SettingsTile(
-                icon: Icons.touch_app_outlined,
-                title: context.l10n.tapZones,
-                subtitle: context.l10n.whatTappingEachPartOfThePageDoes,
-                onTap: () => Navigator.of(context).push(
-                  MaterialPageRoute<void>(
-                    builder: (_) => const TapZonesScreen(),
+          // Desktop readers use keyboard/mouse navigation. Touch-zone editing
+          // cannot affect them and should not look like a functioning PC setting.
+          if (!Platform.isWindows) ...[
+            SettingsSectionLabel(context.l10n.gestures),
+            SettingsCard(
+              children: [
+                SettingsTile(
+                  icon: Icons.touch_app_outlined,
+                  title: context.l10n.tapZones,
+                  subtitle: context.l10n.whatTappingEachPartOfThePageDoes,
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => const TapZonesScreen(),
+                    ),
                   ),
                 ),
-              ),
-            ],
-          ),
+              ],
+            ),
+          ],
           SettingsSectionLabel(context.l10n.modeNovel),
           SettingsCard(
             children: [

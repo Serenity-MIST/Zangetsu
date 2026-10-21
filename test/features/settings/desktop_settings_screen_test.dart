@@ -272,6 +272,24 @@ void main() {
     },
   );
 
+  testWidgets('desktop playback exposes working control-bar customization', (
+    tester,
+  ) async {
+    await pumpSettings(tester);
+    await tester.tap(find.text('Playback'));
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+      find.text('Player controls'),
+      250,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.tap(find.text('Player controls'));
+    await tester.pumpAndSettle();
+    expect(find.text('Reset'), findsOneWidget);
+    expect(find.text('Default player'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('connection summary includes all four trackers', (tester) async {
     final sl = GetIt.instance;
     (sl<AniListService>() as _StubAniList).connected = true;

@@ -9,7 +9,7 @@ import '../../core/tracker/mangabaka_service.dart';
 import '../../core/ui/app_dialog.dart';
 import '../../core/ui/settings_widgets.dart';
 
-/// Connect / disconnect any [Tracker] (AniList, MyAnimeList, Simkl) and toggle
+/// Connect / disconnect any [Tracker], including MangaBaka, and toggle
 /// its auto-sync. Connecting opens the provider's OAuth consent in the browser;
 /// the token returns via the `zangetsu://…` deep link captured by the service.
 class TrackerSettingsScreen extends StatefulWidget {
@@ -59,10 +59,7 @@ class _TrackerSettingsScreenState extends State<TrackerSettingsScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: AppColors.bg,
-      appBar: AppBar(
-        backgroundColor: AppColors.bg,
-        title: Text(_t.displayName),
-      ),
+      appBar: settingsAppBar(_t.displayName),
       body: AnimatedBuilder(
         animation: _t,
         builder: (context, _) {

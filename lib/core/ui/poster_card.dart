@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
@@ -152,6 +154,14 @@ int _responsiveColumns(
 int posterGridColumns(BuildContext context) {
   final wide = posterLayout(context) == PosterCardLayout.wide;
   final availableWidth = MediaQuery.sizeOf(context).width - 32;
+  // Desktop grids use the same card scale as Home instead of stretching the
+  // phone's two/three columns across a full PC window.
+  if (defaultTargetPlatform == TargetPlatform.windows) {
+    return math.max(
+      1,
+      ((availableWidth + 12) / (posterRowWidth(context) + 12)).ceil(),
+    );
+  }
   final base = wide ? 2 : 3;
   return _responsiveColumns(
     _columnsForSize(
@@ -172,7 +182,9 @@ double posterGridCellWidth(BuildContext context) {
 
 double posterRowWidth(BuildContext context) {
   final wide = posterLayout(context) == PosterCardLayout.wide;
-  return (wide ? 184 : 116) * posterCardScale(context);
+  final desktop = defaultTargetPlatform == TargetPlatform.windows;
+  return (wide ? (desktop ? 248 : 184) : (desktop ? 166 : 116)) *
+      posterCardScale(context);
 }
 
 double posterRowHeight(BuildContext context) {

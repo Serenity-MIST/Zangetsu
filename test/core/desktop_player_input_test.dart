@@ -67,4 +67,47 @@ void main() {
     await tester.pump();
     expect(back, 2);
   });
+  testWidgets('custom seek duration applies to keys and forward mouse button', (
+    tester,
+  ) async {
+    final seeks = <int>[];
+    var volume = 0.0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: DesktopPlayerInput(
+          seekSeconds: 30,
+          onPlayPause: () {},
+          onBack: () {},
+          onMute: () {},
+          onSeek: seeks.add,
+          onVolume: (delta) => volume += delta,
+          child: const Scaffold(body: SizedBox.expand()),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyL);
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+    final mouse = await tester.createGesture(
+      kind: PointerDeviceKind.mouse,
+      buttons: kForwardMouseButton,
+    );
+    await mouse.down(const Offset(100, 100));
+    await mouse.up();
+    expect(seeks, [30, -30, 30]);
+    await tester.sendEventToBinding(
+      const PointerScrollEvent(
+        position: Offset(100, 100),
+        scrollDelta: Offset(120, 0),
+      ),
+    );
+    expect(volume, 0, reason: 'Horizontal touchpad scroll is not volume');
+    await tester.sendEventToBinding(
+      const PointerScrollEvent(
+        position: Offset(100, 100),
+        scrollDelta: Offset(0, 120),
+      ),
+    );
+    expect(volume, -5);
+  });
 }

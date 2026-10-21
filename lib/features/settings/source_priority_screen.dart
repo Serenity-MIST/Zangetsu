@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../../core/app_mode.dart';
+import '../../core/mode/content_mode.dart';
+import '../../core/mode/content_mode_cubit.dart';
 import '../../core/di/injector.dart';
 import '../../core/playback/source_health_store.dart';
 import '../../core/theme/app_colors.dart';
@@ -28,6 +30,19 @@ String? reasonForSource({required int plays, required SourceHealth health}) {
   return plays == 0 ? null : 'played $plays times';
 }
 
+/// Preserve pins outside a filtered pool when reordering its visible prefix.
+/// Anime and Movies/TV share preferences; editing Movies must not silently
+/// unpin an anime-only source that the Movies resolver correctly excludes.
+List<String> sourcePinsAfterReorder({
+  required List<String> visible,
+  required List<String> previous,
+  required int placedAt,
+}) => [
+  ...visible.take(placedAt + 1),
+  for (final id in previous)
+    if (!visible.contains(id)) id,
+];
+
 /// Reorder installed sources per content type. Auto Resolve (the default —
 /// see `SourceMatcher`) sweeps sources in this order for every title that
 /// hasn't been pinned to one by hand. Anime and Movies/TV get separate
@@ -48,9 +63,19 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
   // One list. Anime and Movies/TV share the same installed pool, so two
   // orders of the same sources was twice the list to keep straight for a
   // distinction most people don't draw.
-  late List<({String id, String name})> _sources = _ordered(ZKind.anime);
-  late int _cap = _prefs.cap(ZKind.anime);
+  late ZKind _kind = _initialKind();
+  late List<({String id, String name})> _sources = _ordered(_kind);
+  late int _cap = _prefs.cap(_kind);
 
+  /// Open the reading bucket already selected in the dock. Video can then be
+  /// narrowed to Movies/TV, using exactly the resolver's eligible source pool.
+  ZKind _initialKind() => sl.isRegistered<ContentModeCubit>()
+      ? switch (sl<ContentModeCubit>().state) {
+          ContentMode.manga => ZKind.manga,
+          ContentMode.novel => ZKind.novel,
+          ContentMode.anime => ZKind.anime,
+        }
+      : ZKind.anime;
 
   /// What Auto Resolve actually sweeps, in the order it walks them.
   ///
@@ -68,15 +93,13 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
   ///
   /// NOT a mode: pinned sources sit on top and everything below them stays
   /// auto-ranked. It only decides whether there is anything to undo.
-  bool get _hasPins => _prefs.get(ZKind.anime).isNotEmpty;
-
-
+  bool get _hasPins => _prefs.get(_kind).isNotEmpty;
 
   void _refresh(ZKind kind) => setState(() {
-    _sources = _ordered(ZKind.anime);
-    _cap = _prefs.cap(ZKind.anime);
+    _kind = kind;
+    _sources = _ordered(kind);
+    _cap = _prefs.cap(kind);
   });
-
 
   /// A one-word verdict from the health store, when it has one worth showing.
   /// Silent for a healthy source: a row of green "ok" labels is noise, and the
@@ -97,13 +120,21 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
     // Best-effort: a missing tag must never stop the screen from working.
     try {
       final b = categorizedSources();
-      for (final r in [...b.anime, ...b.movies, ...b.nsfw, ...b.manga, ...b.novel]) {
+      for (final r in [
+        ...b.anime,
+        ...b.movies,
+        ...b.nsfw,
+        ...b.manga,
+        ...b.novel,
+      ]) {
         out[r.id] = (
           label: r.label,
           repo: (r.repo?.isNotEmpty ?? false) ? r.repo : null,
         );
       }
-    } catch (_) {/* tags are cosmetic */}
+    } catch (_) {
+      /* tags are cosmetic */
+    }
     return out;
   }
 
@@ -189,9 +220,14 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
     ZKind kind,
     List<({String id, String name})> list, {
     required int placedAt,
-  }) => _prefs.set(kind, [
-    for (final s in list.take(placedAt + 1)) s.id,
-  ]);
+  }) => _prefs.set(
+    kind,
+    sourcePinsAfterReorder(
+      visible: [for (final source in list) source.id],
+      previous: _prefs.get(kind),
+      placedAt: placedAt,
+    ),
+  );
 
   void _reorder(ZKind kind, int oldIndex, int newIndex) {
     final list = _sources;
@@ -241,8 +277,28 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
       body: ListView(
         padding: const EdgeInsets.fromLTRB(0, 10, 0, 36),
         children: [
-          _capControl(ZKind.anime),
-          _section(ZKind.anime, _sources),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+            child: DropdownButtonFormField<ZKind>(
+              key: const ValueKey('source-priority-kind'),
+              initialValue: _kind,
+              decoration: const InputDecoration(labelText: 'Media'),
+              items: const [
+                DropdownMenuItem(value: ZKind.anime, child: Text('Anime')),
+                DropdownMenuItem(
+                  value: ZKind.movie,
+                  child: Text('Movies / TV'),
+                ),
+                DropdownMenuItem(value: ZKind.manga, child: Text('Manga')),
+                DropdownMenuItem(value: ZKind.novel, child: Text('Novels')),
+              ],
+              onChanged: (kind) {
+                if (kind != null) _refresh(kind);
+              },
+            ),
+          ),
+          _capControl(_kind),
+          _section(_kind, _sources),
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
             child: Text(
@@ -257,7 +313,7 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
               padding: const EdgeInsets.fromLTRB(12, 6, 0, 0),
               child: Align(
                 alignment: AlignmentDirectional.centerStart,
-                child: _resetButton(ZKind.anime),
+                child: _resetButton(_kind),
               ),
             ),
         ],
@@ -421,24 +477,24 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
       );
     }
     return _listSurface([
-        if (_isTv)
-          Column(
-            children: [
-              for (var i = 0; i < list.length; i++)
-                _tvRow(kind, list[i], i, list.length),
-            ],
-          )
-        else
-          ReorderableListView(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            buildDefaultDragHandles: false,
-            onReorderItem: (oldIndex, newIndex) =>
-                _reorder(kind, oldIndex, newIndex),
-            children: [
-              for (var i = 0; i < list.length; i++) _row(kind, list[i], i),
-            ],
-          ),
+      if (_isTv)
+        Column(
+          children: [
+            for (var i = 0; i < list.length; i++)
+              _tvRow(kind, list[i], i, list.length),
+          ],
+        )
+      else
+        ReorderableListView(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          buildDefaultDragHandles: false,
+          onReorderItem: (oldIndex, newIndex) =>
+              _reorder(kind, oldIndex, newIndex),
+          children: [
+            for (var i = 0; i < list.length; i++) _row(kind, list[i], i),
+          ],
+        ),
     ]);
   }
 
@@ -603,9 +659,6 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
     );
   }
 
-
-
-
   /// TV row: up/down arrows instead of a drag handle — dragging isn't
   /// D-pad-drivable, so this is the only way to reorder with a remote.
   Widget _tvRow(
@@ -624,47 +677,50 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 22,
-            child: Text(
-              '${index + 1}',
-              style: AppText.caption.copyWith(
-                color: tried
-                    ? AppColors.textSecondary
-                    : AppColors.textTertiary,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 22,
+                child: Text(
+                  '${index + 1}',
+                  style: AppText.caption.copyWith(
+                    color: tried
+                        ? AppColors.textSecondary
+                        : AppColors.textTertiary,
+                  ),
+                ),
               ),
-            ),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Opacity(
-              opacity: tried ? 1 : 0.45,
-              child: _nameAndRepo(
-                s,
-                color: AppColors.textPrimary,
-                reason: _reasonFor(s.id),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Opacity(
+                  opacity: tried ? 1 : 0.45,
+                  child: _nameAndRepo(
+                    s,
+                    color: AppColors.textPrimary,
+                    reason: _reasonFor(s.id),
+                  ),
+                ),
               ),
-            ),
+              if (_health(s.id) case final h?) ...[
+                _healthChip(h),
+                const SizedBox(width: 4),
+              ],
+              _tvMoveButton(
+                icon: Icons.keyboard_arrow_up_rounded,
+                enabled: index > 0,
+                semanticLabel: 'Move ${_labelFor(s)} up',
+                onTap: () => _move(kind, index, -1),
+              ),
+              const SizedBox(width: 6),
+              _tvMoveButton(
+                icon: Icons.keyboard_arrow_down_rounded,
+                enabled: index < count - 1,
+                semanticLabel: 'Move ${_labelFor(s)} down',
+                onTap: () => _move(kind, index, 1),
+              ),
+            ],
           ),
-          if (_health(s.id) case final h?) ...[_healthChip(h), const SizedBox(width: 4)],
-          _tvMoveButton(
-            icon: Icons.keyboard_arrow_up_rounded,
-            enabled: index > 0,
-            semanticLabel: 'Move ${_labelFor(s)} up',
-            onTap: () => _move(kind, index, -1),
-          ),
-          const SizedBox(width: 6),
-          _tvMoveButton(
-            icon: Icons.keyboard_arrow_down_rounded,
-            enabled: index < count - 1,
-            semanticLabel: 'Move ${_labelFor(s)} down',
-            onTap: () => _move(kind, index, 1),
-          ),
-        ],
-      ),
         ),
         if (atCut) _cutLine(),
       ],

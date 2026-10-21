@@ -78,6 +78,17 @@ class _BackupScreenState extends State<BackupScreen> {
           ),
         ),
       );
+    } catch (_) {
+      // File-system errors must leave an actionable result, not an unhandled
+      // future that makes the Save button appear to have done nothing.
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            context.l10n.couldnTSaveTheBackupFileStoragePermissionMayBeNeeded,
+          ),
+        ),
+      );
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -101,6 +112,14 @@ class _BackupScreenState extends State<BackupScreen> {
         return;
       }
       report = await _service.restore(p, _selected);
+    } catch (_) {
+      // A temporary cloud outage must not escape the button handler or leave
+      // users without an explanation. Preserve all local data on failure.
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(context.l10n.cloudBackupFailed)));
+      return;
     } finally {
       if (mounted) setState(() => _busy = false);
     }

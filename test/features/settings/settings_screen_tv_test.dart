@@ -53,6 +53,8 @@ MigrationBridge _fakeBridge() => MigrationBridge(
 class _StubSearchPrefs extends SearchPrefs {
   @override
   SearchLayout get layout => SearchLayout.vertical;
+  @override
+  String get tvSearchStyle => 'classic';
 }
 
 class _StubProviderRegistry implements ProviderRegistry {

@@ -44,6 +44,7 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
   // (separate from our app-side schema settings). Always false for non-CS.
   late Future<bool> _nativeSettingsFuture;
   Map<String, dynamic> _values = <String, dynamic>{};
+  int _textResetRevision = 0;
 
   /// The bare CloudStream api name for this source (`cs:AnimePahe` → `AnimePahe`),
   /// or null when this isn't a CloudStream source.
@@ -73,9 +74,12 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
 
   @override
   void dispose() {
-    for (final t in _textDebounce.values) {
-      t.cancel();
+    final hasPendingText = _textDebounce.values.any((timer) => timer.isActive);
+    for (final timer in _textDebounce.values) {
+      timer.cancel();
     }
+    // Leaving immediately after typing must not discard the last edit.
+    if (hasPendingText) unawaited(_persist());
     super.dispose();
   }
 
@@ -146,8 +150,13 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
   /// Persist the full map and mirror it into the JS runtime so the next
   /// provider call reads the updated values.
   Future<void> _persist() async {
-    await _repo.setFor(_key, _values);
-    _manager.setSettings(widget.sourceId, _values);
+    // Capture this edit before awaiting Hive: a later edit/reset must not make
+    // an older write apply a different map to the runtime.
+    final values = Map<String, dynamic>.from(_values);
+    final manager = _manager;
+    final sourceId = widget.sourceId;
+    await _repo.setFor(_key, values);
+    manager.setSettings(sourceId, values);
   }
 
   void _updateImmediate(String key, Object? value) {
@@ -169,8 +178,16 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
     final defaults = <String, dynamic>{
       for (final s in schema) s.key: s.defaultValue,
     };
+    for (final timer in _textDebounce.values) {
+      timer.cancel();
+    }
+    _textDebounce.clear();
     await _repo.clearFor(_key);
-    setState(() => _values = defaults);
+    if (!mounted) return;
+    setState(() {
+      _values = defaults;
+      _textResetRevision++;
+    });
     _manager.setSettings(widget.sourceId, defaults);
   }
 
@@ -185,7 +202,10 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
           ),
-          insetPadding: const EdgeInsets.symmetric(horizontal: 80, vertical: 48),
+          insetPadding: const EdgeInsets.symmetric(
+            horizontal: 80,
+            vertical: 48,
+          ),
           child: SizedBox(
             width: 460,
             child: Column(
@@ -383,9 +403,7 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
 
   Future<void> _pickMultiEnum(ProviderSettingSchema schema) async {
     final raw = _values[schema.key];
-    final chosen = raw is List
-        ? raw.whereType<String>().toSet()
-        : <String>{};
+    final chosen = raw is List ? raw.whereType<String>().toSet() : <String>{};
     if (_isTv) {
       final saved = await showDialog<bool>(
         context: context,
@@ -395,7 +413,10 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
           ),
-          insetPadding: const EdgeInsets.symmetric(horizontal: 80, vertical: 48),
+          insetPadding: const EdgeInsets.symmetric(
+            horizontal: 80,
+            vertical: 48,
+          ),
           child: SizedBox(
             width: 460,
             child: Column(
@@ -442,7 +463,9 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
                                           style: AppText.headline,
                                         ),
                                       ),
-                                      if (chosen.contains(schema.options[j].value))
+                                      if (chosen.contains(
+                                        schema.options[j].value,
+                                      ))
                                         Icon(
                                           Icons.check,
                                           color: AppColors.accent,
@@ -490,16 +513,16 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
     }
   }
 
-  List<Widget> _buildSchemaList(List<ProviderSettingSchema> schema, bool hasNative) {
+  List<Widget> _buildSchemaList(
+    List<ProviderSettingSchema> schema,
+    bool hasNative,
+  ) {
     if (_isTv) {
       return [
         SettingsCard(
           children: [
             for (var i = 0; i < schema.length; i++)
-              _buildEntry(
-                schema[i],
-                autofocus: !hasNative && i == 0,
-              ),
+              _buildEntry(schema[i], autofocus: !hasNative && i == 0),
           ],
         ),
         const SizedBox(height: 16),
@@ -545,9 +568,7 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
           ),
           label: Text(
             context.l10n.resetToDefaults,
-            style: AppText.body.copyWith(
-              color: AppColors.textSecondary,
-            ),
+            style: AppText.body.copyWith(color: AppColors.textSecondary),
           ),
         ),
       ),
@@ -756,6 +777,9 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
         return _card(
           padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
           child: TextFormField(
+            // Reset must replace the field's controller value, not only the
+            // backing map. Keep the key stable during ordinary typing.
+            key: ValueKey('${schema.key}:$_textResetRevision'),
             initialValue: v,
             style: AppText.body.copyWith(color: AppColors.textPrimary),
             cursorColor: AppColors.accent,
@@ -812,9 +836,7 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
         return SettingsTile(
           icon: Icons.checklist_rounded,
           title: schema.label,
-          subtitle: selected.isEmpty
-              ? null
-              : '${selected.length} selected',
+          subtitle: selected.isEmpty ? null : '${selected.length} selected',
           autofocus: autofocus,
           onTap: () => _pickMultiEnum(schema),
         );

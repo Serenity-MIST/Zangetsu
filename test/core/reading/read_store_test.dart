@@ -24,6 +24,18 @@ void main() {
     expect(s.get('js:m', 'show1', 'ch2'), isNull);
   });
 
+  test(
+    'position timestamps distinguish new saves from legacy/missing marks',
+    () async {
+      final store = ReadStore();
+      expect(store.updatedMs('s', 'book', 'c'), 0);
+      final before = DateTime.now().millisecondsSinceEpoch;
+      await store.save('s', 'book', 'c', pos: 2, total: 10);
+      expect(store.updatedMs('s', 'book', 'c'), greaterThanOrEqualTo(before));
+      expect(store.get('s', 'book', 'c'), (pos: 2, total: 10));
+    },
+  );
+
   test('finished: manga last page', () async {
     final s = ReadStore();
     await s.save('js:m', 'show1', 'ch1', pos: 19, total: 20);

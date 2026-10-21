@@ -2,6 +2,9 @@ import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart'
+    show debugDefaultTargetPlatformOverride, TargetPlatform;
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_widget_from_html/flutter_widget_from_html.dart';
 import 'package:hive/hive.dart';
@@ -29,6 +32,8 @@ import 'package:watch_app/core/supabase/supabase_service.dart';
 import 'package:watch_app/core/tracker/tracker.dart';
 import 'package:watch_app/core/tracker/tracker_hub.dart';
 import 'package:watch_app/features/reader/novel_reader_screen.dart';
+import 'package:watch_app/features/reader/desktop_reader_input.dart';
+import 'package:watch_app/features/reader/reader_auto_scroll_ui.dart';
 
 /// A fake reading-capable source that hands back canned text per chapter
 /// URL — mirrors `_FakeReadingProvider` in reading_leaf_routing_test.dart,
@@ -90,9 +95,9 @@ class _FakeReadingProvider implements BaseProvider, ReadingProvider {
 
   @override
   Future<ChapterText> getText(String chapterUrl) async => ChapterText(
-        html: '<p>${textByUrl[chapterUrl] ?? 'missing'}</p>',
-        folder: folderByUrl?[chapterUrl],
-      );
+    html: '<p>${textByUrl[chapterUrl] ?? 'missing'}</p>',
+    folder: folderByUrl?[chapterUrl],
+  );
 }
 
 /// A reading source whose `getText` throws on the first call and succeeds on
@@ -302,6 +307,21 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   group('novelSpans', () {
+    test('paged paragraph gaps remain measurable pure TextSpans', () {
+      final spans = novelSpans(
+        '<p>One</p><p>Two</p>',
+        const TextStyle(fontSize: 16),
+        paragraphSpacing: 24,
+        textOnly: true,
+      );
+      expect(spans.whereType<WidgetSpan>(), isEmpty);
+      expect(
+        spans.whereType<TextSpan>().any((s) => s.style?.fontSize == 24),
+        isTrue,
+      );
+      expect(TextSpan(children: spans).toPlainText(), contains('One\n\nTwo'));
+    });
+
     test('paragraphs, bold/italic, tags stripped', () {
       // NOTE: the brief's literal fixture used '<p>Next</p>' as the second
       // paragraph and then asserted `isNot(contains('x'))` for the stripped
@@ -452,12 +472,57 @@ void main() {
       ),
     );
 
+    testWidgets(
+      'Windows paged novel uses desktop input and direction-aware arrows',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+        try {
+          final longText = List.generate(
+            200,
+            (i) => 'Paragraph $i contains enough words for a paginated novel.',
+          ).join('</p><p>');
+          ani.register(_FakeReadingProvider('ani:n', {'u1': longText}));
+          await tester.runAsync(() async {
+            await sl<ReaderPrefs>().setNovelPaginated(true);
+            await sl<ReaderPrefs>().setTextDirection('rtl');
+          });
+          await tester.pumpWidget(harness());
+          await tester.pumpAndSettle();
+          expect(find.byType(DesktopReaderInput), findsOneWidget);
+          expect(
+            tester
+                .widget<DesktopReaderInput>(find.byType(DesktopReaderInput))
+                .direction,
+            'rtl',
+          );
+          expect(find.byType(ReaderAutoScrollButton), findsNothing);
+          final pages = tester.widget<PageView>(find.byType(PageView));
+          expect(pages.controller!.page, 0);
+          await tester.runAsync(() async {
+            await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+            await Future<void>.delayed(const Duration(milliseconds: 50));
+          });
+          await tester.pumpAndSettle();
+          expect(pages.controller!.page, 1);
+          await tester.runAsync(() async {
+            await tester.pumpWidget(const SizedBox());
+            await Future<void>.delayed(const Duration(milliseconds: 50));
+          });
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+
     testWidgets('renders chapter text and advances to next chapter', (
       tester,
     ) async {
       await tester.pumpWidget(harness());
       await tester.pumpAndSettle();
-      expect(find.textContaining('chapter one text', findRichText: true), findsOneWidget);
+      expect(
+        find.textContaining('chapter one text', findRichText: true),
+        findsOneWidget,
+      );
 
       // chrome → next — the scroll body is now a lazy sliver HTML view
       // inside a CustomScrollView (was SingleChildScrollView, then a
@@ -474,7 +539,10 @@ void main() {
       });
       await tester.pumpAndSettle();
 
-      expect(find.textContaining('chapter two text', findRichText: true), findsOneWidget);
+      expect(
+        find.textContaining('chapter two text', findRichText: true),
+        findsOneWidget,
+      );
 
       // Explicitly dispose the reader (under runAsync, same reason as
       // above) instead of relying on the framework's between-test teardown
@@ -532,12 +600,18 @@ void main() {
         await tester.pumpAndSettle();
 
         expect(find.text('Retry'), findsOneWidget);
-        expect(find.textContaining('chapter one text', findRichText: true), findsNothing);
+        expect(
+          find.textContaining('chapter one text', findRichText: true),
+          findsNothing,
+        );
 
         await tester.tap(find.text('Retry'));
         await tester.pumpAndSettle();
 
-        expect(find.textContaining('chapter one text', findRichText: true), findsOneWidget);
+        expect(
+          find.textContaining('chapter one text', findRichText: true),
+          findsOneWidget,
+        );
         expect(find.text('Retry'), findsNothing);
 
         // Dispose under runAsync — same reason as the tests above.

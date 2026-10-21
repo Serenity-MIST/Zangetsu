@@ -131,7 +131,11 @@ class _HubPhoneView extends StatelessWidget {
         (showMihon ? mihonCount : 0) +
         (showLnReader ? lnrCount : 0);
     final ecoCount =
-        1 + (showCs ? 1 : 0) + (showAniyomi ? 1 : 0) + (showMihon ? 1 : 0);
+        1 +
+        (showCs ? 1 : 0) +
+        (showAniyomi ? 1 : 0) +
+        (showMihon ? 1 : 0) +
+        (showLnReader ? 1 : 0);
 
     final activeId = sl<ActiveSourceCubit>().state;
     final activeName = activeId.isEmpty
@@ -142,7 +146,11 @@ class _HubPhoneView extends StatelessWidget {
     final activeIsMihon = activeId.startsWith('mihon:');
     final activeIsLnReader = activeId.startsWith('lnr:');
     final activeIsZangetsu =
-        activeId.isNotEmpty && !activeIsCs && !activeIsAni && !activeIsMihon;
+        activeId.isNotEmpty &&
+        !activeIsCs &&
+        !activeIsAni &&
+        !activeIsMihon &&
+        !activeIsLnReader;
 
     // Manga/novel sources are also Zangetsu JS providers under the hood, but
     // get their own hub entry (Task E3) so reading sources read as visibly

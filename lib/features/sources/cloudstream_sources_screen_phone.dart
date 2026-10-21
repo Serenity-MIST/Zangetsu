@@ -842,6 +842,8 @@ class _CsScreenPluginRowState extends State<_CsScreenPluginRow> {
 
   Future<void> _install() async {
     final messenger = ScaffoldMessenger.of(context);
+    // The row may be disposed while the native extension call is running.
+    final l10n = context.l10n;
     setState(() => _busy = true);
     try {
       await sl<CloudStreamManager>().installPlugin(
@@ -851,16 +853,12 @@ class _CsScreenPluginRowState extends State<_CsScreenPluginRow> {
       messenger
         ..clearSnackBars()
         ..showSnackBar(
-          SnackBar(
-            content: Text(context.l10n.installedName(widget.plugin.name)),
-          ),
+          SnackBar(content: Text(l10n.installedName(widget.plugin.name))),
         );
     } catch (e) {
       messenger
         ..clearSnackBars()
-        ..showSnackBar(
-          SnackBar(content: Text(context.l10n.installFailed('$e'))),
-        );
+        ..showSnackBar(SnackBar(content: Text(l10n.installFailed('$e'))));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -870,6 +868,8 @@ class _CsScreenPluginRowState extends State<_CsScreenPluginRow> {
     final update = widget.update;
     if (update == null) return;
     final messenger = ScaffoldMessenger.of(context);
+    // The row may be disposed while the native extension call is running.
+    final l10n = context.l10n;
     setState(() => _busy = true);
     try {
       await sl<CloudStreamManager>().updatePlugin(
@@ -879,14 +879,12 @@ class _CsScreenPluginRowState extends State<_CsScreenPluginRow> {
       messenger
         ..clearSnackBars()
         ..showSnackBar(
-          SnackBar(content: Text(context.l10n.updatedName(widget.plugin.name))),
+          SnackBar(content: Text(l10n.updatedName(widget.plugin.name))),
         );
     } catch (e) {
       messenger
         ..clearSnackBars()
-        ..showSnackBar(
-          SnackBar(content: Text(context.l10n.updateFailed('$e'))),
-        );
+        ..showSnackBar(SnackBar(content: Text(l10n.updateFailed('$e'))));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -894,11 +892,13 @@ class _CsScreenPluginRowState extends State<_CsScreenPluginRow> {
 
   Future<void> _uninstall() async {
     final messenger = ScaffoldMessenger.of(context);
+    // The row may be disposed while the native extension call is running.
+    final l10n = context.l10n;
     final ok = await AppDialog.confirm(
       context,
-      title: context.l10n.uninstallNameQuestion(widget.plugin.name),
-      message: context.l10n.thisRemovesTheSourceFromYourInstalledList,
-      confirmLabel: context.l10n.uninstall,
+      title: l10n.uninstallNameQuestion(widget.plugin.name),
+      message: l10n.thisRemovesTheSourceFromYourInstalledList,
+      confirmLabel: l10n.uninstall,
       destructive: true,
     );
     if (ok != true) return;
@@ -911,16 +911,12 @@ class _CsScreenPluginRowState extends State<_CsScreenPluginRow> {
       messenger
         ..clearSnackBars()
         ..showSnackBar(
-          SnackBar(
-            content: Text(context.l10n.uninstalledName(widget.plugin.name)),
-          ),
+          SnackBar(content: Text(l10n.uninstalledName(widget.plugin.name))),
         );
     } catch (e) {
       messenger
         ..clearSnackBars()
-        ..showSnackBar(
-          SnackBar(content: Text(context.l10n.uninstallFailed('$e'))),
-        );
+        ..showSnackBar(SnackBar(content: Text(l10n.uninstallFailed('$e'))));
     } finally {
       if (mounted) setState(() => _busy = false);
     }

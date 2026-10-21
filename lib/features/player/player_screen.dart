@@ -1693,6 +1693,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// on return only if it was actually playing when you left.
   Future<void> _openSettings() async {
     final previousSpeed = sl<PlaybackPrefs>().defaultSpeed;
+    final previousSubtitle = sl<PlaybackPrefs>().subtitlePreference;
     final wasPlaying = _c.player.state.playing;
     if (wasPlaying) _c.togglePlay();
     // Settings is built for portrait, but the player pins landscape and hides
@@ -1724,6 +1725,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     await _c.applySavedPlaybackSettings();
     if (!mounted) return;
+    // A language changed in app settings must reach the still-open episode;
+    // normal track restoration runs once per episode and will not retry itself.
+    if (sl<PlaybackPrefs>().subtitlePreference != previousSubtitle) {
+      _c.reapplyPreferredSubtitle();
+    }
     if (sl<PlaybackPrefs>().defaultSpeed != previousSpeed) {
       _c.setRate(sl<PlaybackPrefs>().defaultSpeed);
     }

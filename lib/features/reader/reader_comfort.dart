@@ -50,6 +50,12 @@ mixin ReaderComfortMixin<T extends StatefulWidget> on State<T> {
       WakelockPlus.disable().ignore();
     }
 
+    // Desktop brightness belongs to Windows/the monitor; stored phone comfort
+    // preferences must not dim a PC or call unsupported mobile plugin methods.
+    if (Platform.isWindows) {
+      _applyWindowFullscreen(prefs.fullscreen);
+      return;
+    }
     final brightness = prefs.brightness;
     if (brightness >= 0) {
       ScreenBrightness.instance
@@ -61,10 +67,6 @@ mixin ReaderComfortMixin<T extends StatefulWidget> on State<T> {
       );
     }
 
-    if (Platform.isWindows) {
-      _applyWindowFullscreen(prefs.fullscreen);
-      return;
-    }
     SystemChrome.setPreferredOrientations(_orientationsFor(prefs.orientation));
 
     // Bars off while reading. `immersiveSticky`, not `immersive`: a swipe from
@@ -79,13 +81,13 @@ mixin ReaderComfortMixin<T extends StatefulWidget> on State<T> {
   /// `dispose`.
   void restoreReaderComfort() {
     WakelockPlus.disable().ignore();
-    ScreenBrightness.instance.resetApplicationScreenBrightness().catchError(
-      (_) {},
-    );
     if (Platform.isWindows) {
       _applyWindowFullscreen(null);
       return;
     }
+    ScreenBrightness.instance.resetApplicationScreenBrightness().catchError(
+      (_) {},
+    );
     SystemChrome.setPreferredOrientations(_allOrientations);
     // Unconditionally, even when fullscreen was off: the toggle can be flipped
     // from the settings sheet mid-session, so restoring only when the CURRENT

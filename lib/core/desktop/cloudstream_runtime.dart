@@ -13,6 +13,7 @@ import '../platform/app_paths.dart';
 import 'cloudstream_catalog.dart';
 import '../provider/cf_clearance_store.dart';
 import 'extension_runtime.dart';
+import 'desktop_storage.dart';
 import 'desktop_flaresolverr.dart';
 import 'desktop_cloudflare.dart';
 import 'java_properties.dart';
@@ -23,13 +24,18 @@ class DesktopCloudStream {
   DesktopCloudStream({
     this.engineFactory,
     this.dataDirectory,
+    this.relocatePluginPath,
     CloudStreamCatalog? repositoryClient,
   }) : catalog = repositoryClient ?? CloudStreamCatalog();
   final Future<Cs3Engine> Function(String)? engineFactory;
   final Directory? dataDirectory;
+
+  /// Injected only by isolated migration tests; production uses DesktopStorage.
+  final String Function(String path)? relocatePluginPath;
   static final instance = DesktopCloudStream();
   final CloudStreamCatalog catalog;
   Box<dynamic>? _box;
+  Future<Box<dynamic>>? _openingStore;
   Cs3Engine? _engine;
   Future<Cs3Engine>? _starting;
   Future<void> _mutation = Future.value();
@@ -41,8 +47,31 @@ class DesktopCloudStream {
   final Set<String> _settingsPlugins = {};
 
   /// Opens installed-plugin metadata without starting the Java process.
-  Future<Box<dynamic>> _store() async =>
-      _box ??= await openBoxSafely<dynamic>('desktop_cs_plugins');
+  Future<Box<dynamic>> _store() => _openingStore ??= _openStore().catchError((
+    Object error,
+    StackTrace stack,
+  ) {
+    _openingStore = null;
+    Error.throwWithStackTrace(error, stack);
+  });
+
+  /// Rebase once per host, never scanning the filesystem on every search.
+  Future<Box<dynamic>> _openStore() async {
+    final box = _box ??= await openBoxSafely<dynamic>('desktop_cs_plugins');
+    // Plugin metadata predates standard AppData storage and stores absolute
+    // paths. Rewrite only a known app-owned path whose migrated file exists;
+    // this same record then drives startup, update, unload and uninstall.
+    final relocate = relocatePluginPath ?? DesktopStorage.relocatedAppPath;
+    for (final key in box.keys.toList()) {
+      final raw = box.get(key);
+      if (raw is! Map || raw['path'] is! String) continue;
+      final oldPath = raw['path'] as String;
+      final newPath = relocate(oldPath);
+      if (newPath == oldPath || !await File(newPath).exists()) continue;
+      await box.put(key, {...raw, 'path': newPath});
+    }
+    return box;
+  }
 
   /// Uses the selected storage root, or an injected directory in engine tests.
   Future<Directory> _directory() async =>
@@ -66,10 +95,15 @@ class DesktopCloudStream {
   ({Map<String, dynamic> entry, String name}) _providerEntry(String key) {
     final parts = key.split('\u0001');
     final name = parts.last;
-    final matches = _installed.where((item) =>
-        (parts.length == 1 || item['id'] == parts.first) &&
-        (item['providers'] as List).any((provider) => provider['name'] == name));
-    if (matches.isEmpty) throw StateError('This CloudStream extension is not installed.');
+    final matches = _installed.where(
+      (item) =>
+          (parts.length == 1 || item['id'] == parts.first) &&
+          (item['providers'] as List).any(
+            (provider) => provider['name'] == name,
+          ),
+    );
+    if (matches.isEmpty)
+      throw StateError('This CloudStream extension is not installed.');
     return (entry: matches.first, name: name);
   }
 
@@ -78,23 +112,37 @@ class DesktopCloudStream {
   Future<bool> _resetProvider(String key) async {
     final provider = _providerEntry(key);
     final active = _engine ?? await _starting;
-    var url = '${(provider.entry['providers'] as List).firstWhere(
-        (item) => item['name'] == provider.name)['mainUrl'] ?? ''}';
+    var url =
+        '${(provider.entry['providers'] as List).firstWhere((item) => item['name'] == provider.name)['mainUrl'] ?? ''}';
     if (active?.isRunning == true) {
       try {
         final current = (await active!.providers()).whereType<Map>().firstWhere(
-            (item) => item['name'] == provider.name &&
-                item['plugin'] == p.basenameWithoutExtension(provider.entry['path'] as String));
+          (item) =>
+              item['name'] == provider.name &&
+              item['plugin'] ==
+                  p.basenameWithoutExtension(provider.entry['path'] as String),
+        );
         url = '${current['mainUrl'] ?? url}';
-      } catch (_) { /* A broken provider can still have its own state reset. */ }
+      } catch (_) {
+        /* A broken provider can still have its own state reset. */
+      }
       await active!.dispose();
     }
     _engine = null;
     _links.clear();
     var cleared = false;
-    final file = File(p.join((await _directory()).path, 'shared_prefs', 'rebuild_preference.properties'));
+    final file = File(
+      p.join(
+        (await _directory()).path,
+        'shared_prefs',
+        'rebuild_preference.properties',
+      ),
+    );
     if (await file.exists()) {
-      final result = removeJavaPropertyNamespace(latin1.decode(await file.readAsBytes()), provider.name);
+      final result = removeJavaPropertyNamespace(
+        latin1.decode(await file.readAsBytes()),
+        provider.name,
+      );
       if (result.removed > 0) {
         final staged = File('${file.path}.reset.part');
         try {
@@ -108,7 +156,9 @@ class DesktopCloudStream {
     }
     final host = Uri.tryParse(url)?.host;
     if (host != null && host.isNotEmpty) {
-      cleared = cleared || CfClearanceStore().restore().containsKey(host) ||
+      cleared =
+          cleared ||
+          CfClearanceStore().restore().containsKey(host) ||
           DesktopFlareSolverr.hasVerifiedUrl(url);
       CfClearanceStore().forget(host);
       DesktopFlareSolverr.forgetVerifiedUrl(url);
@@ -459,7 +509,9 @@ class DesktopCloudStream {
         // The engine selects a main-page request by its original name. Paging
         // every request merged unrelated rows and made "See all" repeat Home.
         final categoryData = '${args['data'] ?? ''}';
-        final category = categoryData.isNotEmpty ? categoryData : '${args['name'] ?? ''}';
+        final category = categoryData.isNotEmpty
+            ? categoryData
+            : '${args['name'] ?? ''}';
         final result = await engine.call('mainPage', {
           'provider': name,
           'plugin': plugin,
@@ -467,13 +519,15 @@ class DesktopCloudStream {
           if (method == 'getMainPagePaged') 'section': category,
         });
         final provider = (selected.entry['providers'] as List).firstWhere(
-            (item) => item['name'] == name);
+          (item) => item['name'] == name,
+        );
         final categories = (provider['sections'] as List? ?? const []).toSet();
         final sections = [
           for (final section in result['sections'] as List? ?? const [])
             if (section is Map)
               {
-                'title': section['name'], 'items': section['items'] ?? [],
+                'title': section['name'],
+                'items': section['items'] ?? [],
                 if (categories.contains(section['name'])) ...{
                   'categoryName': section['name'],
                   'categoryData': section['name'],

@@ -1,5 +1,6 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 
 import '../../core/di/injector.dart';
 import '../../core/metadata/people_service.dart';
@@ -115,12 +116,20 @@ class _PersonPageState extends State<PersonPage> {
           SliverPadding(
             padding: const EdgeInsets.fromLTRB(16, 4, 16, 40),
             sliver: SliverGrid(
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 3,
-                mainAxisSpacing: 16,
-                crossAxisSpacing: 12,
-                childAspectRatio: 0.5,
-              ),
+              // Keep filmography covers compact when this page fills a PC.
+              gridDelegate: defaultTargetPlatform == TargetPlatform.windows
+                  ? const SliverGridDelegateWithMaxCrossAxisExtent(
+                      maxCrossAxisExtent: 178,
+                      mainAxisSpacing: 16,
+                      crossAxisSpacing: 12,
+                      childAspectRatio: 0.5,
+                    )
+                  : const SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 3,
+                      mainAxisSpacing: 16,
+                      crossAxisSpacing: 12,
+                      childAspectRatio: 0.5,
+                    ),
               delegate: SliverChildBuilderDelegate(
                 (_, i) => _workCard(p.works[i]),
                 childCount: p.works.length,

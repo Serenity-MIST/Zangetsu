@@ -32,6 +32,8 @@ import '../../core/playback/external_player.dart';
 import '../../core/playback/my_list.dart';
 import '../../core/playback/playback_prefs.dart';
 import '../../core/playback/watch_history.dart';
+import '../../core/reading/read_history.dart';
+import 'library_cloud_sync.dart';
 import '../auth/reconnect.dart';
 import '../home/home_catalogue_prefs.dart';
 import '../../core/privacy/incognito_mode.dart';
@@ -207,9 +209,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _syncShellBackIntercept();
       return done.future;
     }
-    return Navigator.of(
-      context,
-    ).push(MaterialPageRoute<void>(builder: builder));
+    // Desktop leaf pages must match the in-hub section slide/fade below;
+    // MaterialPageRoute otherwise chooses a different platform animation.
+    final desktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+    return Navigator.of(context).push<void>(
+      desktop
+          ? PageRouteBuilder<void>(
+              pageBuilder: (context, animation, secondaryAnimation) =>
+                  builder(context),
+              transitionDuration: const Duration(milliseconds: 280),
+              reverseTransitionDuration: const Duration(milliseconds: 280),
+              transitionsBuilder:
+                  (context, animation, secondaryAnimation, child) {
+                    final curved = animation.drive(
+                      CurveTween(curve: Curves.easeOutCubic),
+                    );
+                    return FadeTransition(
+                      opacity: curved,
+                      child: SlideTransition(
+                        position: curved.drive(
+                          Tween<Offset>(
+                            begin: const Offset(1, 0),
+                            end: Offset.zero,
+                          ),
+                        ),
+                        child: child,
+                      ),
+                    );
+                  },
+            )
+          : MaterialPageRoute<void>(builder: builder),
+    );
   }
 
   void _removeTvLeaf(Page<dynamic> page) {
@@ -1031,17 +1061,30 @@ class _SettingsScreenState extends State<SettingsScreen> {
         messenger
           ..clearSnackBars()
           ..showSnackBar(SnackBar(content: Text(l10n.syncingLibraryToCloud)));
-        final h = (await sl<WatchHistory>().pushAllLocalToCloud()).pushed;
-        final l = (await sl<MyListStore>().pushAllLocalToCloud()).pushed;
+        // Reading progress is part of the same library as watch progress.
+        // Preserve partial failures instead of treating a failed upload as an
+        // empty, already-synced library, and continue with the other stores.
+        final history = await uploadLibraryStores([
+          sl<WatchHistory>().pushAllLocalToCloud,
+          if (sl.isRegistered<ReadHistory>())
+            sl<ReadHistory>().pushAllLocalToCloud,
+        ]);
+        final list = await uploadLibraryStores([
+          sl<MyListStore>().pushAllLocalToCloud,
+        ]);
+        final failed = history.failed + list.failed;
         if (!mounted) return;
         messenger
           ..clearSnackBars()
           ..showSnackBar(
             SnackBar(
               content: Text(
-                h == 0 && l == 0
+                failed > 0
+                    ? 'Synced ${history.pushed + list.pushed} items. '
+                          '$failed uploads could not finish. ${l10n.tryAgain}.'
+                    : history.pushed == 0 && list.pushed == 0
                     ? l10n.syncLibraryAlreadySynced
-                    : l10n.syncLibraryPushed(h, l),
+                    : l10n.syncLibraryPushed(history.pushed, list.pushed),
               ),
             ),
           );

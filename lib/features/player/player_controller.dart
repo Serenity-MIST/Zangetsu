@@ -817,7 +817,11 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// ExoPlayer-based apps.
   /// Apply runtime settings when returning from the Settings route.
   Future<void> applySavedPlaybackSettings() async {
+    // Reconfiguring mpv also applies the default gain. Preserve the user's
+    // current volume/mute when returning from settings instead of resetting it.
+    final volume = player.state.volume;
     await _configureMpv();
+    await player.setVolume(volume);
     await applySubtitleStyle();
   }
 
@@ -1991,6 +1995,25 @@ class PlayerCubit extends Cubit<PlayerState> {
   void reapplyPreferredSubtitle() {
     _subApplied = false;
     _autoSubDlTried = false;
+    if (sl<PlaybackPrefs>().subtitlePreference.isEmpty) {
+      // Auto after Off is an actual transition: release the explicit "no"
+      // track and restore the source default rather than leaving subs muted.
+      if (softSubs.isNotEmpty) {
+        final sourceDefault = softSubs.firstWhere(
+          (sub) => sub.isDefault,
+          orElse: () => softSubs.first,
+        );
+        unawaited(
+          _setRemoteSub(
+            sourceDefault.url,
+            title: sourceDefault.label ?? sourceDefault.lang,
+            language: sourceDefault.lang,
+          ),
+        );
+      } else {
+        player.setSubtitleTrack(SubtitleTrack.auto());
+      }
+    }
     _tryApplySubPref();
   }
 
@@ -2609,9 +2632,15 @@ class PlayerCubit extends Cubit<PlayerState> {
     // Fail before subscribing: an absent event channel otherwise leaves the
     // player stuck on "Finding peers" with an asynchronous plugin exception.
     if (!Platform.isAndroid) {
-      emit(state.copyWith(torrentPhase: () => null, loadingSources: false,
-          error: () => 'Torrent streaming is not available on this platform. '
-              'Choose a direct video source.'));
+      emit(
+        state.copyWith(
+          torrentPhase: () => null,
+          loadingSources: false,
+          error: () =>
+              'Torrent streaming is not available on this platform. '
+              'Choose a direct video source.',
+        ),
+      );
       return null;
     }
     await _stopTorrent();
@@ -3683,9 +3712,9 @@ class PlayerCubit extends Cubit<PlayerState> {
       sl<PlaybackPrefs>().styledSubtitles ? 'no' : 'force',
     );
     await set('sub-scale', prefs.subtitleScale.toString());
-    if (prefs.subtitleFont.isNotEmpty) {
-      await set('sub-font', prefs.subtitleFont);
-    }
+    // Empty clears a previously selected font when Reset restores defaults.
+    // Skipping the property would leave the old libass family active forever.
+    await set('sub-font', prefs.subtitleFont);
     await set('sub-color', color);
     await set('sub-back-color', back);
     // Outline preset → libass. This used to be a hardcoded border size, so

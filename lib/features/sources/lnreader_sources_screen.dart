@@ -837,6 +837,8 @@ class _LnReaderSourceRowState extends State<_LnReaderSourceRow> {
       // given id wins, whichever repo it came from. Acceptable: it just
       // overwrites the stored JS, never crashes.
       await sl<LnReaderExtensionService>().install(widget.meta);
+      // The install remains valid after navigation; its old row and parent do not.
+      if (!mounted) return;
       widget.onChanged();
       messenger
         ..clearSnackBars()
@@ -844,6 +846,7 @@ class _LnReaderSourceRowState extends State<_LnReaderSourceRow> {
           SnackBar(content: Text(context.l10n.installedName(widget.meta.name))),
         );
     } catch (e) {
+      if (!mounted) return;
       messenger
         ..clearSnackBars()
         ..showSnackBar(
@@ -867,6 +870,8 @@ class _LnReaderSourceRowState extends State<_LnReaderSourceRow> {
     setState(() => _busy = true);
     try {
       await sl<LnReaderManager>().uninstall(widget.meta.id);
+      // Removing an extension must not rebuild a route that has already closed.
+      if (!mounted) return;
       widget.onChanged();
       messenger
         ..clearSnackBars()
@@ -874,6 +879,7 @@ class _LnReaderSourceRowState extends State<_LnReaderSourceRow> {
           SnackBar(content: Text(context.l10n.removedName(widget.meta.name))),
         );
     } catch (e) {
+      if (!mounted) return;
       messenger
         ..clearSnackBars()
         ..showSnackBar(

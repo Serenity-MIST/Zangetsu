@@ -58,7 +58,9 @@ class DesktopPlayerInput extends StatelessWidget {
         autofocus: true,
         child: Listener(
           onPointerSignal: (event) {
-            if (event is PointerScrollEvent) {
+            // A horizontal touchpad gesture must not lower the volume: only
+            // vertical wheel movement represents the desktop volume action.
+            if (event is PointerScrollEvent && event.scrollDelta.dy != 0) {
               GestureBinding.instance.pointerSignalResolver.register(
                 event,
                 (_) => onVolume(event.scrollDelta.dy < 0 ? 5 : -5),

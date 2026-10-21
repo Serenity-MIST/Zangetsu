@@ -1,4 +1,5 @@
 import '../desktop/extension_runtime.dart';
+import '../desktop/desktop_storage.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -29,6 +30,44 @@ class AniyomiExtensionService {
   /// Hive box name used to persist installed pkg → apk-path entries so they
   /// can be reloaded on a cold start without re-downloading.
   static const String installedBoxName = 'aniyomi_installed';
+
+  /// Removes both durable installation metadata and the APK that cold-start
+  /// scanning reloads. Keep metadata on a failed file delete so removal can be
+  /// retried, and never delete the retained pre-migration recovery copy.
+  static Future<String?> uninstall(String pkg, {Directory? aniyomiDir}) async {
+    if (DesktopExtensionRuntime.isAvailable) {
+      try {
+        await _channel.invokeMethod<void>('uninstallExtension', {'pkg': pkg});
+      } catch (error) {
+        return '$error';
+      }
+    }
+    final box = Hive.isBoxOpen(installedBoxName)
+        ? Hive.box<dynamic>(installedBoxName)
+        : null;
+    var apkPath = box?.get(pkg) as String?;
+    if (Platform.isWindows && apkPath != null) {
+      apkPath = DesktopStorage.relocatedAppPath(apkPath);
+    }
+    try {
+      if (apkPath == null) {
+        final dir =
+            aniyomiDir ??
+            Directory(
+              '${(await getApplicationSupportDirectory()).path}/aniyomi',
+            );
+        final candidate = File('${dir.path}/$pkg.apk');
+        if (!await candidate.exists()) return 'apk not found';
+        apkPath = candidate.path;
+      }
+      final apk = File(apkPath);
+      if (await apk.exists()) await apk.delete();
+      await box?.delete(pkg);
+      return null;
+    } catch (error) {
+      return '$error';
+    }
+  }
 
   /// Loads and registers a single extension APK located at [apkPath].
   ///

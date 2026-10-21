@@ -1,99 +1,259 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
-import 'package:path_provider_windows/path_provider_windows.dart';
-import 'package:shared_preferences_windows/shared_preferences_windows.dart';
-import 'package:shared_preferences_platform_interface/shared_preferences_platform_interface.dart';
-import 'package:shared_preferences_platform_interface/shared_preferences_async_platform_interface.dart';
 
-/// One selected root; the Windows profile retains only the location pointer.
+/// Windows app-owned data lives in the OS application-support directory.
+/// Downloads have an independent location and never move with app preferences.
 class DesktopStorage {
   static String? root;
+  static String? downloadsRoot;
+  static String? previousRoot;
 
-  /// Selects/restores the root before services open files, then redirects
-  /// path_provider and shared-preference APIs to the selected location.
+  /// Repoints app-owned extension/cache records after an upgrade. Download
+  /// paths and files outside the old AppData tree are deliberately unchanged.
+  static String relocatedAppPath(String value) {
+    if (root == null || previousRoot == null || !p.isAbsolute(value)) {
+      return value;
+    }
+    final previous = p.normalize(p.join(previousRoot!, 'AppData'));
+    final target = p.normalize(p.join(root!, 'AppData'));
+    final path = p.normalize(value);
+    if (p.equals(previous, path)) return target;
+    if (!p.isWithin(previous, path)) return value;
+    return p.join(target, p.relative(path, from: previous));
+  }
+
+  /// Completes migration before Hive, auth sessions or browser profiles open.
   static Future<void> initialize() async {
     if (!Platform.isWindows) return;
     final original = PathProviderPlatform.instance;
-    final previous = await original.getApplicationSupportPath();
-    if (previous == null)
-      throw StateError('Windows application data is unavailable');
-    final pointer = File(p.join(previous, 'storage-root.json'));
-    String? selected;
-    try {
-      final data = jsonDecode(await pointer.readAsString());
-      selected = data['root'] as String?;
-      if (selected != null && !await Directory(selected).exists())
-        selected = null;
-    } catch (_) {}
-    if (selected == null) {
-      final done = Completer<String>();
-      runApp(
-        MaterialApp(
-          debugShowCheckedModeBanner: false,
-          theme: ThemeData.dark(),
-          home: _StorageSetup(
-            onChosen: (value) {
-              if (!done.isCompleted) done.complete(value);
-            },
-            previous: previous,
+    final support = await original.getApplicationSupportPath();
+    final downloads = await original.getDownloadsPath();
+    if (support == null || downloads == null) {
+      throw StateError('Windows application folders are unavailable');
+    }
+    // A missing removable legacy folder must offer recovery, not a black
+    // startup screen or a fresh empty account. No database is open at this point.
+    while (true) {
+      try {
+        await prepare(
+          supportPath: support,
+          systemDownloadsPath: downloads,
+          onMigrating: () => runApp(
+            MaterialApp(
+              debugShowCheckedModeBanner: false,
+              theme: ThemeData.dark(),
+              home: const _StorageProgressScreen(),
+            ),
           ),
-        ),
-      );
-      selected = await done.future;
-      await pointer.parent.create(recursive: true);
-      await pointer.writeAsString(jsonEncode({'root': selected}), flush: true);
+        );
+        break;
+      } catch (_) {
+        final retry = Completer<void>();
+        runApp(
+          MaterialApp(
+            debugShowCheckedModeBanner: false,
+            theme: ThemeData.dark(),
+            home: _StorageRecoveryScreen(
+              onRetry: () {
+                if (!retry.isCompleted) retry.complete();
+              },
+            ),
+          ),
+        );
+        await retry.future;
+      }
     }
-    root = selected;
-    for (final name in ['AppData', 'Downloads', 'Backups']) {
-      await Directory(p.join(selected, name)).create(recursive: true);
-    }
-    PathProviderPlatform.instance = _SelectedPaths(original, selected);
-    // Shared preferences constructs its own Windows provider; route the auth
-    // session file as well as path_provider clients to the selected folder.
-    final windowsPaths = _SelectedWindowsPaths(selected);
-    final legacyPreferences = SharedPreferencesStorePlatform.instance;
-    if (legacyPreferences is SharedPreferencesWindows)
-      legacyPreferences.pathProvider = windowsPaths;
-    final preferences = SharedPreferencesAsyncPlatform.instance;
-    if (preferences is SharedPreferencesAsyncWindows)
-      preferences.pathProvider = windowsPaths;
+    PathProviderPlatform.instance = _ApplicationPaths(
+      original,
+      root!,
+      downloadsRoot!,
+    );
   }
 
-  /// Copy before activation, retaining originals and avoiding links/self-copy.
-  static Future<void> migrate(String previous, String selected) async {
-    final destination = p.join(selected, 'AppData');
+  /// Restores versioned routing or copies the legacy root before committing it.
+  /// The old directory remains an untouched rollback copy; a failed copy leaves
+  /// routing unchanged, so retrying startup resumes safely instead of losing data.
+  static Future<void> prepare({
+    required String supportPath,
+    required String systemDownloadsPath,
+    VoidCallback? onMigrating,
+  }) async {
+    final pointer = File(p.join(supportPath, 'storage-root.json'));
+    Map<String, dynamic> saved = {};
+    final previousPointer = File('${pointer.path}.previous');
+    final routing = await pointer.exists() ? pointer : previousPointer;
+    if (await routing.exists()) {
+      // Corruption must be visible rather than treated as a fresh empty account.
+      saved = Map<String, dynamic>.from(
+        jsonDecode(await routing.readAsString()) as Map,
+      );
+    }
+    final legacyRoot = saved['root'] as String?;
+    final version = saved['version'] as int? ?? 1;
+    final downloads =
+        (saved['downloadsRoot'] as String?) ??
+        (version < 2 && legacyRoot != null
+            ? p.join(legacyRoot, 'Downloads')
+            : p.join(systemDownloadsPath, 'Zangetsu'));
+    await Directory(supportPath).create(recursive: true);
+    if (version < 2) {
+      onMigrating?.call();
+      final source = legacyRoot == null
+          ? supportPath
+          : p.join(legacyRoot, 'AppData');
+      if (legacyRoot != null && !await Directory(source).exists()) {
+        throw StateError(
+          'The previous Zangetsu data folder is unavailable. Restore it before starting.',
+        );
+      }
+      await migrate(source, supportPath);
+      // SharedPreferencesWindows intentionally owns its native support path.
+      // Move the active session there rather than overriding a test-only API.
+      final session = File(p.join(source, 'shared_preferences.json'));
+      if (await session.exists()) {
+        await _copyFileVerified(
+          session,
+          File(p.join(supportPath, 'shared_preferences.json')),
+          File(
+            p.join(
+              supportPath,
+              'MigrationBackups',
+              'native-shared_preferences.json',
+            ),
+          ),
+        );
+      }
+      if (legacyRoot != null &&
+          !p.equals(p.absolute(legacyRoot), p.absolute(supportPath))) {
+        await _copyVerified(
+          p.join(legacyRoot, 'Backups'),
+          p.join(supportPath, 'Backups'),
+        );
+      }
+      final staged = File('${pointer.path}.pending');
+      await staged.writeAsString(
+        jsonEncode({
+          'version': 2,
+          'root': supportPath,
+          'downloadsRoot': downloads,
+          if (legacyRoot != null) 'previousRoot': legacyRoot,
+        }),
+        flush: true,
+      );
+      // On Windows rename does not replace an existing destination. Preserve the
+      // old pointer first; if interrupted, prepare() can still recover from it.
+      if (await pointer.exists()) {
+        final backup = File('${pointer.path}.previous');
+        if (!await backup.exists()) await pointer.copy(backup.path);
+      }
+      if (await pointer.exists()) await pointer.delete();
+      await staged.rename(pointer.path);
+    }
+    root = supportPath;
+    previousRoot = version < 2 ? legacyRoot : saved['previousRoot'] as String?;
+    downloadsRoot = downloads;
+    await Directory(p.join(supportPath, 'AppData')).create(recursive: true);
+    await Directory(p.join(supportPath, 'Backups')).create(recursive: true);
+    // Download folders are created by the download flow, not by app startup.
+    // An unplugged download drive must not lock the user out of their library.
+  }
+
+  /// Public migration entry retained for upgrades from the selected-root layout.
+  static Future<void> migrate(String previous, String selected) =>
+      _copyVerified(previous, p.join(selected, 'AppData'));
+
+  /// Copies closed data files through staging files and verifies SHA-256 bytes.
+  /// Existing different destinations are backed up before replacement. Symlinks,
+  /// runtime locks and the migration destination itself are never traversed.
+  static Future<void> _copyVerified(String previous, String destination) async {
     final source = p.normalize(p.absolute(previous));
     final target = p.normalize(p.absolute(destination));
-    if (p.equals(source, target)) return;
-    await Directory(target).create(recursive: true);
-    if (!await Directory(source).exists()) return;
-    await for (final entry in Directory(
-      source,
-    ).list(recursive: true, followLinks: false)) {
-      if (entry is! File || p.isWithin(target, entry.path)) continue;
-      final relative = p.relative(entry.path, from: source);
-      if (relative == 'storage-root.json' ||
-          relative.endsWith('.lock') ||
-          relative.startsWith('browser'))
-        continue;
-      final copied = File(p.join(target, relative));
-      if (await copied.exists()) continue;
-      await copied.parent.create(recursive: true);
-      await entry.copy(copied.path);
+    if (p.equals(source, target) || !await Directory(source).exists()) return;
+    if (p.isWithin(source, target) && p.basename(target) != 'AppData') {
+      throw StateError('Invalid nested migration destination');
     }
+    await Directory(target).create(recursive: true);
+    final pending = <Directory>[Directory(source)];
+    while (pending.isNotEmpty) {
+      await for (final entry in pending.removeLast().list(followLinks: false)) {
+        final name = p.basename(entry.path);
+        if (p.equals(entry.path, target) ||
+            p.isWithin(target, entry.path) ||
+            name == 'MigrationBackups' ||
+            (p.isWithin(source, target) && name == 'Backups') ||
+            name == 'storage-root.json' ||
+            name.startsWith('storage-root.json.') ||
+            name.endsWith('.lock') ||
+            name.endsWith('.migrating') ||
+            const {
+              'LOCK',
+              'SingletonLock',
+              'SingletonCookie',
+              'SingletonSocket',
+              'DevToolsActivePort',
+            }.contains(name)) {
+          continue;
+        }
+        if (entry is Directory) {
+          pending.add(entry);
+        } else if (entry is File) {
+          final relative = p.relative(entry.path, from: source);
+          final copied = File(p.join(target, relative));
+          await _copyFileVerified(
+            entry,
+            copied,
+            File(p.join(p.dirname(target), 'MigrationBackups', relative)),
+          );
+        }
+      }
+    }
+  }
+
+  /// Verifies each staged file and keeps the first displaced destination for
+  /// rollback. A second interrupted run can safely compare and reuse its copy.
+  static Future<void> _copyFileVerified(
+    File source,
+    File target,
+    File backup,
+  ) async {
+    if (p.equals(
+      p.normalize(p.absolute(source.path)),
+      p.normalize(p.absolute(target.path)),
+    )) {
+      return;
+    }
+    final sourceDigest = await sha256.bind(source.openRead()).first;
+    if (await target.exists()) {
+      if (await sha256.bind(target.openRead()).first == sourceDigest) return;
+      await backup.parent.create(recursive: true);
+      if (!await backup.exists()) await target.copy(backup.path);
+    }
+    await target.parent.create(recursive: true);
+    final staged = File('${target.path}.migrating');
+    await source.copy(staged.path);
+    if (await sha256.bind(staged.openRead()).first != sourceDigest) {
+      throw StateError('Could not verify migrated application data');
+    }
+    await staged.copy(target.path);
+    if (await sha256.bind(target.openRead()).first != sourceDigest) {
+      throw StateError('Could not verify activated application data');
+    }
+    await staged.delete();
   }
 }
 
-/// Redirects app-owned paths while preserving the system Documents location.
-class _SelectedPaths extends PathProviderPlatform {
-  _SelectedPaths(this.original, this.root);
+/// Routes application files to AppData while leaving Documents unchanged.
+class _ApplicationPaths extends PathProviderPlatform {
+  _ApplicationPaths(this.original, this.root, this.downloads);
   final PathProviderPlatform original;
   final String root;
+  final String downloads;
   @override
   Future<String?> getApplicationSupportPath() async => p.join(root, 'AppData');
   @override
@@ -110,48 +270,13 @@ class _SelectedPaths extends PathProviderPlatform {
   Future<String?> getApplicationDocumentsPath() =>
       original.getApplicationDocumentsPath();
   @override
-  Future<String?> getDownloadsPath() async => p.join(root, 'Downloads');
+  Future<String?> getDownloadsPath() async => downloads;
 }
 
-/// First-launch folder chooser shown before account/database initialization.
-class _StorageSetup extends StatefulWidget {
-  const _StorageSetup({required this.onChosen, required this.previous});
-  final void Function(String) onChosen;
-  final String previous;
-  @override
-  State<_StorageSetup> createState() => _StorageSetupState();
-}
-
-/// Checks write access and migrates existing data before accepting a folder.
-class _StorageSetupState extends State<_StorageSetup> {
-  bool busy = false;
-  String? error;
-
-  /// Picks a directory, probes write access and retains originals on migration.
-  /// Cancellation keeps setup open rather than starting in an unknown root.
-  Future<void> choose() async {
-    final folder = await FilePicker.getDirectoryPath(
-      dialogTitle: 'Choose your Zangetsu data folder',
-    );
-    if (folder == null || !mounted) return;
-    setState(() {
-      busy = true;
-      error = null;
-    });
-    try {
-      final probe = File(p.join(folder, '.zangetsu-write-check'));
-      await probe.writeAsString('');
-      await probe.delete();
-      await DesktopStorage.migrate(widget.previous, folder);
-      widget.onChosen(folder);
-    } catch (_) {
-      if (mounted)
-        setState(() {
-          busy = false;
-          error = 'This folder could not be used. Choose another folder.';
-        });
-    }
-  }
+/// Explains a failed pre-boot migration without offering destructive reset.
+class _StorageRecoveryScreen extends StatelessWidget {
+  const _StorageRecoveryScreen({required this.onRetry});
+  final VoidCallback onRetry;
 
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -165,34 +290,22 @@ class _StorageSetupState extends State<_StorageSetup> {
             mainAxisSize: MainAxisSize.min,
             children: [
               const Icon(
-                Icons.folder_rounded,
-                size: 64,
+                Icons.folder_off_outlined,
+                size: 48,
                 color: Color(0xffff465b),
               ),
-              const SizedBox(height: 24),
+              const SizedBox(height: 20),
               const Text(
-                'Choose your data folder',
-                style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+                'Your app data could not be opened',
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
               ),
               const SizedBox(height: 16),
               const Text(
-                'Your accounts, library, downloads and backups will live here, organized in AppData, Downloads and Backups.',
+                'Your previous files have been kept. Make sure the previous data folder or drive is available and there is enough free space, then try again.',
                 textAlign: TextAlign.center,
               ),
-              const SizedBox(height: 28),
-              if (busy)
-                const CircularProgressIndicator()
-              else
-                FilledButton.icon(
-                  onPressed: choose,
-                  icon: const Icon(Icons.folder_open),
-                  label: const Text('Choose folder'),
-                ),
-              if (error != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 16),
-                  child: Text(error!),
-                ),
+              const SizedBox(height: 24),
+              FilledButton(onPressed: onRetry, child: const Text('Try again')),
             ],
           ),
         ),
@@ -201,10 +314,36 @@ class _StorageSetupState extends State<_StorageSetup> {
   );
 }
 
-/// Redirects shared-preference implementations that construct a path provider.
-class _SelectedWindowsPaths extends PathProviderWindows {
-  _SelectedWindowsPaths(this.root);
-  final String root;
+/// Keeps the first upgrade responsive while large extension/browser files copy.
+class _StorageProgressScreen extends StatelessWidget {
+  const _StorageProgressScreen();
   @override
-  Future<String?> getApplicationSupportPath() async => p.join(root, 'AppData');
+  Widget build(BuildContext context) => const Scaffold(
+    backgroundColor: Color(0xff0b0b10),
+    body: Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: 28,
+            height: 28,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: Color(0xffff465b),
+            ),
+          ),
+          SizedBox(height: 24),
+          Text(
+            'Preparing your library',
+            style: TextStyle(fontSize: 22, fontWeight: FontWeight.w600),
+          ),
+          SizedBox(height: 12),
+          Text(
+            'Keeping your accounts and settings safe. Your downloads will stay where they are.',
+            textAlign: TextAlign.center,
+          ),
+        ],
+      ),
+    ),
+  );
 }

@@ -1,4 +1,5 @@
 import '../desktop/extension_runtime.dart';
+import '../desktop/desktop_storage.dart';
 import '../models/source_pref.dart';
 import 'dart:convert';
 import 'dart:io';
@@ -74,6 +75,9 @@ class MihonExtensionService {
     if (Hive.isBoxOpen(installedBoxName)) {
       final box = Hive.box<dynamic>(installedBoxName);
       apkPath = box.get(pkg) as String?;
+      if (Platform.isWindows && apkPath != null) {
+        apkPath = DesktopStorage.relocatedAppPath(apkPath);
+      }
       await box.delete(pkg);
     }
     // The box is only a convenience cache of the path, and it has been seen

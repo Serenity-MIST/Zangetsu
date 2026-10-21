@@ -61,15 +61,16 @@ class _SourcePrefsScreenState extends State<SourcePrefsScreen> {
       return;
     }
     setState(() {
-      _prefs = [..._prefs]..[i] = SourcePref(
-        key: p.key,
-        type: p.type,
-        title: p.title,
-        summary: p.summary,
-        value: value,
-        entries: p.entries,
-        values: p.values,
-      );
+      _prefs = [..._prefs]
+        ..[i] = SourcePref(
+          key: p.key,
+          type: p.type,
+          title: p.title,
+          summary: p.summary,
+          value: value,
+          entries: p.entries,
+          values: p.values,
+        );
     });
   }
 
@@ -134,8 +135,7 @@ class _SourcePrefsScreenState extends State<SourcePrefsScreen> {
         child: Row(
           children: [
             Expanded(child: Text(label, style: AppText.headline)),
-            if (selected)
-              Icon(Icons.check, color: AppColors.accent, size: 20),
+            if (selected) Icon(Icons.check, color: AppColors.accent, size: 20),
           ],
         ),
       ),
@@ -305,17 +305,12 @@ class _SourcePrefsScreenState extends State<SourcePrefsScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: AppColors.bg,
-      appBar: AppBar(
-        backgroundColor: AppColors.bg,
-        title: Text(widget.title, style: AppText.headline),
-      ),
+      appBar: settingsAppBar(widget.title),
       body: ListView(
         padding: const EdgeInsets.only(top: 8, bottom: 24),
         children: [
           SettingsCard(
-            children: [
-              for (var i = 0; i < _prefs.length; i++) _row(i),
-            ],
+            children: [for (var i = 0; i < _prefs.length; i++) _row(i)],
           ),
           if (widget.onOpenNative != null) ...[
             SettingsSectionLabel(context.l10n.otherSettings),

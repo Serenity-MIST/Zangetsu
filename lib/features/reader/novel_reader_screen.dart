@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, TargetPlatform;
 import 'package:flutter_widget_from_html/flutter_widget_from_html.dart';
 
 import '../../core/di/injector.dart';
@@ -17,6 +19,7 @@ import '../../core/tracker/tracker.dart';
 import '../../core/tracker/tracker_hub.dart';
 import 'novel_paginator.dart';
 import 'reader_chrome.dart';
+import 'desktop_reader_input.dart';
 import 'reader_auto_scroll.dart';
 import 'reader_auto_scroll_ui.dart';
 import 'reader_comfort.dart';
@@ -24,9 +27,8 @@ import 'reader_pull_chapter.dart';
 import '../../l10n/l10n.dart';
 
 /// Text reader for manga/novel chapters — the reading counterpart of the
-/// video player. Phone-only (no TV twin, no TV focus handling needed).
-///
-/// Nothing routes here yet; Task 11 wires the Detail screen to push it.
+/// video player. Desktop uses transient hover controls and keyboard/mouse input;
+/// touch platforms retain their configured tap zones.
 class NovelReaderScreen extends StatefulWidget {
   const NovelReaderScreen({
     super.key,
@@ -178,6 +180,8 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
   }
 
   Future<void> _load() async {
+    // A slow previous request must not replace a newly selected chapter.
+    final chapterId = _chapter.id;
     setState(() {
       _loading = true;
       _error = null;
@@ -187,14 +191,14 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
         _chapter.url,
         sourceId: widget.sourceId,
       );
-      if (!mounted) return;
+      if (!mounted || _chapter.id != chapterId) return;
       setState(() {
         _text = text;
         _loading = false;
       });
       _restoreScrollPosition();
     } catch (_) {
-      if (!mounted) return;
+      if (!mounted || _chapter.id != chapterId) return;
       setState(() {
         _error = "Couldn't load this chapter.";
         _loading = false;
@@ -223,12 +227,18 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     // Set now, not after the poll lands — a dispose before the poll settles
     // must not fall back to 0 (see `_lastScrollPermille`'s own doc).
     _lastScrollPermille = saved.pos;
-    WidgetsBinding.instance.addPostFrameCallback(
-      (_) => _pollRestoreScroll(saved.pos / 1000),
-    );
+    final chapterId = _chapter.id;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _chapter.id == chapterId) {
+        _pollRestoreScroll(saved.pos / 1000, chapterId: chapterId);
+      }
+    });
   }
 
-  Future<void> _pollRestoreScroll(double fraction) async {
+  Future<void> _pollRestoreScroll(
+    double fraction, {
+    required String chapterId,
+  }) async {
     // Bounded by a fixed tick count, NOT a DateTime.now() deadline: widget
     // tests run on a faked clock where wall-time barely advances, so a
     // real-clock deadline would never trip and this loop would spin forever
@@ -236,7 +246,10 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     double? lastMax;
     for (
       var tick = 0;
-      tick < 60 && mounted && _scrollController.hasClients;
+      tick < 60 &&
+          mounted &&
+          _chapter.id == chapterId &&
+          _scrollController.hasClients;
       tick++
     ) {
       final pos = _scrollController.position;
@@ -429,7 +442,40 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     _load();
   }
 
-  void _toggleChrome() => setState(() => _chromeVisible = !_chromeVisible);
+  bool get _desktopReader => defaultTargetPlatform == TargetPlatform.windows;
+
+  void _toggleChrome() {
+    if (_desktopReader) return;
+    setState(() => _chromeVisible = !_chromeVisible);
+  }
+
+  /// Shares the visible scroll controller so wheel/key input saves progress.
+  void _desktopScroll(double delta) {
+    if (!_scrollController.hasClients || _loading) return;
+    final position = _scrollController.position;
+    _scrollController.jumpTo(
+      (position.pixels + delta).clamp(
+        position.minScrollExtent,
+        position.maxScrollExtent,
+      ),
+    );
+  }
+
+  /// Logical page order is independent of the text's visual direction.
+  void _desktopPage(bool forward) {
+    if (!_pageController.hasClients || _loading) return;
+    if (forward) {
+      _pageController.nextPage(
+        duration: const Duration(milliseconds: 140),
+        curve: Curves.easeOut,
+      );
+    } else {
+      _pageController.previousPage(
+        duration: const Duration(milliseconds: 140),
+        curve: Curves.easeOut,
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -437,47 +483,79 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     final theme = _readerTheme(prefs.theme);
     return Scaffold(
       backgroundColor: _dimmedBg(theme, prefs.novelBgOpacity),
-      body: Stack(
-        children: [
-          Positioned.fill(
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTapUp: (d) => _dispatchTap(d.globalPosition),
-              // Touch pauses; lifting resumes after a grace. See the manga
-              // reader — stopping outright on a drag made a nudge fatal.
-              child: Listener(
-                onPointerDown: (_) => _autoScroll.pauseForTouch(),
-                onPointerUp: (_) => _autoScroll.resumeAfterTouch(),
-                onPointerCancel: (_) => _autoScroll.resumeAfterTouch(),
-                child: ReaderPullChapter(
-                  enabled: prefs.overscrollChapter,
-                  hasPrev: _prevIndex != null,
-                  hasNext: _nextIndex != null,
-                  prevLabel: _chapterLabel(_prevIndex),
-                  nextLabel: _chapterLabel(_nextIndex),
-                  onChangeChapter: (d) =>
-                      _goToChapter(d > 0 ? _nextIndex : _prevIndex),
+      body: _desktopReader
+          ? DesktopReaderInput(
+              direction: !prefs.novelPaginated
+                  ? 'vertical'
+                  : resolveNovelDirection(prefs, _text?.html ?? '') ==
+                        TextDirection.rtl
+                  ? 'rtl'
+                  : 'ltr',
+              onVerticalScroll: _desktopScroll,
+              onPageStep: _desktopPage,
+              builder: (top, bottom) => _buildReaderStack(
+                theme,
+                prefs,
+                topVisible: top,
+                bottomVisible: bottom,
+              ),
+            )
+          : _buildReaderStack(theme, prefs),
+    );
+  }
+
+  /// Keeps content mounted while independently fading the two desktop edges.
+  Widget _buildReaderStack(
+    _ReaderTheme theme,
+    ReaderPrefs prefs, {
+    bool? topVisible,
+    bool? bottomVisible,
+  }) => Stack(
+    children: [
+      Positioned.fill(
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapUp: (d) => _dispatchTap(d.globalPosition),
+          // Touch pauses; lifting resumes after a grace. See the manga
+          // reader — stopping outright on a drag made a nudge fatal.
+          child: Listener(
+            onPointerDown: (_) => _autoScroll.pauseForTouch(),
+            onPointerUp: (_) => _autoScroll.resumeAfterTouch(),
+            onPointerCancel: (_) => _autoScroll.resumeAfterTouch(),
+            child: ReaderPullChapter(
+              enabled: !_desktopReader && prefs.overscrollChapter,
+              hasPrev: _prevIndex != null,
+              hasNext: _nextIndex != null,
+              prevLabel: _chapterLabel(_prevIndex),
+              nextLabel: _chapterLabel(_nextIndex),
+              onChangeChapter: (d) =>
+                  _goToChapter(d > 0 ? _nextIndex : _prevIndex),
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxWidth: _desktopReader ? 960 : double.infinity,
+                  ),
                   child: _buildBody(theme, prefs),
                 ),
               ),
             ),
           ),
-          // Always mounted now (fade instead of build-if-visible) — see the
-          // IgnorePointer inside each for why that doesn't eat page taps.
-          _buildTopBar(),
-          _buildBottomBar(),
-          if (prefs.autoScrollButton)
-            ReaderAutoScrollButton(
-              autoScroll: _autoScroll,
-              onTap: _openAutoScrollSheet,
-              initialX: prefs.autoScrollButtonX,
-              initialY: prefs.autoScrollButtonY,
-              onMoved: prefs.setAutoScrollButtonPos,
-            ),
-        ],
+        ),
       ),
-    );
-  }
+      // Always mounted now (fade instead of build-if-visible) — see the
+      // IgnorePointer inside each for why that doesn't eat page taps.
+      _buildTopBar(visible: topVisible),
+      _buildBottomBar(visible: bottomVisible),
+      if (!_desktopReader && prefs.autoScrollButton)
+        ReaderAutoScrollButton(
+          autoScroll: _autoScroll,
+          onTap: _openAutoScrollSheet,
+          initialX: prefs.autoScrollButtonX,
+          initialY: prefs.autoScrollButtonY,
+          onMoved: prefs.setAutoScrollButtonPos,
+        ),
+    ],
+  );
 
   /// Display name for a neighbouring chapter, for the pull indicator.
   String? _chapterLabel(int? i) {
@@ -716,12 +794,20 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     final key =
         '${identityHashCode(_text)}|${base.fontSize}|${base.fontFamily}'
         '|${base.height}|${base.letterSpacing}|${base.wordSpacing}'
+        '|${sl<ReaderPrefs>().paragraphSpacing}'
         '|${pageSize.width.toStringAsFixed(1)}'
         '|${pageSize.height.toStringAsFixed(1)}';
     if (key == _paginationKey) return;
     final carry = _pages.isEmpty ? _savedPermille() : _pagedPermille();
     _paginationKey = key;
-    final spans = novelSpans(html, base); // paragraphSpacing 0 → pure TextSpans
+    // Paged text uses styled newline gaps: WidgetSpan gaps cannot be measured
+    // by TextPainter and used to make paragraph spacing silently do nothing.
+    final spans = novelSpans(
+      html,
+      base,
+      paragraphSpacing: sl<ReaderPrefs>().paragraphSpacing,
+      textOnly: true,
+    );
     _pages = paginateSpans(
       TextSpan(style: base, children: spans),
       pageSize: pageSize,
@@ -748,6 +834,7 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
   /// Paged and scroll mode use different layouts: turning a page means nothing
   /// in a continuous scroll, and scrolling means nothing on a fixed page.
   void _dispatchTap(Offset global) {
+    if (_desktopReader) return;
     final size = MediaQuery.sizeOf(context);
     if (size.width <= 0 || size.height <= 0) return;
     final prefs = sl<ReaderPrefs>();
@@ -809,7 +896,8 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
   // a shared dark overlay reads over any of the three page themes (dark/
   // black/sepia) the same way the player's own control bars read over any
   // video, so these no longer take the page theme as a parameter.
-  Widget _buildTopBar() {
+  Widget _buildTopBar({bool? visible}) {
+    final show = visible ?? _chromeVisible;
     // IgnorePointer, not the old `if (_chromeVisible) build it at all` — the
     // bar is always in the tree so AnimatedOpacity has something to fade,
     // but that means it'd otherwise sit invisible on top of the page
@@ -820,10 +908,10 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
       left: 0,
       right: 0,
       child: IgnorePointer(
-        ignoring: !_chromeVisible,
+        ignoring: !show,
         child: AnimatedOpacity(
           duration: const Duration(milliseconds: 200),
-          opacity: _chromeVisible ? 1 : 0,
+          opacity: show ? 1 : 0,
           // Same floating pills as the manga reader: back · title (tap for
           // chapters) · settings.
           child: SafeArea(
@@ -893,6 +981,7 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
       builder: (_) => ReaderAutoScrollSheet(
+        desktop: _desktopReader,
         running: _autoScroll.running.value,
         speed: prefs.autoScrollSpeed,
         showButton: prefs.autoScrollButton,
@@ -909,7 +998,8 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     );
   }
 
-  Widget _buildBottomBar() {
+  Widget _buildBottomBar({bool? visible}) {
+    final show = visible ?? _chromeVisible;
     final hasPrev = _prevIndex != null;
     final hasNext = _nextIndex != null;
     final paged = sl<ReaderPrefs>().novelPaginated;
@@ -919,10 +1009,10 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
       right: 0,
       bottom: 0,
       child: IgnorePointer(
-        ignoring: !_chromeVisible,
+        ignoring: !show,
         child: AnimatedOpacity(
           duration: const Duration(milliseconds: 200),
-          opacity: _chromeVisible ? 1 : 0,
+          opacity: show ? 1 : 0,
           // One floating pill: prev · page slider · text size · next.
           // The slider only exists in PAGED mode, where pages are discrete and
           // a PageController can jump to one. Scrolling mode has no page to
@@ -1260,7 +1350,10 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
                             ),
                           ),
                         ),
-                        Text(context.l10n.readerSettings, style: AppText.headline),
+                        Text(
+                          context.l10n.readerSettings,
+                          style: AppText.headline,
+                        ),
                         readerSheetSection('Text'),
                         readerSheetGroup([
                           readerSheetRow(
@@ -1470,16 +1563,17 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
                               _openAutoScrollSheet();
                             },
                           ),
-                          readerSheetRow(
-                            icon: Icons.swipe_vertical_rounded,
-                            label: context.l10n.pullToChangeChapter,
-                            trailing: Switch(
-                              value: prefs.overscrollChapter,
-                              activeThumbColor: AppColors.accent,
-                              onChanged: (v) =>
-                                  apply(() => prefs.setOverscrollChapter(v)),
+                          if (!_desktopReader)
+                            readerSheetRow(
+                              icon: Icons.swipe_vertical_rounded,
+                              label: context.l10n.pullToChangeChapter,
+                              trailing: Switch(
+                                value: prefs.overscrollChapter,
+                                activeThumbColor: AppColors.accent,
+                                onChanged: (v) =>
+                                    apply(() => prefs.setOverscrollChapter(v)),
+                              ),
                             ),
-                          ),
                         ]),
                         readerSheetSection('Comfort'),
                         readerSheetGroup([
@@ -1764,16 +1858,27 @@ TextDirection resolveNovelDirection(ReaderPrefs prefs, String html) {
   }
 }
 
+/// Converts HTML styling and paragraph gaps into reader spans. [textOnly]
+/// represents gaps as styled newline runs for the page measurer; scroll layouts
+/// keep their exact-pixel widget gaps. Both honor the same spacing preference.
 List<InlineSpan> novelSpans(
   String html,
   TextStyle base, {
   double paragraphSpacing = 0,
+  bool textOnly = false,
 }) {
   final spans = <InlineSpan>[];
   for (final t in _tokenizeHtml(html)) {
     if (t.isBreak) {
       spans.add(const TextSpan(text: '\n'));
-      if (t.paragraphBreak && paragraphSpacing > 0) {
+      if (t.paragraphBreak && paragraphSpacing > 0 && textOnly) {
+        spans.add(
+          TextSpan(
+            text: '\n',
+            style: TextStyle(fontSize: paragraphSpacing, height: 1),
+          ),
+        );
+      } else if (t.paragraphBreak && paragraphSpacing > 0) {
         spans.add(
           WidgetSpan(
             child: SizedBox(height: paragraphSpacing, width: double.infinity),

@@ -128,8 +128,11 @@ class ReaderAutoScrollSheet extends StatefulWidget {
     required this.onToggle,
     required this.onSpeed,
     required this.onShowButton,
+    this.desktop = false,
   });
 
+  /// Desktop controls live in the hover menu, not a draggable phone button.
+  final bool desktop;
   final bool running;
   final double speed;
   final bool showButton;
@@ -151,7 +154,9 @@ class _ReaderAutoScrollSheetState extends State<ReaderAutoScrollSheet> {
     return readerSheetBody(
       context: context,
       title: context.l10n.autoScroll,
-      subtitle: context.l10n.touchThePageToPauseItPicksUpAgainWhenYouLetGo,
+      subtitle: widget.desktop
+          ? 'Click the page to pause; it resumes when you release.'
+          : context.l10n.touchThePageToPauseItPicksUpAgainWhenYouLetGo,
       children: [
         readerSheetSection('Scrolling'),
         readerSheetGroup([
@@ -190,21 +195,23 @@ class _ReaderAutoScrollSheetState extends State<ReaderAutoScrollSheet> {
             ),
           ),
         ]),
-        readerSheetSection('Control'),
-        readerSheetGroup([
-          readerSheetRow(
-            icon: Icons.smart_button_rounded,
-            label: context.l10n.floatingButton,
-            trailing: Switch(
-              value: _showButton,
-              activeThumbColor: AppColors.accent,
-              onChanged: (v) {
-                setState(() => _showButton = v);
-                widget.onShowButton(v);
-              },
+        if (!widget.desktop) ...[
+          readerSheetSection('Control'),
+          readerSheetGroup([
+            readerSheetRow(
+              icon: Icons.smart_button_rounded,
+              label: context.l10n.floatingButton,
+              trailing: Switch(
+                value: _showButton,
+                activeThumbColor: AppColors.accent,
+                onChanged: (v) {
+                  setState(() => _showButton = v);
+                  widget.onShowButton(v);
+                },
+              ),
             ),
-          ),
-        ]),
+          ]),
+        ],
       ],
     );
   }

@@ -79,10 +79,7 @@ class _AniyomiAddRepoDialogState extends State<AniyomiAddRepoDialog> {
               ),
             ),
             const SizedBox(height: 10),
-            Text(
-              context.l10n.pasteRepoBaseUrlAniyomi,
-              style: AppText.caption,
-            ),
+            Text(context.l10n.pasteRepoBaseUrlAniyomi, style: AppText.caption),
           ],
         ),
       ),
@@ -123,7 +120,7 @@ class _AniyomiAddRepoDialogState extends State<AniyomiAddRepoDialog> {
 /// - [installFn]: replaces [AniyomiExtensionService.installFromRepo].
 /// - [uninstallFn]: replaces the default uninstall logic.
 /// - [installedPkgsFn]: replaces the Hive-box installed check.
-class AniyomiRepoTab extends StatelessWidget {
+class AniyomiRepoTab extends StatefulWidget {
   const AniyomiRepoTab({
     super.key,
     required this.repoUrls,
@@ -147,6 +144,22 @@ class AniyomiRepoTab extends StatelessWidget {
   final bool Function(String pkg)? installedPkgsFn;
 
   @override
+  State<AniyomiRepoTab> createState() => _AniyomiRepoTabState();
+}
+
+/// Retains a refresh revision so pulling refresh really refetches each repo.
+class _AniyomiRepoTabState extends State<AniyomiRepoTab> {
+  int _revision = 0;
+  List<String> get repoUrls => widget.repoUrls;
+  void Function(String) get onRemoveRepo => widget.onRemoveRepo;
+  String get query => widget.query;
+  Future<List<AniyomiRepoEntry>> Function(String)? get fetchIndexFn =>
+      widget.fetchIndexFn;
+  Future<void> Function(AniyomiRepoEntry)? get installFn => widget.installFn;
+  Future<void> Function(String)? get uninstallFn => widget.uninstallFn;
+  bool Function(String)? get installedPkgsFn => widget.installedPkgsFn;
+
+  @override
   Widget build(BuildContext context) {
     if (repoUrls.isEmpty) {
       return EmptyState(
@@ -157,11 +170,12 @@ class AniyomiRepoTab extends StatelessWidget {
     return RefreshIndicator(
       color: AppColors.accent,
       backgroundColor: AppColors.surface,
-      onRefresh: () async {},
+      onRefresh: () async => setState(() => _revision++),
       child: ListView.builder(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
         itemCount: repoUrls.length,
         itemBuilder: (_, i) => _AniyomiRepoSection(
+          key: ValueKey('${repoUrls[i]}:$_revision'),
           url: repoUrls[i],
           onRemove: () => onRemoveRepo(repoUrls[i]),
           query: query,
@@ -181,6 +195,7 @@ class AniyomiRepoTab extends StatelessWidget {
 
 class _AniyomiRepoSection extends StatefulWidget {
   const _AniyomiRepoSection({
+    super.key,
     required this.url,
     required this.onRemove,
     this.query = '',
@@ -229,8 +244,9 @@ class _AniyomiRepoSectionState extends State<_AniyomiRepoSection> {
 
   /// Null in widget tests that don't register it — the language filter is then
   /// off (every entry shows). Always registered in the app.
-  final AnimeLangPrefs? _langPrefs =
-      sl.isRegistered<AnimeLangPrefs>() ? sl<AnimeLangPrefs>() : null;
+  final AnimeLangPrefs? _langPrefs = sl.isRegistered<AnimeLangPrefs>()
+      ? sl<AnimeLangPrefs>()
+      : null;
 
   @override
   void initState() {
@@ -305,7 +321,8 @@ class _AniyomiRepoSectionState extends State<_AniyomiRepoSection> {
     final ok = await AppDialog.confirm(
       context,
       title: context.l10n.removeRepo,
-      message: context.l10n.alreadyInstalledExtensionsStay +
+      message:
+          context.l10n.alreadyInstalledExtensionsStay +
           context.l10n.youCanAddRepoBackLater,
       confirmLabel: context.l10n.removeDownloadTooltip,
       destructive: true,
@@ -331,8 +348,8 @@ class _AniyomiRepoSectionState extends State<_AniyomiRepoSection> {
               list.isEmpty
                   ? context.l10n.alreadyUpToDate
                   : list.length == 1
-                      ? context.l10n.oneUpdate
-                      : context.l10n.nUpdates(list.length),
+                  ? context.l10n.oneUpdate
+                  : context.l10n.nUpdates(list.length),
             ),
           ),
         );
@@ -389,7 +406,11 @@ class _AniyomiRepoSectionState extends State<_AniyomiRepoSection> {
     messenger
       ..clearSnackBars()
       ..showSnackBar(
-        SnackBar(content: Text(context.l10n.updatedSourcesCount(done, done == 1 ? '' : 's'))),
+        SnackBar(
+          content: Text(
+            context.l10n.updatedSourcesCount(done, done == 1 ? '' : 's'),
+          ),
+        ),
       );
   }
 
@@ -724,7 +745,9 @@ class _AniyomiExtensionRowState extends State<_AniyomiExtensionRow> {
       widget.onInstalled();
       messenger
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(content: Text(l10n.installedName(_entry.name))));
+        ..showSnackBar(
+          SnackBar(content: Text(l10n.installedName(_entry.name))),
+        );
     } catch (e) {
       messenger
         ..clearSnackBars()
@@ -755,25 +778,23 @@ class _AniyomiExtensionRowState extends State<_AniyomiExtensionRow> {
       widget.onUninstalled();
       messenger
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(content: Text(context.l10n.uninstalledName(_entry.name))));
+        ..showSnackBar(
+          SnackBar(content: Text(context.l10n.uninstalledName(_entry.name))),
+        );
     } catch (e) {
       messenger
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(content: Text(context.l10n.uninstallFailed('$e'))));
+        ..showSnackBar(
+          SnackBar(content: Text(context.l10n.uninstallFailed('$e'))),
+        );
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
   Future<void> _defaultUninstall() async {
-    // Remove from installed box.
-    try {
-      if (Hive.isBoxOpen(AniyomiExtensionService.installedBoxName)) {
-        await Hive.box<dynamic>(
-          AniyomiExtensionService.installedBoxName,
-        ).delete(_entry.pkg);
-      }
-    } catch (_) {}
+    final failure = await AniyomiExtensionService.uninstall(_entry.pkg);
+    if (failure != null) throw StateError(failure);
     // Remove from the manager so the source disappears from the picker.
     if (GetIt.instance.isRegistered<AniyomiManager>()) {
       GetIt.instance.get<AniyomiManager>().removeWhere(

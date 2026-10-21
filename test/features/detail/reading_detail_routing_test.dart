@@ -8,6 +8,7 @@
 // we just pump DetailScreen(item:) directly and let it load.
 
 import 'dart:io';
+import 'dart:async';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
@@ -131,10 +132,6 @@ class _FakeTitlePrefs extends TitlePrefsStore {
 class _FakeMyListStore implements MyListStore {
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
-  // Added with the on-demand resolver: SourceMatcher now asks whether a JS
-  // provider is loaded before searching it. These fakes are already "loaded".
-  @override
-  Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
   bool contains(MediaItem m) => false;
@@ -146,10 +143,6 @@ class _FakeMyListStore implements MyListStore {
 class _FakeListStatusStore implements ListStatusStore {
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
-  // Added with the on-demand resolver: SourceMatcher now asks whether a JS
-  // provider is loaded before searching it. These fakes are already "loaded".
-  @override
-  Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
   WatchStatus? statusOf(MediaItem m) => null;
@@ -161,10 +154,6 @@ class _FakeListStatusStore implements ListStatusStore {
 class _FakeResumeStore implements ResumeStore {
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
-  // Added with the on-demand resolver: SourceMatcher now asks whether a JS
-  // provider is loaded before searching it. These fakes are already "loaded".
-  @override
-  Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
   ResumeMark? get(String sourceId, String showId, String episodeId) => null;
@@ -183,6 +172,17 @@ class _FakeReadStore extends ReadStore {
     String showId,
     String chapterId,
   ) => marks[chapterId];
+
+  @override
+  Future<void> save(
+    String sourceId,
+    String showId,
+    String chapterId, {
+    required int pos,
+    required int total,
+  }) async {
+    marks[chapterId] = (pos: pos, total: total);
+  }
 
   @override
   bool finished(String sourceId, String showId, String chapterId) {
@@ -270,13 +270,23 @@ class _FakeReadHistory extends ReadHistory {
   ReadEntry? get(String sourceId, String showId) => entry;
 }
 
+/// Holds the initial history fetch until after the viewer clicks Read.
+class _DelayedReadHistory extends ReadHistory {
+  _DelayedReadHistory() : super(SupabaseService(), () => null);
+  final pending = Completer<ReadEntry?>();
+  ReadEntry? entry;
+  @override
+  ReadEntry? get(String sourceId, String showId) => entry;
+  @override
+  Future<ReadEntry?> refreshFromCloud(String sourceId, String showId) async {
+    entry = await pending.future;
+    return entry;
+  }
+}
+
 class _FakeProviderRegistry implements ProviderRegistry {
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
-  // Added with the on-demand resolver: SourceMatcher now asks whether a JS
-  // provider is loaded before searching it. These fakes are already "loaded".
-  @override
-  Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
   ProviderRegistryEntry? entryFor(String sourceId) => null;
@@ -289,10 +299,6 @@ class _FakeCloudStreamManager extends ChangeNotifier
     implements CloudStreamManager {
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
-  // Added with the on-demand resolver: SourceMatcher now asks whether a JS
-  // provider is loaded before searching it. These fakes are already "loaded".
-  @override
-  Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
   BaseProvider? get(String sourceId) => null;
@@ -307,10 +313,6 @@ class _FakeCloudStreamManager extends ChangeNotifier
 class _FakeDownloadManager extends ChangeNotifier implements DownloadManager {
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
-  // Added with the on-demand resolver: SourceMatcher now asks whether a JS
-  // provider is loaded before searching it. These fakes are already "loaded".
-  @override
-  Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
   DownloadRecord? recordFor(String sourceId, String showId, String episodeId) =>
@@ -892,6 +894,56 @@ void main() {
         find.byType(NovelReaderScreen),
       );
       expect(reader.startIndex, 1); // resumed onto chapter 2 (index 1)
+    },
+  );
+
+  testWidgets(
+    'Read clicked before sync finishes uses the newly synced chapter and position',
+    (tester) async {
+      tester.view.physicalSize = const Size(800, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      sl.registerSingleton<SourceRepository>(
+        _StubSourceRepository(_novelDetail),
+      );
+      sl.registerSingleton<CatalogueRepository>(sl<SourceRepository>());
+      final history = _DelayedReadHistory();
+      sl.unregister<ReadHistory>();
+      sl.registerSingleton<ReadHistory>(history);
+      final positions = _FakeReadStore({});
+      sl.unregister<ReadStore>();
+      sl.registerSingleton<ReadStore>(positions);
+      await tester.pumpWidget(
+        const MaterialApp(home: DetailScreen(item: _novelItem)),
+      );
+      await tester.pump();
+      await tester.pump();
+      await tester.tap(find.text('Read').first);
+      await tester.pump();
+      expect(find.byType(NovelReaderScreen), findsNothing);
+      history.pending.complete(
+        ReadEntry(
+          sourceId: 'test',
+          showId: 'test-novel',
+          title: 'Test Novel',
+          chapterId: 'mobile-c2',
+          chapterUrl: '/mobile/c2',
+          chapterNumber: 2,
+          pos: 450,
+          total: 1000,
+          updatedMs: 200,
+          type: ProviderType.novel,
+        ),
+      );
+      await tester.pumpAndSettle();
+      final reader = tester.widget<NovelReaderScreen>(
+        find.byType(NovelReaderScreen),
+      );
+      expect(reader.startIndex, 1);
+      expect(positions.get('test', 'test-novel', 'c2'), (
+        pos: 450,
+        total: 1000,
+      ));
     },
   );
 
