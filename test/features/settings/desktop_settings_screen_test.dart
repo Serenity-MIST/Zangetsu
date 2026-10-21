@@ -60,8 +60,9 @@ class _StubProviderRegistry implements ProviderRegistry {
 class _StubAniList implements AniListService {
   @override
   String get displayName => 'AniList';
+  bool connected = false;
   @override
-  bool get isConnected => false;
+  bool get isConnected => connected;
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
 }
@@ -69,8 +70,9 @@ class _StubAniList implements AniListService {
 class _StubMal implements MalService {
   @override
   String get displayName => 'MyAnimeList';
+  bool connected = false;
   @override
-  bool get isConnected => false;
+  bool get isConnected => connected;
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
 }
@@ -78,16 +80,18 @@ class _StubMal implements MalService {
 class _StubSimkl implements SimklService {
   @override
   String get displayName => 'Simkl';
+  bool connected = false;
   @override
-  bool get isConnected => false;
+  bool get isConnected => connected;
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
 }
 
 /// Keeps the tracker list offline while checking desktop-only navigation.
 class _StubMangaBaka implements MangaBakaService {
+  bool connected = false;
   @override
-  bool get isConnected => false;
+  bool get isConnected => connected;
   @override
   String get displayName => 'MangaBaka';
   @override
@@ -201,7 +205,7 @@ void main() {
     await tester.tap(
       find.descendant(
         of: find.byType(AppBar),
-        matching: find.byType(BackButton),
+        matching: find.byTooltip('Back'),
       ),
     );
     await tester.pumpAndSettle();
@@ -249,6 +253,35 @@ void main() {
     // Other sections' rows are gone (we're on the Sources sub-page).
     expect(find.text('Downloads'), findsNothing);
     expect(find.text('About'), findsNothing);
+  });
+
+  testWidgets(
+    'desktop settings have one header and section back returns to hub',
+    (tester) async {
+      await pumpSettings(tester);
+      expect(find.text('Settings.'), findsNothing);
+      expect(find.byType(AppBar), findsOneWidget);
+      await tester.tap(find.text('Sources'));
+      await tester.pumpAndSettle();
+      expect(find.text('Settings'), findsNothing);
+      expect(find.text('Sources'), findsOneWidget);
+      expect(find.byTooltip('Back'), findsOneWidget);
+      await tester.tap(find.byTooltip('Back'));
+      await tester.pumpAndSettle();
+      expect(find.text('Account & sync'), findsOneWidget);
+    },
+  );
+
+  testWidgets('connection summary includes all four trackers', (tester) async {
+    final sl = GetIt.instance;
+    (sl<AniListService>() as _StubAniList).connected = true;
+    (sl<MalService>() as _StubMal).connected = true;
+    (sl<SimklService>() as _StubSimkl).connected = true;
+    (sl<MangaBakaService>() as _StubMangaBaka).connected = true;
+    await pumpSettings(tester);
+    await tester.tap(find.text('Account & sync'));
+    await tester.pumpAndSettle();
+    expect(find.text('4 connected'), findsOneWidget);
   });
 
   testWidgets('desktop account settings do not offer phone QR pairing', (

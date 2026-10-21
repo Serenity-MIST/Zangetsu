@@ -163,6 +163,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
     super.dispose();
   }
 
+  /// Counts every account type, including the reading-only MangaBaka tracker.
+  int get _connectedTrackerCount => <Tracker>[
+    if (sl.isRegistered<AniListService>()) sl<AniListService>(),
+    if (sl.isRegistered<MalService>()) sl<MalService>(),
+    if (sl.isRegistered<SimklService>()) sl<SimklService>(),
+    if (sl.isRegistered<MangaBakaService>()) sl<MangaBakaService>(),
+  ].where((tracker) => tracker.isConnected).length;
+
+  /// Desktop uses a single route header for both the hub and section pages.
+  PreferredSizeWidget _desktopHeader(SettingsState state) => settingsAppBar(
+    widget.returnToPlayer
+        ? 'Back to player'
+        : state.openSection == null
+        ? context.l10n.settingsTitle
+        : settingsSectionTitle(context.l10n, state.openSection!),
+    showBack:
+        widget.showBackButton ||
+        widget.returnToPlayer ||
+        state.openSection != null,
+    onBack: () {
+      if (state.openSection != null && !widget.returnToPlayer) {
+        _settingsCubit.back();
+      } else {
+        Navigator.of(context).maybePop();
+      }
+    },
+  );
+
   ProviderRegistry get _registry => sl<ProviderRegistry>();
 
   Future<void> _push(Widget screen) => _pushBuilder((_) => screen);
@@ -206,11 +234,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// TV multi-item section list — same Material page push/pop as Playback.
   Widget _tvSectionPage(BuildContext context, String section) {
     final enabledCount = _registry.getAll().where((e) => e.enabled).length;
-    final connectedCount = <Tracker>[
-      sl<AniListService>(),
-      sl<MalService>(),
-      sl<SimklService>(),
-    ].where((t) => t.isConnected).length;
+    final connectedCount = _connectedTrackerCount;
     final items = _buildSettingsEntries(
       l10n: context.l10n,
       enabledCount: enabledCount,
@@ -1418,11 +1442,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Widget build(BuildContext context) {
     final enabledCount = _registry.getAll().where((e) => e.enabled).length;
     final l10n = context.l10n;
-    final connectedCount = <Tracker>[
-      sl<AniListService>(),
-      sl<MalService>(),
-      sl<SimklService>(),
-    ].where((t) => t.isConnected).length;
+    final connectedCount = _connectedTrackerCount;
 
     // Single source of truth for both the grouped list and the search filter.
     final entries = _buildSettingsEntries(
@@ -1481,7 +1501,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Widget _buildHub(List<_SettingsEntry> entries) {
     return Scaffold(
       backgroundColor: AppColors.bg,
-      appBar: widget.returnToPlayer
+      appBar: Platform.isWindows && !_isTv
+          ? PreferredSize(
+              preferredSize: const Size.fromHeight(kToolbarHeight),
+              child: BlocBuilder<SettingsCubit, SettingsState>(
+                bloc: _settingsCubit,
+                builder: (_, state) => _desktopHeader(state),
+              ),
+            )
+          : widget.returnToPlayer
           ? AppBar(
               leading: BackButton(onPressed: () => Navigator.of(context).pop()),
               title: const Text('Back to player'),
@@ -1510,20 +1538,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
               // (lead row accent-tinted).
               final items = entries.where((e) => e.section == section).toList();
               children
-                ..add(_sectionHeader(section))
+                ..addAll(
+                  Platform.isWindows && !_isTv
+                      ? const <Widget>[]
+                      : [_sectionHeader(section)],
+                )
                 ..addAll(_groupedRows(items));
             } else {
-              children.add(
-                Padding(
-                  padding: EdgeInsets.fromLTRB(
-                    _isTv ? 56 : 20,
-                    _isTv ? 24 : 12,
-                    _isTv ? 48 : 20,
-                    _isTv ? 16 : 14,
+              if (!Platform.isWindows || _isTv) {
+                children.add(
+                  Padding(
+                    padding: EdgeInsets.fromLTRB(
+                      _isTv ? 56 : 20,
+                      _isTv ? 24 : 12,
+                      _isTv ? 48 : 20,
+                      _isTv ? 16 : 14,
+                    ),
+                    child: _settingsWordmark(size: _isTv ? 34 : 30),
                   ),
-                  child: _settingsWordmark(size: _isTv ? 34 : 30),
-                ),
-              );
+                );
+              }
               if (!_isTv) children.add(_searchField(query));
               if (query.isEmpty) {
                 // Browse view: account row + one tappable row per section.
@@ -1577,14 +1611,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       // Bottom: clear the floating dock (its height arrives as
                       // MediaQuery bottom padding thanks to extendBody).
                       padding: EdgeInsets.only(
-                        left: Platform.isWindows
-                            ? ((MediaQuery.sizeOf(context).width - 1200) / 2)
-                                  .clamp(0.0, double.infinity)
-                            : 0,
-                        right: Platform.isWindows
-                            ? ((MediaQuery.sizeOf(context).width - 1200) / 2)
-                                  .clamp(0.0, double.infinity)
-                            : 0,
                         bottom: 24 + MediaQuery.paddingOf(context).bottom,
                       ),
                       sliver: SliverList.list(children: children),

@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -975,6 +976,33 @@ void main() {
 
       await disposeHarness(tester);
     });
+
+    testWidgets(
+      'Windows reader turns actual pages with keyboard and hides touch controls',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+        addTearDown(() => debugDefaultTargetPlatformOverride = null);
+        await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+        await tester.pumpWidget(harness());
+        await settle(tester);
+        final pageView = tester.widget<PageView>(find.byType(PageView));
+        expect(pageView.controller!.page, 0);
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 200));
+        expect(pageView.controller!.page, 1);
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 200));
+        expect(pageView.controller!.page, 0);
+        expect(
+          find.byKey(const ValueKey('manga-translation-floating-control')),
+          findsNothing,
+        );
+        await disposeHarness(tester);
+        debugDefaultTargetPlatformOverride = null;
+      },
+    );
 
     testWidgets('ltr direction renders a non-reversed PageView', (
       tester,

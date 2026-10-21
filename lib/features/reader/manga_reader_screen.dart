@@ -1,5 +1,7 @@
 import '../../core/desktop/extension_runtime.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, TargetPlatform;
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
@@ -49,6 +51,7 @@ import '../../core/theme/app_text.dart';
 import '../../core/tracker/tracker.dart';
 import '../../core/tracker/tracker_hub.dart';
 import 'reader_chrome.dart';
+import 'desktop_reader_input.dart';
 import 'reader_auto_scroll.dart';
 import 'reader_auto_scroll_ui.dart';
 import 'reader_comfort.dart';
@@ -1912,7 +1915,13 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     _saveProgress(flush: false);
   }
 
-  void _toggleChrome() => setState(() => _chromeVisible = !_chromeVisible);
+  /// UI input follows Flutter's platform; native transport still follows the OS.
+  bool get _desktopReader => defaultTargetPlatform == TargetPlatform.windows;
+
+  void _toggleChrome() {
+    if (_desktopReader) return;
+    setState(() => _chromeVisible = !_chromeVisible);
+  }
 
   /// The direction this chapter is actually shown with, in priority order:
   /// this series' own override (set from the settings sheet's Direction
@@ -1975,6 +1984,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// widget says nothing about where on the SCREEN the finger went. Zones are
   /// normalised, so this is the one measurement that works in every mode.
   void _dispatchTap(Offset global) {
+    if (_desktopReader) return;
     final size = MediaQuery.sizeOf(context);
     if (size.width <= 0 || size.height <= 0) return;
     final prefs = sl<ReaderPrefs>();
@@ -2090,41 +2100,88 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     final prefs = sl<ReaderPrefs>();
     return Scaffold(
       backgroundColor: readerBgColor(prefs.mangaBackground),
-      body: Stack(
-        children: [
-          Positioned.fill(
-            child: Platform.isWindows
-                ? Align(
-                    alignment: Alignment.topCenter,
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 1040),
-                      child: _buildBody(prefs),
-                    ),
-                  )
-                : _buildBody(prefs),
-          ),
-          // Both bars stay in the tree at all times now (an AnimatedOpacity
-          // fade instead of the old conditional if (_chromeVisible) build) so
-          // the fade can actually animate — see the IgnorePointer below for
-          // why that doesn't let a hidden bar eat page taps.
-          _buildTopBar(),
-          _buildBottomBar(),
-          if (_showFloatingMangaTranslation &&
-              _pages != null &&
-              _pages!.isNotEmpty)
-            _buildFloatingMangaTranslationControl(),
-          if (prefs.autoScrollButton)
-            ReaderAutoScrollButton(
-              autoScroll: _autoScroll,
-              onTap: _openAutoScrollSheet,
-              initialX: prefs.autoScrollButtonX,
-              initialY: prefs.autoScrollButtonY,
-              onMoved: prefs.setAutoScrollButtonPos,
-            ),
-        ],
+      body: _desktopReader
+          ? DesktopReaderInput(
+              direction: _effectiveDirection(prefs),
+              onVerticalScroll: _desktopScroll,
+              onPageStep: _desktopPage,
+              builder: (top, bottom) => _buildReaderStack(
+                prefs,
+                topVisible: top,
+                bottomVisible: bottom,
+              ),
+            )
+          : _buildReaderStack(prefs),
+    );
+  }
+
+  /// Scrolls through the same strip controller used to save reading progress.
+  void _desktopScroll(double delta) {
+    if (!_verticalController.hasClients) return;
+    final position = _verticalController.position;
+    _verticalController.jumpTo(
+      (position.pixels + delta).clamp(
+        position.minScrollExtent,
+        position.maxScrollExtent,
       ),
     );
   }
+
+  /// PageController handles both individual pages and landscape spreads.
+  void _desktopPage(bool forward) {
+    if (!_pageController.hasClients || _loading) return;
+    if (forward) {
+      _pageController.nextPage(
+        duration: const Duration(milliseconds: 140),
+        curve: Curves.easeOut,
+      );
+    } else {
+      _pageController.previousPage(
+        duration: const Duration(milliseconds: 140),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
+  /// Keeps mobile chrome unchanged while desktop reveals each bar independently.
+  Widget _buildReaderStack(
+    ReaderPrefs prefs, {
+    bool? topVisible,
+    bool? bottomVisible,
+  }) => Stack(
+    children: [
+      Positioned.fill(
+        child: _desktopReader
+            ? Align(
+                alignment: Alignment.topCenter,
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 1040),
+                  child: _buildBody(prefs),
+                ),
+              )
+            : _buildBody(prefs),
+      ),
+      // Both bars stay in the tree at all times now (an AnimatedOpacity
+      // fade instead of the old conditional if (_chromeVisible) build) so
+      // the fade can actually animate — see the IgnorePointer below for
+      // why that doesn't let a hidden bar eat page taps.
+      _buildTopBar(visible: topVisible),
+      _buildBottomBar(visible: bottomVisible),
+      if (!_desktopReader &&
+          _showFloatingMangaTranslation &&
+          _pages != null &&
+          _pages!.isNotEmpty)
+        _buildFloatingMangaTranslationControl(),
+      if (!_desktopReader && prefs.autoScrollButton)
+        ReaderAutoScrollButton(
+          autoScroll: _autoScroll,
+          onTap: _openAutoScrollSheet,
+          initialX: prefs.autoScrollButtonX,
+          initialY: prefs.autoScrollButtonY,
+          onMoved: prefs.setAutoScrollButtonPos,
+        ),
+    ],
+  );
 
   /// Volume-key paging, driven by the native `dispatchKeyEvent` hook (see
   /// [VolumeKeys] for why it can't be done in Dart).
@@ -2164,7 +2221,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// Re-applies the volume-key pref — called on init and whenever the settings
   /// sheet changes it, so toggling it takes effect without leaving the reader.
   void _syncVolumeKeys() {
-    if (sl<ReaderPrefs>().volumeKeyPaging) {
+    if (!_desktopReader && sl<ReaderPrefs>().volumeKeyPaging) {
       VolumeKeys.enable(_onVolumeKey);
     } else {
       VolumeKeys.disable();
@@ -2229,7 +2286,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       onPointerUp: (_) => _autoScroll.resumeAfterTouch(),
       onPointerCancel: (_) => _autoScroll.resumeAfterTouch(),
       child: ReaderPullChapter(
-        enabled: prefs.overscrollChapter,
+        enabled: !_desktopReader && prefs.overscrollChapter,
         // Past the END OF THE STRIP, not past the chapter being read. The
         // strip can already hold the next chapter or two, so pulling at its
         // bottom means "the one after everything loaded" — offering the one
@@ -2900,7 +2957,10 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
             onTapUp: (d) => _dispatchTap(d.globalPosition),
             onDoubleTapDown: (d) => _lastDoubleTapPos = d.localPosition,
             onDoubleTap: () => _toggleZoom(ctrl),
-            onLongPress: () => _showPageActions(page),
+            onLongPress: _desktopReader ? null : () => _showPageActions(page),
+            onSecondaryTap: _desktopReader
+                ? () => _showPageActions(page)
+                : null,
             child: Listener(
               behavior: HitTestBehavior.opaque,
               onPointerDown: (event) =>
@@ -2957,7 +3017,8 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
         onTapUp: (d) => _dispatchTap(d.globalPosition),
-        onLongPress: () => _showPageActions(page),
+        onLongPress: _desktopReader ? null : () => _showPageActions(page),
+        onSecondaryTap: _desktopReader ? () => _showPageActions(page) : null,
         child: _cropIfEnabled(
           _withPageTranslation(
             _verticalPageImage(context, page, index),
@@ -3443,7 +3504,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
             mainAxisSize: MainAxisSize.min,
             children: [
               Text('Page ${index + 1} could not load'),
-              if (Platform.isWindows &&
+              if (_desktopReader &&
                   error is PlatformException &&
                   error.code == 'CLOUDFLARE')
                 TextButton(
@@ -3493,7 +3554,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 16),
-            if (_cloudflareUrl != null && Platform.isWindows)
+            if (_cloudflareUrl != null && _desktopReader)
               TextButton.icon(
                 icon: const Icon(Icons.verified_user_outlined),
                 label: const Text('Verify source'),
@@ -3552,7 +3613,8 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     );
   }
 
-  Widget _buildTopBar() {
+  Widget _buildTopBar({bool? visible}) {
+    final show = visible ?? _chromeVisible;
     final pages = _pages;
     // IgnorePointer, not the old `if (_chromeVisible) build it at all` — the
     // bar is always in the tree so AnimatedOpacity has something to fade,
@@ -3562,17 +3624,17 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     // working exactly as before.
     return Positioned(
       top: 0,
-      left: Platform.isWindows
+      left: _desktopReader
           ? math.max(12.0, (MediaQuery.sizeOf(context).width - 760) / 2)
           : 0,
-      right: Platform.isWindows
+      right: _desktopReader
           ? math.max(12.0, (MediaQuery.sizeOf(context).width - 760) / 2)
           : 0,
       child: IgnorePointer(
-        ignoring: !_chromeVisible,
+        ignoring: !show,
         child: AnimatedOpacity(
           duration: const Duration(milliseconds: 200),
-          opacity: _chromeVisible ? 1 : 0,
+          opacity: show ? 1 : 0,
           // Floating pills, no scrim: back · title (tap for chapters) ·
           // settings. The settings button moved up here from the bottom row,
           // which the bottom pill needed the width for.
@@ -3623,25 +3685,26 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     );
   }
 
-  Widget _buildBottomBar() {
+  Widget _buildBottomBar({bool? visible}) {
+    final show = visible ?? _chromeVisible;
     final pages = _pages;
     final pageCount = pages?.length ?? 0;
     final hasPrev = _prevIndex != null;
     final hasNext = _nextIndex != null;
     // Same IgnorePointer-while-hidden reasoning as _buildTopBar.
     return Positioned(
-      left: Platform.isWindows
+      left: _desktopReader
           ? math.max(12.0, (MediaQuery.sizeOf(context).width - 600) / 2)
           : 0,
-      right: Platform.isWindows
+      right: _desktopReader
           ? math.max(12.0, (MediaQuery.sizeOf(context).width - 600) / 2)
           : 0,
       bottom: 0,
       child: IgnorePointer(
-        ignoring: !_chromeVisible,
+        ignoring: !show,
         child: AnimatedOpacity(
           duration: const Duration(milliseconds: 200),
-          opacity: _chromeVisible ? 1 : 0,
+          opacity: show ? 1 : 0,
           // One floating pill: prev chapter · page slider · next chapter.
           // The page counter that used to flank the slider now lives in the
           // title pill's subtitle, so the numbers aren't lost.
@@ -4346,16 +4409,17 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                         ]),
                         readerSheetSection('Navigation'),
                         readerSheetGroup([
-                          readerSheetRow(
-                            icon: Icons.swipe_vertical_rounded,
-                            label: context.l10n.pullToChangeChapter,
-                            trailing: Switch(
-                              value: prefs.overscrollChapter,
-                              activeThumbColor: AppColors.accent,
-                              onChanged: (v) =>
-                                  apply(() => prefs.setOverscrollChapter(v)),
+                          if (!_desktopReader)
+                            readerSheetRow(
+                              icon: Icons.swipe_vertical_rounded,
+                              label: context.l10n.pullToChangeChapter,
+                              trailing: Switch(
+                                value: prefs.overscrollChapter,
+                                activeThumbColor: AppColors.accent,
+                                onChanged: (v) =>
+                                    apply(() => prefs.setOverscrollChapter(v)),
+                              ),
                             ),
-                          ),
                           readerSheetRow(
                             icon: Icons.play_circle_outline_rounded,
                             label: context.l10n.autoScroll,
@@ -4371,18 +4435,19 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                           ),
                           // Hardware rocker interception is an Android-only
                           // channel; PC readers use the keyboard page bindings.
-                          if (Platform.isAndroid) readerSheetRow(
-                            icon: Icons.volume_up_rounded,
-                            label: context.l10n.volumeKeysTurnPages,
-                            trailing: Switch(
-                              value: prefs.volumeKeyPaging,
-                              activeThumbColor: AppColors.accent,
-                              onChanged: (v) => apply(() {
-                                prefs.setVolumeKeyPaging(v);
-                                _syncVolumeKeys();
-                              }),
+                          if (Platform.isAndroid)
+                            readerSheetRow(
+                              icon: Icons.volume_up_rounded,
+                              label: context.l10n.volumeKeysTurnPages,
+                              trailing: Switch(
+                                value: prefs.volumeKeyPaging,
+                                activeThumbColor: AppColors.accent,
+                                onChanged: (v) => apply(() {
+                                  prefs.setVolumeKeyPaging(v);
+                                  _syncVolumeKeys();
+                                }),
+                              ),
                             ),
-                          ),
                           // Only worth showing once the keys actually do
                           // something — a lone "invert" switch above a feature
                           // that's off reads as broken.
@@ -4424,27 +4489,28 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                               }),
                             ),
                           ),
-                          readerSheetRow(
-                            icon: Icons.brightness_6_rounded,
-                            label: context.l10n.brightness,
-                            trailing: _systemBrightnessTag(
-                              prefs.brightness < 0,
-                              () => apply(() {
-                                prefs.setBrightness(-1.0);
-                                applyReaderComfort();
-                              }),
+                          if (!_desktopReader)
+                            readerSheetRow(
+                              icon: Icons.brightness_6_rounded,
+                              label: context.l10n.brightness,
+                              trailing: _systemBrightnessTag(
+                                prefs.brightness < 0,
+                                () => apply(() {
+                                  prefs.setBrightness(-1.0);
+                                  applyReaderComfort();
+                                }),
+                              ),
+                              child: Slider(
+                                value: prefs.brightness.clamp(-1.0, 1.0),
+                                min: -1.0,
+                                max: 1.0,
+                                activeColor: AppColors.accent,
+                                onChanged: (v) => apply(() {
+                                  prefs.setBrightness(v);
+                                  applyReaderComfort();
+                                }),
+                              ),
                             ),
-                            child: Slider(
-                              value: prefs.brightness.clamp(-1.0, 1.0),
-                              min: -1.0,
-                              max: 1.0,
-                              activeColor: AppColors.accent,
-                              onChanged: (v) => apply(() {
-                                prefs.setBrightness(v);
-                                applyReaderComfort();
-                              }),
-                            ),
-                          ),
                         ]),
                       ],
                     ),
