@@ -118,6 +118,7 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
     _checkVoice();
   }
 
+  /// Rebuilds immediately when the saved Classic/New preference changes.
   void _onStyleChanged() {
     if (!mounted) return;
     _syncShellBackIntercept(context.read<SearchBloc>().state);
@@ -173,9 +174,10 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
     }
   }
 
+  /// Searches the current catalogue with the same source and genre restrictions.
   Future<List<MediaItem>> _loadTypingRecommendations(String query) async {
     if (_isLibrary && sl.isRegistered<MetadataRepository>()) {
-      return sl<MetadataRepository>().searchFiltered(
+      return sl<MetadataRepository>().tvSearchWithSourceRecovery(
         query,
         filters: _metaFilters,
       );
@@ -246,9 +248,18 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
     Navigator.push(context, DetailScreen.route(item));
   }
 
+  /// Records submitted drafts without navigating away from inline search.
   Future<void> _recordNewSearch(String query) async {
+    if (!_isLibrary && query.trim().isNotEmpty) {
+      context.read<SearchBloc>().add(SearchRunRequested(query));
+    }
     await widget.history?.add(query);
     if (mounted) setState(() {});
+  }
+
+  void _openNewSearchDetail(MediaItem item) {
+    if (!_isLibrary) widget.history?.add(_controller.text);
+    _openDetail(item);
   }
 
   Future<void> _openMetaFilters() async {
@@ -262,6 +273,7 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
     if (!_newSearch) applyMetaFilters(context, _metaFilters);
   }
 
+  /// Applies a genre directly to New search without opening the Classic page.
   Future<void> _openNewGenres() async {
     if (!sl.isRegistered<MetadataRepository>() ||
         !sl<MetadataRepository>().supportsFilters) {
@@ -317,6 +329,7 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
     );
   }
 
+  /// Places source, genre, and filter actions beneath the compact keyboard.
   Widget _newSearchControls() {
     Widget chip(
       String id,
@@ -327,38 +340,48 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
     }) => TvFocusable(
       key: ValueKey(id),
       waitForKeyUp: true,
+      requireKeyDown: true,
       scale: 1,
-      variant: TvFocusVariant.pill,
-      borderRadius: 10,
+      variant: TvFocusVariant.none,
+      borderRadius: 8,
       onTap: action,
-      builder: (focused) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      builder: (focused) => AnimatedContainer(
+        duration: Duration(
+          milliseconds: MediaQuery.disableAnimationsOf(context) ? 0 : 110,
+        ),
+        curve: Curves.easeOutCubic,
+        height: 24,
+        alignment: Alignment.center,
+        padding: const EdgeInsets.symmetric(horizontal: 6),
         decoration: BoxDecoration(
           color: focused || selected ? Colors.white : AppColors.surface2,
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.circular(8),
         ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              icon,
-              size: 16,
-              color: focused || selected
-                  ? Colors.black
-                  : AppColors.textSecondary,
-            ),
-            const SizedBox(width: 7),
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                icon,
+                size: 16,
                 color: focused || selected
                     ? Colors.black
-                    : AppColors.textPrimary,
+                    : AppColors.textSecondary,
               ),
-            ),
-          ],
+              const SizedBox(width: 7),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: focused || selected
+                      ? Colors.black
+                      : AppColors.textPrimary,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -400,31 +423,47 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
       );
     }
     final count = metaFilterActiveCount(_metaFilters);
-    return Wrap(
-      spacing: 8,
-      runSpacing: 6,
-      children: [
-        chip(
-          'tv-search-filters',
-          Icons.tune_rounded,
-          '${context.l10n.filters}${count > 0 ? ' · $count' : ''}',
-          _openMetaFilters,
-        ),
-        chip(
-          'tv-search-genres',
-          Icons.grid_view_rounded,
-          context.l10n.genres,
-          _openNewGenres,
-        ),
-        if (count > 0) ...[
-          chip(
-            'tv-search-clear-filters',
-            Icons.close_rounded,
-            context.l10n.clear,
-            () => setState(() => _metaFilters = const MetaFilters()),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // Match the three action-key columns, including their horizontal inset.
+        Widget slot(Widget child) => SizedBox(
+          width: constraints.maxWidth / 3,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+            child: child,
           ),
-        ],
-      ],
+        );
+        return Wrap(
+          runSpacing: 6,
+          children: [
+            slot(
+              chip(
+                'tv-search-filters',
+                Icons.tune_rounded,
+                '${context.l10n.filters}${count > 0 ? ' · $count' : ''}',
+                _openMetaFilters,
+              ),
+            ),
+            slot(
+              chip(
+                'tv-search-genres',
+                Icons.grid_view_rounded,
+                context.l10n.genres,
+                _openNewGenres,
+              ),
+            ),
+            if (count > 0)
+              slot(
+                chip(
+                  'tv-search-clear-filters',
+                  Icons.close_rounded,
+                  context.l10n.clear,
+                  () => setState(() => _metaFilters = const MetaFilters()),
+                ),
+              ),
+          ],
+        );
+      },
     );
   }
 
@@ -736,7 +775,7 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
   @override
   Widget build(BuildContext context) {
     if (_newSearch) {
-      return TvSearchInputScreen(
+      Widget keyboard(SearchState? state) => TvSearchInputScreen(
         key: const ValueKey('tv-new-search-page'),
         initialQuery: _controller.text,
         compactStyle: true,
@@ -748,7 +787,15 @@ class _SearchScreenTvState extends State<SearchScreenTv> {
         loadRecommendations: _loadTypingRecommendations,
         onQueryChanged: (query) => _controller.text = query,
         onSearchSubmitted: _recordNewSearch,
-        onRecommendationSelected: _openDetail,
+        onRecommendationSelected: _openNewSearchDetail,
+        submittedResults: state == null
+            ? null
+            : [for (final group in state.sortedVisibleGroups) ...group.items],
+        submittedLoading: state?.status == SearchStatus.loading,
+      );
+      if (_isLibrary) return keyboard(null);
+      return BlocBuilder<SearchBloc, SearchState>(
+        builder: (context, state) => keyboard(state),
       );
     }
     final hint = searchHintForScope(context, widget.scope);

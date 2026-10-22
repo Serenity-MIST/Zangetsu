@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -38,46 +39,59 @@ const alternative = MediaItem(
 );
 
 void main() {
-  testWidgets('OK opening Search cannot type A on its release', (tester) async {
-    var opened = false;
-    await tester.pumpWidget(
-      MaterialApp(
-        home: StatefulBuilder(
-          builder: (context, update) => opened
-              ? const TvSearchInputScreen(
-                  initialQuery: '',
-                  compactStyle: true,
-                  inlineSearch: true,
-                )
-              : TvFocusable(
-                  autofocus: true,
-                  onTap: () => update(() => opened = true),
-                  child: const Text('Search'),
-                ),
-        ),
-      ),
-    );
-    await tester.pumpAndSettle();
-    await tester.sendKeyDownEvent(LogicalKeyboardKey.select);
-    await tester.pumpAndSettle();
-    expect(opened, isTrue);
-    expect(
-      FocusManager.instance.primaryFocus!.debugLabel,
-      'tv-new-search-first-key',
-    );
-    await tester.sendKeyUpEvent(LogicalKeyboardKey.select);
-    await tester.pumpAndSettle();
-    expect(
-      tester.widget<Text>(find.byKey(const ValueKey('tv-search-draft'))).data,
-      'Search',
-    );
-    await tester.sendKeyEvent(LogicalKeyboardKey.select);
-    await tester.pumpAndSettle();
-    expect(
-      tester.widget<Text>(find.byKey(const ValueKey('tv-search-draft'))).data,
-      'A',
-    );
-  });
+  for (final platform in [TargetPlatform.android, TargetPlatform.iOS]) {
+    testWidgets('OK opening Search cannot type A on its release on $platform', (
+      tester,
+    ) async {
+      debugDefaultTargetPlatformOverride = platform;
+      try {
+        var opened = false;
+        await tester.pumpWidget(
+          MaterialApp(
+            home: StatefulBuilder(
+              builder: (context, update) => opened
+                  ? const TvSearchInputScreen(
+                      initialQuery: '',
+                      compactStyle: true,
+                      inlineSearch: true,
+                    )
+                  : TvFocusable(
+                      autofocus: true,
+                      onTap: () => update(() => opened = true),
+                      child: const Text('Search'),
+                    ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.select);
+        await tester.pumpAndSettle();
+        expect(opened, isTrue);
+        expect(
+          FocusManager.instance.primaryFocus!.debugLabel,
+          'tv-new-search-first-key',
+        );
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.select);
+        await tester.pumpAndSettle();
+        expect(
+          tester
+              .widget<Text>(find.byKey(const ValueKey('tv-search-draft')))
+              .data,
+          'Search',
+        );
+        await tester.sendKeyEvent(LogicalKeyboardKey.select);
+        await tester.pumpAndSettle();
+        expect(
+          tester
+              .widget<Text>(find.byKey(const ValueKey('tv-search-draft')))
+              .data,
+          'A',
+        );
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    });
+  }
   testWidgets('New starts on the keyboard when its shell tab becomes active', (
     tester,
   ) async {
@@ -219,6 +233,11 @@ void main() {
       final controls = tester.getRect(
         find.byKey(const ValueKey('tv-search-keyboard-controls')),
       );
+      final history = tester.getRect(
+        find.byKey(const ValueKey('tv-search-history-column')),
+      );
+      expect(history.width, lessThanOrEqualTo(360));
+      expect(keyboard.left - history.right, closeTo(24, 0.01));
       expect(controls.left, keyboard.left);
       expect(controls.right, keyboard.right);
       expect(controls.top, greaterThanOrEqualTo(keyboard.bottom));

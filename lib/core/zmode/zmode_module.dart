@@ -74,6 +74,7 @@ Future<void> registerZangetsuMode(GetIt sl) async {
             sl<ViewerProfileStore>().adultMetadataAllowed,
       ),
       tmdb: TmdbCatalogue(TmdbCatalogue.dioGet(sl<Dio>())),
+      searchCandidates: sweepCandidates,
       mal: MalCatalogue(sl<Dio>()),
       simkl: SimklCatalogue(sl<Dio>()),
       providerPrefs: providerPrefs,

@@ -8,8 +8,10 @@ import '../../core/tv/tv_focusable.dart';
 import '../../l10n/l10n.dart';
 
 /// App-owned keyboard for New search, with controls and live results.
+/// Used by both Android TV and Apple TV; input and focus stay in shared Flutter code.
 /// Classic search uses its original system text field and does not open this.
 class TvSearchInputScreen extends StatefulWidget {
+  /// Configures the keyboard, query callbacks, and optional inline results.
   const TvSearchInputScreen({
     super.key,
     required this.initialQuery,
@@ -22,23 +24,49 @@ class TvSearchInputScreen extends StatefulWidget {
     this.requestKey,
     this.onQueryChanged,
     this.onSearchSubmitted,
+    this.submittedResults,
+    this.submittedLoading = false,
   });
 
+  /// Draft to restore when entering search.
   final String initialQuery;
+
+  /// Uses the compact alphabet grid and recommendation layout.
   final bool compactStyle;
+
+  /// Recent submitted searches shown before predictions become available.
   final List<String> recentQueries;
+
+  /// Loads catalogue matches; failures leave the draft editable.
   final Future<List<MediaItem>> Function(String)? loadRecommendations;
+
+  /// Opens a selected result through the owning search screen.
   final ValueChanged<MediaItem>? onRecommendationSelected;
+
+  /// Keeps submission in the shell and delegates Back to Home navigation.
   final bool inlineSearch;
+
+  /// Source, filter, and genre controls rendered beneath the keyboard.
   final Widget? controls;
+
+  /// Changes when catalogue scope changes, invalidating cached matches.
   final Object? requestKey;
+
+  /// Keeps the owning screen in sync with each draft edit.
   final ValueChanged<String>? onQueryChanged;
+
+  /// Records explicit submissions without closing inline search.
   final ValueChanged<String>? onSearchSubmitted;
+
+  /// Results from the owning search bloc after an explicit submission.
+  final List<MediaItem>? submittedResults;
+  final bool submittedLoading;
 
   @override
   State<TvSearchInputScreen> createState() => _TvSearchInputScreenState();
 }
 
+/// Owns draft input, remote focus, and cancellable recommendation requests.
 class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
   static const _rows = ['1234567890', 'qwertyuiop', 'asdfghjkl-', "zxcvbnm'.?"];
   late String _query = widget.initialQuery;
@@ -71,6 +99,7 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
     return best < 999 ? best + 2 : 999;
   }
 
+  /// Scores prefix edits, including adjacent swaps, with a short-query limit.
   int _fuzzyPrefix(String title) {
     final query = _query.trim().toLowerCase();
     final text = title.trim().toLowerCase();
@@ -117,6 +146,7 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
     return best <= limit ? best : 999;
   }
 
+  /// Ranks both display and English titles without discarding provider aliases.
   int _itemScore(MediaItem item) {
     final title = _prefixScore(item.title);
     final english = item.englishTitle == null
@@ -125,6 +155,7 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
     return title < english ? title : english;
   }
 
+  /// Replaces recent queries with distinct title predictions after three letters.
   List<String> get _predictions {
     final seen = <String>{};
     final values = [
@@ -166,13 +197,16 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
     super.dispose();
   }
 
+  /// Submits inline results in place; standalone callers receive the draft.
   void _finish() {
     if (widget.inlineSearch) {
       _submitted = true;
       widget.onSearchSubmitted?.call(_query);
       _recommendCache.remove(_query.trim().toLowerCase());
       setState(() {});
-      _refreshRecommendations(immediate: true, force: true);
+      if (widget.submittedResults == null) {
+        _refreshRecommendations(immediate: true, force: true);
+      }
       return;
     }
     if (_closing) return;
@@ -180,6 +214,7 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
     Navigator.of(context).pop(_query);
   }
 
+  /// Delegates inline Back to the shell so it returns directly to Home.
   void _back() {
     if (widget.inlineSearch) {
       Navigator.of(context).maybePop();
@@ -192,6 +227,7 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
     }
   }
 
+  /// Updates the draft and invalidates submitted results before requesting hints.
   void _insert(String text) {
     setState(() {
       _confirmBack = false;
@@ -203,6 +239,7 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
     _refreshRecommendations();
   }
 
+  /// Removes one grapheme cluster so composed characters stay intact.
   void _delete() {
     setState(() {
       _confirmBack = false;
@@ -214,6 +251,7 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
     _refreshRecommendations();
   }
 
+  /// Clears input and restores automatic initial-letter capitalization.
   void _clear() {
     setState(() {
       _query = '';
@@ -226,10 +264,12 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
     _refreshRecommendations();
   }
 
+  /// Capitalizes the first letter until the user explicitly chooses a case.
   void _syncAutomaticCase() {
     if (_automaticCase) _uppercase = !RegExp(r'[A-Za-z]').hasMatch(_query);
   }
 
+  /// Displays the title variant that best matches the current query.
   String _recommendationTitle(MediaItem item) {
     if (item.englishTitle != null &&
         _prefixScore(item.englishTitle!) < _prefixScore(item.title)) {
@@ -238,6 +278,7 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
     return item.title;
   }
 
+  /// Debounces queries and rejects stale responses using a request sequence.
   void _refreshRecommendations({bool immediate = false, bool force = false}) {
     _recommendDebounce?.cancel();
     final sequence = ++_recommendSeq;
@@ -259,7 +300,7 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
     _recommendDebounce = Timer(Duration(milliseconds: immediate ? 0 : 350), () async {
       try {
         final items = await widget.loadRecommendations!(query).timeout(
-          const Duration(seconds: 8),
+          const Duration(seconds: 18),
         );
         if (!mounted || sequence != _recommendSeq) return;
         final candidates = [
@@ -297,8 +338,9 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
           return match && seen.add('${item.sourceId}:${item.id}');
         }).toList();
         matching.sort((a, b) => _itemScore(a).compareTo(_itemScore(b)));
-        if (_recommendCache.length >= 20)
+        if (_recommendCache.length >= 20) {
           _recommendCache.remove(_recommendCache.keys.first);
+        }
         _recommendCache[key] = matching
             .take(widget.inlineSearch ? 30 : 8)
             .toList();
@@ -316,9 +358,17 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
     });
   }
 
+  /// Shows recent queries, predictions, and consistently sized poster results.
   Widget _recommendationPanel(BuildContext context) {
     final panelHeight = widget.inlineSearch ? 200.0 : 150.0;
     final cardWidth = widget.inlineSearch ? 90.0 : 150.0;
+    final externalResults = _submitted && widget.submittedResults != null;
+    final results = externalResults
+        ? widget.submittedResults!
+        : _recommendations;
+    final loading = externalResults
+        ? widget.submittedLoading
+        : _loadingRecommendations;
     if ((!_submitted && _query.trim().characters.length < 3) ||
         widget.loadRecommendations == null) {
       return SizedBox(height: panelHeight);
@@ -340,7 +390,7 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
           ),
           const SizedBox(height: 6),
           Expanded(
-            child: _loadingRecommendations
+            child: loading
                 ? const Center(
                     child: SizedBox(
                       width: 22,
@@ -348,7 +398,7 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
                       child: CircularProgressIndicator(strokeWidth: 2),
                     ),
                   )
-                : _recommendations.isEmpty
+                : results.isEmpty
                 ? Align(
                     alignment: Alignment.topLeft,
                     child: Text(
@@ -364,10 +414,10 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
                 : ListView.separated(
                     scrollDirection: Axis.horizontal,
                     clipBehavior: Clip.none,
-                    itemCount: _recommendations.length,
+                    itemCount: results.length,
                     separatorBuilder: (_, _) => const SizedBox(width: 12),
                     itemBuilder: (context, index) {
-                      final item = _recommendations[index];
+                      final item = results[index];
                       // Search uses the same cover as the mobile poster cards.
                       // A hero banner is a different image, not a wider poster.
                       final artwork = item.cover;
@@ -385,7 +435,9 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
                           onTap: () {
                             widget.onRecommendationSelected?.call(item);
                             if (widget.inlineSearch) {
-                              widget.onSearchSubmitted?.call(_query);
+                              if (widget.submittedResults == null) {
+                                widget.onSearchSubmitted?.call(_query);
+                              }
                               return;
                             }
                             _query = title;
@@ -470,6 +522,7 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
     );
   }
 
+  /// Handles remote Back and physical typing without opening a system IME.
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     final key = event.logicalKey;
     if (key == LogicalKeyboardKey.goBack || key == LogicalKeyboardKey.escape) {
@@ -491,6 +544,7 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
     return KeyEventResult.ignored;
   }
 
+  /// Builds a remote key that requires its own press before accepting release.
   Widget _key(
     String id,
     String label,
@@ -557,6 +611,7 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
     ),
   );
 
+  /// Fits the alphabet grid above filters beside history and predictions.
   Widget _compactBody(BuildContext context) {
     final rows = _symbols
         ? ['1234567', '890@#&+', '!?/:;()', '[]{}=_-']
@@ -771,7 +826,17 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
                     ? Row(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Expanded(flex: 4, child: history),
+                          if (widget.inlineSearch)
+                            SizedBox(
+                              key: const ValueKey('tv-search-history-column'),
+                              width: (constraints.maxWidth - 324).clamp(
+                                0.0,
+                                360.0,
+                              ),
+                              child: history,
+                            )
+                          else
+                            Expanded(flex: 4, child: history),
                           const SizedBox(width: 24),
                           if (widget.inlineSearch)
                             SizedBox(width: 300, child: keyboardPanel)
@@ -826,8 +891,9 @@ class _TvSearchInputScreenState extends State<TvSearchInputScreen> {
           onFocusChange: (focused) {
             // The shell seeds a traversal leaf when entering from the rail.
             // Start New on the keyboard even if it picks a control below it.
-            if (!focused || !widget.inlineSearch || _seededKeyboardFocus)
+            if (!focused || !widget.inlineSearch || _seededKeyboardFocus) {
               return;
+            }
             _seededKeyboardFocus = true;
             WidgetsBinding.instance.addPostFrameCallback((_) {
               if (mounted &&

@@ -51,6 +51,7 @@ class SearchPrefs extends ChangeNotifier {
         : 'classic';
   }
 
+  /// Persists the selected search experience and rebuilds listening screens.
   Future<void> setTvSearchStyle(String style) async {
     final value = style == 'new' ? 'new' : 'classic';
     await _box.put('tvSearchStyle', value);

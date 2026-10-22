@@ -536,6 +536,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (mounted) setState(() {});
   }
 
+  /// Picks the result layout independently of the TV keyboard style.
   Future<void> _pickSearchLayout() async {
     final prefs = sl<SearchPrefs>();
     final SearchLayout? picked;
