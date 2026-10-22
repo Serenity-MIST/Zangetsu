@@ -565,7 +565,7 @@ void main() {
         .onTap();
     await tester.pumpAndSettle();
     expect(find.text('Change profile?'), findsOneWidget);
-    expect(find.text('Log out'), findsNothing);
+    expect(find.text('Log out'), findsOneWidget);
     await tester.tap(find.text('Cancel'));
     await tester.pumpAndSettle();
     expect(find.byType(ViewerProfilesScreen), findsNothing);
@@ -573,7 +573,7 @@ void main() {
         .widget<TvFocusable>(find.byKey(const ValueKey('tv-nav-avatar')))
         .onTap();
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Change profile'));
+    await tester.tap(find.text('Change'));
     await tester.pumpAndSettle();
     expect(find.byType(ViewerProfilesScreen), findsOneWidget);
     expect(

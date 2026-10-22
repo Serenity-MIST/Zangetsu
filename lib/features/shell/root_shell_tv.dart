@@ -22,6 +22,7 @@ import '../../core/tv/tv_shell_tab_scope.dart';
 import '../../core/ui/dock_visibility.dart';
 import '../auth/auth_cubit.dart';
 import '../auth/auth_screens_tv.dart';
+import '../auth/reconnect.dart';
 import '../downloads/downloads_screen.dart';
 import '../../l10n/l10n.dart';
 import '../home/cubit/home_cubit.dart';
@@ -64,6 +65,8 @@ class _RailItem {
   final String label;
   final String iconAsset;
 }
+
+enum _AvatarAction { changeProfile, logOut }
 
 const int _kRailItemCount = 6;
 const int _kMyListRailItem = 2;
@@ -547,25 +550,42 @@ class _RootShellTvState extends State<RootShellTv> with WidgetsBindingObserver {
       ? Duration.zero
       : const Duration(milliseconds: 360);
   Future<void> _confirmProfileSwitch() async {
-    final confirmed = await showDialog<bool>(
+    final auth = context.read<AuthCubit>();
+    final action = await showDialog<_AvatarAction>(
       context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Change profile?'),
-        content: const Text('Choose who is watching.'),
-        actions: [
-          TextButton(
-            autofocus: true,
-            onPressed: () => Navigator.of(dialogContext).pop(false),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(true),
-            child: const Text('Change profile'),
-          ),
-        ],
-      ),
+      builder: (dialogContext) {
+        final l10n = dialogContext.l10n;
+        return AlertDialog(
+          title: Text(l10n.changeProfile),
+          content: Text(l10n.chooseWhoIsWatching),
+          actions: [
+            TextButton(
+              autofocus: true,
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: Text(l10n.cancel),
+            ),
+            TextButton(
+              onPressed: () =>
+                  Navigator.of(dialogContext).pop(_AvatarAction.logOut),
+              child: Text(l10n.logOut),
+            ),
+            TextButton(
+              onPressed: () =>
+                  Navigator.of(dialogContext).pop(_AvatarAction.changeProfile),
+              child: Text(l10n.change),
+            ),
+          ],
+        );
+      },
     );
-    if (!mounted || confirmed != true) return;
+    if (!mounted || action == null) return;
+    if (action == _AvatarAction.logOut) {
+      // Back the library up first (if we have a live session) so the
+      // logout-time clearLocal can't lose an un-synced library.
+      await backupLibraryIfPossible();
+      await auth.logout();
+      return;
+    }
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => const ViewerProfilesScreen(selectionOnly: true),
@@ -800,84 +820,6 @@ class _RootShellTvState extends State<RootShellTv> with WidgetsBindingObserver {
             ),
           ),
         ),
-      ),
-    );
-  }
-}
-
-/// Compact "Log out?" confirm card shown from the nav avatar. Kept top-level so
-/// it can be widget-tested without the shell/DI. The "Log out" action
-/// autofocuses; Back dismisses the hosting dialog.
-class TvLogoutSheet extends StatelessWidget {
-  const TvLogoutSheet({super.key, required this.onConfirm, this.onCancel});
-  final VoidCallback onConfirm;
-  final VoidCallback? onCancel;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 300,
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: const Color(0xFF0E0F13),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: AppColors.hairline),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          TvFocusable(
-            autofocus: true,
-            variant: TvFocusVariant.pill,
-            onTap: onConfirm,
-            builder: (focused) => Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 13),
-              child: Row(
-                children: [
-                  Icon(
-                    Icons.logout_rounded,
-                    size: 20,
-                    color: focused ? Colors.black : const Color(0xFFFF5C5C),
-                  ),
-                  const SizedBox(width: 12),
-                  Text(
-                    context.l10n.logOut,
-                    style: TextStyle(
-                      color: focused ? Colors.black : const Color(0xFFFF5C5C),
-                      fontSize: 16,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          TvFocusable(
-            variant: TvFocusVariant.pill,
-            onTap: onCancel ?? () {},
-            builder: (focused) => Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 13),
-              child: Row(
-                children: [
-                  Icon(
-                    Icons.close_rounded,
-                    size: 20,
-                    color: focused ? Colors.black : AppColors.textSecondary,
-                  ),
-                  const SizedBox(width: 12),
-                  Text(
-                    context.l10n.cancel,
-                    style: TextStyle(
-                      color: focused ? Colors.black : AppColors.textSecondary,
-                      fontSize: 16,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
       ),
     );
   }
