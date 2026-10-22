@@ -58,6 +58,7 @@ class TvFocusable extends StatefulWidget {
     this.semanticLabel,
     this.isButton = true,
     this.borderRadius = 10,
+    this.focusScrollAlignment = 0.5,
   }) : assert(
          child != null || builder != null,
          'TvFocusable needs either child or builder',
@@ -114,6 +115,9 @@ class TvFocusable extends StatefulWidget {
   /// outline hugs stadium pills, rounded chips, and poster tiles alike.
   /// Defaults to 10 (poster / card language).
   final double borderRadius;
+
+  /// Where this control lands in its scroll viewport when focused.
+  final double focusScrollAlignment;
 
   @override
   State<TvFocusable> createState() => _TvFocusableState();
@@ -411,7 +415,7 @@ class _TvFocusableState extends State<TvFocusable> {
             if (f) {
               Scrollable.ensureVisible(
                 context,
-                alignment: 0.5,
+                alignment: widget.focusScrollAlignment,
                 duration: const Duration(milliseconds: 200),
               );
             } else {

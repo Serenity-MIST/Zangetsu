@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
@@ -20,7 +19,6 @@ import '../../core/theme/app_colors.dart';
 import '../../core/tv/tv_focusable.dart';
 import '../../core/tv/tv_shell_tab_scope.dart';
 import '../../core/ui/dock_visibility.dart';
-import '../../core/zmode/zmode_prefs.dart';
 import '../auth/auth_cubit.dart';
 import '../auth/auth_screens_tv.dart';
 import '../auth/reconnect.dart';
@@ -29,35 +27,29 @@ import '../../l10n/l10n.dart';
 import '../home/cubit/home_cubit.dart';
 import '../schedule/schedule_screen.dart';
 import 'root_shell.dart';
-import 'tv_mode_page.dart';
 
-/// Collapsed (icon-only) and expanded (labelled) drawer widths.
-const double _kNavCollapsed = 74;
-const double _kNavExpanded = 312;
+/// Width of the TV-only navigation zone while it is focused.
+const double _kNavExpanded = 224;
 
-/// Horizontal inset inside the rail so pill focus chrome is not flush with
-/// the rounded drawer (collapsed + expanded).
+/// Horizontal inset for the TV navigation focus chrome.
 const double _kRailHPad = 18;
 
-/// Width of the icon/logo column. Sized so icons sit dead-centre in the
-/// *visible* collapsed rail: the column has [_kRailHPad] on each side, so
-/// using full [_kNavCollapsed] here would shift every icon to the right.
-const double _kIconSlot = _kNavCollapsed - 2 * _kRailHPad;
+/// Width of each navigation icon column.
+const double _kIconSlot = 38;
 
-/// TV-only navigation shell: a collapsing left drawer over an [IndexedStack].
+/// Width of the persistent icon rail (icon slot + both horizontal insets).
+const double _kNavCollapsed = _kIconSlot + _kRailHPad * 2;
+
+/// TV-only navigation shell: a persistent icon rail over an [IndexedStack].
 ///
 /// Rendered when [AppMode.isTv] is true (gated in [RootShell.build]). The phone
 /// [RootShell] and its [NavigationBar] are completely unchanged.
 ///
-/// Metadata catalogue browse is always on in production ([ZModePrefs.enabled]
-/// defaults true). When on, an inline Anime / Movie·TV toggle sits in the rail
-/// under the profile row — no separate page.
-///
-/// The drawer overlays the page area on the left. It shows a slim icon rail by
-/// default and pops open to a full labelled drawer whenever focus is in the
-/// rail zone — Apple-TV style. Pages reuse [buildShellPages] from [RootShell]
-/// (one source of truth); all cubits are GetIt singletons so nothing is
-/// re-instantiated.
+/// The rail stays visible as a narrow icon strip; moving focus into it (LEFT
+/// from content) expands it into a labelled drawer, and returning focus to
+/// content collapses it back to icons. Pages reuse [buildShellPages] from
+/// [RootShell] (one source of truth); all cubits are GetIt singletons so
+/// nothing is re-instantiated.
 class RootShellTv extends StatefulWidget {
   const RootShellTv({super.key});
 
@@ -139,7 +131,7 @@ class _RootShellTvState extends State<RootShellTv> with WidgetsBindingObserver {
   /// heavy shell; building every [IndexedStack] child on the first frame can
   /// delay the splash overlay from clearing.
   final Set<int> _mountedPages = {0};
-  bool _navOpen = false; // drawer expanded ⇔ focus is in the rail zone
+  bool _navOpen = false; // visible ⇔ focus is in the rail zone
   DateTime? _lastBackPress;
 
   final ValueNotifier<int> _searchFocusSignal = ValueNotifier<int>(0);
@@ -156,7 +148,6 @@ class _RootShellTvState extends State<RootShellTv> with WidgetsBindingObserver {
     _kRailItemCount,
     (_) => FocusNode(),
   );
-  final FocusNode _streamKindNode = FocusNode(debugLabel: 'tv-stream-kind');
 
   @override
   void initState() {
@@ -299,7 +290,7 @@ class _RootShellTvState extends State<RootShellTv> with WidgetsBindingObserver {
     }
   }
 
-  /// Move focus into the rail so the drawer expands (its onFocusChange drives
+  /// Move focus into the rail so it appears (its onFocusChange drives
   /// [_navOpen]). A single requestFocus can silently no-op after the shell was
   /// covered by the player/detail route and revealed — the rail scope comes back
   /// stale — so if focus didn't cross in, retry next frame by seeding from the
@@ -405,21 +396,7 @@ class _RootShellTvState extends State<RootShellTv> with WidgetsBindingObserver {
     for (final n in _navNodes) {
       n.dispose();
     }
-    _streamKindNode.dispose();
     super.dispose();
-  }
-
-  Future<void> _pickStreamKind(StreamKind kind) async {
-    if (kind == ZModePrefs.streamKind) return;
-    await ZModePrefs.setStreamKind(kind);
-    if (!mounted) return;
-    // Keep focus on the toggle so a Home rebuild can't steal the KeyUp and
-    // accidentally resume Continue Watching.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && _streamKindNode.canRequestFocus) {
-        _streamKindNode.requestFocus();
-      }
-    });
   }
 
   void _onItemSelected(int i) {
@@ -513,62 +490,6 @@ class _RootShellTvState extends State<RootShellTv> with WidgetsBindingObserver {
 
   // ── Drawer pieces ─────────────────────────────────────────────────────────
 
-  /// Brand lockup at the top of the rail: the square app icon is always shown
-  /// (so the collapsed rail never looks blank), and the wordmark fades in beside
-  /// it when the drawer opens.
-  Widget _brand() {
-    return Row(
-      children: [
-        // Logo centered in the icon slot so it sits dead-centre when collapsed
-        // and lines up with the nav icons below.
-        SizedBox(
-          width: _kIconSlot,
-          child: Center(
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(7),
-              child: Image.asset(
-                'assets/icon/app_icon.png',
-                width: 30,
-                height: 30,
-                fit: BoxFit.cover,
-              ),
-            ),
-          ),
-        ),
-        if (_navOpen) ...[
-          Expanded(
-            child: Image.asset(
-              'assets/icon/wordmark.png',
-              key: const ValueKey('tv-rail-wordmark'),
-              height: 18,
-              fit: BoxFit.contain,
-              alignment: AlignmentDirectional.centerStart,
-            ),
-          ),
-          const SizedBox(width: 12),
-        ],
-      ],
-    );
-  }
-
-  Widget _streamKindToggle() {
-    // Listen here — not on the whole shell. setState on [ZModePrefs.revision]
-    // used to rebuild every tab (two 10-foot Homes + Search + Schedule) and
-    // freeze the UI for seconds even when HomeCubit already had a cache hit.
-    return ValueListenableBuilder<int>(
-      valueListenable: ZModePrefs.revision,
-      builder: (context, _, _) {
-        if (!ZModePrefs.enabled) return const SizedBox.shrink();
-        return TvStreamKindRailToggle(
-          navOpen: _navOpen,
-          iconSlotWidth: _kIconSlot,
-          focusNode: _streamKindNode,
-          onToggle: _pickStreamKind,
-        );
-      },
-    );
-  }
-
   Widget _navItem(int i, _RailItem item) {
     final selected = _index == i;
     return TvFocusable(
@@ -584,42 +505,55 @@ class _RootShellTvState extends State<RootShellTv> with WidgetsBindingObserver {
           padding: const EdgeInsets.symmetric(vertical: 12),
           child: Row(
             children: [
-              SizedBox(
+              // Quiet selected-state marker when the rail is collapsed: the
+              // focused state already paints the full white pill, so only draw
+              // this while unfocused.
+              Container(
                 width: _kIconSlot,
-                child: Center(
-                  child: Icon(
-                    selected ? item.selectedIcon : item.icon,
-                    color: focused
-                        ? Colors.black
-                        // Active tab reads from the filled glyph + bright white,
-                        // not a red tint — keeps the rail premium and calm.
-                        : (selected
-                              ? AppColors.textPrimary
-                              : AppColors.textTertiary),
-                    size: 26,
-                  ),
+                height: _kIconSlot,
+                decoration: BoxDecoration(
+                  color: (selected && !focused)
+                      ? Colors.white.withValues(alpha: 0.08)
+                      : Colors.transparent,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(
+                  selected ? item.selectedIcon : item.icon,
+                  color: focused
+                      ? Colors.black
+                      // Active tab reads from the filled glyph + bright white,
+                      // not a red tint — keeps the rail premium and calm.
+                      : (selected
+                            ? AppColors.textPrimary
+                            : AppColors.textTertiary),
+                  size: 26,
                 ),
               ),
               Expanded(
-                child: _navOpen
-                    ? ExcludeSemantics(
-                        child: Text(
-                          item.label,
-                          maxLines: 1,
-                          softWrap: false,
-                          overflow: TextOverflow.clip,
-                          style: TextStyle(
-                            color: fg,
-                            fontSize: 18,
-                            fontWeight: selected
-                                ? FontWeight.w700
-                                : FontWeight.w500,
-                          ),
+                child: AnimatedOpacity(
+                  opacity: _navOpen ? 1 : 0,
+                  duration: const Duration(milliseconds: 180),
+                  curve: Curves.easeOut,
+                  child: Padding(
+                    padding: const EdgeInsets.only(left: 12),
+                    child: ExcludeSemantics(
+                      child: Text(
+                        item.label,
+                        maxLines: 1,
+                        softWrap: false,
+                        overflow: TextOverflow.clip,
+                        style: TextStyle(
+                          color: fg,
+                          fontSize: 18,
+                          fontWeight: selected
+                              ? FontWeight.w700
+                              : FontWeight.w500,
                         ),
-                      )
-                    : const SizedBox.shrink(),
+                      ),
+                    ),
+                  ),
+                ),
               ),
-              if (_navOpen) const SizedBox(width: 12),
             ],
           ),
         );
@@ -708,38 +642,43 @@ class _RootShellTvState extends State<RootShellTv> with WidgetsBindingObserver {
                   ),
                 ),
                 Expanded(
-                  child: _navOpen
-                      ? Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              name,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                color: focused
-                                    ? Colors.black
-                                    : AppColors.textPrimary,
-                                fontSize: 16,
-                                fontWeight: FontWeight.w700,
-                              ),
+                  child: AnimatedOpacity(
+                    opacity: _navOpen ? 1 : 0,
+                    duration: const Duration(milliseconds: 180),
+                    curve: Curves.easeOut,
+                    child: Padding(
+                      padding: const EdgeInsets.only(left: 12),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: focused
+                                  ? Colors.black
+                                  : AppColors.textPrimary,
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
                             ),
-                            Text(
-                              sub,
-                              maxLines: 1,
-                              style: TextStyle(
-                                color: focused
-                                    ? const Color(0xFF555555)
-                                    : AppColors.textTertiary,
-                                fontSize: 12,
-                              ),
+                          ),
+                          Text(
+                            sub,
+                            maxLines: 1,
+                            style: TextStyle(
+                              color: focused
+                                  ? const Color(0xFF555555)
+                                  : AppColors.textTertiary,
+                              fontSize: 12,
                             ),
-                          ],
-                        )
-                      : const SizedBox.shrink(),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
                 ),
-                if (_navOpen) const SizedBox(width: 12),
               ],
             ),
           ),
@@ -748,10 +687,7 @@ class _RootShellTvState extends State<RootShellTv> with WidgetsBindingObserver {
     );
   }
 
-  /// The full-width (expanded) drawer content column. It's ALWAYS laid out at
-  /// [_kNavExpanded] wide inside an OverflowBox and clipped to the animated
-  /// width, so collapsing/expanding just reveals more of the same column — the
-  /// labels fade via their own AnimatedOpacity.
+  /// TV navigation stays laid out while hidden so LEFT can restore focus.
   Widget _railColumn() {
     return SafeArea(
       left: false,
@@ -769,19 +705,8 @@ class _RootShellTvState extends State<RootShellTv> with WidgetsBindingObserver {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const SizedBox(height: 12),
-            _brand(), // Zangetsu wordmark, revealed when open
-            const SizedBox(height: 8),
             _avatarBlock(), // profile
-            const SizedBox(height: 4),
-            _streamKindToggle(),
-            const SizedBox(height: 6),
-            const Divider(
-              height: 1,
-              color: AppColors.hairline,
-              indent: 16,
-              endIndent: 16,
-            ),
-            const SizedBox(height: 6),
+            const SizedBox(height: 16),
             // Spread nav items across the remaining height (Android-TV style) so
             // Settings stays visible at the bottom instead of clipping off.
             Expanded(
@@ -827,14 +752,18 @@ class _RootShellTvState extends State<RootShellTv> with WidgetsBindingObserver {
                 //    so content is never hidden behind it; the expanded drawer
                 //    overlays this inset — Apple-TV style). ────────────────────
                 Positioned.fill(
-                  left: _kNavCollapsed,
                   child: Focus(
                     focusNode: _contentScope,
                     onKeyEvent: _onContentKey,
                     child: Padding(
-                      // Overscan-safe inset. Extra left gap so page content
-                      // (esp. Settings cards) doesn't sit flush against the rail.
-                      padding: const EdgeInsets.fromLTRB(28, 24, 24, 16),
+                      // Overscan-safe inset. Left gap clears the persistent
+                      // collapsed rail so page content never sits under it.
+                      padding: const EdgeInsets.fromLTRB(
+                        _kNavCollapsed + 16,
+                        24,
+                        24,
+                        16,
+                      ),
                       child: TvShellTabScope(
                         activeIndex: _index,
                         child: IndexedStack(
@@ -855,7 +784,7 @@ class _RootShellTvState extends State<RootShellTv> with WidgetsBindingObserver {
                     ),
                   ),
                 ),
-                // ── Drawer overlay (icon rail ⇄ full drawer) ──────────────────
+                // ── Nav rail (icon strip ⇄ labelled drawer) ───────────────────
                 Positioned(
                   top: 0,
                   bottom: 0,
@@ -864,43 +793,32 @@ class _RootShellTvState extends State<RootShellTv> with WidgetsBindingObserver {
                     focusNode: _railScope,
                     onKeyEvent: _onRailKey,
                     // Expand while focus is anywhere in the rail zone; collapse
-                    // when it leaves (i.e. content is focused).
+                    // to the icon strip when it leaves (content is focused).
                     onFocusChange: (hasFocus) {
-                      if (hasFocus != _navOpen)
+                      if (hasFocus != _navOpen) {
                         setState(() => _navOpen = hasFocus);
+                      }
                     },
                     child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 320),
-                      curve: Curves.easeOutCubic,
+                      key: const ValueKey('tv-nav-slide'),
                       width: _navOpen ? _kNavExpanded : _kNavCollapsed,
-                      margin: const EdgeInsets.all(14),
-                      decoration: BoxDecoration(
-                        gradient: const LinearGradient(
-                          begin: Alignment.topCenter,
-                          end: Alignment.bottomCenter,
-                          colors: [Color(0xFF23242B), Color(0xFF141519)],
-                        ),
-                        borderRadius: BorderRadius.circular(22),
-                        border: Border.all(
-                          color: Colors.white.withValues(alpha: 0.06),
-                        ),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.55),
-                            blurRadius: 40,
-                            offset: const Offset(0, 20),
+                      duration: const Duration(milliseconds: 220),
+                      curve: Curves.easeOutCubic,
+                      child: ClipRect(
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              colors: [
+                                Colors.black.withValues(
+                                  alpha: _navOpen ? 0.86 : 0.55,
+                                ),
+                                Colors.black.withValues(
+                                  alpha: _navOpen ? 0.62 : 0.28,
+                                ),
+                                Colors.transparent,
+                              ],
+                            ),
                           ),
-                        ],
-                      ),
-                      // Always clip to the rounded drawer. Nav focus chrome is kept
-                      // inside via [_railColumn] insets + scroll padding above.
-                      clipBehavior: Clip.antiAlias,
-                      child: OverflowBox(
-                        minWidth: _kNavExpanded,
-                        maxWidth: _kNavExpanded,
-                        alignment: AlignmentDirectional.centerStart,
-                        child: SizedBox(
-                          width: _kNavExpanded,
                           child: _railColumn(),
                         ),
                       ),
