@@ -70,6 +70,7 @@ function environment() {
     writes,
     deletes,
     AVATAR_PUBLIC_BASE: 'https://avatars.example',
+    AVATAR_LEGACY_PUBLIC_BASE: 'https://legacy.example',
     AVATARS: {
       async put(...args) {
         writes.push(args);
@@ -171,12 +172,28 @@ test('deletes only an authenticated user’s avatar object', async () => {
   assert.deepEqual(env.deletes, [`avatars/${userId}/${id}.jpg`]);
 });
 
+test('deletes a saved avatar URL from before the domain change', async () => {
+  const env = environment();
+  const id = '11111111-1111-4111-8111-111111111111';
+  const response = await worker.fetch(
+    deleteRequest(
+      await token(),
+      `${env.AVATAR_LEGACY_PUBLIC_BASE}/avatars/${userId}/${id}.jpg`,
+    ),
+    env,
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(env.deletes, [`avatars/${userId}/${id}.jpg`]);
+});
+
 test('cannot delete another user’s photo or profile-picker artwork', async () => {
   const env = environment();
   const jwt = await token();
   const id = '11111111-1111-4111-8111-111111111111';
   for (const url of [
     `${env.AVATAR_PUBLIC_BASE}/avatars/other-user/${id}.jpg`,
+    `${env.AVATAR_LEGACY_PUBLIC_BASE}/avatars/other-user/${id}.jpg`,
     `${env.AVATAR_PUBLIC_BASE}/profile-picker/zangetsu-sword.webp`,
   ]) {
     const response = await worker.fetch(deleteRequest(jwt, url), env);

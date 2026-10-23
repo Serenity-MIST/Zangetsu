@@ -115,10 +115,17 @@ export default {
       } catch (_) {
         return json({ error: 'bad avatar URL' }, 400);
       }
-      const prefix = `${env.AVATAR_PUBLIC_BASE.replace(/\/+$/, '')}/avatars/${user}/`;
-      const file = typeof target === 'string' && target.startsWith(prefix)
-        ? target.slice(prefix.length)
-        : '';
+      let file = '';
+      if (typeof target === 'string') {
+        for (const base of [env.AVATAR_PUBLIC_BASE, env.AVATAR_LEGACY_PUBLIC_BASE]) {
+          if (!base) continue;
+          const prefix = `${base.replace(/\/+$/, '')}/avatars/${user}/`;
+          if (target.startsWith(prefix)) {
+            file = target.slice(prefix.length);
+            break;
+          }
+        }
+      }
       if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(?:jpg|gif)$/i.test(file)) {
         return json({ error: 'bad avatar URL' }, 400);
       }

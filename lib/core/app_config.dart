@@ -42,7 +42,7 @@ const String kLogIntakeUrl = 'https://zangetsu-logs.log-intake.workers.dev';
 /// Public R2 manifest for the rotating profile-picker backdrops. The manifest
 /// contains up to three image filenames stored beside it in this bucket.
 const String kProfilePickerArtworkManifestUrl =
-    'https://pub-a8b67f6edb404cb1b7545e19bc2b5b94.r2.dev/profile-picker/manifest.json';
+    'https://avatars.zangetsu.online/profile-picker/manifest.json';
 
 /// Developer announcements feed (a plain JSON file in the public app repo).
 /// The app READS this on launch to show in-app announcements — never writes.
