@@ -598,7 +598,12 @@ class _RecordingProfileStore extends ViewerProfileStore {
 }
 
 class _FakeKlipyGifService extends KlipyGifService {
-  _FakeKlipyGifService() : super(Dio(), apiKey: 'test-key');
+  _FakeKlipyGifService()
+    : super(
+        Dio(),
+        baseUrl: 'https://sync.zangetsu.online/klipy/v1',
+        accessToken: () => 'test-access-token',
+      );
 
   static const gif = KlipyGif(
     slug: 'zoro-wave',

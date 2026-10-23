@@ -122,7 +122,8 @@ class _KlipyGifPickerState extends State<_KlipyGifPicker> {
                   key: const ValueKey('profile-gif-search'),
                   controller: _query,
                   autofocus: true,
-                  enabled: widget.service.isConfigured,
+                  enabled:
+                      widget.service.isConfigured && widget.service.isSignedIn,
                   onChanged: _search,
                   textInputAction: TextInputAction.search,
                   decoration: InputDecoration(
@@ -141,7 +142,14 @@ class _KlipyGifPickerState extends State<_KlipyGifPicker> {
                   child: !widget.service.isConfigured
                       ? const Center(
                           child: Text(
-                            'GIF search is not configured in this build.',
+                            'GIF search is unavailable right now.',
+                            textAlign: TextAlign.center,
+                          ),
+                        )
+                      : !widget.service.isSignedIn
+                      ? const Center(
+                          child: Text(
+                            'Sign in to search for GIFs.',
                             textAlign: TextAlign.center,
                           ),
                         )

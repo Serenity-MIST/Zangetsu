@@ -115,7 +115,12 @@ void main() {
 }
 
 class _KlipyAvatarUrlService extends KlipyGifService {
-  _KlipyAvatarUrlService() : super(Dio(), apiKey: 'test-key');
+  _KlipyAvatarUrlService()
+    : super(
+        Dio(),
+        baseUrl: 'https://sync.zangetsu.online/klipy/v1',
+        accessToken: () => 'test-access-token',
+      );
 
   @override
   Future<String?> avatarUrlForSlug(String slug) async =>

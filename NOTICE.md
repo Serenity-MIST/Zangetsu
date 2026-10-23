@@ -56,6 +56,17 @@ Aniyomi / Tachiyomi
 Other dependencies (Flutter/Dart packages and Android libraries) are used under
 their respective open-source licenses; refer to each package for details.
 
+KLIPY proxy (server-side Python dependencies)
+  PyJWT 2.15.1 — MIT
+  https://github.com/jpadilla/pyjwt
+  cryptography 50.0.2 — Apache-2.0 OR BSD-3-Clause
+  https://github.com/pyca/cryptography
+  cffi 2.1.1 — MIT-0
+  https://github.com/python-cffi/cffi
+  pycparser 3.12 — BSD-3-Clause
+  https://github.com/eliben/pycparser
+  Pinned versions are listed in server/sync/requirements-klipy.txt.
+
 Mozilla CA certificate bundle
   https://curl.se/docs/caextract.html
   Source: Mozilla NSS certdata, extracted by curl's mk-ca-bundle.
