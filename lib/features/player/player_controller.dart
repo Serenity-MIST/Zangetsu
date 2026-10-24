@@ -2604,25 +2604,15 @@ class PlayerCubit extends Cubit<PlayerState> {
     );
     _torrentSub = sl<TorrentService>().events().listen((p) {
       if (g != _gen) return;
-      if (p.state == TorrentState.error) {
-        emit(
-          state.copyWith(
-            torrentPhase: () => null,
-            loadingSources: false,
-            error: () => torrentFailureMessage(p.error),
-          ),
-        );
-        return;
-      }
       final txt = switch (p.state) {
         TorrentState.finding => 'Finding peers…',
         TorrentState.buffering =>
           'Buffering ${(p.bufferPct * 100).clamp(0, 100).toStringAsFixed(0)}%'
               '${p.peers > 0 ? ' · ${p.peers} peers' : ''}',
         TorrentState.ready => 'Starting…',
-        TorrentState.error => null,
+        TorrentState.error => 'Finding peers…',
       };
-      if (txt != null) emit(state.copyWith(torrentPhase: () => txt));
+      emit(state.copyWith(torrentPhase: () => txt));
     });
     try {
       final t = await sl<TorrentService>().startStream(
@@ -2652,8 +2642,11 @@ class PlayerCubit extends Cubit<PlayerState> {
       await _torrentSub?.cancel();
       _torrentSub = null;
       if (g != _gen) return null;
-      final reason = e is PlatformException ? (e.message ?? e.code) : '$e';
-      final msg = torrentFailureMessage(reason);
+      final msg = (e is PlatformException && e.code == 'wifi_only')
+          ? 'Torrents are set to Wi-Fi only. Turn on mobile data for torrents '
+                'in Settings › Torrents.'
+          : "Couldn't stream this torrent — no peers or it timed out. "
+                'Try another source.';
       emit(
         state.copyWith(
           torrentPhase: () => null,

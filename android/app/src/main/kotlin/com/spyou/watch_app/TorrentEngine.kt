@@ -1,7 +1,6 @@
 package com.spyou.watch_app
 
 import android.content.Context
-import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import fi.iki.elonen.NanoHTTPD
@@ -162,20 +161,18 @@ class TorrentEngine(
                 // Sequential download for smooth streaming.
                 h.setFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD)
 
-                // Torrentio's index identifies the requested episode file in a
-                // multi-file torrent. Keep the largest-video fallback for sources
-                // that don't provide an index.
+                // Pick the largest video file; download only it.
                 val files = ti.files()
-                val fileNames = (0 until files.numFiles()).map { files.fileName(it) }
-                val fileSizes = (0 until files.numFiles()).map { files.fileSize(it) }
-                val requestedIndex = Uri.parse(uri)
-                    .getQueryParameter("index")
-                    ?.toIntOrNull()
-                val fileIndex = selectTorrentVideoFileIndex(
-                    fileNames,
-                    fileSizes,
-                    requestedIndex,
-                )
+                var fileIndex = -1
+                var bestSize = -1L
+                for (i in 0 until files.numFiles()) {
+                    val name = files.fileName(i).lowercase()
+                    val isVideo = VIDEO_EXTS.any { name.endsWith(it) }
+                    if (isVideo && files.fileSize(i) > bestSize) {
+                        bestSize = files.fileSize(i)
+                        fileIndex = i
+                    }
+                }
                 if (fileIndex < 0) throw IllegalStateException("no_video_in_torrent")
                 for (i in 0 until files.numFiles()) {
                     h.filePriority(i, if (i == fileIndex) Priority.DEFAULT else Priority.IGNORE)
@@ -370,35 +367,7 @@ class TorrentEngine(
         }
     }
 
-}
-
-private val VIDEO_EXTS = listOf(
-    ".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v", ".ts", ".flv",
-)
-
-internal fun selectTorrentVideoFileIndex(
-    fileNames: List<String>,
-    fileSizes: List<Long>,
-    requestedIndex: Int?,
-): Int {
-    val count = minOf(fileNames.size, fileSizes.size)
-    fun isVideo(index: Int) = VIDEO_EXTS.any {
-        fileNames[index].lowercase().endsWith(it)
+    companion object {
+        private val VIDEO_EXTS = listOf(".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v", ".ts", ".flv")
     }
-
-    if (requestedIndex != null && requestedIndex in 0 until count &&
-        isVideo(requestedIndex)
-    ) {
-        return requestedIndex
-    }
-
-    var bestIndex = -1
-    var bestSize = -1L
-    for (index in 0 until count) {
-        if (isVideo(index) && fileSizes[index] > bestSize) {
-            bestIndex = index
-            bestSize = fileSizes[index]
-        }
-    }
-    return bestIndex
 }

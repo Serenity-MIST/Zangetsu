@@ -2,24 +2,6 @@ import 'package:flutter/services.dart';
 
 enum TorrentState { finding, buffering, ready, error }
 
-String torrentFailureMessage(String? reason) {
-  if (reason == 'wifi_only') {
-    return 'Torrents are set to Wi-Fi only. Turn on mobile data for torrents '
-        'in Settings › Torrents.';
-  }
-  if (reason == 'no_metadata') {
-    return 'No peers responded to this torrent. Try another source.';
-  }
-  if (reason == 'no_handle') {
-    return 'Couldn’t connect to this torrent. Try another source.';
-  }
-  if (reason == 'no_video_in_torrent') {
-    return 'This torrent has no supported video file. Try another source.';
-  }
-  return 'Couldn’t stream this torrent. It may have no active peers or may '
-      'have timed out. Try another source.';
-}
-
 class TorrentProgress {
   const TorrentProgress({
     required this.id,
