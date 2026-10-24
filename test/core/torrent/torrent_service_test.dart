@@ -50,4 +50,16 @@ void main() {
     expect(p.peers, 3);
     expect(p.downSpeedBps, 1000);
   });
+
+  test('torrent failures are shown as readable messages', () {
+    expect(
+      torrentFailureMessage('no_metadata'),
+      contains('No peers responded'),
+    );
+    expect(
+      torrentFailureMessage('no_video_in_torrent'),
+      contains('no supported video'),
+    );
+    expect(torrentFailureMessage('unknown'), contains('Try another source'));
+  });
 }
