@@ -24,8 +24,9 @@ class NotificationService {
       FlutterLocalNotificationsPlugin();
   final Dio _dio = Dio();
   // Native (CS worker) notification taps come over this channel.
-  static const MethodChannel _notifChannel =
-      MethodChannel('zangetsu/notifications');
+  static const MethodChannel _notifChannel = MethodChannel(
+    'zangetsu/notifications',
+  );
   bool _inited = false;
 
   Future<bool> get canShowAlerts async {
@@ -41,8 +42,8 @@ class NotificationService {
   Future<void> init() async {
     if (_inited || !(Platform.isAndroid || Platform.isIOS)) return;
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
-    // Permission is requested by PushService (one prompt, at a moment we
-    // choose) rather than here on first init.
+    // PushService owns the runtime permission request, so local notifications
+    // do not request the same Android permission a second time.
     const darwin = DarwinInitializationSettings(
       requestAlertPermission: false,
       requestBadgePermission: false,
@@ -54,11 +55,6 @@ class NotificationService {
       onDidReceiveNotificationResponse: (r) =>
           openShowFromNotification(r.payload),
     );
-    await _plugin
-        .resolvePlatformSpecificImplementation<
-          AndroidFlutterLocalNotificationsPlugin
-        >()
-        ?.requestNotificationsPermission();
     _inited = true;
   }
 
@@ -207,7 +203,9 @@ class NotificationService {
       );
       final bytes = res.data;
       if (bytes == null || bytes.isEmpty) return null;
-      final file = File('${Directory.systemTemp.path}/notif_${url.hashCode}.img');
+      final file = File(
+        '${Directory.systemTemp.path}/notif_${url.hashCode}.img',
+      );
       await file.writeAsBytes(bytes);
       return FilePathAndroidBitmap(file.path);
     } catch (_) {
