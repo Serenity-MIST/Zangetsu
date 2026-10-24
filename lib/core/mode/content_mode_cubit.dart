@@ -47,15 +47,9 @@ class ContentModeCubit extends Cubit<ContentMode> {
     return sl<SourceRepository>().loadedSources.any((s) => s.id == id);
   }
 
-  /// Which mode a source id belongs to, by id prefix — no manager lookup, so
-  /// it's cheap and can't throw when the registry isn't up yet: `lnr:` = novel,
-  /// `mihon:` = manga, everything else (JS / CloudStream / Aniyomi) = anime.
-  /// Matches the prefix rules in [sourceTypeOf].
-  static bool _sourceInMode(String id, ContentMode m) => switch (m) {
-    ContentMode.novel => id.startsWith('lnr:'),
-    ContentMode.manga => id.startsWith('mihon:'),
-    ContentMode.anime => !id.startsWith('lnr:') && !id.startsWith('mihon:'),
-  };
+  /// Cheap ID-only mode check; Mangayomi's key encodes its declared type.
+  static bool _sourceInMode(String id, ContentMode m) =>
+      sourceIdMatchesContentMode(id, m);
 
   /// No valid remembered source for [m] — don't leave a source from another
   /// mode active (the "enter Novel and the header still shows an anime source"
@@ -110,13 +104,21 @@ class ContentModeCubit extends Cubit<ContentMode> {
     // switcher calls setMode without awaiting it — and can't block the other
     // key's write either.
     unawaited(
-      _box.put('src.${outgoingMode.name}', outgoingSource).catchError(
-        (e) => debugPrint('[ContentModeCubit] failed to park $outgoingSource: $e'),
+      _box
+          .put('src.${outgoingMode.name}', outgoingSource)
+          .catchError(
+            (e) => debugPrint(
+              '[ContentModeCubit] failed to park $outgoingSource: $e',
+            ),
       ),
     );
     unawaited(
-      _box.put('mode', m.name).catchError(
-        (e) => debugPrint('[ContentModeCubit] failed to persist mode ${m.name}: $e'),
+      _box
+          .put('mode', m.name)
+          .catchError(
+            (e) => debugPrint(
+              '[ContentModeCubit] failed to persist mode ${m.name}: $e',
+            ),
       ),
     );
   }

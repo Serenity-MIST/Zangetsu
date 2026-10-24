@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/material.dart';
+import 'package:zangetsu_source_bridge/zangetsu_source_bridge.dart';
 
 import '../aniyomi/aniyomi_provider.dart';
 import '../app_mode.dart';
@@ -8,6 +9,8 @@ import '../hive/source_icon_store.dart';
 import '../i18n/source_languages.dart';
 import 'source_icon_tile.dart';
 import '../lnreader/lnreader_manager.dart';
+import '../mangayomi/mangayomi_manager.dart';
+import '../mangayomi/mangayomi_source_id.dart';
 import '../mihon/mihon_manager.dart';
 import '../prefs/source_lang_prefs.dart';
 import '../mode/content_mode.dart';
@@ -320,6 +323,39 @@ SourceBuckets categorizedSources() {
       ));
     }
   }
+  if (sl.isRegistered<MangayomiManager>()) {
+    var mangayomiSources = sl<MangayomiManager>().all;
+    final mangayomiLangs = sl.isRegistered<MangayomiLangPrefs>()
+        ? (sl<MangayomiLangPrefs>().enabled ?? defaultSourceLangs())
+        : null;
+    if (mangayomiLangs != null) {
+      mangayomiSources = visibleInstalledSources(
+        mangayomiSources,
+        mangayomiLangs,
+        pkgOf: (p) => p.source.name,
+        langOf: (p) => p.source.language,
+      );
+    }
+    for (final p in mangayomiSources) {
+      final source = p.source;
+      final mgRow = (
+        id: p.sourceId,
+        label: 'MG · ${p.displayName}',
+        repo: 'Mangayomi · ${source.language}',
+        icon: source.iconUrl?.toString(),
+      );
+      switch (p.type) {
+        case ProviderType.anime:
+          anime.add(mgRow);
+        case ProviderType.movie:
+          movies.add(mgRow);
+        case ProviderType.manga:
+          manga.add(mgRow);
+        case ProviderType.novel:
+          novel.add(mgRow);
+      }
+    }
+  }
 
   anime.sort(byRowLabel);
   movies.sort(byRowLabel);
@@ -363,6 +399,14 @@ ProviderType sourceTypeOf(String id) {
   // source as anime. No GetIt lookup needed: the prefix alone is authoritative,
   // since a Mihon source is manga-only by construction.
   if (id.startsWith('mihon:')) return ProviderType.manga;
+  if (id.startsWith('mg:')) {
+    return switch (mangayomiContentTypeOf(id)) {
+      MangayomiContentType.manga => ProviderType.manga,
+      MangayomiContentType.video => ProviderType.anime,
+      MangayomiContentType.novel => ProviderType.novel,
+      null => ProviderType.anime,
+    };
+  }
   // ponytail: hardcoded to anime — wrong by construction the day manga
   // reuses the Aniyomi extension machinery (a real, planned direction; see
   // watch-app-manga-novel-support). Fix then: read the loaded extension's
@@ -388,6 +432,14 @@ ProviderType _typeOfFromMap(String id, Map<String, String> typeMap) {
   // bucket it was just put in.
   if (id.startsWith('lnr:')) return ProviderType.novel;
   if (id.startsWith('mihon:')) return ProviderType.manga;
+  if (id.startsWith('mg:')) {
+    return switch (mangayomiContentTypeOf(id)) {
+      MangayomiContentType.manga => ProviderType.manga,
+      MangayomiContentType.video => ProviderType.anime,
+      MangayomiContentType.novel => ProviderType.novel,
+      null => ProviderType.anime,
+    };
+  }
   if (id.startsWith('ani:')) return ProviderType.anime; // Aniyomi is video-only
   final t = typeMap[id];
   if (t == null) return ProviderType.anime;
@@ -405,9 +457,10 @@ List<({String title, List<({String id, String label, String? repo, String? icon}
 ecosystemTabs(List<({String id, String label, String? repo, String? icon})> rows) {
   bool isCs(String id) => id.startsWith('cs:');
   bool isAni(String id) => id.startsWith('ani:');
+  bool isMangayomi(String id) => id.startsWith('mg:');
   final zangetsu = [
     for (final r in rows)
-      if (!isCs(r.id) && !isAni(r.id)) r,
+      if (!isCs(r.id) && !isAni(r.id) && !isMangayomi(r.id)) r,
   ];
   final cs = [
     for (final r in rows)
@@ -417,10 +470,15 @@ ecosystemTabs(List<({String id, String label, String? repo, String? icon})> rows
     for (final r in rows)
       if (isAni(r.id)) r,
   ];
+  final mangayomi = [
+    for (final r in rows)
+      if (isMangayomi(r.id)) r,
+  ];
   return [
     if (zangetsu.isNotEmpty) (title: 'Zangetsu', rows: zangetsu),
     if (cs.isNotEmpty) (title: 'CloudStream', rows: cs),
     if (ani.isNotEmpty) (title: 'Aniyomi', rows: ani),
+    if (mangayomi.isNotEmpty) (title: 'Mangayomi', rows: mangayomi),
   ];
 }
 
@@ -540,6 +598,7 @@ class SourceSwitcher extends StatelessWidget {
   static const Color _aniColor = Color(0xFFBB8CFF);
   static const Color _mihonColor = Color(0xFF6FD8A8);
   static const Color _lnrColor = Color(0xFFF6A96B); // LNReader (novel) — amber
+  static const Color _mgColor = Color(0xFF8B9CF6);
 
   /// Short colored ecosystem tag + source name for the chip. The tag replaces
   /// the old "CS · " name prefix: still text (a colored dot alone was too
@@ -583,6 +642,16 @@ class SourceSwitcher extends StatelessWidget {
       return (
         'LN',
         _lnrColor,
+        (name != null && name.isNotEmpty) ? name : currentId,
+      );
+    }
+    if (currentId.startsWith('mg:')) {
+      final name = sl.isRegistered<MangayomiManager>()
+          ? sl<MangayomiManager>().get(currentId)?.displayName
+          : null;
+      return (
+        'MG',
+        _mgColor,
         (name != null && name.isNotEmpty) ? name : currentId,
       );
     }

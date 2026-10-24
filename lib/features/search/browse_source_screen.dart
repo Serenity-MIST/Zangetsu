@@ -32,6 +32,8 @@ import '../../core/aniyomi/aniyomi_filters.dart';
 import '../../core/mihon/mihon_filters.dart';
 import '../aniyomi/aniyomi_filter_sheet.dart';
 import '../mihon/mihon_filter_sheet.dart';
+import 'mangayomi_filter_sheet.dart';
+import 'dart:convert';
 import 'bloc/search_state.dart' show SearchEcosystem, ecosystemOf;
 import 'cubit/browse_source_cubit.dart';
 
@@ -142,7 +144,9 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
   /// Zangetsu sources have no such concept, so they get no filter button
   /// rather than one that opens an empty sheet.
   bool get _canFilter =>
-      _eco == SearchEcosystem.aniyomi || _eco == SearchEcosystem.mihon;
+      _eco == SearchEcosystem.aniyomi ||
+      _eco == SearchEcosystem.mihon ||
+      _eco == SearchEcosystem.mangayomi;
   late final String _kind = sourceTypeOf(widget.sourceId).name;
   late final String? _language = sl<SourceRepository>().languageFor(
     widget.sourceId,
@@ -380,7 +384,21 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
   /// search screen does.
   Future<void> _openFilters(String stored) => _eco == SearchEcosystem.mihon
       ? _openMihonFilters(stored)
+      : _eco == SearchEcosystem.mangayomi
+      ? _openMangayomiFilters(stored)
       : _openAniFilters(stored);
+
+  Future<void> _openMangayomiFilters(String stored) async {
+    final filters = stored.isNotEmpty
+        ? (jsonDecode(stored) as List)
+              .map((item) => Map<String, dynamic>.from(item as Map))
+              .toList()
+        : await sl<SourceRepository>().mangayomiFilters(widget.sourceId);
+    if (!mounted || !_warnIfEmpty(filters)) return;
+    final result = await showMangayomiFilterSheet(context, filters);
+    if (result == null || !mounted) return;
+    await context.read<BrowseSourceCubit>().applyFilters(jsonEncode(result));
+  }
 
   /// [stored] is the selection already applied, so reopening the sheet shows
   /// the last choice instead of resetting to defaults.

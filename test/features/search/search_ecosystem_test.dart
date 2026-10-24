@@ -31,6 +31,10 @@ void main() {
       expect(ecosystemOf('cs:MovieBox@cncverse'), SearchEcosystem.cloudstream);
     });
 
+    test('maps `mg:` source ids to Mangayomi', () {
+      expect(ecosystemOf('mg:repo:0:0:17'), SearchEcosystem.mangayomi);
+    });
+
     test('maps anything else to Zangetsu', () {
       expect(ecosystemOf('allanime'), SearchEcosystem.zangetsu);
       expect(ecosystemOf('netmirror'), SearchEcosystem.zangetsu);
@@ -74,13 +78,22 @@ void main() {
       expect(tabs, contains(SearchEcosystem.aniyomi));
     });
 
-    test('all three ecosystems present → All + all three, in fixed order', () {
-      expect(ecosystemTabsFor(const ['allanime', 'cs:AnimePahe', 'ani:1']), [
+    test('all ecosystems present → All + each ecosystem, in fixed order', () {
+      expect(
+        ecosystemTabsFor(const [
+          'allanime',
+          'cs:AnimePahe',
+          'ani:1',
+          'mg:repo:1:1:23',
+        ]),
+        [
         SearchEcosystem.all,
         SearchEcosystem.zangetsu,
         SearchEcosystem.cloudstream,
         SearchEcosystem.aniyomi,
-      ]);
+          SearchEcosystem.mangayomi,
+        ],
+      );
     });
 
     test('order is fixed regardless of input order; no duplicates', () {

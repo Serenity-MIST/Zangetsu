@@ -1,17 +1,21 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/di/injector.dart' show sl;
+import 'package:watch_app/core/mangayomi/mangayomi_manager.dart';
 import 'package:watch_app/core/mode/content_mode.dart';
 import 'package:watch_app/core/playback/playback_prefs.dart';
+import 'package:watch_app/core/prefs/source_lang_prefs.dart';
 import 'package:watch_app/core/provider/cloudstream_provider.dart';
 import 'package:watch_app/core/provider/provider_downloader.dart';
 import 'package:watch_app/core/provider/provider_manager.dart';
 import 'package:watch_app/core/provider/provider_registry.dart';
 import 'package:watch_app/core/provider/provider_repo_registry.dart';
 import 'package:watch_app/core/ui/source_switcher.dart';
+import 'package:zangetsu_source_bridge/zangetsu_source_bridge.dart';
 
 // ---------------------------------------------------------------------------
 // Stubs (same shape as test/features/sources/mode_filtered_sources_test.dart)
@@ -82,6 +86,7 @@ Future<void> _seedJsSource({
 
 void main() {
   late Directory tempDir;
+  MangayomiManager? mangayomi;
 
   setUp(() async {
     tempDir = await Directory.systemTemp.createTemp('reading_buckets_test');
@@ -104,12 +109,83 @@ void main() {
   });
 
   tearDown(() async {
+    mangayomi?.dispose();
+    mangayomi = null;
     await sl.reset();
     await Hive.close();
     try {
       await tempDir.delete(recursive: true);
     } catch (_) {}
   });
+
+  test(
+    'Mangayomi sources appear only in their declared picker bucket',
+    () async {
+      final directory = Directory('${tempDir.path}/mangayomi');
+      await directory.create(recursive: true);
+      final codeFileName = '${List.filled(64, '0').join()}.source';
+      await File(
+        '${directory.path}/$codeFileName',
+      ).writeAsString('source code');
+      final repository = Uri.parse('https://repo.example.com/index.json');
+      final manifests = [
+        for (final (id, type, name) in [
+          (1, 0, 'MG Manga'),
+          (2, 1, 'MG Video'),
+          (3, 2, 'MG Novel'),
+        ])
+          {
+            'id': id,
+            'name': name,
+            'baseUrl': 'https://source$id.example.com',
+            'sourceCodeUrl': 'https://cdn.example.com/$id.dart',
+            'version': '1.0.0',
+            'itemType': type,
+            'sourceCodeLanguage': 0,
+            'lang': 'en',
+          },
+      ];
+      await File('${directory.path}/installed.json').writeAsString(
+        jsonEncode([
+          for (final manifest in manifests)
+            {
+              'repository': repository.toString(),
+              'source': manifest,
+              'codeFile': codeFileName,
+            },
+        ]),
+      );
+      mangayomi = MangayomiManager(MangayomiExtensionService(directory));
+      await mangayomi!.init();
+      sl.registerSingleton<MangayomiManager>(mangayomi!);
+
+      final ids = {
+        for (final item in mangayomi!.installed)
+          item.source.contentType: item.source.key,
+      };
+      final buckets = categorizedSources();
+      expect(
+        buckets.manga.map((row) => row.id),
+        contains(ids[MangayomiContentType.manga]),
+      );
+      expect(
+        buckets.anime.map((row) => row.id),
+        contains(ids[MangayomiContentType.video]),
+      );
+      expect(
+        buckets.novel.map((row) => row.id),
+        contains(ids[MangayomiContentType.novel]),
+      );
+      expect(
+        buckets.movies.map((row) => row.id),
+        isNot(contains(ids[MangayomiContentType.manga])),
+      );
+      expect(
+        buckets.movies.map((row) => row.id),
+        isNot(contains(ids[MangayomiContentType.novel])),
+      );
+    },
+  );
 
   test('a manga-typed JS source lands in categorizedSources().manga', () async {
     await _seedJsSource(id: 'js:m', type: 'manga');
@@ -172,6 +248,57 @@ void main() {
     final filtered = filterBucketsForMode(raw, ContentMode.anime);
     expect(filtered.manga, isEmpty);
     expect(filtered.novel, isEmpty);
+  });
+
+  test('Mangayomi sources respect the language filter in the picker', () async {
+    final directory = Directory('${tempDir.path}/mangayomi');
+    await directory.create(recursive: true);
+    final codeFileName = '${List.filled(64, '0').join()}.source';
+    await File('${directory.path}/$codeFileName').writeAsString('source code');
+    final repository = Uri.parse('https://repo.example.com/index.json');
+    await File('${directory.path}/installed.json').writeAsString(
+      jsonEncode([
+        for (final (id, name, lang) in [
+          (1, 'MG Multi', 'en'),
+          (2, 'MG Multi', 'pt-BR'),
+        ])
+          {
+            'repository': repository.toString(),
+            'source': {
+              'id': id,
+              'name': name,
+              'baseUrl': 'https://source$id.example.com',
+              'sourceCodeUrl': 'https://cdn.example.com/$id.dart',
+              'version': '1.0.0',
+              'itemType': 0,
+              'sourceCodeLanguage': 0,
+              'lang': lang,
+            },
+            'codeFile': codeFileName,
+          },
+      ]),
+    );
+    mangayomi = MangayomiManager(MangayomiExtensionService(directory));
+    await mangayomi!.init();
+    sl.registerSingleton<MangayomiManager>(mangayomi!);
+
+    final prefs = MangayomiLangPrefs();
+    await prefs.init();
+    await prefs.setEnabled({'en'});
+    sl.registerSingleton<MangayomiLangPrefs>(prefs);
+
+    expect(prefs.enabled, {'en'});
+    expect(
+      mangayomi!.installed.map((item) => item.source.language),
+      containsAll(['en', 'pt-BR']),
+    );
+    final ids = {
+      for (final item in mangayomi!.installed)
+        item.source.language: item.source.key,
+    };
+    final manga = categorizedSources().manga;
+    expect(manga.map((row) => row.id), contains(ids['en']));
+    expect(manga.map((row) => row.id), isNot(contains(ids['pt-BR'])));
   });
 
   // ── hasReadingSourcesFor (Task E2 — Home/Search/My List "no sources" gate) ─

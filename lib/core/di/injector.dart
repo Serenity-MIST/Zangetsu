@@ -10,10 +10,12 @@ import 'package:flutter/services.dart' show MethodChannel, rootBundle;
 import 'package:get_it/get_it.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:supabase_flutter/supabase_flutter.dart' show PostgrestClient;
+import 'package:zangetsu_source_bridge/zangetsu_source_bridge.dart';
 
 import '../announce/announcement.dart';
 import '../backup/backup_cloud.dart';
 import '../logging/log_report_service.dart';
+import '../mangayomi/mangayomi_manager.dart';
 import '../announce/announcement_service.dart';
 import '../cache/app_image_cache.dart';
 import '../platform/apple_tv.dart';
@@ -469,6 +471,9 @@ Future<void> initDependencies() async {
   final animeLangPrefs = AnimeLangPrefs();
   await animeLangPrefs.init();
   sl.registerSingleton<AnimeLangPrefs>(animeLangPrefs);
+  final mangayomiLangPrefs = MangayomiLangPrefs();
+  await mangayomiLangPrefs.init();
+  sl.registerSingleton<MangayomiLangPrefs>(mangayomiLangPrefs);
   await SearchPrefs.init();
   sl.registerSingleton<SearchPrefs>(SearchPrefs());
   await NavPrefs.init();
@@ -777,6 +782,15 @@ Future<void> initDependencies() async {
     await openBoxSafely<String>('lnreader_repos');
   }
 
+  // Mangayomi is a separate, on-device runtime. Boot only reads its local
+  // repository/install metadata; extension code and both runtimes stay lazy
+  // until the user opens or calls an installed source.
+  final mangayomiManager = MangayomiManager(
+    MangayomiExtensionService(await writableAppSubdir('mangayomi')),
+  );
+  await mangayomiManager.init();
+  sl.registerSingleton<MangayomiManager>(mangayomiManager);
+
   // --- Provider registry data layer ---------------------------------
   await ProviderReposRegistry.init();
   await ProviderRegistry.init();
@@ -801,6 +815,7 @@ Future<void> initDependencies() async {
         aniyomi: AniyomiExtensionService(),
         mihon: MihonExtensionService(),
         lnreader: lnrService,
+        mangayomi: mangayomiManager,
       ),
       LibraryBackup(),
       SettingsBackup(),
@@ -1050,6 +1065,7 @@ Future<void> initDependencies() async {
         ...manager.installedIds,
         ...csManager.all.map((p) => p.sourceId),
         ...lnrManager.installedSources.map((s) => s.id),
+        ...mangayomiManager.all.map((p) => p.sourceId),
       },
     ),
   );
@@ -1069,6 +1085,7 @@ Future<void> initDependencies() async {
       aniManager: aniyomiManager,
       mihonManager: mihonManager,
       lnrManager: lnrManager,
+      mangayomiManager: mangayomiManager,
       activeSource: sl<ActiveSourceCubit>(),
       prefs: sl<PlaybackPrefs>(),
       // The language sets the sources screens already filter their lists by.

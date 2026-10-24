@@ -11,6 +11,7 @@ import '../models/media_item.dart';
 import '../models/provider_info.dart';
 import '../playback/source_health_store.dart';
 import '../models/video_source.dart';
+import '../mode/content_mode.dart';
 import '../repository/catalogue_repository.dart';
 import '../repository/source_repository.dart';
 import 'anilist_catalogue.dart';
@@ -83,20 +84,15 @@ class MetadataRepository implements CatalogueRepository {
     SourceRepository sources,
   ) => (kind) {
     final all = sources.pickableSources;
-    return switch (kind) {
-      ZKind.manga => [
-        for (final s in all)
-          if (s.id.startsWith('mihon:')) s,
-      ],
-      ZKind.novel => [
-        for (final s in all)
-          if (s.id.startsWith('lnr:')) s,
-      ],
-      _ => [
-        for (final s in all)
-          if (!s.id.startsWith('mihon:') && !s.id.startsWith('lnr:')) s,
-      ],
+    final mode = switch (kind) {
+      ZKind.manga => ContentMode.manga,
+      ZKind.novel => ContentMode.novel,
+      _ => ContentMode.anime,
     };
+    return [
+      for (final s in all)
+        if (sourceIdMatchesContentMode(s.id, mode)) s,
+    ];
   };
 
   void _bindPlayback() {

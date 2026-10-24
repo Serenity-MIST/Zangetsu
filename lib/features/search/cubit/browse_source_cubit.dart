@@ -98,6 +98,7 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
   /// back to the catalogue, same as [clearSearch].
   Future<void> search(String query) async {
     final q = query.trim();
+    final filters = state.filtersJson;
     if (q.isEmpty) {
       clearSearch();
       return;
@@ -107,18 +108,25 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
         sections: state.sections,
         loading: false,
         searching: true,
+        filtersJson: state.filtersJson,
+        query: q,
       ),
     );
     try {
-      final results = await _repo
-          .search(q, sourceId: sourceId)
-          .timeout(timeout);
+      final results = filters.isNotEmpty && sourceId.startsWith('mg:')
+          ? (await _repo
+                    .searchStatus(q, sourceId: sourceId, filtersJson: filters)
+                    .timeout(timeout))
+                .items
+          : await _repo.search(q, sourceId: sourceId).timeout(timeout);
       if (isClosed) return;
       emit(
         BrowseSourceState(
           sections: state.sections,
           loading: false,
           searchResults: results,
+          filtersJson: filters,
+          query: q,
         ),
       );
     } catch (_) {
@@ -128,6 +136,8 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
           sections: state.sections,
           loading: false,
           searchFailed: true,
+          filtersJson: filters,
+          query: q,
         ),
       );
     }

@@ -685,8 +685,14 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
     final noSourceForMode = ZModePrefs.enabled
         ? false
         : switch (mode) {
-            ContentMode.manga => !activeId.startsWith('mihon:'),
-            ContentMode.novel => !activeId.startsWith('lnr:'),
+            ContentMode.manga => !sourceIdMatchesContentMode(
+              activeId,
+              ContentMode.manga,
+            ),
+            ContentMode.novel => !sourceIdMatchesContentMode(
+              activeId,
+              ContentMode.novel,
+            ),
             ContentMode.anime => false,
             null => false,
           };

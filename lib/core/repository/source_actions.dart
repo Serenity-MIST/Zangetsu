@@ -5,6 +5,7 @@ import '../models/source_pref.dart';
 import '../aniyomi/aniyomi_extension_service.dart';
 import '../di/injector.dart';
 import '../mihon/mihon_extension_service.dart';
+import '../mangayomi/mangayomi_manager.dart';
 import '../provider/cloudstream_provider.dart';
 import '../zmode/zmode_ids.dart';
 import 'source_repository.dart';
@@ -32,6 +33,13 @@ Future<bool> hasSourceSettings(String id) {
         : MihonExtensionService().hasSourceSettings(raw);
   }
   if (id.startsWith('cs:')) return csPluginHasSettings(id.substring(3));
+  if (id.startsWith('mg:') && sl.isRegistered<MangayomiManager>()) {
+    return sl<MangayomiManager>()
+        .sourcePreferences(id)
+        .then((prefs) => prefs.isNotEmpty)
+        .timeout(const Duration(seconds: 3))
+        .catchError((_) => false);
+  }
   return Future.value(false);
 }
 
@@ -73,6 +81,22 @@ Future<void> openSourceSettings(
       MaterialPageRoute<void>(
         builder: (_) =>
             SourceSettingsScreen(sourceId: id, repoUrl: '', displayName: name),
+      ),
+    );
+  }
+  if (id.startsWith('mg:') &&
+      sl.isRegistered<MangayomiManager>() &&
+      context.mounted) {
+    final manager = sl<MangayomiManager>();
+    final prefs = await manager.sourcePreferences(id);
+    if (prefs.isEmpty || !context.mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SourcePrefsScreen(
+          title: name,
+          prefs: prefs,
+          write: (key, value) => manager.setSourcePreference(id, key, value),
+        ),
       ),
     );
   }

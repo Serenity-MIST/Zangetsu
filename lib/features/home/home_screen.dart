@@ -1975,8 +1975,14 @@ class _HomeViewState extends State<_HomeView>
                       _sourceCatalogueSelected || ZModePrefs.enabled
                       ? false
                       : switch (sl<ContentModeCubit>().state) {
-                          ContentMode.manga => !activeId.startsWith('mihon:'),
-                          ContentMode.novel => !activeId.startsWith('lnr:'),
+                          ContentMode.manga => !sourceIdMatchesContentMode(
+                            activeId,
+                            ContentMode.manga,
+                          ),
+                          ContentMode.novel => !sourceIdMatchesContentMode(
+                            activeId,
+                            ContentMode.novel,
+                          ),
                           ContentMode.anime => false,
                         };
                   return CustomScrollView(

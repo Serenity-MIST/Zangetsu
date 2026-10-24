@@ -6,6 +6,7 @@ import '../../core/ui/settings_widgets.dart';
 import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
 import '../../core/lnreader/lnreader_manager.dart';
+import '../../core/mangayomi/mangayomi_manager.dart';
 import '../../core/mihon/mihon_manager.dart';
 import '../../core/models/provider_info.dart';
 import '../../core/provider/cloudstream_provider.dart';
@@ -22,6 +23,7 @@ import 'aniyomi_sources_screen.dart';
 import 'bloc/sources_state.dart';
 import 'cloudstream_sources_screen.dart';
 import 'lnreader_sources_screen.dart';
+import 'mangayomi_sources_screen.dart';
 import 'mihon_sources_screen.dart';
 import 'zangetsu_sources_screen.dart';
 import '../../l10n/l10n.dart';
@@ -73,6 +75,9 @@ class _HubPhoneView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final mangayomi = sl.isRegistered<MangayomiManager>()
+        ? sl<MangayomiManager>()
+        : null;
     // Recompute the counts live when a source is installed / enabled / updated
     // while the hub is open (CS + Aniyomi managers are ChangeNotifiers). The
     // Zangetsu registry isn't a Listenable, but it can only be mutated from its
@@ -82,12 +87,13 @@ class _HubPhoneView extends StatelessWidget {
         sl<CloudStreamManager>(),
         sl<AniyomiManager>(),
         sl<MihonManager>(),
+        if (mangayomi != null) mangayomi,
       ]),
-      builder: (context, _) => _body(context),
+      builder: (context, _) => _body(context, mangayomi),
     );
   }
 
-  Widget _body(BuildContext context) {
+  Widget _body(BuildContext context, MangayomiManager? mangayomi) {
     final zangetsuCount = sl<ProviderRegistry>().getAll().length;
     final showCs = Platform.isAndroid;
     final showAniyomi = Platform.isAndroid;
@@ -108,6 +114,7 @@ class _HubPhoneView extends StatelessWidget {
     final lnrCount = showLnReader
         ? sl<LnReaderManager>().installedSources.length
         : 0;
+    final mangayomiCount = mangayomi?.installed.length ?? 0;
 
     // Read-only pending-update counts. Zangetsu reuses SourcesState's own
     // installed-vs-manifest comparison (same result the Zangetsu screen shows);
@@ -127,7 +134,8 @@ class _HubPhoneView extends StatelessWidget {
         (showCs ? csInstalled : 0) +
         (showAniyomi ? aniCount : 0) +
         (showMihon ? mihonCount : 0) +
-        (showLnReader ? lnrCount : 0);
+        (showLnReader ? lnrCount : 0) +
+        mangayomiCount;
     final ecoCount =
         1 + (showCs ? 1 : 0) + (showAniyomi ? 1 : 0) + (showMihon ? 1 : 0);
 
@@ -139,8 +147,13 @@ class _HubPhoneView extends StatelessWidget {
     final activeIsAni = activeId.startsWith('ani:');
     final activeIsMihon = activeId.startsWith('mihon:');
     final activeIsLnReader = activeId.startsWith('lnr:');
+    final activeIsMangayomi = activeId.startsWith('mg:');
     final activeIsZangetsu =
-        activeId.isNotEmpty && !activeIsCs && !activeIsAni && !activeIsMihon;
+        activeId.isNotEmpty &&
+        !activeIsCs &&
+        !activeIsAni &&
+        !activeIsMihon &&
+        !activeIsMangayomi;
 
     // Manga/novel sources are also Zangetsu JS providers under the hood, but
     // get their own hub entry (Task E3) so reading sources read as visibly
@@ -167,11 +180,26 @@ class _HubPhoneView extends StatelessWidget {
             // ecosystem count (ecoCount itself is untouched, still just
             // Zangetsu/CS/Aniyomi/Mihon), just the header copy matching
             // what's on screen.
-            ecoCount: ecoCount + 1,
+            ecoCount: ecoCount + (mangayomi == null ? 0 : 1),
             activeName: activeName,
             totalUpdates: totalUpdates,
           ),
           const SizedBox(height: 24),
+          if (mangayomi != null) ...[
+            const _SectionLabel('ALL'),
+            const SizedBox(height: 12),
+            _EcoRow(
+              icon: Icons.extension_rounded,
+              title: 'Mangayomi',
+              desc: 'Streaming, manga, and novel sources',
+              info:
+                  '$mangayomiCount sources · ${mangayomi.repositories.length} repos',
+              active: activeIsMangayomi,
+              updateCount: 0,
+              onTap: () => open(const MangayomiSourcesScreen()),
+            ),
+            const SizedBox(height: 28),
+          ],
           const _SectionLabel('STREAMING'),
           const SizedBox(height: 12),
           _EcoRow(
@@ -525,6 +553,9 @@ class _HubTvViewState extends State<_HubTvView> {
 
   @override
   Widget build(BuildContext context) {
+    final mangayomi = sl.isRegistered<MangayomiManager>()
+        ? sl<MangayomiManager>()
+        : null;
     // Same live-count listenables as the phone hub so install/enable on an
     // ecosystem screen is reflected when the user returns (and while this
     // route is still under the stack).
@@ -533,15 +564,17 @@ class _HubTvViewState extends State<_HubTvView> {
         sl<CloudStreamManager>(),
         sl<AniyomiManager>(),
         sl<MihonManager>(),
+        if (mangayomi != null) mangayomi,
       ]),
-      builder: (context, _) => _body(context),
+      builder: (context, _) => _body(context, mangayomi),
     );
   }
 
-  Widget _body(BuildContext context) {
+  Widget _body(BuildContext context, MangayomiManager? mangayomi) {
     final zangetsuCount = sl<ProviderRegistry>().getAll().length;
     final showCs = Platform.isAndroid;
     final showAniyomi = Platform.isAndroid;
+    final mangayomiCount = mangayomi?.installed.length ?? 0;
     var autofocusAssigned = false;
 
     Widget row({
@@ -635,6 +668,14 @@ class _HubTvViewState extends State<_HubTvView> {
                   clipBehavior: Clip.none,
                   padding: const EdgeInsets.fromLTRB(40, 0, 40, 48),
                   children: [
+                    if (mangayomi != null)
+                      row(
+                        icon: Icons.extension_rounded,
+                        title: 'Mangayomi',
+                        subtitle: '$mangayomiCount installed',
+                        tint: const Color(0xFF8B9CF6),
+                        onTap: () => _open(const MangayomiSourcesScreen()),
+                      ),
                     row(
                       icon: Icons.dns_rounded,
                       title: context.l10n.zangetsuProviders,

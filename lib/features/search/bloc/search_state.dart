@@ -3,6 +3,7 @@ import 'package:equatable/equatable.dart';
 import '../../../core/models/media_detail.dart' show MediaStatus;
 import '../../../core/models/media_item.dart';
 import '../../../core/models/provider_info.dart';
+import '../../../core/mangayomi/mangayomi_source_id.dart';
 import '../../../core/playback/source_health_store.dart' show SourceOutcome;
 
 enum SearchStatus { idle, loading, success, error }
@@ -173,7 +174,8 @@ enum SearchEcosystem {
   cloudstream('CloudStream'),
   aniyomi('Aniyomi'),
   mihon('Mihon'),
-  lnreader('LNReader');
+  lnreader('LNReader'),
+  mangayomi('Mangayomi');
 
   const SearchEcosystem(this.label);
   final String label;
@@ -191,6 +193,9 @@ SearchEcosystem ecosystemOf(String sourceId) {
   // A future ecosystem (Mangayomi, say) is one prefix and one enum value.
   if (sourceId.startsWith('mihon:')) return SearchEcosystem.mihon;
   if (sourceId.startsWith('lnr:')) return SearchEcosystem.lnreader;
+  if (mangayomiContentTypeOf(sourceId) != null) {
+    return SearchEcosystem.mangayomi;
+  }
   return SearchEcosystem.zangetsu;
 }
 
@@ -209,6 +214,7 @@ List<SearchEcosystem> ecosystemTabsFor(Iterable<String> sourceIds) {
       SearchEcosystem.aniyomi,
       SearchEcosystem.mihon,
       SearchEcosystem.lnreader,
+      SearchEcosystem.mangayomi,
     ])
       if (present.contains(e)) e,
   ];

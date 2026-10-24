@@ -182,12 +182,7 @@ class SourceCatalogueHomeContentState
       .loadedSources
       .where((source) {
         final id = source.id;
-        return switch (_mode) {
-          ContentMode.anime =>
-            !id.startsWith('mihon:') && !id.startsWith('lnr:'),
-          ContentMode.manga => id.startsWith('mihon:'),
-          ContentMode.novel => id.startsWith('lnr:'),
-        };
+        return sourceIdMatchesContentMode(id, _mode);
       })
       .toList(growable: false);
 
