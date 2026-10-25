@@ -107,20 +107,25 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
     }
   }
 
-  Future<void> _refreshRepositories() async {
-    if (!mounted) return;
+  Future<void> _refreshRepositories({Uri? repository}) async {
+    if (!mounted || _refreshing) return;
     setState(() => _refreshing = true);
-    _errors.clear();
+    if (repository == null) {
+      _errors.clear();
+    } else {
+      _errors.remove(repository);
+    }
     await Future.wait([
-      for (final repository in _manager.repositories)
-        _manager.refreshRepository(repository).catchError((Object error) {
-          _errors[repository] = error;
+      for (final url
+          in repository == null ? _manager.repositories : [repository])
+        _manager.refreshRepository(url).catchError((Object error) {
+          _errors[url] = error;
           return const <MangayomiSource>[];
         }),
     ]);
     if (!mounted) return;
     setState(() => _refreshing = false);
-    final count = _updates.length;
+    final count = _manager.updateCount;
     // Notify once per new update count, so repeated refreshes don't spam.
     if (count > 0 && count != _lastUpdateNotifyCount) {
       _lastUpdateNotifyCount = count;
@@ -130,26 +135,46 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
     }
   }
 
-  List<MangayomiSource> get _updates =>
-      mangayomiOutdatedSources(_manager.installed, [
-        for (final repository in _manager.repositories)
-          ..._manager.catalogueFor(repository),
-      ]);
-
   Future<void> _addRepository() async {
+    final typeIndex = await showModalBottomSheet<int>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const ListTile(title: Text('Add repository')),
+            for (final (index, label, icon) in [
+              (1, 'Anime', Icons.play_circle_outline_rounded),
+              (2, 'Manga', Icons.menu_book_rounded),
+              (3, 'Novel', Icons.auto_stories_rounded),
+            ])
+              ListTile(
+                leading: Icon(icon),
+                title: Text(label),
+                onTap: () => Navigator.pop(context, index),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (typeIndex == null || !mounted) return;
     var repositoryUrl = '';
     final value = await showDialog<String>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Add repository'),
+        title: Text(
+          'Add ${switch (typeIndex) {
+            1 => 'Anime',
+            2 => 'Manga',
+            _ => 'Novel',
+          }} repository',
+        ),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'Paste an index link for one source type, or the repository '
-              'folder URL — it loads Streaming, Manga, and Novel from all '
-              'indexes it finds.',
+              'Paste the matching index link. Each category is saved separately.',
               style: Theme.of(context).textTheme.bodySmall,
             ),
             const SizedBox(height: 12),
@@ -157,9 +182,13 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
               autofocus: true,
               keyboardType: TextInputType.url,
               onChanged: (value) => repositoryUrl = value.trim(),
-              decoration: const InputDecoration(
+              decoration: InputDecoration(
                 labelText: 'HTTPS repository URL',
-                hintText: 'https://example.com/repository/',
+                hintText: switch (typeIndex) {
+                  1 => 'https://example.com/anime_index.json',
+                  2 => 'https://example.com/manga_index.json',
+                  _ => 'https://example.com/novel_index.json',
+                },
               ),
             ),
           ],
@@ -179,16 +208,23 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
     if (value == null || value.isEmpty) return;
     try {
       final repository = Uri.parse(value);
+      final file = repository.pathSegments.lastOrNull;
+      final validFile = switch (typeIndex) {
+        1 => file == 'anime_index.json',
+        2 => file == 'index.json' || file == 'manga_index.json',
+        _ => file == 'novel_index.json',
+      };
+      if (!validFile) {
+        throw FormatException(
+          'Paste the ${switch (typeIndex) {
+            1 => 'anime_index.json',
+            2 => 'index.json or manga_index.json',
+            _ => 'novel_index.json',
+          }} link',
+        );
+      }
       final sources = await _manager.addRepository(repository);
       if (mounted) {
-        final types = sources.map((source) => source.contentType).toSet();
-        final type = types.length == 1 ? types.single : null;
-        final typeIndex = switch (type) {
-          MangayomiContentType.video => 1,
-          MangayomiContentType.manga => 2,
-          MangayomiContentType.novel => 3,
-          null => 0,
-        };
         _search.clear();
         setState(() {
           _query = '';
@@ -326,11 +362,6 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
               onPressed: () => _pickLanguages(isTv),
               icon: const Icon(Icons.language_rounded),
             ),
-          IconButton(
-            tooltip: 'Refresh repositories',
-            onPressed: _refreshing ? null : _refreshRepositories,
-            icon: const Icon(Icons.refresh_rounded),
-          ),
           if (isTv)
             IconButton(
               tooltip: 'Add repository',
@@ -572,7 +603,8 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
   }
 
   Widget _repositoriesTab(Set<String> offered) {
-    final filtered = _query.isNotEmpty || _typeFilter != null;
+    final filtered =
+        _query.isNotEmpty || _typeFilter != null || _langPrefs != null;
     final repositories = _manager.repositories.where((repository) {
       if (_errors.containsKey(repository)) return true;
       if (!filtered) return true;
@@ -607,8 +639,9 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
                   ? 'No repositories added yet. Add one to browse sources.'
                   : _query.isNotEmpty
                   ? 'No extensions match "${_search.text.trim()}".'
-                  : 'No ${_contentType(type!)} repositories added yet. '
-                        'Add one to browse sources.',
+                  : type == null
+                  ? 'No repositories match the selected languages.'
+                  : 'No ${_contentType(type)} repositories match the selected filters.',
             ),
         ],
       );
@@ -713,7 +746,9 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
                     color: AppColors.textSecondary,
                   ),
                   onSelected: (action) {
-                    if (action == 'check') _refreshRepositories();
+                    if (action == 'check') {
+                      _refreshRepositories(repository: repository);
+                    }
                     if (action == 'remove') _removeRepository(repository);
                   },
                   itemBuilder: (_) => const [
@@ -800,11 +835,42 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  source.name,
-                  style: AppText.headline.copyWith(fontSize: 15),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+                Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        source.name,
+                        style: AppText.headline.copyWith(fontSize: 15),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    if (source.isNsfw) ...[
+                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: AppColors.accent.withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(4),
+                          border: Border.all(
+                            color: AppColors.accent.withValues(alpha: 0.5),
+                          ),
+                        ),
+                        child: Text(
+                          context.l10n.nsfw,
+                          style: AppText.overline.copyWith(
+                            color: AppColors.accent,
+                            fontWeight: FontWeight.w700,
+                            fontSize: 9,
+                            letterSpacing: 0.5,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
                 ),
                 const SizedBox(height: 2),
                 Text(
@@ -825,7 +891,8 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
 
   Widget _catalogueAction(MangayomiSource source) {
     final installed = _manager.get(source.key)?.source;
-    if (installed != null && installed.version == source.version) {
+    if (installed != null &&
+        !mangayomiVersionIsNewer(source.version, installed.version)) {
       return OutlinedButton(
         onPressed: () => _uninstall(source.key),
         style: OutlinedButton.styleFrom(

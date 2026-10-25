@@ -195,7 +195,7 @@ class _HubPhoneView extends StatelessWidget {
               info:
                   '$mangayomiCount sources · ${mangayomi.repositories.length} repos',
               active: activeIsMangayomi,
-              updateCount: 0,
+              updateCount: mangayomi.updateCount,
               onTap: () => open(const MangayomiSourcesScreen()),
             ),
             const SizedBox(height: 28),

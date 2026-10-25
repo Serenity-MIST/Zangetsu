@@ -34,7 +34,8 @@ class SourcePickerRowActions extends StatelessWidget {
         !sourceId.startsWith('ani:') &&
         !sourceId.startsWith('mihon:') &&
         !sourceId.startsWith('cs:') &&
-        !sourceId.startsWith('lnr:');
+        !sourceId.startsWith('lnr:') &&
+        !sourceId.startsWith('mg:');
 
     return FutureBuilder<bool>(
       future: source_actions.hasSourceSettings(sourceId),
@@ -56,8 +57,12 @@ class SourcePickerRowActions extends StatelessWidget {
                   child: Icon(Icons.shield_rounded, size: 18),
                 ),
                 color: _cfOrange,
-                onPressed: () =>
-                    _solveCloudflare(sourceId, solveTarget, isJs: isJs),
+                onPressed: () => _solveCloudflare(
+                  context,
+                  sourceId,
+                  solveTarget,
+                  isJs: isJs,
+                ),
               ),
             if (hasMenu)
               _overflow(
@@ -92,7 +97,7 @@ class SourcePickerRowActions extends StatelessWidget {
     itemBuilder: (_) => [
       if (showSolve)
         PopupMenuItem<VoidCallback>(
-          value: () => _solveCloudflare(id, solveTarget, isJs: isJs),
+          value: () => _solveCloudflare(context, id, solveTarget, isJs: isJs),
           child: Text(context.l10n.solveCloudflare),
         ),
       if (showSignIn)
@@ -113,10 +118,22 @@ class SourcePickerRowActions extends StatelessWidget {
   );
 
   Future<void> _solveCloudflare(
+    BuildContext context,
     String id,
     String fallbackTarget, {
     required bool isJs,
   }) async {
+    if (id.startsWith('mg:') &&
+        Theme.of(context).platform == TargetPlatform.iOS) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Cloudflare verification for Mangayomi sources is not available on iOS yet.',
+          ),
+        ),
+      );
+      return;
+    }
     final target =
         await sl<SourceRepository>().cfSolveTargetFor(id) ?? fallbackTarget;
     if (target.isEmpty) return;

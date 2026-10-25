@@ -5,7 +5,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:zangetsu_source_bridge/zangetsu_source_bridge.dart';
 
+import '../error/exceptions.dart';
 import '../models/source_pref.dart';
+import '../provider/cf_solve_needed.dart';
+import '../update/update_service.dart';
 import 'mangayomi_provider.dart';
 
 class MangayomiManager extends ChangeNotifier {
@@ -25,6 +28,11 @@ class MangayomiManager extends ChangeNotifier {
   List<InstalledMangayomiSource> get installed =>
       List.unmodifiable(_installed.values);
   List<Uri> get repositories => List.unmodifiable(_repositories);
+  List<MangayomiSource> get updates => mangayomiOutdatedSources(
+    _installed.values,
+    _catalogues.values.expand((sources) => sources),
+  );
+  int get updateCount => updates.length;
 
   Future<void> init() async {
     if (_initialized) return;
@@ -156,6 +164,11 @@ class MangayomiManager extends ChangeNotifier {
     entry.active++;
     try {
       return await operation(entry.worker);
+    } on StateError catch (error, stackTrace) {
+      final url = mangayomiCloudflareChallengeUrl(error);
+      if (url == null) Error.throwWithStackTrace(error, stackTrace);
+      CfSolveNeeded.needsSolve(Uri.parse(url).host, url, sourceId: sourceId);
+      Error.throwWithStackTrace(CloudflareRequiredException(url), stackTrace);
     } finally {
       entry.active--;
       await _trimWorkers();
@@ -219,6 +232,23 @@ class MangayomiManager extends ChangeNotifier {
   }
 }
 
+@visibleForTesting
+String? mangayomiCloudflareChallengeUrl(Object error) {
+  if (error is! StateError) return null;
+  const marker = 'Cloudflare challenge at ';
+  final message = error.toString();
+  final markerIndex = message.indexOf(marker);
+  if (markerIndex < 0) return null;
+  final url = message.substring(markerIndex + marker.length).trim();
+  final uri = Uri.tryParse(url);
+  if (uri == null ||
+      (uri.scheme != 'http' && uri.scheme != 'https') ||
+      uri.host.isEmpty) {
+    return null;
+  }
+  return url;
+}
+
 class _WorkerEntry {
   _WorkerEntry(this.worker);
   final MangayomiRuntimeWorker worker;
@@ -235,7 +265,10 @@ List<MangayomiSource> mangayomiOutdatedSources(
   return [
     for (final item in installed)
       if (byKey[item.source.key] case final source?
-          when source.version != item.source.version)
+          when mangayomiVersionIsNewer(source.version, item.source.version))
         source,
   ];
 }
+
+bool mangayomiVersionIsNewer(String available, String installed) =>
+    UpdateService.compareVersions(available, installed) > 0;

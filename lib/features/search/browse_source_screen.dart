@@ -285,6 +285,29 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
     );
     if (target == null || target.isEmpty) return;
     await MihonExtensionService.solveCloudflare(target);
+    if (widget.sourceId.startsWith('mg:') && mounted) {
+      final cubit = context.read<BrowseSourceCubit>();
+      final state = cubit.state;
+      if (state.searchFailed && state.query.isNotEmpty) {
+        await cubit.search(state.query);
+      } else if (state.searchFailed && state.filtersJson.isNotEmpty) {
+        await cubit.applyFilters(state.filtersJson);
+      } else {
+        await cubit.load();
+      }
+    }
+  }
+
+  Widget _mangayomiCloudflareState(BuildContext context) {
+    final unsupported = Theme.of(context).platform == TargetPlatform.iOS;
+    return EmptyState(
+      icon: Icons.shield_outlined,
+      message: unsupported
+          ? 'Cloudflare-protected Mangayomi sources are not supported on iOS yet.'
+          : 'This Mangayomi source is protected by Cloudflare.',
+      actionLabel: unsupported ? null : context.l10n.solveCloudflare,
+      onAction: unsupported ? null : _solveCloudflare,
+    );
   }
 
   /// Let the user point this source's site actions at a domain of their own.
@@ -563,6 +586,9 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
                 // both are fixable from right here rather than from the
                 // overflow menu the user has no reason to open.
                 final blocked = CfSolveNeeded.sourceFlagged(widget.sourceId);
+                if (blocked && widget.sourceId.startsWith('mg:')) {
+                  return _mangayomiCloudflareState(context);
+                }
                 return EmptyState(
                   icon: blocked
                       ? Icons.shield_outlined
@@ -621,6 +647,10 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
       return const Center(child: CircularProgressIndicator());
     }
     if (state.searchFailed) {
+      if (widget.sourceId.startsWith('mg:') &&
+          CfSolveNeeded.sourceFlagged(widget.sourceId)) {
+        return _mangayomiCloudflareState(context);
+      }
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(24),

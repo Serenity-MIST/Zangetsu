@@ -188,9 +188,6 @@ void main() {
   test('Mangayomi backup restores selected sources from saved repositories',
       () async {
     const repoUrl = 'https://repo.example.com/index.json';
-    // Index-file links normalize to their repository directory (bridge
-    // treats the directory as the repo identity).
-    const rootUrl = 'https://repo.example.com/';
     const codeUrl = 'https://cdn.example.com/source.dart';
     final manifest = {
       'id': 17,
@@ -222,7 +219,7 @@ void main() {
     final snapshot = SourcesBackup(
       _StubRepos([]), _StubProviderRegistry([]), null, mangayomi: original,
     ).build();
-    expect(snapshot['mangayomiRepoUrls'], [rootUrl]);
+    expect(snapshot['mangayomiRepoUrls'], [repoUrl]);
     expect(snapshot['mangayomiSourceKeys'], [source.key]);
     expect(snapshot, isNot(contains('mangayomiCode')));
 
@@ -236,7 +233,7 @@ void main() {
     ).merge(snapshot);
 
     expect(failures, isEmpty);
-    expect(restored.repositories.map((url) => url.toString()), [rootUrl]);
+    expect(restored.repositories.map((url) => url.toString()), [repoUrl]);
     expect(restored.installed.map((item) => item.source.key), [source.key]);
     original.dispose();
     restored.dispose();

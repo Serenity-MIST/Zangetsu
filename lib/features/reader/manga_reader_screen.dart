@@ -19,6 +19,7 @@ import 'package:share_plus/share_plus.dart';
 
 import '../../core/di/injector.dart';
 import '../../core/error/exceptions.dart';
+import '../../core/mihon/mihon_extension_service.dart';
 import '../../core/models/episode.dart';
 import '../../core/reading/chapter_nav.dart';
 import '../../core/reading/manga_translation/manga_page_translation_models.dart';
@@ -152,6 +153,8 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
 
   bool _loading = true;
   String? _error;
+  String? _cloudflareUrl;
+  bool _solvingCloudflare = false;
 
   /// Every page currently in the strip — which, once you read past the end of
   /// a chapter, spans MORE THAN ONE chapter. [_slots] says which.
@@ -420,6 +423,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     setState(() {
       _loading = true;
       _error = null;
+      _cloudflareUrl = null;
     });
     try {
       final pages = await _fetchPages();
@@ -460,6 +464,15 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       _preload(start, pages);
       _restoreControllerPositions(start, pages.length);
       _detectWebtoon();
+    } on CloudflareRequiredException catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _error = kChapterLoadFailedMessage;
+        if (widget.sourceId.startsWith('mg:')) {
+          _cloudflareUrl = error.url;
+        }
+        _loading = false;
+      });
     } catch (_) {
       if (!mounted) return;
       setState(() {
@@ -3406,7 +3419,58 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     );
   }
 
-  Widget _buildError() => _buildMessage(_error!);
+  Widget _buildError() {
+    final url = _cloudflareUrl;
+    if (url == null) return _buildMessage(_error!);
+    final unsupported = Platform.isIOS;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.shield_outlined,
+              size: 40,
+              color: AppColors.textTertiary,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              unsupported
+                  ? 'Cloudflare-protected Mangayomi sources are not supported on iOS yet.'
+                  : 'This Mangayomi chapter is protected by Cloudflare.',
+              style: AppText.body.copyWith(color: Colors.white),
+              textAlign: TextAlign.center,
+            ),
+            if (!unsupported) ...[
+              const SizedBox(height: 16),
+              FilledButton.icon(
+                onPressed: _solvingCloudflare
+                    ? null
+                    : () => unawaited(_solveMangayomiCloudflare(url)),
+                icon: _solvingCloudflare
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.shield_rounded),
+                label: Text(context.l10n.solveCloudflare),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _solveMangayomiCloudflare(String url) async {
+    setState(() => _solvingCloudflare = true);
+    await MihonExtensionService.solveCloudflare(url);
+    if (!mounted) return;
+    setState(() => _solvingCloudflare = false);
+    await _load();
+  }
 
   /// Icon, message, and a Retry that re-runs [_load]. Shared by the failure
   /// and the empty-chapter cases — both leave the reader with nothing to show

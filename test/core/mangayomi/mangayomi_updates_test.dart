@@ -34,6 +34,13 @@ void main() {
     expect(mangayomiOutdatedSources([_installed(current)], [current]), isEmpty);
   });
 
+  test('outdated: older catalogue version is not offered as an update', () {
+    final installed = _source(id: 1, version: '2.0.0');
+    final older = _source(id: 1, version: '1.9.9');
+    expect(mangayomiOutdatedSources([_installed(installed)], [older]), isEmpty);
+    expect(mangayomiVersionIsNewer(older.version, installed.version), isFalse);
+  });
+
   test('outdated: installed source missing from catalogue is left alone', () {
     final orphaned = _source(id: 2);
     final other = _source(id: 3, version: '9.9.9');

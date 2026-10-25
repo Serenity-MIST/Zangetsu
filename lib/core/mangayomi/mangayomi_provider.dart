@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/services.dart';
 import 'package:zangetsu_source_bridge/zangetsu_source_bridge.dart';
 
 import '../models/episode.dart';
@@ -13,6 +14,10 @@ import '../provider/base_provider.dart';
 import '../provider/reading_provider.dart';
 import '../torrent/torrent_util.dart';
 import 'mangayomi_manager.dart';
+
+const MethodChannel _mangayomiCloudflareChannel = MethodChannel(
+  'zangetsu/mihon',
+);
 
 class MangayomiProvider implements BaseProvider, ReadingProvider {
   MangayomiProvider({required this.manager, required this.installed});
@@ -164,21 +169,119 @@ class MangayomiProvider implements BaseProvider, ReadingProvider {
     bool fast = false,
   }) => manager.run(sourceId, (worker) async {
     final videos = await worker.getVideoList(episodeUrl);
-    return [
-      for (final video in videos)
-        if (video.url.isNotEmpty) MangayomiMapping.video(source, video),
-    ];
+    final headersByHost = await _cloudflareHeadersByHost(
+      videos.map((video) => video.url),
+    );
+    final sources = <VideoSource>[];
+    for (final video in videos) {
+      if (video.url.isEmpty) continue;
+      final host = Uri.tryParse(video.url)?.host;
+      sources.add(
+        MangayomiMapping.video(
+          source,
+          video,
+          headers: _mergeHeaders(
+            video.headers,
+            host == null ? const {} : headersByHost[host] ?? const {},
+          ),
+        ),
+      );
+    }
+    return sources;
   });
 
   @override
   Future<List<PageImage>> getPages(String chapterUrl) =>
       manager.run(sourceId, (worker) async {
         final pages = await worker.getPageList(chapterUrl);
-        return [
+        final mapped = [
           for (final page in pages)
             if (page.url.isNotEmpty) MangayomiMapping.page(source, page),
         ];
+        final headersByHost = await _cloudflareHeadersByHost(
+          mapped.map((page) => page.url),
+        );
+        return [
+          for (final page in mapped)
+            PageImage(
+              url: page.url,
+              headers: _mergeHeaders(
+                page.headers,
+                headersByHost[Uri.tryParse(page.url)?.host] ?? const {},
+              ),
+            ),
+        ];
       });
+
+  Future<Map<String, Map<String, String>>> _cloudflareHeadersByHost(
+    Iterable<String> urls,
+  ) async {
+    if (!source.hasCloudflare) return const {};
+    final urlsByHost = <String, String>{};
+    for (final url in urls) {
+      final uri = Uri.tryParse(url);
+      if (uri == null ||
+          (uri.scheme != 'http' && uri.scheme != 'https') ||
+          uri.host.isEmpty) {
+        continue;
+      }
+      urlsByHost.putIfAbsent(uri.host, () => url);
+    }
+    final entries = await Future.wait(
+      urlsByHost.entries.map(
+        (entry) async =>
+            MapEntry(entry.key, await _cloudflareHeaders(entry.value)),
+      ),
+    );
+    return Map.fromEntries(entries);
+  }
+
+  Future<Map<String, String>> _cloudflareHeaders(String url) async {
+    if (!source.hasCloudflare) return const {};
+    final uri = Uri.tryParse(url);
+    if (uri == null ||
+        (uri.scheme != 'http' && uri.scheme != 'https') ||
+        uri.host.isEmpty) {
+      return const {};
+    }
+    try {
+      final result = await _mangayomiCloudflareChannel
+          .invokeMapMethod<String, String>('imageCookie', {'url': url});
+      if (result?['Cookie']?.isNotEmpty != true) return const {};
+      return result!;
+    } on MissingPluginException {
+      // Protected Mangayomi sources are reported as unsupported on iOS.
+      return const {};
+    } on PlatformException {
+      return const {};
+    }
+  }
+
+  Map<String, String>? _mergeHeaders(
+    Map<String, String>? extensionHeaders,
+    Map<String, String> cloudflareHeaders,
+  ) {
+    if (cloudflareHeaders.isEmpty) return extensionHeaders;
+    final headers = <String, String>{...?extensionHeaders};
+    String? existingKey(String name) {
+      for (final key in headers.keys) {
+        if (key.toLowerCase() == name) return key;
+      }
+      return null;
+    }
+
+    final cookieKey = existingKey('cookie');
+    final existingCookie = cookieKey == null ? null : headers.remove(cookieKey);
+    final clearance = cloudflareHeaders['Cookie']!;
+    headers['Cookie'] = existingCookie == null || existingCookie.isEmpty
+        ? clearance
+        : '$clearance; $existingCookie';
+    if (existingKey('user-agent') == null) {
+      final userAgent = cloudflareHeaders['User-Agent'];
+      if (userAgent != null) headers['User-Agent'] = userAgent;
+    }
+    return headers;
+  }
 
   @override
   Future<ChapterText> getText(String chapterUrl) =>
@@ -266,14 +369,18 @@ abstract final class MangayomiMapping {
   static PageImage page(MangayomiSource source, MPage page) =>
       PageImage(url: _resolve(source, page.url), headers: page.headers);
 
-  static VideoSource video(MangayomiSource source, MVideo video) {
+  static VideoSource video(
+    MangayomiSource source,
+    MVideo video, {
+    Map<String, String>? headers,
+  }) {
     final url = video.url;
     return VideoSource(
       url: url,
       quality: video.quality.isEmpty ? null : video.quality,
       label: video.quality.isEmpty ? null : video.quality,
       container: _container(url),
-      headers: video.headers,
+      headers: headers ?? video.headers,
       subtitles: [
         for (final track in video.subtitles ?? const <Track>[])
           if ((track.file ?? '').isNotEmpty)

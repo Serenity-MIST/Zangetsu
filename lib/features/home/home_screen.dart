@@ -2074,6 +2074,10 @@ class _HomeViewState extends State<_HomeView>
                             // apply to it.
                             isMetadataProvider:
                                 _repo.sourceId == ZmodeIds.sourceId,
+                            cloudflareUnsupported:
+                                state.cloudflareUrl != null &&
+                                Platform.isIOS &&
+                                _repo.sourceId.startsWith('mg:'),
                             rateLimitedSeconds: state.rateLimitedSeconds,
                             onRetry: () =>
                                 context.read<HomeCubit>().load(reset: true),
@@ -2085,10 +2089,13 @@ class _HomeViewState extends State<_HomeView>
                                 builder: (_) => const ProvidersHubScreen(),
                               ),
                             ),
-                            // Cloudflare-blocked (Mihon) source: offer the visible
-                            // solve, then reload once the user closes the WebView.
+                            // Cloudflare-blocked source: solve, then reload after
+                            // the user closes the WebView.
                             cloudflareUrl: state.cloudflareUrl,
-                            onSolveCloudflare: state.cloudflareUrl == null
+                            onSolveCloudflare:
+                                state.cloudflareUrl == null ||
+                                    (Platform.isIOS &&
+                                        _repo.sourceId.startsWith('mg:'))
                                 ? null
                                 : () async {
                                     await MihonExtensionService.solveCloudflare(
@@ -2228,6 +2235,7 @@ class HomeLoadedEmptyView extends StatelessWidget {
     required this.onInstallSources,
     this.cloudflareUrl,
     this.onSolveCloudflare,
+    this.cloudflareUnsupported = false,
     this.offline = false,
     this.isMetadataProvider = false,
     this.rateLimitedSeconds,
@@ -2256,16 +2264,19 @@ class HomeLoadedEmptyView extends StatelessWidget {
   /// [onSolveCloudflare] opens the visible solve WebView and reloads after.
   final String? cloudflareUrl;
   final Future<void> Function()? onSolveCloudflare;
+  final bool cloudflareUnsupported;
 
   @override
   Widget build(BuildContext context) {
     // A Cloudflare block takes priority over the no-sources guide: the source
     // IS installed, it's just gated behind a challenge the user can solve.
-    if (cloudflareUrl != null && onSolveCloudflare != null) {
+    if (cloudflareUrl != null &&
+        (onSolveCloudflare != null || cloudflareUnsupported)) {
       return _SourceUnavailable(
         sourceName: sourceName,
         onRetry: onRetry,
         onSolveCloudflare: onSolveCloudflare,
+        cloudflareUnsupported: cloudflareUnsupported,
       );
     }
     if (offline) {
@@ -2373,6 +2384,7 @@ class _SourceUnavailable extends StatelessWidget {
     required this.sourceName,
     required this.onRetry,
     this.onSolveCloudflare,
+    this.cloudflareUnsupported = false,
     this.offline = false,
     this.isMetadataProvider = false,
     this.rateLimitedSeconds,
@@ -2395,12 +2407,13 @@ class _SourceUnavailable extends StatelessWidget {
   /// When set, this is a Cloudflare block (not a generic outage): show a shield
   /// + a primary "Solve Cloudflare" action that opens the visible solve WebView.
   final Future<void> Function()? onSolveCloudflare;
+  final bool cloudflareUnsupported;
 
   static const Color _cloudflareOrange = Color(0xFFF48120);
 
   @override
   Widget build(BuildContext context) {
-    final isCloudflare = onSolveCloudflare != null;
+    final isCloudflare = onSolveCloudflare != null || cloudflareUnsupported;
     return Padding(
       padding: const EdgeInsets.fromLTRB(36, 40, 36, 56),
       child: Column(
@@ -2446,8 +2459,11 @@ class _SourceUnavailable extends StatelessWidget {
           const SizedBox(height: 10),
           Text(
             isCloudflare
-                ? 'Complete the Cloudflare check once and this source will '
-                      'load normally from then on.'
+                ? cloudflareUnsupported
+                      ? 'Cloudflare verification for Mangayomi sources is not '
+                            'available on iOS yet. Unprotected sources still work.'
+                      : 'Complete the Cloudflare check once and this source will '
+                            'load normally from then on.'
                 : offline
                 ? "Nothing could reach the network. Check your connection "
                       "and try again — $sourceName is probably fine."
@@ -2465,36 +2481,38 @@ class _SourceUnavailable extends StatelessWidget {
           ),
           const SizedBox(height: 24),
           if (isCloudflare) ...[
-            ElevatedButton.icon(
-              onPressed: () => onSolveCloudflare!(),
-              icon: const Icon(Icons.shield_rounded, size: 20),
-              label: Text(context.l10n.solveCloudflare),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: _cloudflareOrange,
-                foregroundColor: Colors.white,
-                elevation: 0,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 30,
-                  vertical: 13,
-                ),
-                textStyle: const TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600,
-                ),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(26),
+            if (!cloudflareUnsupported) ...[
+              ElevatedButton.icon(
+                onPressed: () => onSolveCloudflare!(),
+                icon: const Icon(Icons.shield_rounded, size: 20),
+                label: Text(context.l10n.solveCloudflare),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: _cloudflareOrange,
+                  foregroundColor: Colors.white,
+                  elevation: 0,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 30,
+                    vertical: 13,
+                  ),
+                  textStyle: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(26),
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(height: 6),
-            TextButton.icon(
-              onPressed: onRetry,
-              icon: const Icon(Icons.refresh_rounded, size: 18),
-              label: Text(context.l10n.retry),
-              style: TextButton.styleFrom(
-                foregroundColor: AppColors.textSecondary,
+              const SizedBox(height: 6),
+              TextButton.icon(
+                onPressed: onRetry,
+                icon: const Icon(Icons.refresh_rounded, size: 18),
+                label: Text(context.l10n.retry),
+                style: TextButton.styleFrom(
+                  foregroundColor: AppColors.textSecondary,
+                ),
               ),
-            ),
+            ],
           ] else
             ElevatedButton.icon(
               onPressed: onRetry,

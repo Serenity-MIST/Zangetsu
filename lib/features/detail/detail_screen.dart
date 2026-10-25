@@ -234,9 +234,10 @@ String? _repoLabelFromUrl(String? repoUrl) {
 /// title opened from AniList/TMDB (Z Mode) offers the same solve instead of
 /// failing silently. Uses the SAME solver Home does and reloads on success.
 class _DetailCloudflareBlocked extends StatefulWidget {
-  const _DetailCloudflareBlocked({required this.url});
+  const _DetailCloudflareBlocked({required this.url, this.isMangayomi = false});
 
   final String url;
+  final bool isMangayomi;
 
   @override
   State<_DetailCloudflareBlocked> createState() =>
@@ -255,7 +256,9 @@ class _DetailCloudflareBlockedState extends State<_DetailCloudflareBlocked> {
     // matching solve (the cookie has to land in THIS host's own cache, not
     // just the system-wide one MihonExtensionService's solve populates).
     final host = Uri.tryParse(widget.url)?.host ?? '';
-    if (CfSolveNeeded.hostFlagged(host)) {
+    if (widget.isMangayomi) {
+      await MihonExtensionService.solveCloudflare(widget.url);
+    } else if (CfSolveNeeded.hostFlagged(host)) {
       await sl<ProviderManager>().solveCloudflareForHost(host, widget.url);
     } else {
       await MihonExtensionService.solveCloudflare(widget.url);
@@ -267,6 +270,7 @@ class _DetailCloudflareBlockedState extends State<_DetailCloudflareBlocked> {
 
   @override
   Widget build(BuildContext context) {
+    final iosUnsupported = widget.isMangayomi && Platform.isIOS;
     return Center(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(36, 40, 36, 56),
@@ -287,8 +291,10 @@ class _DetailCloudflareBlockedState extends State<_DetailCloudflareBlocked> {
               ),
             ),
             const SizedBox(height: 20),
-            const Text(
-              'This source is protected by Cloudflare',
+            Text(
+              iosUnsupported
+                  ? 'Cloudflare-protected Mangayomi sources are not supported on iOS yet'
+                  : 'This source is protected by Cloudflare',
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: AppColors.textPrimary,
@@ -297,9 +303,11 @@ class _DetailCloudflareBlockedState extends State<_DetailCloudflareBlocked> {
               ),
             ),
             const SizedBox(height: 10),
-            const Text(
-              'Complete the Cloudflare check once and this title will load '
-              'normally from then on.',
+            Text(
+              iosUnsupported
+                  ? 'Mangayomi sources without Cloudflare protection can still be used on iOS.'
+                  : 'Complete the Cloudflare check once and this title will load '
+                        'normally from then on.',
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: AppColors.textSecondary,
@@ -308,33 +316,34 @@ class _DetailCloudflareBlockedState extends State<_DetailCloudflareBlocked> {
               ),
             ),
             const SizedBox(height: 24),
-            ElevatedButton.icon(
-              onPressed: _solving ? null : _solve,
-              icon: _solving
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: Colors.white,
-                      ),
-                    )
-                  : const Icon(Icons.shield_rounded, size: 20),
-              label: Text(context.l10n.solveCloudflare),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: _cloudflareOrange,
-                foregroundColor: Colors.white,
-                elevation: 0,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 30,
-                  vertical: 13,
-                ),
-                textStyle: const TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600,
+            if (!iosUnsupported)
+              ElevatedButton.icon(
+                onPressed: _solving ? null : _solve,
+                icon: _solving
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      )
+                    : const Icon(Icons.shield_rounded, size: 20),
+                label: Text(context.l10n.solveCloudflare),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: _cloudflareOrange,
+                  foregroundColor: Colors.white,
+                  elevation: 0,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 30,
+                    vertical: 13,
+                  ),
+                  textStyle: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
               ),
-            ),
           ],
         ),
       ),
@@ -1947,7 +1956,12 @@ class _DetailViewState extends State<_DetailView>
             return const _DetailSkeleton(heroHeight: _expandedHeight);
           }
           if (state.cloudflareUrl != null) {
-            return _DetailCloudflareBlocked(url: state.cloudflareUrl!);
+            return _DetailCloudflareBlocked(
+              url: state.cloudflareUrl!,
+              isMangayomi:
+                  widget.item.sourceId.startsWith('mg:') ||
+                  (state.detail?.sourceId.startsWith('mg:') ?? false),
+            );
           }
           if (state.status == DetailStatus.error || state.detail == null) {
             // The row you tapped already carried a title and a cover, so a
