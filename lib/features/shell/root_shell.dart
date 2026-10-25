@@ -346,8 +346,7 @@ class _RootShellState extends State<RootShell>
             // false throughout — it reads the scroll, never eats it.
             onNotification: (notification) => DockScrollCollapse.onNotification(
               notification,
-              enabled:
-                  _navPrefs.style == NavBarStyle.dock && !_keepDockExpanded,
+              enabled: !_keepDockExpanded,
             ),
             child: Builder(
               builder: (context) {
@@ -468,7 +467,9 @@ class _RootShellState extends State<RootShell>
                               return _LiquidNavDock(
                                 tabs: tabs,
                                 active: _tab,
+                                collapsed: collapsed && !_keepDockExpanded,
                                 glassTint: _navPrefs.glassTint,
+                                glassQuality: _navPrefs.glassQuality,
                                 onSelected: _onTabSelected,
                                 modesEnabled: ZModePrefs.enabled,
                                 onModeSelected: (mode, kind) async {
@@ -521,7 +522,9 @@ class _LiquidNavDock extends StatelessWidget {
   const _LiquidNavDock({
     required this.tabs,
     required this.active,
+    required this.collapsed,
     required this.glassTint,
+    required this.glassQuality,
     required this.onSelected,
     required this.modesEnabled,
     required this.onModeSelected,
@@ -529,7 +532,9 @@ class _LiquidNavDock extends StatelessWidget {
 
   final List<DockTab> tabs;
   final DockTab active;
+  final bool collapsed;
   final double glassTint;
+  final GlassQuality glassQuality;
   final ValueChanged<DockTab> onSelected;
   final bool modesEnabled;
   final void Function(ContentMode, StreamKind) onModeSelected;
@@ -573,8 +578,17 @@ class _LiquidNavDock extends StatelessWidget {
       glassColor: AppColors.settingsCard.withValues(alpha: 0.84),
       blur: 8,
     );
+    final glassTabs = [
+      for (final tab in tabs)
+        GlassTab(
+          icon: _icon(tab),
+          activeIcon: _icon(tab, selected: true),
+          label: tab.localizedLabel(context),
+          semanticLabel: tab.localizedLabel(context),
+        ),
+    ];
     return ConstrainedBox(
-      constraints: BoxConstraints(minHeight: 84 + bottomInset),
+      constraints: BoxConstraints(minHeight: 96 + bottomInset),
       child: Align(
         alignment: Alignment.bottomCenter,
         child: Padding(
@@ -586,37 +600,16 @@ class _LiquidNavDock extends StatelessWidget {
           child: Row(
             children: [
               Expanded(
-                child: GlassTabBar.bottom(
-                  tabs: [
-                    for (final tab in tabs)
-                      GlassTab(
-                        icon: _icon(tab),
-                        activeIcon: _icon(tab, selected: true),
-                        label: tab.localizedLabel(context),
-                      ),
-                  ],
+                child: _LiquidGlassTabBar(
+                  tabs: glassTabs,
                   selectedIndex: tabs.indexOf(active).clamp(0, tabs.length - 1),
-                  onTabSelected: (index) => onSelected(tabs[index]),
-                  horizontalPadding: 4,
-                  verticalPadding: 12,
-                  barHeight: 60,
-                  barBorderRadius: 30,
-                  tabPadding: const EdgeInsets.symmetric(horizontal: 2),
-                  iconSize: 22,
-                  labelFontSize: 10,
-                  quality: GlassQuality.premium,
-                  backgroundQuality: GlassQuality.premium,
+                  collapsed: collapsed,
+                  alignment: modesEnabled
+                      ? Alignment.centerRight
+                      : Alignment.center,
+                  quality: glassQuality,
                   settings: glass,
-                  indicatorColor: AppColors.accent.withValues(alpha: 0.14),
-                  selectedIconColor: AppColors.accent,
-                  unselectedIconColor: AppColors.textPrimary,
-                  selectedLabelColor: AppColors.textPrimary,
-                  unselectedLabelColor: AppColors.textSecondary,
-                  indicatorExpansion: const EdgeInsets.symmetric(
-                    horizontal: 8,
-                    vertical: 8,
-                  ),
-                  magnification: 1.08,
+                  onTabSelected: (index) => onSelected(tabs[index]),
                 ),
               ),
               if (modesEnabled) ...[
@@ -631,7 +624,7 @@ class _LiquidNavDock extends StatelessWidget {
                     menuWidth: 224,
                     menuBorderRadius: 28,
                     itemBorderRadius: 20,
-                    quality: GlassQuality.premium,
+                    quality: glassQuality,
                     settings: menuGlass,
                     selectionColor: AppColors.accent.withValues(alpha: 0.14),
                     enableInteractionGlow: false,
@@ -642,7 +635,7 @@ class _LiquidNavDock extends StatelessWidget {
                       onTap: toggleMenu,
                       width: 56,
                       height: 56,
-                      quality: GlassQuality.premium,
+                      quality: glassQuality,
                       settings: glass,
                       isStationary: true,
                     ),
@@ -686,6 +679,83 @@ class _LiquidNavDock extends StatelessWidget {
       ),
     );
   }
+}
+
+class _LiquidGlassTabBar extends StatelessWidget {
+  const _LiquidGlassTabBar({
+    required this.tabs,
+    required this.selectedIndex,
+    required this.collapsed,
+    required this.alignment,
+    required this.quality,
+    required this.settings,
+    required this.onTabSelected,
+  });
+
+  final List<GlassTab> tabs;
+  final int selectedIndex;
+  final bool collapsed;
+  final Alignment alignment;
+  final GlassQuality quality;
+  final LiquidGlassSettings settings;
+  final ValueChanged<int> onTabSelected;
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      final compactWidth = math.min(
+        constraints.maxWidth,
+        tabs.length * 52.0 + 8,
+      );
+      return TweenAnimationBuilder<double>(
+        tween: Tween(end: collapsed ? 1 : 0),
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOutCubic,
+        builder: (context, progress, _) {
+          return Align(
+            alignment: alignment,
+            child: SizedBox(
+              width:
+                  constraints.maxWidth +
+                  (compactWidth - constraints.maxWidth) * progress,
+              child: GlassTabBar.bottom(
+                tabs: tabs,
+                selectedIndex: selectedIndex,
+                onTabSelected: onTabSelected,
+                horizontalPadding: 4,
+                verticalPadding: 12 - 8 * progress,
+                barHeight: 60 - 10 * progress,
+                barBorderRadius: 30,
+                tabPadding: const EdgeInsets.symmetric(horizontal: 2),
+                iconSize: 22,
+                labelFontSize: math.max(0.01, 10 * (1 - progress)),
+                iconLabelSpacing: 4 * (1 - progress),
+                quality: quality,
+                backgroundQuality: progress == 0 || progress == 1
+                    ? quality
+                    : GlassQuality.minimal,
+                settings: settings,
+                indicatorColor: AppColors.accent.withValues(alpha: 0.14),
+                selectedIconColor: AppColors.accent,
+                unselectedIconColor: AppColors.textPrimary,
+                selectedLabelColor: AppColors.textPrimary.withValues(
+                  alpha: 1 - progress,
+                ),
+                unselectedLabelColor: AppColors.textSecondary.withValues(
+                  alpha: 1 - progress,
+                ),
+                indicatorExpansion: const EdgeInsets.symmetric(
+                  horizontal: 8,
+                  vertical: 8,
+                ),
+                magnification: 1.08,
+              ),
+            ),
+          );
+        },
+      );
+    },
+  );
 }
 
 /// The frosted floating capsule: blurred surface, hairline border, five

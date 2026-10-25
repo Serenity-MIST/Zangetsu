@@ -46,6 +46,7 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
   late bool _keepDockExpanded = _prefs.keepDockExpanded;
   late NavBarStyle _style = _prefs.style;
   late double _glassTint = _prefs.glassTint;
+  late GlassQuality _glassQuality = _prefs.glassQuality;
 
   /// The centre button is drawn from a real [DockTab]'s slot count, so it has
   /// to be mirrored here too: it is always on the bar and never editable.
@@ -73,6 +74,11 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
   }
 
   Future<void> _saveGlassTint(double value) => _prefs.setGlassTint(value);
+
+  Future<void> _setGlassQuality(GlassQuality value) async {
+    setState(() => _glassQuality = value);
+    await _prefs.setGlassQuality(value);
+  }
 
   Future<void> _resetGlassTint() async {
     setState(() => _glassTint = NavPrefs.defaultGlassTint);
@@ -116,6 +122,7 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
       _keepDockExpanded = _prefs.keepDockExpanded;
       _style = _prefs.style;
       _glassTint = _prefs.glassTint;
+      _glassQuality = _prefs.glassQuality;
     });
   }
 
@@ -168,6 +175,45 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
               if (_style == NavBarStyle.liquid) _glassTintControl(),
             ],
           ),
+          if (_style == NavBarStyle.liquid) ...[
+            const SettingsSectionLabel('Glass quality'),
+            SettingsCard(
+              children: [
+                for (final quality in [
+                  GlassQuality.premium,
+                  GlassQuality.standard,
+                ])
+                  SettingsTile(
+                    icon: _glassQualityIcon(quality),
+                    title: _glassQualityTitle(quality),
+                    subtitle: _glassQualitySubtitle(quality),
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (quality == NavPrefs.defaultGlassQuality) ...[
+                          Text(
+                            'Default',
+                            style: AppText.caption.copyWith(
+                              color: AppColors.textSecondary,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                        ],
+                        Icon(
+                          _glassQuality == quality
+                              ? Icons.radio_button_checked_rounded
+                              : Icons.radio_button_unchecked_rounded,
+                          color: _glassQuality == quality
+                              ? AppColors.accent
+                              : AppColors.textTertiary,
+                        ),
+                      ],
+                    ),
+                    onTap: () => _setGlassQuality(quality),
+                  ),
+              ],
+            ),
+          ],
           SettingsSectionLabel(
             // The cap is visible before you hit it, rather than discovered as
             // a greyed-out button.
@@ -190,13 +236,21 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
               if (_hasSwitcher) _switcherRow(),
             ],
           ),
-          SettingsSectionLabel(l10n.navDockBehavior),
+          SettingsSectionLabel(
+            _style == NavBarStyle.liquid
+                ? 'Navigation behaviour'
+                : l10n.navDockBehavior,
+          ),
           SettingsCard(
             children: [
               SettingsTile(
                 icon: Icons.unfold_more_rounded,
-                title: l10n.keepDockExpanded,
-                subtitle: l10n.keepDockExpandedSubtitle,
+                title: _style == NavBarStyle.liquid
+                    ? 'Keep navigation expanded'
+                    : l10n.keepDockExpanded,
+                subtitle: _style == NavBarStyle.liquid
+                    ? 'Keep tabs and labels visible while scrolling'
+                    : l10n.keepDockExpandedSubtitle,
                 onTap: () => _setKeepDockExpanded(!_keepDockExpanded),
                 trailing: Switch.adaptive(
                   key: const ValueKey('keep-dock-expanded-switch'),
@@ -309,8 +363,8 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
             tabPadding: EdgeInsets.zero,
             iconSize: 16,
             labelFontSize: 8,
-            quality: GlassQuality.premium,
-            backgroundQuality: GlassQuality.premium,
+            quality: _glassQuality,
+            backgroundQuality: _glassQuality,
             settings: glass,
             indicatorColor: AppColors.accent.withValues(alpha: 0.14),
             selectedIconColor: AppColors.accent,
@@ -332,7 +386,7 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
             onTap: () {},
             width: 42,
             height: 42,
-            quality: GlassQuality.premium,
+            quality: _glassQuality,
             settings: glass,
             isStationary: true,
           ),
@@ -348,6 +402,19 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
         ? Icon(_iconFor(tab, selected), size: 16, color: color)
         : DockIcon(glyph, color: color, filled: selected, size: 16);
   }
+
+  IconData _glassQualityIcon(GlassQuality quality) =>
+      quality == GlassQuality.premium
+      ? Icons.auto_awesome_rounded
+      : Icons.speed_rounded;
+
+  String _glassQualityTitle(GlassQuality quality) =>
+      quality == GlassQuality.premium ? 'Premium' : 'Standard';
+
+  String _glassQualitySubtitle(GlassQuality quality) =>
+      quality == GlassQuality.premium
+      ? 'Most detailed glass effect'
+      : 'Lighter effect for smoother scrolling';
 
   Widget _glassTintControl() {
     return Padding(

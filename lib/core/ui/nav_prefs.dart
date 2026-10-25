@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:hive/hive.dart';
+import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
 
 /// A tab the phone dock can show.
@@ -40,7 +41,9 @@ class NavPrefs extends ChangeNotifier {
   static const String _keepDockExpandedKey = 'keepDockExpanded';
   static const String _styleKey = 'style';
   static const String _glassTintKey = 'glassTint';
+  static const String _glassQualityKey = 'glassQuality';
   static const double defaultGlassTint = 0.82;
+  static const GlassQuality defaultGlassQuality = GlassQuality.premium;
 
   /// The dock is a fixed-width capsule that fits five icons; below three it
   /// looks empty and above five the labels start colliding.
@@ -149,12 +152,26 @@ class NavPrefs extends ChangeNotifier {
     notifyListeners();
   }
 
+  GlassQuality get glassQuality =>
+      _box?.get(_glassQualityKey) == GlassQuality.standard.name
+      ? GlassQuality.standard
+      : defaultGlassQuality;
+
+  Future<void> setGlassQuality(GlassQuality value) async {
+    await _box?.put(
+      _glassQualityKey,
+      value == GlassQuality.standard ? value.name : defaultGlassQuality.name,
+    );
+    notifyListeners();
+  }
+
   Future<void> reset() async {
     await _box?.delete(_tabsKey);
     await _box?.delete(_startKey);
     await _box?.delete(_keepDockExpandedKey);
     await _box?.delete(_styleKey);
     await _box?.delete(_glassTintKey);
+    await _box?.delete(_glassQualityKey);
     notifyListeners();
   }
 
@@ -163,7 +180,8 @@ class NavPrefs extends ChangeNotifier {
       startTab == defaultTabs.first &&
       !keepDockExpanded &&
       style == NavBarStyle.dock &&
-      glassTint == defaultGlassTint;
+      glassTint == defaultGlassTint &&
+      glassQuality == defaultGlassQuality;
 
   /// The validation the getter and setter both apply, exposed so the
   /// invariants can be tested without opening a Hive box.
