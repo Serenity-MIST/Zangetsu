@@ -54,42 +54,32 @@ class MangayomiProvider implements BaseProvider, ReadingProvider {
   Future<List<HomeSection>?> getHome({String category = 'sub'}) async {
     Object? popularFailure;
     StackTrace? popularStackTrace;
-    var items = <MediaItem>[];
-    try {
-      items = await popular();
-    } catch (error, stackTrace) {
-      popularFailure = error;
-      popularStackTrace = stackTrace;
+    final results = await Future.wait([
+      popular().catchError((Object error, StackTrace stackTrace) {
+        popularFailure = error;
+        popularStackTrace = stackTrace;
+        return <MediaItem>[];
+      }),
+      latest().catchError((_) => <MediaItem>[]),
+    ]);
+    final items = results[0];
+    final updates = results[1];
+    if (items.isEmpty && updates.isEmpty && popularFailure != null) {
+      Error.throwWithStackTrace(popularFailure!, popularStackTrace!);
     }
-    if (items.isNotEmpty) {
-      return [
+    return [
+      if (items.isNotEmpty)
         HomeSection(
           title: 'Popular',
           items: items,
           more: BrowseMore(sourceId: sourceId, kind: 'mg_popular'),
         ),
-      ];
-    }
-
-    List<MediaItem> updates;
-    try {
-      updates = await latest();
-    } catch (_) {
-      if (popularFailure != null) {
-        Error.throwWithStackTrace(popularFailure, popularStackTrace!);
-      }
-      return const [];
-    }
-    if (updates.isEmpty && popularFailure != null) {
-      Error.throwWithStackTrace(popularFailure, popularStackTrace!);
-    }
-    if (updates.isEmpty) return const [];
-    return [
-      HomeSection(
-        title: 'Latest',
-        items: updates,
-        more: BrowseMore(sourceId: sourceId, kind: 'mg_latest'),
-      ),
+      if (updates.isNotEmpty)
+        HomeSection(
+          title: 'Latest',
+          items: updates,
+          more: BrowseMore(sourceId: sourceId, kind: 'mg_latest'),
+        ),
     ];
   }
 
