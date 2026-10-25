@@ -100,6 +100,7 @@ class _RootShellState extends State<RootShell>
   /// Double-back-to-exit: timestamp of the last root Back press. A second Back
   /// within 2s exits the app; the first just shows the "press back again" toast.
   DateTime? _lastBackPress;
+  DateTime? _lastProfileTap;
 
   /// Tab-switch entrance: the visible page swaps immediately and the INCOMING
   /// tab fades + slides up into place (200ms, ease-out). We never fade the old
@@ -221,6 +222,23 @@ class _RootShellState extends State<RootShell>
   }
 
   void _onTabSelected(DockTab tab) {
+    if (tab == DockTab.profile) {
+      final now = DateTime.now();
+      final lastTap = _lastProfileTap;
+      _lastProfileTap = now;
+      if (lastTap != null &&
+          now.difference(lastTap) < const Duration(milliseconds: 350)) {
+        _lastProfileTap = null;
+        Navigator.of(context).push<void>(
+          MaterialPageRoute<void>(
+            builder: (_) => const SettingsScreen(showBackButton: true),
+          ),
+        );
+        return;
+      }
+    } else {
+      _lastProfileTap = null;
+    }
     if (tab == _tab) return; // Re-tapping the current tab: no transition.
     DockScrollCollapse.reset();
     setState(() => _tab = tab);

@@ -55,6 +55,7 @@ import 'package:watch_app/features/home/cubit/home_cubit.dart';
 import 'package:watch_app/features/home/home_screen.dart';
 import 'package:watch_app/features/shell/root_shell.dart';
 import 'package:watch_app/features/shell/root_shell_tv.dart';
+import 'package:watch_app/features/settings/settings_screen.dart';
 
 /// The gradient one of Home's cards is painting behind its label.
 List<Color> _cardFill(WidgetTester tester, String key) {
@@ -472,6 +473,31 @@ void main() {
     expect(find.byType(ViewerProfileHomeScreen), findsOneWidget);
     expect(find.byTooltip('Profile menu'), findsOneWidget);
     expect(find.text('About'), findsNothing);
+  });
+
+  testWidgets('double-tapping the phone Profile tab opens Settings', (
+    tester,
+  ) async {
+    sl.registerSingleton<AppMode>(const AppMode(isTv: false));
+    await tester.pumpWidget(wrap(const RootShell()));
+    await tester.pump(const Duration(milliseconds: 250));
+
+    expect(find.byType(SettingsScreen), findsNothing);
+
+    await tester.tap(dockLabel('Profile'));
+    await tester.pump();
+    expect(find.byType(ViewerProfileHomeScreen), findsOneWidget);
+    expect(
+      tester.state<NavigatorState>(find.byType(Navigator)).canPop(),
+      isFalse,
+    );
+    await tester.tap(dockLabel('Profile'));
+    await tester.pump(const Duration(milliseconds: 500));
+
+    final settings = tester.element(
+      find.byType(SettingsScreen, skipOffstage: false),
+    );
+    expect(ModalRoute.of(settings)?.isCurrent, isTrue);
   });
 
   testWidgets('profile launch gate hides the entire phone shell', (
