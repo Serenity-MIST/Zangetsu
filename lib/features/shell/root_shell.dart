@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:cached_network_image/cached_network_image.dart';
-import 'package:cue/cue.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:flutter_bloc/flutter_bloc.dart';
@@ -443,13 +442,14 @@ class _RootShellState extends State<RootShell>
                     curve: hide
                         ? const Interval(0.88, 1, curve: Curves.easeOutCubic)
                         : const Interval(0, 0.12, curve: Curves.easeOutCubic),
-                    builder: (context, factor, child) => ClipRect(
-                      child: Align(
+                    builder: (context, factor, child) {
+                      final aligned = Align(
                         alignment: Alignment.topCenter,
                         heightFactor: factor,
                         child: child,
-                      ),
-                    ),
+                      );
+                      return factor < 1 ? ClipRect(child: aligned) : aligned;
+                    },
                     child: AnimatedSlide(
                       offset: hide ? const Offset(0, 1.6) : Offset.zero,
                       duration: const Duration(milliseconds: 240),
@@ -569,6 +569,10 @@ class _LiquidNavDock extends StatelessWidget {
   Widget build(BuildContext context) {
     final bottomInset = MediaQuery.paddingOf(context).bottom;
     final glass = liquidNavGlassSettings(glassTint);
+    final menuGlass = glass.copyWith(
+      glassColor: AppColors.settingsCard.withValues(alpha: 0.84),
+      blur: 8,
+    );
     return ConstrainedBox(
       constraints: BoxConstraints(minHeight: 84 + bottomInset),
       child: Align(
@@ -620,71 +624,59 @@ class _LiquidNavDock extends StatelessWidget {
                 SizedBox(
                   width: 56,
                   height: 56,
-                  child: CueModalTransition(
-                    alignment: Alignment.bottomRight,
-                    barrierColor: Colors.black.withValues(alpha: 0.12),
-                    barrierLabel: 'Close mode menu',
-                    motion: Spring.smooth(),
-                    triggerBuilder: (context, open) => GlassButton(
+                  child: GlassMenu(
+                    menuAlignment: GlassMenuAlignment.bottomRight,
+                    autoAdjustToScreen: true,
+                    menuPadding: const EdgeInsets.all(12),
+                    menuWidth: 224,
+                    menuBorderRadius: 28,
+                    itemBorderRadius: 20,
+                    quality: GlassQuality.premium,
+                    settings: menuGlass,
+                    selectionColor: AppColors.accent.withValues(alpha: 0.14),
+                    enableInteractionGlow: false,
+                    semanticLabel: 'Change content mode',
+                    triggerBuilder: (context, toggleMenu) => GlassButton(
                       icon: const Icon(Icons.menu_rounded),
                       label: 'Change content mode',
-                      onTap: open,
+                      onTap: toggleMenu,
                       width: 56,
                       height: 56,
                       quality: GlassQuality.premium,
                       settings: glass,
                       isStationary: true,
                     ),
-                    builder: (menuContext, rect) => Actor(
-                      acts: [
-                        .sizedClip(
-                          from: .size(rect.size),
-                          alignment: Alignment.bottomRight,
-                        ),
-                        .fadeIn(),
-                        .slideY(from: 0.12),
-                      ],
-                      child: GlassContainer(
-                        width: 236,
-                        quality: GlassQuality.premium,
-                        settings: glass,
-                        shape: const LiquidRoundedSuperellipse(
-                          borderRadius: 28,
-                        ),
-                        padding: const EdgeInsets.symmetric(vertical: 8),
-                        child: Material(
-                          color: Colors.transparent,
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              for (final choice in modeChoices)
-                                if (ZModePrefs.enabled ||
-                                    choice.mode != ContentMode.anime ||
-                                    choice.kind == StreamKind.anime)
-                                  ListTile(
-                                    leading: Icon(choice.icon),
-                                    title: Text(choice.label(menuContext)),
-                                    trailing:
-                                        choice.mode ==
-                                                sl<ContentModeCubit>().state &&
-                                            (choice.mode != ContentMode.anime ||
-                                                choice.kind ==
-                                                    ZModePrefs.streamKind)
-                                        ? Icon(
-                                            Icons.check_rounded,
-                                            color: AppColors.accent,
-                                          )
-                                        : null,
-                                    onTap: () {
-                                      Navigator.of(menuContext).pop();
-                                      onModeSelected(choice.mode, choice.kind);
-                                    },
-                                  ),
-                            ],
+                    items: [
+                      for (final choice in modeChoices)
+                        if (ZModePrefs.enabled ||
+                            choice.mode != ContentMode.anime ||
+                            choice.kind == StreamKind.anime)
+                          GlassMenuItem(
+                            title: choice.label(context),
+                            icon: Icon(choice.icon),
+                            trailing:
+                                choice.mode == sl<ContentModeCubit>().state &&
+                                    (choice.mode != ContentMode.anime ||
+                                        choice.kind == ZModePrefs.streamKind)
+                                ? Icon(
+                                    Icons.check_rounded,
+                                    color: AppColors.accent,
+                                  )
+                                : null,
+                            isSelected:
+                                choice.mode == sl<ContentModeCubit>().state &&
+                                (choice.mode != ContentMode.anime ||
+                                    choice.kind == ZModePrefs.streamKind),
+                            iconColor: AppColors.textPrimary,
+                            titleStyle: const TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w500,
+                            ),
+                            height: 48,
+                            onTap: () =>
+                                onModeSelected(choice.mode, choice.kind),
                           ),
-                        ),
-                      ),
-                    ),
+                    ],
                   ),
                 ),
               ],
