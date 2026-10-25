@@ -324,7 +324,9 @@ SourceBuckets categorizedSources() {
     }
   }
   if (sl.isRegistered<MangayomiManager>()) {
-    var mangayomiSources = sl<MangayomiManager>().all;
+    var mangayomiSources = sl<MangayomiManager>().all
+        .where((p) => !p.source.isNsfw || nsfwEnabled)
+        .toList();
     final mangayomiLangs = sl.isRegistered<MangayomiLangPrefs>()
         ? (sl<MangayomiLangPrefs>().enabled ?? defaultSourceLangs())
         : null;

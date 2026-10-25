@@ -175,8 +175,9 @@ class SourceRepository implements CatalogueRepository {
   /// and source labelling. JS providers first (registry order), then any
   /// installed CloudStream sources, then Aniyomi sources.
   ///
-  /// NSFW Aniyomi sources are excluded when [PlaybackPrefs.showNsfwAniyomi]
-  /// is false so toggling the pref is immediately reflected here.
+  /// NSFW Aniyomi sources are excluded when
+  /// [PlaybackPrefs.showNsfwAniyomi] is false; other NSFW extensions use
+  /// [PlaybackPrefs.nsfwSources]. Toggling either preference is reflected here.
   /// Installed sources as `{id, name}`, with same-named entries disambiguated
   /// by language.
   ///
@@ -386,9 +387,12 @@ class SourceRepository implements CatalogueRepository {
         (s) => (id: s.id, name: s.name, lang: null),
       ),
     if (_mangayomiManager != null)
-      ..._mangayomiManager.all.map(
-        (p) => (id: p.sourceId, name: p.displayName, lang: p.source.language),
-      ),
+      ..._mangayomiManager.all
+          .where((p) => !p.source.isNsfw || _prefs.nsfwSources)
+          .map(
+            (p) =>
+                (id: p.sourceId, name: p.displayName, lang: p.source.language),
+          ),
   ];
 
   /// Base site URL for a source. For Mihon/Aniyomi/LNReader this turns a
