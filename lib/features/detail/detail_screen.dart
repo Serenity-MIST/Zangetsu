@@ -37,6 +37,7 @@ import '../../core/cache/app_image_cache.dart';
 import '../../core/di/injector.dart';
 import '../../core/discord/discord_rpc.dart';
 import '../../core/mihon/mihon_extension_service.dart';
+import '../../core/mangayomi/mangayomi_cloudflare.dart';
 import '../../core/metadata/episode_metadata_service.dart';
 import '../../core/metadata/metadata_enrichment.dart';
 import '../../core/notify/cs_notify.dart';
@@ -257,7 +258,7 @@ class _DetailCloudflareBlockedState extends State<_DetailCloudflareBlocked> {
     // just the system-wide one MihonExtensionService's solve populates).
     final host = Uri.tryParse(widget.url)?.host ?? '';
     if (widget.isMangayomi) {
-      await MihonExtensionService.solveCloudflare(widget.url);
+      await MangayomiCloudflare.solve(widget.url);
     } else if (CfSolveNeeded.hostFlagged(host)) {
       await sl<ProviderManager>().solveCloudflareForHost(host, widget.url);
     } else {
@@ -270,7 +271,6 @@ class _DetailCloudflareBlockedState extends State<_DetailCloudflareBlocked> {
 
   @override
   Widget build(BuildContext context) {
-    final iosUnsupported = widget.isMangayomi && Platform.isIOS;
     return Center(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(36, 40, 36, 56),
@@ -292,9 +292,7 @@ class _DetailCloudflareBlockedState extends State<_DetailCloudflareBlocked> {
             ),
             const SizedBox(height: 20),
             Text(
-              iosUnsupported
-                  ? 'Cloudflare-protected Mangayomi sources are not supported on iOS yet'
-                  : 'This source is protected by Cloudflare',
+              'This source is protected by Cloudflare',
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: AppColors.textPrimary,
@@ -304,10 +302,8 @@ class _DetailCloudflareBlockedState extends State<_DetailCloudflareBlocked> {
             ),
             const SizedBox(height: 10),
             Text(
-              iosUnsupported
-                  ? 'Mangayomi sources without Cloudflare protection can still be used on iOS.'
-                  : 'Complete the Cloudflare check once and this title will load '
-                        'normally from then on.',
+              'Complete the Cloudflare check once and this title will load '
+              'normally from then on.',
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: AppColors.textSecondary,
@@ -316,34 +312,33 @@ class _DetailCloudflareBlockedState extends State<_DetailCloudflareBlocked> {
               ),
             ),
             const SizedBox(height: 24),
-            if (!iosUnsupported)
-              ElevatedButton.icon(
-                onPressed: _solving ? null : _solve,
-                icon: _solving
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Colors.white,
-                        ),
-                      )
-                    : const Icon(Icons.shield_rounded, size: 20),
-                label: Text(context.l10n.solveCloudflare),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: _cloudflareOrange,
-                  foregroundColor: Colors.white,
-                  elevation: 0,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 30,
-                    vertical: 13,
-                  ),
-                  textStyle: const TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.w600,
-                  ),
+            ElevatedButton.icon(
+              onPressed: _solving ? null : _solve,
+              icon: _solving
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    )
+                  : const Icon(Icons.shield_rounded, size: 20),
+              label: Text(context.l10n.solveCloudflare),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _cloudflareOrange,
+                foregroundColor: Colors.white,
+                elevation: 0,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 30,
+                  vertical: 13,
+                ),
+                textStyle: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
                 ),
               ),
+            ),
           ],
         ),
       ),

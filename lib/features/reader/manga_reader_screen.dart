@@ -19,7 +19,7 @@ import 'package:share_plus/share_plus.dart';
 
 import '../../core/di/injector.dart';
 import '../../core/error/exceptions.dart';
-import '../../core/mihon/mihon_extension_service.dart';
+import '../../core/mangayomi/mangayomi_cloudflare.dart';
 import '../../core/models/episode.dart';
 import '../../core/reading/chapter_nav.dart';
 import '../../core/reading/manga_translation/manga_page_translation_models.dart';
@@ -3422,7 +3422,6 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   Widget _buildError() {
     final url = _cloudflareUrl;
     if (url == null) return _buildMessage(_error!);
-    final unsupported = Platform.isIOS;
     return Center(
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 32),
@@ -3436,28 +3435,24 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
             ),
             const SizedBox(height: 12),
             Text(
-              unsupported
-                  ? 'Cloudflare-protected Mangayomi sources are not supported on iOS yet.'
-                  : 'This Mangayomi chapter is protected by Cloudflare.',
+              'This Mangayomi chapter is protected by Cloudflare.',
               style: AppText.body.copyWith(color: Colors.white),
               textAlign: TextAlign.center,
             ),
-            if (!unsupported) ...[
-              const SizedBox(height: 16),
-              FilledButton.icon(
-                onPressed: _solvingCloudflare
-                    ? null
-                    : () => unawaited(_solveMangayomiCloudflare(url)),
-                icon: _solvingCloudflare
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.shield_rounded),
-                label: Text(context.l10n.solveCloudflare),
-              ),
-            ],
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: _solvingCloudflare
+                  ? null
+                  : () => unawaited(_solveMangayomiCloudflare(url)),
+              icon: _solvingCloudflare
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.shield_rounded),
+              label: Text(context.l10n.solveCloudflare),
+            ),
           ],
         ),
       ),
@@ -3466,7 +3461,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
 
   Future<void> _solveMangayomiCloudflare(String url) async {
     setState(() => _solvingCloudflare = true);
-    await MihonExtensionService.solveCloudflare(url);
+    await MangayomiCloudflare.solve(url);
     if (!mounted) return;
     setState(() => _solvingCloudflare = false);
     await _load();

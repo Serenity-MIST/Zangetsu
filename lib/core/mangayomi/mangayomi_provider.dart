@@ -250,7 +250,7 @@ class MangayomiProvider implements BaseProvider, ReadingProvider {
       if (result?['Cookie']?.isNotEmpty != true) return const {};
       return result!;
     } on MissingPluginException {
-      // Protected Mangayomi sources are reported as unsupported on iOS.
+      // A missing cookie bridge must not block the source.
       return const {};
     } on PlatformException {
       return const {};

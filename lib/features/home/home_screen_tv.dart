@@ -4,7 +4,6 @@ import '../../core/zmode/tmdb_catalogue.dart';
 import '../settings/streaming_services_screen_tv.dart';
 import 'cubit/home_rows_composer.dart';
 import 'dart:async';
-import 'dart:io';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
@@ -19,6 +18,7 @@ import '../../core/ui/global_messenger.dart';
 import '../../core/ui/native_cover_provider.dart';
 import '../../core/metadata/title_logo_service.dart';
 import '../../core/mihon/mihon_extension_service.dart';
+import '../../core/mangayomi/mangayomi_cloudflare.dart';
 import '../../core/models/episode.dart';
 import '../../core/models/home_section.dart';
 import '../../core/models/media_detail.dart';
@@ -715,24 +715,22 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
           offline: state.offline,
           mode: mode ?? ContentMode.anime,
           sourceName: repo.displayName(repo.sourceId),
-          cloudflareUnsupported:
-              state.cloudflareUrl != null &&
-              Platform.isIOS &&
-              repo.sourceId.startsWith('mg:'),
           onRetry: () => context.read<HomeCubit>().load(reset: true),
           onInstallSources: () => Navigator.of(context).push(
             MaterialPageRoute<void>(builder: (_) => const ProvidersHubScreen()),
           ),
           cloudflareUrl: state.cloudflareUrl,
-          onSolveCloudflare:
-              state.cloudflareUrl == null ||
-                  (Platform.isIOS && repo.sourceId.startsWith('mg:'))
+          onSolveCloudflare: state.cloudflareUrl == null
               ? null
               : () async {
                   // Native-extension Cloudflare solve — same path as phone Home.
-                  await MihonExtensionService.solveCloudflare(
-                    state.cloudflareUrl!,
-                  );
+                  if (repo.sourceId.startsWith('mg:')) {
+                    await MangayomiCloudflare.solve(state.cloudflareUrl!);
+                  } else {
+                    await MihonExtensionService.solveCloudflare(
+                      state.cloudflareUrl!,
+                    );
+                  }
                   if (context.mounted) {
                     context.read<HomeCubit>().load(reset: true);
                   }

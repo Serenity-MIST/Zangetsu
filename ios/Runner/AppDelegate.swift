@@ -3,6 +3,8 @@ import UIKit
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
+  private var mangayomiCloudflareBridge: MangayomiCloudflareBridge?
+
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
@@ -12,6 +14,18 @@ import UIKit
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "MangayomiCloudflareBridge") {
+      let channel = FlutterMethodChannel(
+        name: "zangetsu/mihon",
+        binaryMessenger: registrar.messenger()
+      )
+      let bridge = MangayomiCloudflareBridge()
+      mangayomiCloudflareBridge = bridge
+      channel.setMethodCallHandler { [weak bridge] call, result in
+        bridge?.handle(call, result: result) ?? result(FlutterMethodNotImplemented)
+      }
+    }
 
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "MangaTranslationBridge") {
       let channel = FlutterMethodChannel(

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/di/injector.dart';
 import '../../core/mihon/mihon_extension_service.dart';
+import '../../core/mangayomi/mangayomi_cloudflare.dart';
 import '../../core/provider/cf_solve_needed.dart';
 import '../../core/provider/provider_manager.dart';
 import '../../core/repository/source_actions.dart' as source_actions;
@@ -123,21 +124,12 @@ class SourcePickerRowActions extends StatelessWidget {
     String fallbackTarget, {
     required bool isJs,
   }) async {
-    if (id.startsWith('mg:') &&
-        Theme.of(context).platform == TargetPlatform.iOS) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Cloudflare verification for Mangayomi sources is not available on iOS yet.',
-          ),
-        ),
-      );
-      return;
-    }
     final target =
         await sl<SourceRepository>().cfSolveTargetFor(id) ?? fallbackTarget;
     if (target.isEmpty) return;
-    if (isJs) {
+    if (id.startsWith('mg:')) {
+      await MangayomiCloudflare.solve(target);
+    } else if (isJs) {
       await sl<ProviderManager>().solveCloudflareForHost(
         Uri.parse(target).host,
         target,

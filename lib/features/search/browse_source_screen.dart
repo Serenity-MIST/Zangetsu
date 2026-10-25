@@ -7,6 +7,7 @@ import '../../core/ui/app_dialog.dart';
 import '../../core/ui/app_toast.dart';
 import '../../core/di/injector.dart';
 import '../../core/mihon/mihon_extension_service.dart';
+import '../../core/mangayomi/mangayomi_cloudflare.dart';
 import '../../core/models/home_section.dart';
 import '../../core/models/media_item.dart';
 import '../../core/repository/source_actions.dart' as source_actions;
@@ -284,7 +285,11 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
       widget.sourceId,
     );
     if (target == null || target.isEmpty) return;
-    await MihonExtensionService.solveCloudflare(target);
+    if (widget.sourceId.startsWith('mg:')) {
+      await MangayomiCloudflare.solve(target);
+    } else {
+      await MihonExtensionService.solveCloudflare(target);
+    }
     if (widget.sourceId.startsWith('mg:') && mounted) {
       final cubit = context.read<BrowseSourceCubit>();
       final state = cubit.state;
@@ -299,14 +304,11 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
   }
 
   Widget _mangayomiCloudflareState(BuildContext context) {
-    final unsupported = Theme.of(context).platform == TargetPlatform.iOS;
     return EmptyState(
       icon: Icons.shield_outlined,
-      message: unsupported
-          ? 'Cloudflare-protected Mangayomi sources are not supported on iOS yet.'
-          : 'This Mangayomi source is protected by Cloudflare.',
-      actionLabel: unsupported ? null : context.l10n.solveCloudflare,
-      onAction: unsupported ? null : _solveCloudflare,
+      message: 'This Mangayomi source is protected by Cloudflare.',
+      actionLabel: context.l10n.solveCloudflare,
+      onAction: _solveCloudflare,
     );
   }
 

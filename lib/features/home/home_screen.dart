@@ -23,6 +23,7 @@ import '../../core/ui/global_messenger.dart';
 import '../../core/update/extension_auto_updater.dart';
 import '../../core/provider/cloudstream_provider.dart';
 import '../../core/provider/provider_manager.dart';
+import '../../core/mangayomi/mangayomi_cloudflare.dart';
 import '../../core/models/episode.dart';
 import '../../core/models/home_row.dart';
 import '../../core/models/home_section.dart';
@@ -2074,10 +2075,6 @@ class _HomeViewState extends State<_HomeView>
                             // apply to it.
                             isMetadataProvider:
                                 _repo.sourceId == ZmodeIds.sourceId,
-                            cloudflareUnsupported:
-                                state.cloudflareUrl != null &&
-                                Platform.isIOS &&
-                                _repo.sourceId.startsWith('mg:'),
                             rateLimitedSeconds: state.rateLimitedSeconds,
                             onRetry: () =>
                                 context.read<HomeCubit>().load(reset: true),
@@ -2092,15 +2089,18 @@ class _HomeViewState extends State<_HomeView>
                             // Cloudflare-blocked source: solve, then reload after
                             // the user closes the WebView.
                             cloudflareUrl: state.cloudflareUrl,
-                            onSolveCloudflare:
-                                state.cloudflareUrl == null ||
-                                    (Platform.isIOS &&
-                                        _repo.sourceId.startsWith('mg:'))
+                            onSolveCloudflare: state.cloudflareUrl == null
                                 ? null
                                 : () async {
-                                    await MihonExtensionService.solveCloudflare(
-                                      state.cloudflareUrl!,
-                                    );
+                                    if (_repo.sourceId.startsWith('mg:')) {
+                                      await MangayomiCloudflare.solve(
+                                        state.cloudflareUrl!,
+                                      );
+                                    } else {
+                                      await MihonExtensionService.solveCloudflare(
+                                        state.cloudflareUrl!,
+                                      );
+                                    }
                                     if (context.mounted) {
                                       context.read<HomeCubit>().load(
                                         reset: true,

@@ -146,4 +146,19 @@ void main() {
     expect(pages.last.headers, containsPair('Referer', 'extension'));
     expect(pages.last.headers, isNot(contains('User-Agent')));
   });
+
+  test('missing native channel leaves headers untouched', () async {
+    // A missing channel handler must degrade to plain extension headers.
+    final provider = MangayomiProvider(
+      manager: _FakeManager(_FakeWorker()),
+      installed: InstalledMangayomiSource(source, File('unused.js')),
+    );
+
+    final videos = await provider.getVideoSources('/episode');
+    final pages = await provider.getPages('/chapter');
+    expect(videos.first.headers, containsPair('user-agent', 'Extension UA'));
+    expect(videos.first.headers, isNot(contains('Cookie')));
+    expect(pages.first.headers, containsPair('cookie', 'session=source'));
+    expect(pages.last.headers, containsPair('Referer', 'extension'));
+  });
 }
