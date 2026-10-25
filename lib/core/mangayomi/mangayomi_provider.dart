@@ -149,7 +149,7 @@ class MangayomiProvider implements BaseProvider, ReadingProvider {
         final manga = await worker.getDetail(url);
         final chapters = manga.chapters ?? const <MChapter>[];
         final episodes = MangayomiMapping.episodes(source, chapters);
-        _rememberChapters(chapters, episodes);
+        _rememberChapters(chapters);
         return MangayomiMapping.detail(source, manga, type, url, episodes);
       });
 
@@ -159,7 +159,7 @@ class MangayomiProvider implements BaseProvider, ReadingProvider {
         final manga = await worker.getDetail(url);
         final chapters = manga.chapters ?? const <MChapter>[];
         final episodes = MangayomiMapping.episodes(source, chapters);
-        _rememberChapters(chapters, episodes);
+        _rememberChapters(chapters);
         return episodes;
       });
 
@@ -293,14 +293,12 @@ class MangayomiProvider implements BaseProvider, ReadingProvider {
         return ChapterText(html: html);
       });
 
-  void _rememberChapters(List<MChapter> chapters, List<Episode> episodes) {
-    for (
-      var index = 0;
-      index < chapters.length && index < episodes.length;
-      index++
-    ) {
-      final url = episodes[index].url;
-      if (url.isNotEmpty) _chapterNames[url] = chapters[index].name ?? '';
+  void _rememberChapters(List<MChapter> chapters) {
+    for (final chapter in chapters) {
+      final url = chapter.url;
+      if (url != null && url.isNotEmpty) {
+        _chapterNames[url] = chapter.name ?? '';
+      }
     }
   }
 }
@@ -351,20 +349,43 @@ abstract final class MangayomiMapping {
   static List<Episode> episodes(
     MangayomiSource source,
     List<MChapter> chapters,
-  ) => [
-    for (var index = 0; index < chapters.length; index++)
-      if ((chapters[index].url ?? '').isNotEmpty)
-        Episode(
-          id: chapters[index].url!,
-          title: chapters[index].name ?? 'Chapter ${index + 1}',
-          number: _number(chapters[index].name),
-          url: chapters[index].url!,
-          date: chapters[index].dateUpload,
-          thumbnail: _resolveNullable(source, chapters[index].thumbnailUrl),
-          filler: chapters[index].isFiller ?? false,
-          scanlator: chapters[index].scanlator,
-        ),
-  ];
+  ) {
+    final episodes = [
+      for (var index = 0; index < chapters.length; index++)
+        if ((chapters[index].url ?? '').isNotEmpty)
+          Episode(
+            id: chapters[index].url!,
+            title: chapters[index].name ?? 'Chapter ${index + 1}',
+            number: _number(chapters[index].name),
+            url: chapters[index].url!,
+            date: _uploadDate(chapters[index].dateUpload),
+            thumbnail: _resolveNullable(source, chapters[index].thumbnailUrl),
+            filler: chapters[index].isFiller ?? false,
+            scanlator: chapters[index].scanlator,
+          ),
+    ];
+    if (episodes.length < 2) return episodes;
+    if (episodes.any((episode) => episode.number == null)) return episodes;
+    episodes.sort((a, b) => a.number!.compareTo(b.number!));
+    return episodes;
+  }
+
+  static String? _uploadDate(String? value) {
+    if (value == null) return null;
+    final timestamp = int.tryParse(value.trim());
+    if (timestamp == null || timestamp < 100000000) return value;
+
+    final milliseconds = timestamp < 100000000000
+        ? timestamp * 1000
+        : timestamp;
+    try {
+      return DateTime.fromMillisecondsSinceEpoch(
+        milliseconds,
+      ).toIso8601String();
+    } on RangeError {
+      return value;
+    }
+  }
 
   static PageImage page(MangayomiSource source, MPage page) =>
       PageImage(url: _resolve(source, page.url), headers: page.headers);

@@ -60,4 +60,56 @@ void main() {
     final page = MangayomiMapping.page(source, MPage('/pages/1.jpg'));
     expect(page.url, 'https://torrentio.strem.fun/pages/1.jpg');
   });
+
+  test('orders numbered chapters from oldest to newest', () {
+    final episodes = MangayomiMapping.episodes(source, [
+      MChapter(name: 'Chapter 4', url: '/chapter/4'),
+      MChapter(name: 'Chapter 3', url: '/chapter/3'),
+      MChapter(name: 'Chapter 2', url: '/chapter/2'),
+      MChapter(name: 'Chapter 1', url: '/chapter/1'),
+    ]);
+
+    expect(episodes.map((episode) => episode.number), [1, 2, 3, 4]);
+    expect(episodes.map((episode) => episode.url), [
+      '/chapter/1',
+      '/chapter/2',
+      '/chapter/3',
+      '/chapter/4',
+    ]);
+  });
+
+  test('preserves source order when chapter numbers are unavailable', () {
+    final episodes = MangayomiMapping.episodes(source, [
+      MChapter(name: 'Latest release', url: '/chapter/latest'),
+      MChapter(name: 'Earlier release', url: '/chapter/earlier'),
+    ]);
+
+    expect(episodes.map((episode) => episode.url), [
+      '/chapter/latest',
+      '/chapter/earlier',
+    ]);
+  });
+
+  test('converts Unix upload timestamps but preserves readable dates', () {
+    final seconds = MangayomiMapping.episodes(source, [
+      MChapter(name: 'Episode 1', url: '/episode/1', dateUpload: '1792029292'),
+    ]).single.date;
+    final milliseconds = MangayomiMapping.episodes(source, [
+      MChapter(
+        name: 'Episode 2',
+        url: '/episode/2',
+        dateUpload: '1792029292000',
+      ),
+    ]).single.date;
+    final readable = MangayomiMapping.episodes(source, [
+      MChapter(name: 'Episode 3', url: '/episode/3', dateUpload: '2026-10-14'),
+    ]).single.date;
+    final expected = DateTime.fromMillisecondsSinceEpoch(
+      1792029292000,
+    ).toIso8601String();
+
+    expect(seconds, expected);
+    expect(milliseconds, expected);
+    expect(readable, '2026-10-14');
+  });
 }
