@@ -2,10 +2,12 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:cue/cue.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:fluttertoast/fluttertoast.dart';
+import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
 import '../search/browse_sources_screen.dart';
 import '../../core/app_mode.dart';
@@ -20,6 +22,7 @@ import '../../core/reading/read_history.dart';
 import '../../core/mode/content_mode.dart';
 import '../../core/mode/content_mode_cubit.dart';
 import '../../core/theme/app_colors.dart';
+import '../../core/ui/liquid_nav_glass.dart';
 import '../../core/zmode/zmode_prefs.dart';
 import '../../l10n/ui_strings.dart';
 import '../../l10n/l10n.dart';
@@ -344,7 +347,8 @@ class _RootShellState extends State<RootShell>
             // false throughout — it reads the scroll, never eats it.
             onNotification: (notification) => DockScrollCollapse.onNotification(
               notification,
-              enabled: !_keepDockExpanded,
+              enabled:
+                  _navPrefs.style == NavBarStyle.dock && !_keepDockExpanded,
             ),
             child: Builder(
               builder: (context) {
@@ -391,7 +395,7 @@ class _RootShellState extends State<RootShell>
               return Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  if (ZModePrefs.enabled)
+                  if (ZModePrefs.enabled && _navPrefs.style == NavBarStyle.dock)
                     Padding(
                       padding: const EdgeInsets.only(bottom: 8),
                       child: BlocBuilder<ContentModeCubit, ContentMode>(
@@ -458,27 +462,46 @@ class _RootShellState extends State<RootShell>
                         // builds every tab — is never rebuilt by this.
                         child: ValueListenableBuilder<bool>(
                           valueListenable: dockCollapsedByScroll,
-                          builder: (context, collapsed, child) => _FloatingDock(
-                            collapsed: collapsed && !_keepDockExpanded,
-                            tabs: _visibleTabs(),
-                            active: _tab,
-                            onSelected: _onTabSelected,
-                            centre: ZModePrefs.enabled
-                                ? BlocBuilder<ContentModeCubit, ContentMode>(
-                                    bloc: sl<ContentModeCubit>(),
-                                    builder: (_, mode) => ModeFab(
-                                      open: _modeBarOpen,
-                                      icon: iconForMode(
-                                        mode,
-                                        ZModePrefs.streamKind,
+                          builder: (context, collapsed, child) {
+                            final tabs = _visibleTabs();
+                            if (_navPrefs.style == NavBarStyle.liquid) {
+                              return _LiquidNavDock(
+                                tabs: tabs,
+                                active: _tab,
+                                glassTint: _navPrefs.glassTint,
+                                onSelected: _onTabSelected,
+                                modesEnabled: ZModePrefs.enabled,
+                                onModeSelected: (mode, kind) async {
+                                  await ZModePrefs.setStreamKind(kind);
+                                  await sl<ContentModeCubit>().setMode(mode);
+                                  if (mode != ContentMode.anime) {
+                                    sl<HomeCubit>().load(reset: true);
+                                  }
+                                },
+                              );
+                            }
+                            return _FloatingDock(
+                              collapsed: collapsed && !_keepDockExpanded,
+                              tabs: tabs,
+                              active: _tab,
+                              onSelected: _onTabSelected,
+                              centre: ZModePrefs.enabled
+                                  ? BlocBuilder<ContentModeCubit, ContentMode>(
+                                      bloc: sl<ContentModeCubit>(),
+                                      builder: (_, mode) => ModeFab(
+                                        open: _modeBarOpen,
+                                        icon: iconForMode(
+                                          mode,
+                                          ZModePrefs.streamKind,
+                                        ),
+                                        onTap: () => setState(
+                                          () => _modeBarOpen = !_modeBarOpen,
+                                        ),
                                       ),
-                                      onTap: () => setState(
-                                        () => _modeBarOpen = !_modeBarOpen,
-                                      ),
-                                    ),
-                                  )
-                                : null,
-                          ),
+                                    )
+                                  : null,
+                            );
+                          },
                         ),
                       ),
                     ),
@@ -486,6 +509,186 @@ class _RootShellState extends State<RootShell>
                 ],
               );
             },
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Liquid-glass navigation tabs with a Cue mode menu on the right.
+class _LiquidNavDock extends StatelessWidget {
+  const _LiquidNavDock({
+    required this.tabs,
+    required this.active,
+    required this.glassTint,
+    required this.onSelected,
+    required this.modesEnabled,
+    required this.onModeSelected,
+  });
+
+  final List<DockTab> tabs;
+  final DockTab active;
+  final double glassTint;
+  final ValueChanged<DockTab> onSelected;
+  final bool modesEnabled;
+  final void Function(ContentMode, StreamKind) onModeSelected;
+
+  Widget _icon(DockTab tab, {bool selected = false}) {
+    final color = selected ? AppColors.accent : AppColors.textPrimary;
+    if (tab == DockTab.profile) {
+      final profile = sl.isRegistered<ViewerProfileStore>()
+          ? sl<ViewerProfileStore>().activeProfile
+          : null;
+      if (profile != null) {
+        return ClipOval(
+          child: ProfileAvatarFace(
+            profile: profile,
+            photoUrl: profilePhotoForFace(
+              profile: profile,
+              accountPhotoUrl: sl.isRegistered<AuthCubit>()
+                  ? sl<AuthCubit>().state.avatarUrl
+                  : null,
+            ),
+            iconSize: 18,
+            photoDiameter: 26,
+          ),
+        );
+      }
+      return Icon(Icons.person_outline_rounded, color: color);
+    }
+    final glyph = dockGlyphFor(tab);
+    if (glyph != null) {
+      return DockIcon(glyph, color: color, filled: selected, size: 23);
+    }
+    final icons = _iconFor(tab)!;
+    return Icon(selected ? icons.$2 : icons.$1, color: color);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomInset = MediaQuery.paddingOf(context).bottom;
+    final glass = liquidNavGlassSettings(glassTint);
+    return ConstrainedBox(
+      constraints: BoxConstraints(minHeight: 84 + bottomInset),
+      child: Align(
+        alignment: Alignment.bottomCenter,
+        child: Padding(
+          padding: EdgeInsets.only(
+            left: 12,
+            right: 12,
+            bottom: bottomInset + 12,
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: GlassTabBar.bottom(
+                  tabs: [
+                    for (final tab in tabs)
+                      GlassTab(
+                        icon: _icon(tab),
+                        activeIcon: _icon(tab, selected: true),
+                        label: tab.localizedLabel(context),
+                      ),
+                  ],
+                  selectedIndex: tabs.indexOf(active).clamp(0, tabs.length - 1),
+                  onTabSelected: (index) => onSelected(tabs[index]),
+                  horizontalPadding: 4,
+                  verticalPadding: 12,
+                  barHeight: 60,
+                  barBorderRadius: 30,
+                  tabPadding: const EdgeInsets.symmetric(horizontal: 2),
+                  iconSize: 22,
+                  labelFontSize: 10,
+                  quality: GlassQuality.premium,
+                  backgroundQuality: GlassQuality.premium,
+                  settings: glass,
+                  indicatorColor: AppColors.accent.withValues(alpha: 0.14),
+                  selectedIconColor: AppColors.accent,
+                  unselectedIconColor: AppColors.textPrimary,
+                  selectedLabelColor: AppColors.textPrimary,
+                  unselectedLabelColor: AppColors.textSecondary,
+                  indicatorExpansion: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 8,
+                  ),
+                  magnification: 1.08,
+                ),
+              ),
+              if (modesEnabled) ...[
+                const SizedBox(width: 8),
+                SizedBox(
+                  width: 56,
+                  height: 56,
+                  child: CueModalTransition(
+                    alignment: Alignment.bottomRight,
+                    barrierColor: Colors.black.withValues(alpha: 0.12),
+                    barrierLabel: 'Close mode menu',
+                    motion: Spring.smooth(),
+                    triggerBuilder: (context, open) => GlassButton(
+                      icon: const Icon(Icons.menu_rounded),
+                      label: 'Change content mode',
+                      onTap: open,
+                      width: 56,
+                      height: 56,
+                      quality: GlassQuality.premium,
+                      settings: glass,
+                      isStationary: true,
+                    ),
+                    builder: (menuContext, rect) => Actor(
+                      acts: [
+                        .sizedClip(
+                          from: .size(rect.size),
+                          alignment: Alignment.bottomRight,
+                        ),
+                        .fadeIn(),
+                        .slideY(from: 0.12),
+                      ],
+                      child: GlassContainer(
+                        width: 236,
+                        quality: GlassQuality.premium,
+                        settings: glass,
+                        shape: const LiquidRoundedSuperellipse(
+                          borderRadius: 28,
+                        ),
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                        child: Material(
+                          color: Colors.transparent,
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              for (final choice in modeChoices)
+                                if (ZModePrefs.enabled ||
+                                    choice.mode != ContentMode.anime ||
+                                    choice.kind == StreamKind.anime)
+                                  ListTile(
+                                    leading: Icon(choice.icon),
+                                    title: Text(choice.label(menuContext)),
+                                    trailing:
+                                        choice.mode ==
+                                                sl<ContentModeCubit>().state &&
+                                            (choice.mode != ContentMode.anime ||
+                                                choice.kind ==
+                                                    ZModePrefs.streamKind)
+                                        ? Icon(
+                                            Icons.check_rounded,
+                                            color: AppColors.accent,
+                                          )
+                                        : null,
+                                    onTap: () {
+                                      Navigator.of(menuContext).pop();
+                                      onModeSelected(choice.mode, choice.kind);
+                                    },
+                                  ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ],
           ),
         ),
       ),

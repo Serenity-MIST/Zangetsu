@@ -56,6 +56,11 @@ Aniyomi / Tachiyomi
 Other dependencies (Flutter/Dart packages and Android libraries) are used under
 their respective open-source licenses; refer to each package for details.
 
+Liquid Glass Widgets
+  https://pub.dev/packages/liquid_glass_widgets
+  License: MIT
+  Used for the optional phone navigation style.
+
 KLIPY proxy (server-side Python dependencies)
   PyJWT 2.15.1 — MIT
   https://github.com/jpadilla/pyjwt

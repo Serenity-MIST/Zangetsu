@@ -6,6 +6,7 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:visibility_detector/visibility_detector.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -66,6 +67,7 @@ Future<void> main() async {
   runZonedGuarded(
     () async {
       WidgetsFlutterBinding.ensureInitialized();
+      unawaited(LiquidGlassWidgets.initialize(enablePerformanceMonitor: false));
       await AppLogger.instance.init();
       // Mirror debugPrint into the log (still prints to the console too).
       final origDebugPrint = debugPrint;
@@ -721,46 +723,49 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
   }
 
   Widget _buildMaterialApp({required bool shellFeatures}) {
-    return MaterialApp(
-      title: kAppName,
-      theme: buildAppTheme(),
-      debugShowCheckedModeBanner: false,
-      localizationsDelegates: AppLocalizations.localizationsDelegates,
-      supportedLocales: AppLocalizations.supportedLocales,
-      locale: LocaleController.locale,
-      localeResolutionCallback: (locale, supported) =>
-          resolveAppLocale(locale, supported),
-      scaffoldMessengerKey: shellFeatures ? rootMessengerKey : null,
-      navigatorKey: rootNavigatorKey,
-      navigatorObservers: shellFeatures
-          ? [Analytics.observer, appRouteObserver, TvRoutePopGuardObserver()]
-          : const [],
-      home: _buildHome(),
-      builder: (_, child) {
-        final content = shellFeatures
-            ? Stack(
-                children: [
-                  ?child,
-                  if (WatchTogetherController.isEnabled)
-                    const Positioned(
-                      top: 0,
-                      left: 0,
-                      right: 0,
-                      child: SafeArea(
-                        child: Align(
-                          alignment: Alignment.topCenter,
-                          child: PartyBar(),
+    return LiquidGlassWidgets.wrap(
+      child: MaterialApp(
+        title: kAppName,
+        theme: buildAppTheme(),
+        debugShowCheckedModeBanner: false,
+        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        supportedLocales: AppLocalizations.supportedLocales,
+        locale: LocaleController.locale,
+        localeResolutionCallback: (locale, supported) =>
+            resolveAppLocale(locale, supported),
+        scaffoldMessengerKey: shellFeatures ? rootMessengerKey : null,
+        navigatorKey: rootNavigatorKey,
+        navigatorObservers: shellFeatures
+            ? [Analytics.observer, appRouteObserver, TvRoutePopGuardObserver()]
+            : const [],
+        home: _buildHome(),
+        builder: (_, child) {
+          final content = shellFeatures
+              ? Stack(
+                  children: [
+                    ?child,
+                    if (WatchTogetherController.isEnabled)
+                      const Positioned(
+                        top: 0,
+                        left: 0,
+                        right: 0,
+                        child: SafeArea(
+                          child: Align(
+                            alignment: Alignment.topCenter,
+                            child: PartyBar(),
+                          ),
                         ),
                       ),
-                    ),
-                ],
-              )
-            : (child ?? const SizedBox.shrink());
-        final isTv = sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
-        return PosterCardScope(
-          child: isTv ? TvViewport(child: content) : content,
-        );
-      },
+                  ],
+                )
+              : (child ?? const SizedBox.shrink());
+          final isTv = sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
+          return PosterCardScope(
+            child: isTv ? TvViewport(child: content) : content,
+          );
+        },
+      ),
+      brightnessResolver: Theme.maybeBrightnessOf,
     );
   }
 
