@@ -42,6 +42,7 @@ class NavPrefs extends ChangeNotifier {
   static const String _styleKey = 'style';
   static const String _glassTintKey = 'glassTint';
   static const String _glassQualityKey = 'glassQuality';
+  static const String _glassBlurKey = 'glassBlur';
   static const double defaultGlassTint = 0.82;
   static const GlassQuality defaultGlassQuality = GlassQuality.premium;
 
@@ -131,7 +132,7 @@ class NavPrefs extends ChangeNotifier {
       NavBarStyle.values
           .where((value) => value.name == _box?.get(_styleKey))
           .firstOrNull ??
-      NavBarStyle.dock;
+      NavBarStyle.liquid;
 
   Future<void> setStyle(NavBarStyle value) async {
     await _box?.put(_styleKey, value.name);
@@ -165,6 +166,13 @@ class NavPrefs extends ChangeNotifier {
     notifyListeners();
   }
 
+  bool get glassBlurEnabled => _box?.get(_glassBlurKey) != false;
+
+  Future<void> setGlassBlurEnabled(bool value) async {
+    await _box?.put(_glassBlurKey, value);
+    notifyListeners();
+  }
+
   Future<void> reset() async {
     await _box?.delete(_tabsKey);
     await _box?.delete(_startKey);
@@ -172,6 +180,7 @@ class NavPrefs extends ChangeNotifier {
     await _box?.delete(_styleKey);
     await _box?.delete(_glassTintKey);
     await _box?.delete(_glassQualityKey);
+    await _box?.delete(_glassBlurKey);
     notifyListeners();
   }
 
@@ -179,9 +188,10 @@ class NavPrefs extends ChangeNotifier {
       listEquals(tabs, defaultTabs) &&
       startTab == defaultTabs.first &&
       !keepDockExpanded &&
-      style == NavBarStyle.dock &&
+      style == NavBarStyle.liquid &&
       glassTint == defaultGlassTint &&
-      glassQuality == defaultGlassQuality;
+      glassQuality == defaultGlassQuality &&
+      glassBlurEnabled;
 
   /// The validation the getter and setter both apply, exposed so the
   /// invariants can be tested without opening a Hive box.

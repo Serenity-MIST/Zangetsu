@@ -47,6 +47,7 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
   late NavBarStyle _style = _prefs.style;
   late double _glassTint = _prefs.glassTint;
   late GlassQuality _glassQuality = _prefs.glassQuality;
+  late bool _glassBlurEnabled = _prefs.glassBlurEnabled;
 
   /// The centre button is drawn from a real [DockTab]'s slot count, so it has
   /// to be mirrored here too: it is always on the bar and never editable.
@@ -78,6 +79,11 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
   Future<void> _setGlassQuality(GlassQuality value) async {
     setState(() => _glassQuality = value);
     await _prefs.setGlassQuality(value);
+  }
+
+  Future<void> _setGlassBlurEnabled(bool value) async {
+    setState(() => _glassBlurEnabled = value);
+    await _prefs.setGlassBlurEnabled(value);
   }
 
   Future<void> _resetGlassTint() async {
@@ -123,6 +129,7 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
       _style = _prefs.style;
       _glassTint = _prefs.glassTint;
       _glassQuality = _prefs.glassQuality;
+      _glassBlurEnabled = _prefs.glassBlurEnabled;
     });
   }
 
@@ -211,6 +218,18 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
                     ),
                     onTap: () => _setGlassQuality(quality),
                   ),
+                SettingsTile(
+                  icon: Icons.blur_on_rounded,
+                  title: 'Blur background',
+                  subtitle: 'Softens artwork behind the liquid navbar',
+                  onTap: () => _setGlassBlurEnabled(!_glassBlurEnabled),
+                  trailing: Switch.adaptive(
+                    key: const ValueKey('glass-blur-switch'),
+                    value: _glassBlurEnabled,
+                    activeThumbColor: AppColors.accent,
+                    onChanged: _setGlassBlurEnabled,
+                  ),
+                ),
               ],
             ),
           ],
@@ -341,7 +360,10 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
   );
 
   Widget _liquidPreview() {
-    final glass = liquidNavGlassSettings(_glassTint);
+    final glass = liquidNavGlassSettings(
+      _glassTint,
+      extraBlur: _glassBlurEnabled,
+    );
     return Row(
       children: [
         Expanded(

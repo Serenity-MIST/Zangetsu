@@ -135,6 +135,26 @@ void main() {
       expect(NavPrefs().isDefault, isTrue);
     });
 
+    test('extra glass blur starts on and can be turned off', () async {
+      expect(NavPrefs().glassBlurEnabled, isTrue);
+
+      await NavPrefs().setGlassBlurEnabled(false);
+      expect(NavPrefs().glassBlurEnabled, isFalse);
+
+      await NavPrefs().reset();
+      expect(NavPrefs().glassBlurEnabled, isTrue);
+    });
+
+    test('liquid is the default, but a chosen dock is preserved', () async {
+      expect(NavPrefs().style, NavBarStyle.liquid);
+
+      await NavPrefs().setStyle(NavBarStyle.dock);
+      expect(NavPrefs().style, NavBarStyle.dock);
+
+      await NavPrefs().reset();
+      expect(NavPrefs().style, NavBarStyle.liquid);
+    });
+
     test('a chosen landing tab survives a restart', () async {
       await NavPrefs().setStartTab(DockTab.myList);
 

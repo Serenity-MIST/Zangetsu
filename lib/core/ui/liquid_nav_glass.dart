@@ -1,14 +1,17 @@
 import 'package:flutter/material.dart';
 import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
-LiquidGlassSettings liquidNavGlassSettings(double tint) => LiquidGlassSettings(
+LiquidGlassSettings liquidNavGlassSettings(
+  double tint, {
+  bool extraBlur = true,
+}) => LiquidGlassSettings(
   glassColor: Color.lerp(
     Colors.white,
     Colors.black,
     tint,
   )!.withValues(alpha: 0.12),
   bodyMode: GlassBodyMode.clear,
-  blur: 0.6,
+  blur: extraBlur ? 3 : 0.6,
   thickness: 26,
   chromaticAberration: 0,
   lightIntensity: 0.16,

@@ -470,6 +470,7 @@ class _RootShellState extends State<RootShell>
                                 collapsed: collapsed && !_keepDockExpanded,
                                 glassTint: _navPrefs.glassTint,
                                 glassQuality: _navPrefs.glassQuality,
+                                glassBlurEnabled: _navPrefs.glassBlurEnabled,
                                 onSelected: _onTabSelected,
                                 modesEnabled: ZModePrefs.enabled,
                                 onModeSelected: (mode, kind) async {
@@ -525,6 +526,7 @@ class _LiquidNavDock extends StatelessWidget {
     required this.collapsed,
     required this.glassTint,
     required this.glassQuality,
+    required this.glassBlurEnabled,
     required this.onSelected,
     required this.modesEnabled,
     required this.onModeSelected,
@@ -535,6 +537,7 @@ class _LiquidNavDock extends StatelessWidget {
   final bool collapsed;
   final double glassTint;
   final GlassQuality glassQuality;
+  final bool glassBlurEnabled;
   final ValueChanged<DockTab> onSelected;
   final bool modesEnabled;
   final void Function(ContentMode, StreamKind) onModeSelected;
@@ -573,7 +576,10 @@ class _LiquidNavDock extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final bottomInset = MediaQuery.paddingOf(context).bottom;
-    final glass = liquidNavGlassSettings(glassTint);
+    final glass = liquidNavGlassSettings(
+      glassTint,
+      extraBlur: glassBlurEnabled,
+    );
     final menuGlass = glass.copyWith(
       glassColor: AppColors.settingsCard.withValues(alpha: 0.84),
       blur: 8,
