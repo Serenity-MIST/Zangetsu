@@ -186,6 +186,15 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
                 onChanged: ThemeController.setAdaptiveColour,
                 subtitleMaxLines: null,
               ),
+              _switchTile(
+                icon: Icons.title_rounded,
+                title: 'Title artwork',
+                subtitle:
+                    'Show the official title logo instead of plain text on Detail',
+                value: ThemeController.titleLogo,
+                onChanged: ThemeController.setTitleLogo,
+                subtitleMaxLines: null,
+              ),
             ],
           ),
 

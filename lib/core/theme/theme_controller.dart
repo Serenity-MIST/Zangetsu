@@ -18,6 +18,7 @@ class ThemeController {
   static const String _amoledKey = 'amoled';
   static const String _materialYouKey = 'materialYou';
   static const String _adaptiveKey = 'adaptiveColour';
+  static const String _titleLogoKey = 'titleLogo';
 
   /// Near-black palette used when AMOLED is on (bg + card surfaces).
   static const Color amoledBg = Color(0xFF000000);
@@ -185,6 +186,20 @@ class ThemeController {
   /// Persist the poster-tint toggle and rebuild listeners.
   static Future<void> setAdaptiveColour(bool on) async {
     await _box.put(_adaptiveKey, on);
+    revision.value++;
+  }
+
+  /// Whether the Detail screen shows the official TMDB title logo instead of
+  /// plain text. On by default. Device-wide, like [adaptiveColour]. A title
+  /// with no logo still shows text — the toggle only unlocks the logo look.
+  static bool get titleLogo {
+    if (!Hive.isBoxOpen(boxName)) return true;
+    return _box.get(_titleLogoKey, defaultValue: true) as bool;
+  }
+
+  /// Persist the title-logo toggle and rebuild listeners.
+  static Future<void> setTitleLogo(bool on) async {
+    await _box.put(_titleLogoKey, on);
     revision.value++;
   }
 

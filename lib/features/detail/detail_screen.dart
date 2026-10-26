@@ -44,6 +44,7 @@ import '../../core/mihon/mihon_extension_service.dart';
 import '../../core/mangayomi/mangayomi_cloudflare.dart';
 import '../../core/metadata/episode_metadata_service.dart';
 import '../../core/metadata/metadata_enrichment.dart';
+import '../../core/metadata/title_logo_service.dart';
 import '../../core/notify/cs_notify.dart';
 import '../../core/notify/notification_service.dart';
 import '../../core/notify/subscription_store.dart';
@@ -516,6 +517,11 @@ class _DetailViewState extends State<_DetailView>
   final ValueNotifier<Color?> _tint = ValueNotifier(null);
   String? _tintUrl;
 
+  /// Official TMDB title logo (null → plain text title). Resolved once per
+  /// page when the Title artwork toggle is on; the service caches hits in
+  /// memory + Hive, so repeat opens don't pop.
+  String? _logoUrl;
+
   /// Kick off (once) the YouTube-id lookup for the resolved detail. When it
   /// completes with a non-null id, store it in [_trailerId] and rebuild so the
   /// hero can mount the trailer player.
@@ -539,6 +545,8 @@ class _DetailViewState extends State<_DetailView>
   void initState() {
     super.initState();
     _tint.addListener(_onTintChanged);
+    ThemeController.revision.addListener(_onThemeRevision);
+    _loadLogo();
     // Discord Rich Presence: "Looking at <title>" while this detail is open.
     if (sl.isRegistered<DiscordRpc>()) {
       sl<DiscordRpc>().setBrowsing(
@@ -554,6 +562,51 @@ class _DetailViewState extends State<_DetailView>
     if (mounted) setState(() {});
   }
 
+  /// Any theme change rebuilds: picks up the Title artwork toggle being
+  /// flipped while this page is open (on → resolve the logo, off → text).
+  void _onThemeRevision() {
+    if (!mounted) return;
+    if (!ThemeController.titleLogo) {
+      if (_logoUrl != null) setState(() => _logoUrl = null);
+      return;
+    }
+    if (_logoUrl == null) {
+      _loadLogo();
+    } else {
+      setState(() {});
+    }
+  }
+
+  /// Plain-text titles (the Title artwork toggle only swaps in a logo once
+  /// one has actually resolved — and back to text if it fails to load).
+  Widget _headerTitleText(String title) => Text(
+    title,
+    style: AppText.largeTitle.copyWith(fontSize: 28),
+    maxLines: 2,
+    overflow: TextOverflow.ellipsis,
+  );
+
+  Widget _barTitleText(String title) => Text(
+    title,
+    style: AppText.headline,
+    maxLines: 1,
+    overflow: TextOverflow.ellipsis,
+  );
+
+  /// Best-effort TMDB title-logo lookup (no-op unless the toggle is on).
+  /// Stays text until (and unless) a logo resolves; a genuine "no logo"
+  /// simply never sets [_logoUrl].
+  Future<void> _loadLogo() async {
+    if (!ThemeController.titleLogo) return;
+    if (!sl.isRegistered<TitleLogoService>()) return;
+    try {
+      final url = await sl<TitleLogoService>().logoFor(widget.item);
+      if (mounted && url != null && url.isNotEmpty && _logoUrl != url) {
+        setState(() => _logoUrl = url);
+      }
+    } catch (_) {}
+  }
+
   @override
   void dispose() {
     _routeAnimation?.removeStatusListener(_onRouteStatusChanged);
@@ -564,6 +617,7 @@ class _DetailViewState extends State<_DetailView>
     if (sl.isRegistered<DiscordRpc>()) sl<DiscordRpc>().setBrowsing();
     _scrollController.dispose();
     _tint.removeListener(_onTintChanged);
+    ThemeController.revision.removeListener(_onThemeRevision);
     _tint.dispose();
     _tabController.dispose();
     super.dispose();
@@ -2301,12 +2355,21 @@ class _DetailViewState extends State<_DetailView>
             opacity: _showAppBarTitle ? 1.0 : 0.0,
             duration: const Duration(milliseconds: 180),
             curve: Curves.easeOut,
-            child: Text(
-              detail.title,
-              style: AppText.headline,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
+            // Mini title logo in the collapsed bar; plain text until (and
+            // unless) one resolves.
+            child: _logoUrl != null
+                ? Align(
+                    alignment: Alignment.centerLeft,
+                    child: CachedNetworkImage(
+                      imageUrl: _logoUrl!,
+                      height: 24,
+                      fit: BoxFit.contain,
+                      alignment: Alignment.centerLeft,
+                      fadeInDuration: const Duration(milliseconds: 250),
+                      errorWidget: (_, _, _) => _barTitleText(detail.title),
+                    ),
+                  )
+                : _barTitleText(detail.title),
           ),
           flexibleSpace: FlexibleSpaceBar(
             collapseMode: CollapseMode.parallax,
@@ -2345,11 +2408,33 @@ class _DetailViewState extends State<_DetailView>
                             SearchScreen(initialQuery: detail.title),
                       ),
                     ),
-                    child: Text(
-                      detail.title,
-                      style: AppText.largeTitle.copyWith(fontSize: 28),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
+                    // Official title logo when the toggle resolved one —
+                    // grows in smoothly instead of shoving Play down.
+                    child: AnimatedSize(
+                      duration: const Duration(milliseconds: 250),
+                      curve: Curves.easeOut,
+                      alignment: Alignment.topCenter,
+                      child: _logoUrl != null
+                          // Compact natural-size box (never full-width): the
+                          // logo fades in exactly where it lands — no
+                          // centre-then-left snap while loading.
+                          ? ConstrainedBox(
+                              constraints: const BoxConstraints(
+                                maxHeight: 56,
+                                maxWidth: 220,
+                              ),
+                              child: CachedNetworkImage(
+                                imageUrl: _logoUrl!,
+                                fit: BoxFit.contain,
+                                alignment: Alignment.centerLeft,
+                                fadeInDuration: const Duration(
+                                  milliseconds: 250,
+                                ),
+                                errorWidget: (_, _, _) =>
+                                    _headerTitleText(detail.title),
+                              ),
+                            )
+                          : _headerTitleText(detail.title),
                     ),
                   ),
                   // Late metadata grows this block instead of shoving Play
