@@ -245,89 +245,149 @@ class ViewerProfileStore {
     final request = ++_loadRequest;
     final userId = _currentUserId?.call();
     final owner = userId ?? 'local';
-    bool isCurrentLoad() => request == _loadRequest && owner == _owner;
 
     final local = _readLocal(owner);
-    var recoverable = _readProfiles(_recoveryKey(owner));
-    var next = local.isEmpty ? [_defaultProfile(displayName)] : local;
+    final recoverable = _readProfiles(_recoveryKey(owner));
+    final next = local.isEmpty ? [_defaultProfile(displayName)] : local;
+    // Local first: boot (and the splash) never waits on the network. The
+    // cloud merge below re-applies over this when it arrives.
+    await _finishLoad(
+      recoverable: recoverable,
+      next: next,
+      owner: owner,
+      displayName: displayName,
+      request: request,
+    );
+
     final remote = _remote;
-    if (userId != null && remote != null) {
-      try {
-        final rows = await remote.listFor(userId);
+    if (userId == null || remote == null) return;
+    try {
+      await _mergeRemote(
+        remote: remote,
+        userId: userId,
+        local: local,
+        recoverable: recoverable,
+        owner: owner,
+        displayName: displayName,
+        request: request,
+      ).timeout(const Duration(seconds: 10));
+    } catch (_) {
+      // Offline or too slow: the local list applied above stays.
+    }
+  }
+
+  /// Cloud half of [loadForUser]: merge remote profiles over the locally
+  /// applied list, push pending writes, then re-apply. Runs bounded (see the
+  /// timeout at the call site) so a dead network can't trap boot.
+  Future<void> _mergeRemote({
+    required ViewerProfileRemote remote,
+    required String userId,
+    required List<ViewerProfile> local,
+    required List<ViewerProfile> recoverable,
+    required String owner,
+    required String displayName,
+    required int request,
+  }) async {
+    bool isCurrentLoad() => request == _loadRequest && owner == _owner;
+    var mergedRecoverable = recoverable;
+    try {
+      final rows = await remote.listFor(userId);
+      if (!isCurrentLoad()) return;
+      final cloud = [
+        for (final row in rows)
+          if (_validRemoteProfile(row)) _fromRemote(row),
+      ];
+      final pending = _pending(owner);
+      final cloudIds = cloud.map((profile) => profile.id).toSet();
+      mergedRecoverable = {
+        for (final profile in recoverable)
+          if (!cloudIds.contains(profile.id)) profile.id: profile,
+        for (final profile in local)
+          if (profile.id != kDefaultProfileId &&
+              !cloudIds.contains(profile.id) &&
+              pending[profile.id] == null)
+            profile.id: profile,
+      }.values.toList();
+      final unsynced = [
+        for (final profile in local)
+          if (pending[profile.id] == _PendingProfileWrite.create ||
+              (pending[profile.id] == _PendingProfileWrite.update &&
+                  cloudIds.contains(profile.id)))
+            profile,
+      ];
+      final deletedWhileOffline = [
+        for (final profile in local)
+          if (profile.id != kDefaultProfileId &&
+              pending[profile.id] == _PendingProfileWrite.update &&
+              !cloudIds.contains(profile.id))
+            profile.id,
+      ];
+      var merged = {
+        for (final profile in cloud) profile.id: profile,
+        for (final profile in unsynced) profile.id: profile,
+      }.values.toList();
+      if (!merged.any((p) => p.id == kDefaultProfileId)) {
+        final fallback =
+            local.where((p) => p.id == kDefaultProfileId).firstOrNull ??
+            _defaultProfile(displayName);
+        merged.insert(0, fallback);
+        await remote.upsert(userId, fallback);
         if (!isCurrentLoad()) return;
-        final cloud = [
-          for (final row in rows)
-            if (_validRemoteProfile(row)) _fromRemote(row),
-        ];
-        final pending = _pending(owner);
-        final cloudIds = cloud.map((profile) => profile.id).toSet();
-        recoverable = {
-          for (final profile in recoverable)
-            if (!cloudIds.contains(profile.id)) profile.id: profile,
-          for (final profile in local)
-            if (profile.id != kDefaultProfileId &&
-                !cloudIds.contains(profile.id) &&
-                pending[profile.id] == null)
-              profile.id: profile,
-        }.values.toList();
-        final unsynced = [
-          for (final profile in local)
-            if (pending[profile.id] == _PendingProfileWrite.create ||
-                (pending[profile.id] == _PendingProfileWrite.update &&
-                    cloudIds.contains(profile.id)))
-              profile,
-        ];
-        final deletedWhileOffline = [
-          for (final profile in local)
-            if (profile.id != kDefaultProfileId &&
-                pending[profile.id] == _PendingProfileWrite.update &&
-                !cloudIds.contains(profile.id))
-              profile.id,
-        ];
-        next = {
-          for (final profile in cloud) profile.id: profile,
-          for (final profile in unsynced) profile.id: profile,
-        }.values.toList();
-        if (!next.any((p) => p.id == kDefaultProfileId)) {
-          final fallback =
-              local.where((p) => p.id == kDefaultProfileId).firstOrNull ??
-              _defaultProfile(displayName);
-          next.insert(0, fallback);
-          await remote.upsert(userId, fallback);
-          if (!isCurrentLoad()) return;
-        }
-        for (final profileId in deletedWhileOffline) {
-          await _deleteLocalProfileData(profileId);
-          await _setPending(owner, profileId, null);
-        }
-        for (final profile in unsynced) {
-          await remote.upsert(userId, profile);
-          if (!isCurrentLoad()) return;
-          await _setPending(owner, profile.id, null);
-        }
-      } catch (_) {
-        // Keep the local profile list usable during offline startup.
       }
+      for (final profileId in deletedWhileOffline) {
+        await _deleteLocalProfileData(profileId);
+        await _setPending(owner, profileId, null);
+      }
+      for (final profile in unsynced) {
+        await remote.upsert(userId, profile);
+        if (!isCurrentLoad()) return;
+        await _setPending(owner, profile.id, null);
+      }
+      await _finishLoad(
+        recoverable: mergedRecoverable,
+        next: merged,
+        owner: owner,
+        displayName: displayName,
+        request: request,
+      );
+    } catch (_) {
+      // Offline: the local list applied by loadForUser stays.
+      return;
     }
+  }
+
+  /// Applies a profile list: guarantees a default profile first, persists the
+  /// recovery + local copies, then picks the active profile and theme.
+  /// Idempotent — [loadForUser] runs it for local data first, then again
+  /// after a cloud merge arrives.
+  Future<void> _finishLoad({
+    required List<ViewerProfile> recoverable,
+    required List<ViewerProfile> next,
+    required String owner,
+    required String displayName,
+    required int request,
+  }) async {
+    bool isCurrentLoad() => request == _loadRequest && owner == _owner;
+    final result = [...next];
     // Do not trim older profiles to make room for Home; let users remove them.
-    if (!next.any((p) => p.id == kDefaultProfileId)) {
-      next.insert(0, _defaultProfile(displayName));
+    if (!result.any((p) => p.id == kDefaultProfileId)) {
+      result.insert(0, _defaultProfile(displayName));
     }
-    final defaultIndex = next.indexWhere((p) => p.id == kDefaultProfileId);
-    if (defaultIndex > 0) next.insert(0, next.removeAt(defaultIndex));
+    final defaultIndex = result.indexWhere((p) => p.id == kDefaultProfileId);
+    if (defaultIndex > 0) result.insert(0, result.removeAt(defaultIndex));
     if (!isCurrentLoad()) return;
     await _box.put(_recoveryKey(owner), [
       for (final profile in recoverable) profile.toJson(),
     ]);
     if (!isCurrentLoad()) return;
-    await _saveLocal(owner, next);
+    await _saveLocal(owner, result);
     if (!isCurrentLoad()) return;
     _loadedOwner = owner;
-    _profiles = next;
+    _profiles = result;
     final storedId = _box.get(_activeKey(owner)) as String?;
     final chosen =
-        next.where((p) => p.id == storedId).firstOrNull ??
-        next.firstWhere((p) => p.id == kDefaultProfileId);
+        result.where((p) => p.id == storedId).firstOrNull ??
+        result.firstWhere((p) => p.id == kDefaultProfileId);
     active.value = chosen;
     await _applyTheme(chosen);
     revision.value++;

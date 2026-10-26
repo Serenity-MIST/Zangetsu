@@ -532,9 +532,11 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
     try {
       await sl<AuthCubit>().restore().timeout(const Duration(seconds: 5));
       if (sl<AuthCubit>().state.isLoggedIn) {
-        await sl<ViewerProfileStore>().loadForUser(
-          displayName: sl<AuthCubit>().state.displayName,
-        );
+        // Bounded: local profiles apply immediately inside loadForUser; the
+        // cloud merge must never trap the splash on a dead network.
+        await sl<ViewerProfileStore>()
+            .loadForUser(displayName: sl<AuthCubit>().state.displayName)
+            .timeout(const Duration(seconds: 15));
         Future<void> cloudSync() async {
           await Future.wait([
             sl<MyListStore>().seedCloudIfNeeded(),
@@ -566,9 +568,9 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
     } catch (_) {}
     if (!sl<ViewerProfileStore>().isLoadedForCurrentUser) {
       try {
-        await sl<ViewerProfileStore>().loadForUser(
-          displayName: sl<AuthCubit>().state.displayName,
-        );
+        await sl<ViewerProfileStore>()
+            .loadForUser(displayName: sl<AuthCubit>().state.displayName)
+            .timeout(const Duration(seconds: 15));
       } catch (_) {}
     }
     // Rows saved under a source before the browse screen started resolving
