@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:cue/cue.dart';
 import 'package:flutter/cupertino.dart' show CupertinoPicker;
 import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
@@ -358,35 +359,10 @@ class DetailScreen extends StatelessWidget {
   /// AniList's page even when MyAnimeList is the app-wide choice.
   final PreferredProvider? prefer;
 
-  /// Opening transition: the page fades in while sliding up and scaling from
-  /// 0.96 — a smooth "rise" into the detail rather than the platform push.
+  /// Opens with a Cue spring while the lightweight tapped-title preview shows.
   static Route<void> route(MediaItem item, {PreferredProvider? prefer}) =>
-      PageRouteBuilder<void>(
-        transitionDuration: const Duration(milliseconds: 340),
-        reverseTransitionDuration: const Duration(milliseconds: 260),
+      _CueDetailRoute(
         pageBuilder: (_, _, _) => DetailScreen(item: item, prefer: prefer),
-        transitionsBuilder: (_, animation, _, child) {
-          final curved = CurvedAnimation(
-            parent: animation,
-            curve: Curves.easeOutCubic,
-            reverseCurve: Curves.easeInCubic,
-          );
-          // A single slide, like the iOS default. It was a fade + slide +
-          // scale stacked together, which is the most expensive thing you can
-          // animate on a phone: a fade cannot be a GPU transform, so the whole
-          // screen is rendered into a separate offscreen buffer and blended
-          // every frame for 340ms, on top of the loading shimmer's own
-          // full-screen ShaderMask. Two full-screen operations at once is what
-          // made opening this screen stutter on a low-end device. A slide is a
-          // pure transform: composited on the GPU, no buffer, no blend.
-          return SlideTransition(
-            position: Tween(
-              begin: const Offset(1, 0),
-              end: Offset.zero,
-            ).animate(curved),
-            child: child,
-          );
-        },
       );
 
   @override
@@ -407,6 +383,34 @@ class DetailScreen extends StatelessWidget {
       child: _DetailView(item: item, prefer: prefer),
     );
   }
+}
+
+class _CueDetailRoute extends PageRouteBuilder<void>
+    with CueModalRouteMixin<void> {
+  _CueDetailRoute({required super.pageBuilder})
+    : super(
+        transitionDuration: const Duration(milliseconds: 340),
+        reverseTransitionDuration: const Duration(milliseconds: 260),
+        transitionsBuilder: (_, animation, _, child) => SlideTransition(
+          position: Tween(
+            begin: const Offset(1, 0),
+            end: Offset.zero,
+          ).animate(animation),
+          child: child,
+        ),
+      );
+
+  @override
+  CueMotion get motion => const Spring.smooth();
+
+  @override
+  CueMotion? get reverseMotion => const Spring.snappy();
+
+  @override
+  AnimationStatusListener? get onAnimationStatusChanged => null;
+
+  @override
+  bool get hideOnPushNext => false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -432,6 +436,8 @@ class _DetailViewState extends State<_DetailView>
     with SingleTickerProviderStateMixin {
   static const double _expandedHeight = 320;
   bool _showAppBarTitle = false;
+  bool _hasEntered = false;
+  Animation<double>? _routeAnimation;
 
   // The episode url we've already kicked a background source-prefetch for, so we
   // don't re-fire it on every rebuild (see _maybePrefetch).
@@ -443,6 +449,25 @@ class _DetailViewState extends State<_DetailView>
   /// started for them. Long enough that a back-and-forth browse never starts
   /// one, short enough that a viewer reading the page still gets the warm menu.
   static const Duration _prefetchStayDelay = Duration(milliseconds: 700);
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final animation = ModalRoute.of(context)?.animation;
+    if (identical(animation, _routeAnimation)) return;
+    _routeAnimation?.removeStatusListener(_onRouteStatusChanged);
+    _routeAnimation = animation;
+    if (animation == null || animation.status == AnimationStatus.completed) {
+      _hasEntered = true;
+    } else {
+      animation.addStatusListener(_onRouteStatusChanged);
+    }
+  }
+
+  void _onRouteStatusChanged(AnimationStatus status) {
+    if (status != AnimationStatus.completed || _hasEntered || !mounted) return;
+    setState(() => _hasEntered = true);
+  }
 
   Timer? _prefetchTimer;
 
@@ -531,6 +556,7 @@ class _DetailViewState extends State<_DetailView>
 
   @override
   void dispose() {
+    _routeAnimation?.removeStatusListener(_onRouteStatusChanged);
     // Leaving before the stay-delay elapsed: no viewer is here to warm a menu
     // for, so the pending resolve never starts.
     _prefetchTimer?.cancel();
@@ -1931,6 +1957,12 @@ class _DetailViewState extends State<_DetailView>
   @override
   Widget build(BuildContext context) {
     if (sl<AppMode>().isTv) return DetailScreenTv(item: widget.item);
+    if (!_hasEntered) {
+      return _DetailOpeningPreview(
+        item: widget.item,
+        heroHeight: _expandedHeight,
+      );
+    }
     return Scaffold(
       backgroundColor: AppColors.bg,
       body: Stack(
@@ -2245,6 +2277,14 @@ class _DetailViewState extends State<_DetailView>
         SliverAppBar(
           expandedHeight: _expandedHeight,
           pinned: true,
+          // iOS-style chip with its own background (no top fade needed).
+          // Padded to sit 14px off the edge, mirroring the top-right
+          // trailer controls.
+          leadingWidth: 62,
+          leading: const Padding(
+            padding: EdgeInsets.only(left: 14),
+            child: _DetailBackButton(),
+          ),
           // Opaque while adaptive colour is on, painted in the same wash as the
           // body, so the pinned bar hides scrolled content instead of letting
           // it show through (a transparent bar read as an unfinished page).
@@ -2312,34 +2352,50 @@ class _DetailViewState extends State<_DetailView>
                       overflow: TextOverflow.ellipsis,
                     ),
                   ),
-                  if (metaLine.isNotEmpty) ...[
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Flexible(
-                          child: Text(
-                            metaLine,
-                            style: AppText.body.copyWith(
-                              color: AppColors.textSecondary,
-                            ),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        // What the source claims it serves — "4K", "HD",
-                        // "CAM". Only CloudStream reports one, so it is
-                        // usually absent.
-                        if ((item.quality ?? '').trim().isNotEmpty) ...[
-                          const SizedBox(width: 8),
-                          _MetaBadge(item.quality!.trim().toUpperCase()),
-                        ],
-                        if (detail.isAdult) ...[
-                          const SizedBox(width: 8),
-                          const _MetaBadge('18+'),
-                        ],
-                      ],
-                    ),
-                  ],
+                  // Late metadata grows this block instead of shoving Play
+                  // down a frame — that shove read as open-transition jitter.
+                  AnimatedSize(
+                    duration: const Duration(milliseconds: 250),
+                    curve: Curves.easeOut,
+                    alignment: Alignment.topCenter,
+                    child: metaLine.isNotEmpty
+                        ? Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const SizedBox(height: 8),
+                              Row(
+                                children: [
+                                  Flexible(
+                                    child: Text(
+                                      metaLine,
+                                      style: AppText.body.copyWith(
+                                        color: AppColors.textSecondary,
+                                      ),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                  // What the source claims it serves — "4K", "HD",
+                                  // "CAM". Only CloudStream reports one, so it is
+                                  // usually absent.
+                                  if ((item.quality ?? '')
+                                      .trim()
+                                      .isNotEmpty) ...[
+                                    const SizedBox(width: 8),
+                                    _MetaBadge(
+                                      item.quality!.trim().toUpperCase(),
+                                    ),
+                                  ],
+                                  if (detail.isAdult) ...[
+                                    const SizedBox(width: 8),
+                                    const _MetaBadge('18+'),
+                                  ],
+                                ],
+                              ),
+                            ],
+                          )
+                        : const SizedBox.shrink(),
+                  ),
                 ],
               ),
             ),
@@ -2397,60 +2453,85 @@ class _DetailViewState extends State<_DetailView>
               // source search until full metadata arrives: resolve() shares
               // in-flight work by title id, so an early search would make the
               // later alias-aware lookup reuse the incomplete one.
-              if (sourceMetadataReady && ZmodeIds.isZ(widget.item.url))
-                MatchLine(
-                  canonical: ZmodeIds.parseShow(widget.item.url)!,
-                  title: detail.title,
-                  altTitle: detail.englishTitle,
-                  malId: detail.malId,
-                  metadataAliases: [
-                    if (detail.englishTitle != null) detail.englishTitle!,
-                    if (detail.nativeTitle != null) detail.nativeTitle!,
-                    ...detail.synonyms,
-                  ],
-                ),
+              // Same late-arrival growth as the meta line above.
+              AnimatedSize(
+                duration: const Duration(milliseconds: 250),
+                curve: Curves.easeOut,
+                alignment: Alignment.topCenter,
+                child: sourceMetadataReady && ZmodeIds.isZ(widget.item.url)
+                    ? MatchLine(
+                        canonical: ZmodeIds.parseShow(widget.item.url)!,
+                        title: detail.title,
+                        altTitle: detail.englishTitle,
+                        malId: detail.malId,
+                        metadataAliases: [
+                          if (detail.englishTitle != null) detail.englishTitle!,
+                          if (detail.nativeTitle != null) detail.nativeTitle!,
+                          ...detail.synonyms,
+                        ],
+                      )
+                    : const SizedBox.shrink(),
+              ),
             ],
           ),
         ),
 
         // ── 4. Synopsis (clamped) + "Read more" → Details tab ───────────────
-        if ((cleanSynopsis(detail.description) ?? '').isNotEmpty)
-          SliverToBoxAdapter(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 18, 16, 0),
-              child: _Description(
-                text: cleanSynopsis(detail.description) ?? '',
-                // "Read more" reveals the Details tab (full synopsis) rather
-                // than expanding inline; the header stays clamped to 3 lines.
-                onReadMore: () => _revealTab(3),
-              ),
-            ),
+        SliverToBoxAdapter(
+          child: AnimatedSize(
+            duration: const Duration(milliseconds: 250),
+            curve: Curves.easeOut,
+            alignment: Alignment.topCenter,
+            child: (cleanSynopsis(detail.description) ?? '').isNotEmpty
+                ? Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 18, 16, 0),
+                    child: _Description(
+                      text: cleanSynopsis(detail.description) ?? '',
+                      // "Read more" reveals the Details tab (full synopsis) rather
+                      // than expanding inline; the header stays clamped to 3 lines.
+                      onReadMore: () => _revealTab(3),
+                    ),
+                  )
+                : const SizedBox.shrink(),
           ),
+        ),
 
         // ── 5. Starring / Creators / Genres muted lines ─────────────────────
-        if (starring != null || creators != null || genresLine != null)
-          SliverToBoxAdapter(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  if (starring != null)
-                    _CreditLine(
-                      label: context.l10n.starring,
-                      value: starring,
-                      more: starringMore,
-                      // Tapping the line (or its "… more") reveals the Cast tab.
-                      onMore: starringMore ? () => _revealTab(1) : null,
+        SliverToBoxAdapter(
+          child: AnimatedSize(
+            duration: const Duration(milliseconds: 250),
+            curve: Curves.easeOut,
+            alignment: Alignment.topCenter,
+            child: starring != null || creators != null || genresLine != null
+                ? Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (starring != null)
+                          _CreditLine(
+                            label: context.l10n.starring,
+                            value: starring,
+                            more: starringMore,
+                            // Tapping the line (or its "… more") reveals the Cast tab.
+                            onMore: starringMore ? () => _revealTab(1) : null,
+                          ),
+                        if (genresLine != null)
+                          _CreditLine(
+                            label: context.l10n.genres,
+                            value: genresLine,
+                          ),
+                        if (creators != null)
+                          _CreditLine(
+                            label: context.l10n.creators,
+                            value: creators,
+                          ),
+                      ],
                     ),
-                  if (genresLine != null)
-                    _CreditLine(label: context.l10n.genres, value: genresLine),
-                  if (creators != null)
-                    _CreditLine(label: context.l10n.creators, value: creators),
-                ],
-              ),
-            ),
+                  )
+                : const SizedBox.shrink(),
           ),
+        ),
 
         // ── 6. Icon-over-label action row (My List / Trailer / Share / Web) ─
         // "Trailer" is a CloudStream-style result action (recloudstream's

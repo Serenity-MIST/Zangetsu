@@ -44,12 +44,4 @@ abstract class AppColors {
     colors: [Color(0xF20B0B0F), Color(0x000B0B0F)],
     stops: [0.0, 0.65],
   );
-
-  /// Top-down scrim for hero readability under the status bar.
-  static const topScrim = LinearGradient(
-    begin: Alignment.topCenter,
-    end: Alignment.bottomCenter,
-    colors: [Color(0x990B0B0F), Color(0x000B0B0F)],
-    stops: [0.0, 0.5],
-  );
 }

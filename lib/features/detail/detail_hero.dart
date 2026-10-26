@@ -87,12 +87,8 @@ class _Hero extends StatelessWidget {
                 placeholder: _coverBackdrop(),
               )
             : _coverBackdrop(),
-        // Gradients render OVER the video for title readability.
-        const IgnorePointer(
-          child: DecoratedBox(
-            decoration: BoxDecoration(gradient: AppColors.topScrim),
-          ),
-        ),
+        // Gradients render OVER the video for title readability. No top
+        // fade: the back chip below carries its own background.
         if (t == null)
           const IgnorePointer(
             child: DecoratedBox(
@@ -124,6 +120,27 @@ class _Hero extends StatelessWidget {
             ),
           ),
       ],
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Back chip — the same translucent circle as the top-right trailer controls
+// ([_HeroCircleButton]), mirrored at the left edge. It brings its own
+// background, so the hero needs no full-width top fade to stay readable.
+// Shared by the real app bar and the opening preview (same widget, same
+// spot) so the preview → body swap stays invisible.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class _DetailBackButton extends StatelessWidget {
+  const _DetailBackButton();
+
+  @override
+  Widget build(BuildContext context) {
+    return _HeroCircleButton(
+      icon: Icons.arrow_back_ios_new_rounded,
+      onTap: () => Navigator.of(context).maybePop(),
+      semanticLabel: MaterialLocalizations.of(context).backButtonTooltip,
     );
   }
 }

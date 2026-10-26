@@ -160,6 +160,97 @@ class _DetailSkeleton extends StatelessWidget {
   }
 }
 
+/// Lightweight first frame: artwork and title are known from the tapped row,
+/// so the screen feels immediate while the complete detail tree waits for the
+/// spring transition to settle.
+class _DetailOpeningPreview extends StatelessWidget {
+  const _DetailOpeningPreview({required this.item, required this.heroHeight});
+
+  final MediaItem item;
+  final double heroHeight;
+
+  @override
+  Widget build(BuildContext context) {
+    final coverUrl = mobileHeroArt(item.cover, item.banner) ?? '';
+    final topInset = MediaQuery.paddingOf(context).top;
+    final titleStyle = AppText.largeTitle.copyWith(fontSize: 28);
+
+    return Scaffold(
+      backgroundColor: AppColors.bg,
+      body: Stack(
+        children: [
+          CustomScrollView(
+            physics: const NeverScrollableScrollPhysics(),
+            slivers: [
+              SliverToBoxAdapter(
+                child: SizedBox(
+                  // Exactly the real hero height: SliverAppBar's expandedHeight
+                  // already includes the status-bar area, so adding topInset
+                  // here made the preview taller and the swap visibly jumped.
+                  height: heroHeight,
+                  child: RepaintBoundary(
+                    child: _Hero(
+                      coverUrl: coverUrl,
+                      coverHeaders: item.coverHeaders,
+                      hasCover: coverUrl.isNotEmpty,
+                    ),
+                  ),
+                ),
+              ),
+              SliverToBoxAdapter(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 24),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        item.title,
+                        style: titleStyle,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      if ((item.quality?.trim().isNotEmpty ?? false) ||
+                          item.isAdult) ...[
+                        const SizedBox(height: 8),
+                        Wrap(
+                          spacing: 8,
+                          children: [
+                            if (item.quality?.trim().isNotEmpty ?? false)
+                              _MetaBadge(item.quality!.trim().toUpperCase()),
+                            if (item.isAdult) const _MetaBadge('18+'),
+                          ],
+                        ),
+                      ],
+                      const SizedBox(height: 18),
+                      _bone(double.infinity, 48, 14),
+                      const SizedBox(height: 12),
+                      _bone(double.infinity, 48, 14),
+                      const SizedBox(height: 22),
+                      _bone(double.infinity, 12),
+                      const SizedBox(height: 9),
+                      _bone(double.infinity, 12),
+                      const SizedBox(height: 9),
+                      _bone(180, 12),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+          Positioned(
+            // Same widget and spot as the SliverAppBar's automatic leading
+            // (56-wide leading box, icon centred): a different style or a few
+            // pixels off reads as a pop on the preview → body swap.
+            top: topInset + 4,
+            left: 14,
+            child: const _DetailBackButton(),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 /// Placeholder episode rows for the Episodes tab while the matched source's
 /// list is still being fetched — see [DetailState.episodesLoading]. The
 /// screen now paints before that fetch finishes, and an empty list there
