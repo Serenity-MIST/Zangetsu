@@ -12,6 +12,7 @@ import '../../core/di/injector.dart';
 import '../../core/profiles/viewer_profile.dart';
 import '../../l10n/l10n.dart';
 import '../../core/ui/animation_prefs.dart';
+import '../../core/ui/detail_prefs.dart';
 
 /// Theme and colour: accent as preview cards (+ a Custom colour picker), the
 /// pure-black AMOLED toggle, the adaptive poster tint, the app font and how
@@ -235,6 +236,21 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
                   ),
                   onTap: _pickAnimStyle,
                 ),
+            ],
+          ),
+          // ── Behaviour ─────────────────────────────────────────────────────
+          SettingsSectionLabel('Behaviour'),
+          SettingsCard(
+            children: [
+              _switchTile(
+                icon: Icons.swap_vert_rounded,
+                title: 'Reverse episode list always on',
+                subtitle:
+                    'Every detail screen opens newest-first; the list button still flips it for that visit',
+                value: DetailPrefs.reverseEpisodesDefault,
+                onChanged: DetailPrefs.setReverseEpisodesDefault,
+                subtitleMaxLines: null,
+              ),
             ],
           ),
         ],

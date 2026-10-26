@@ -112,7 +112,10 @@ class _EpisodesTab extends StatefulWidget {
 
 class _EpisodesTabState extends State<_EpisodesTab> {
   bool _grid = false;
-  bool _reverseList = false;
+
+  /// Starts from the Behaviour setting — newest-first on every detail screen
+  /// when on. The list button still flips it; that only lasts this visit.
+  bool _reverseList = DetailPrefs.reverseEpisodesDefault;
 
   /// Selected scanlation group, or null for "All". Several groups release the
   /// same chapter number, so an unfiltered list legitimately reads 1, 1, 2, 2

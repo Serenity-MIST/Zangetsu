@@ -39,6 +39,7 @@ import '../profiles/viewer_profile.dart';
 import '../profiles/profile_avatar_uploader.dart';
 import '../search/title_suggestion_service.dart';
 import '../ui/animation_prefs.dart';
+import '../ui/detail_prefs.dart';
 import '../playback/skip_service.dart';
 import '../playback/resume_store.dart';
 import '../reading/read_history.dart';
@@ -458,6 +459,7 @@ Future<void> initDependencies() async {
   await SearchHistory.init();
   sl.registerSingleton<SearchHistory>(SearchHistory());
   await AnimationPrefs.init(); // list/grid reveal toggle (phone/iOS only)
+  await DetailPrefs.init(); // episode lists open reversed when enabled
   await IncognitoMode.init(); // privacy: pause history/tracking/RPC when on
   await PinnedSources.init(); // favourite sources pinned atop the source picker
   await SearchSourcePrefs.init();
