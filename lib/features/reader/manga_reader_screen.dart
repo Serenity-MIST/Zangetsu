@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -203,6 +204,11 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   int get _pageIndex => _pageIndexVN.value;
   set _pageIndex(int value) => _pageIndexVN.value = value;
 
+  /// Bumped on every scroll frame (both modes — PageView scrolls too) so the
+  /// page pill can show *while* scrolling, not just when the page flips.
+  /// Nobody rebuilds on this except the pill itself.
+  final ValueNotifier<int> _scrollTickVN = ValueNotifier<int>(0);
+
   late final MangaPageTranslationService _translationService =
       widget.translationService ?? MangaPageTranslationService();
   final Map<String, MangaPageTranslationResult> _translatedPages = {};
@@ -356,6 +362,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       c.dispose();
     }
     _pageIndexVN.dispose();
+    _scrollTickVN.dispose();
     super.dispose();
   }
 
@@ -1586,10 +1593,6 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     final dir = _effectiveDirection(prefs);
     if (dir == 'vertical') return null;
     if (MediaQuery.orientationOf(context) != Orientation.landscape) return null;
-    // ponytail: wide-page detection deferred (needs the image decoded to read
-    // its aspect ratio) — every pair is two portrait pages. Upgrade path:
-    // resolve each page's decoded size via an ImageStream listener and pass
-    // the landscape (aspect > 1) indices here as `wide`.
     return pairPages(pages.length, rtl: dir == 'rtl', wide: const {});
   }
 
@@ -2082,17 +2085,38 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   @override
   Widget build(BuildContext context) {
     final prefs = sl<ReaderPrefs>();
+    final pageTotal = _activeSpreads()?.length ?? _pages?.length ?? 0;
     return Scaffold(
       backgroundColor: readerBgColor(prefs.mangaBackground),
       body: Stack(
         children: [
-          Positioned.fill(child: _buildBody(prefs)),
+          Positioned.fill(
+            child: NotificationListener<ScrollNotification>(
+              // ScrollUpdate covers drags, flings and programmatic moves
+              // in both modes. Bubbles up from the deep PageView/ListView
+              // — returning false so nothing else is affected.
+              onNotification: (n) {
+                if (n is ScrollUpdateNotification) _scrollTickVN.value++;
+                return false;
+              },
+              child: _buildBody(prefs),
+            ),
+          ),
           // Both bars stay in the tree at all times now (an AnimatedOpacity
           // fade instead of the old conditional if (_chromeVisible) build) so
           // the fade can actually animate — see the IgnorePointer below for
           // why that doesn't let a hidden bar eat page taps.
           _buildTopBar(),
           _buildBottomBar(),
+          // Mihon-style page pill ("08/26"): pops up on every page turn in
+          // both modes and fades 1.5s after the last one. Hidden while the
+          // chrome (which carries its own counter) is up.
+          _ScrollPagePill(
+            pageIndex: _pageIndexVN,
+            activity: _scrollTickVN,
+            total: pageTotal,
+            visible: !_chromeVisible,
+          ),
           if (_showFloatingMangaTranslation &&
               _pages != null &&
               _pages!.isNotEmpty)
@@ -4934,4 +4958,123 @@ enum _ReaderMenuAction {
   toggleRead,
   settings,
   translatePage,
+}
+
+/// Mihon-style page pill ("08/26"), floating bottom-centre. Appears on every
+/// page turn in both modes and fades 1.5s after the last one. Listens to the
+/// index notifier itself so page turns never rebuild the reader, and stays
+/// hidden while the chrome (which carries its own counter) is up.
+class _ScrollPagePill extends StatefulWidget {
+  const _ScrollPagePill({
+    required this.pageIndex,
+    required this.activity,
+    required this.total,
+    required this.visible,
+  });
+
+  final ValueListenable<int> pageIndex;
+
+  /// Bumped every scroll frame — wakes the pill while scrolling.
+  final ValueListenable<int> activity;
+  final int total;
+  final bool visible;
+
+  @override
+  State<_ScrollPagePill> createState() => _ScrollPagePillState();
+}
+
+class _ScrollPagePillState extends State<_ScrollPagePill> {
+  bool _show = false;
+  Timer? _hideTimer;
+  int? _lastSeen;
+
+  @override
+  void initState() {
+    super.initState();
+    _lastSeen = widget.pageIndex.value;
+    widget.pageIndex.addListener(_onPage);
+    widget.activity.addListener(_poke);
+  }
+
+  @override
+  void didUpdateWidget(_ScrollPagePill oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.pageIndex, widget.pageIndex)) {
+      oldWidget.pageIndex.removeListener(_onPage);
+      widget.pageIndex.addListener(_onPage);
+    }
+    if (!identical(oldWidget.activity, widget.activity)) {
+      oldWidget.activity.removeListener(_poke);
+      widget.activity.addListener(_poke);
+    }
+  }
+
+  void _onPage() {
+    if (_lastSeen == widget.pageIndex.value) return;
+    _lastSeen = widget.pageIndex.value;
+    _poke();
+  }
+
+  /// Show (or keep shown) and restart the 1.5s fade-out timer.
+  void _poke() {
+    _hideTimer?.cancel();
+    if (mounted && !_show) setState(() => _show = true);
+    if (!mounted) return;
+    _hideTimer = Timer(const Duration(milliseconds: 1500), () {
+      if (mounted) setState(() => _show = false);
+    });
+  }
+
+  @override
+  void dispose() {
+    widget.pageIndex.removeListener(_onPage);
+    widget.activity.removeListener(_poke);
+    _hideTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final total = widget.total;
+    final show = _show && widget.visible && total > 0;
+    return Positioned(
+      left: 0,
+      right: 0,
+      bottom: 36,
+      child: IgnorePointer(
+        child: AnimatedOpacity(
+          opacity: show ? 1.0 : 0.0,
+          duration: const Duration(milliseconds: 250),
+          child: Center(
+            child: ValueListenableBuilder<int>(
+              valueListenable: widget.pageIndex,
+              builder: (context, index, _) {
+                final width = math.max(2, total.toString().length);
+                final cur = (index + 1).toString().padLeft(width, '0');
+                final tot = total.toString().padLeft(width, '0');
+                return Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 5,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.6),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text(
+                    '$cur/$tot',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
