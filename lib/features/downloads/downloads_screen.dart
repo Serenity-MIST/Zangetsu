@@ -874,8 +874,22 @@ class DownloadTile extends StatelessWidget {
     return parts.isEmpty ? '' : ' · ${parts.join(' · ')}';
   }
 
-  Future<void> _play(BuildContext context) =>
-      launchDownloadedEpisode(context, record);
+  Future<void> _play(BuildContext context) async {
+    // The whole downloaded season, not just this row — otherwise Next has
+    // nowhere to go and the user is bounced back out to pick manually.
+    final queue = await downloadedSiblingQueue(
+      showRecords: manager.byShow[record.showId] ?? const [],
+      record: record,
+      filePresent: manager.filePresent,
+    );
+    if (!context.mounted) return;
+    await launchDownloadedEpisode(
+      context,
+      record,
+      episodes: queue.episodes,
+      startIndex: queue.startIndex,
+    );
+  }
 
   @override
   Widget build(BuildContext context) {

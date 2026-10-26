@@ -17,6 +17,7 @@ import '../../core/ui/states.dart';
 import '../../l10n/l10n.dart';
 import '../settings/download_location_screen.dart' show folderLabelFromUri;
 import 'downloads_screen.dart';
+import 'downloaded_episode_playback.dart';
 
 /// TV Downloads: a full-screen focusable list of downloaded episodes backed by
 /// [DownloadManager]. Mirrors the phone's [DownloadsScreen] layout and data;
@@ -327,7 +328,20 @@ class _TvDownloadActions extends StatelessWidget {
       out.add((
         l10n.play,
         Icons.play_arrow_rounded,
-        () => launchDownloadedEpisode(context, r),
+        () async {
+          final queue = await downloadedSiblingQueue(
+            showRecords: manager.byShow[r.showId] ?? const [],
+            record: r,
+            filePresent: manager.filePresent,
+          );
+          if (!context.mounted) return;
+          await launchDownloadedEpisode(
+            context,
+            r,
+            episodes: queue.episodes,
+            startIndex: queue.startIndex,
+          );
+        },
       ));
     }
     if (r.status == DownloadStatus.downloading) {
