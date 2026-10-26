@@ -549,17 +549,23 @@ class _LiquidNavDock extends StatelessWidget {
           ? sl<ViewerProfileStore>().activeProfile
           : null;
       if (profile != null) {
-        return ClipOval(
-          child: ProfileAvatarFace(
-            profile: profile,
-            photoUrl: profilePhotoForFace(
+        // Hero landing spot for the profile-picker avatar flight — the old
+        // dock has the same tag, so the flight works on both navbars. Only
+        // one of icon/activeIcon is ever mounted, so the tag stays unique.
+        return Hero(
+          tag: viewerProfileHeroTag(profile.id),
+          child: ClipOval(
+            child: ProfileAvatarFace(
               profile: profile,
-              accountPhotoUrl: sl.isRegistered<AuthCubit>()
-                  ? sl<AuthCubit>().state.avatarUrl
-                  : null,
+              photoUrl: profilePhotoForFace(
+                profile: profile,
+                accountPhotoUrl: sl.isRegistered<AuthCubit>()
+                    ? sl<AuthCubit>().state.avatarUrl
+                    : null,
+              ),
+              iconSize: 18,
+              photoDiameter: 26,
             ),
-            iconSize: 18,
-            photoDiameter: 26,
           ),
         );
       }
