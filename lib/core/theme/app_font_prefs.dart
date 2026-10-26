@@ -41,7 +41,8 @@ class AppFontPrefs {
   static final ValueNotifier<int> revision = ValueNotifier<int>(0);
 
   /// Offered in the picker, in the order shown. Nunito first: it is the
-  /// default and the one the app is designed around.
+  /// default and the one the app is designed around. System last: the
+  /// device's own font (no download, always available) — see [isSystem].
   static const List<AppFont> fonts = [
     AppFont('Nunito', 'Nunito', bundled: true),
     AppFont('Inter', 'Inter', bundled: true),
@@ -51,7 +52,14 @@ class AppFontPrefs {
     AppFont('Source Sans 3', 'Source Sans 3'),
     AppFont('Montserrat', 'Montserrat'),
     AppFont('Roboto', 'Roboto'),
+    AppFont('System', 'System'),
   ];
+
+  /// The device's default font. Not a real family: [AppText] maps it to a
+  /// null fontFamily (platform default) and it must never be downloaded.
+  static const String systemFamily = 'System';
+
+  static bool isSystem(String family) => family == systemFamily;
 
   static bool isBundled(String family) =>
       fonts.any((f) => f.family == family && f.bundled);
@@ -60,7 +68,7 @@ class AppFontPrefs {
   /// download failed — the caller must NOT save it, or the app restarts into a
   /// family Flutter has never heard of and silently draws the platform default.
   static Future<bool> ensure(String family) async {
-    if (isBundled(family)) return true;
+    if (isSystem(family) || isBundled(family)) return true;
     return SubtitleFontService.instance.ensure(family);
   }
 
@@ -76,7 +84,7 @@ class AppFontPrefs {
     // family has to be registered again before it is applied — otherwise the
     // app boots into a font Flutter doesn't know and quietly draws the
     // platform default, which reads as the setting having been forgotten.
-    if (!isBundled(saved)) {
+    if (!isBundled(saved) && !isSystem(saved)) {
       final ok = await SubtitleFontService.instance.ensure(saved);
       if (!ok) {
         AppText.fontFamily = AppText.defaultFontFamily;
@@ -106,9 +114,7 @@ class AppFontPrefs {
   }
 
   /// The label for what is set, for the settings row's trailing value.
-  static String get label =>
-      fonts.firstWhere(
-        (f) => f.family == family,
-        orElse: () => fonts.first,
-      ).label;
+  static String get label => fonts
+      .firstWhere((f) => f.family == family, orElse: () => fonts.first)
+      .label;
 }

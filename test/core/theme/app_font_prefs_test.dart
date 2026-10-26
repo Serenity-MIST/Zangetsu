@@ -86,7 +86,11 @@ void main() {
 
   test('a downloadable font is NOT bundled, or it costs install size', () async {
     final pubspec = await File('pubspec.yaml').readAsString();
-    for (final f in AppFontPrefs.fonts.where((f) => !f.bundled)) {
+    // System is neither bundled nor downloaded — it is the platform font.
+    final fetchable = AppFontPrefs.fonts.where(
+      (f) => !f.bundled && !AppFontPrefs.isSystem(f.family),
+    );
+    for (final f in fetchable) {
       expect(
         pubspec.contains('- family: ${f.family}\n'),
         isFalse,

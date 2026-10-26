@@ -304,7 +304,9 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
                     ),
                   ),
                   subtitle: Text(
-                    f.bundled
+                    AppFontPrefs.isSystem(f.family)
+                        ? "Your phone's default font"
+                        : f.bundled
                         ? 'Watch anime, movies and series'
                         : 'Downloads on first use',
                     style: AppText.caption.copyWith(
@@ -313,7 +315,7 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
                   ),
                   trailing: f.family == AppFontPrefs.family
                       ? Icon(Icons.check, color: AppColors.accent)
-                      : (f.bundled
+                      : (f.bundled || AppFontPrefs.isSystem(f.family)
                             ? null
                             : Icon(
                                 Icons.download_outlined,
