@@ -2,11 +2,23 @@ package com.spyou.watch_app
 
 import android.app.Activity
 import android.content.pm.ActivityInfo
+import android.content.res.ColorStateList
 import android.content.res.Configuration
+import android.graphics.Matrix
+import android.media.AudioManager
 import android.os.Bundle
+import android.provider.Settings
+import android.view.Gravity
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
+import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
@@ -91,6 +103,48 @@ class PhonePlayerActivity : Activity() {
     private val hideRunnable = Runnable { hideControls() }
     private var scrubbing = false
     private var controlsHiding = false
+
+    // ── MPV-parity touch gestures ──────────────────────────────────────────
+    // Same set as the MPV player: tap toggles chrome; double-tap sides seek
+    // (accumulating, with a transient label); horizontal swipe scrubs with a
+    // time bubble; vertical swipe left/right adjusts brightness/volume with a
+    // Netflix-style HUD; pinch zooms the TextureView (1–4x, pans when zoomed).
+    private var gestureMode = 0 // 0 idle, 1 horizontal scrub, 2 vertical slide
+    private var downX = 0f
+    private var downY = 0f
+    private var hSeekBase = 0L
+    private var hSeekTarget = 0L
+    private var vStart = 0f
+    private var vIsBrightness = true
+    private var lastHudPct = -1
+    private val pointers = LinkedHashMap<Int, Pair<Float, Float>>()
+    private var pinchActive = false
+    private var pinchEndAt = 0L
+    private var pinchBaseSpan = 0f
+    private var pinchBaseZoom = 1f
+    private var zoom = 1f
+    private var panX = 0f
+    private var panY = 0f
+    private var dblAccumL = 0L
+    private var dblAccumR = 0L
+    private val resetDbl =
+        Runnable {
+            dblAccumL = 0L
+            dblAccumR = 0L
+            dblLeft.visibility = View.GONE
+            dblRight.visibility = View.GONE
+        }
+    private val hideHud =
+        Runnable {
+            hudPill.visibility = View.GONE
+            seekBubble.visibility = View.GONE
+        }
+    private lateinit var hudPill: LinearLayout
+    private lateinit var hudBar: ProgressBar
+    private lateinit var hudLabel: TextView
+    private lateinit var seekBubble: TextView
+    private lateinit var dblLeft: TextView
+    private lateinit var dblRight: TextView
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -232,19 +286,23 @@ class PhonePlayerActivity : Activity() {
                     // play button's territory and is left alone.
                     val third = playerView.width / 3f
                     when {
-                        e.x < third -> seekBy(-seekMs)
-                        e.x > third * 2 -> seekBy(seekMs)
+                        e.x < third -> {
+                            seekBy(-seekMs)
+                            flashSeekLabel(-1)
+                        }
+                        e.x > third * 2 -> {
+                            seekBy(seekMs)
+                            flashSeekLabel(1)
+                        }
                         else -> togglePlay()
                     }
                     return true
                 }
             },
         )
+        createGestureOverlays()
         findViewById<View>(R.id.player_root).setOnTouchListener { v, ev ->
-            taps.onTouchEvent(ev)
-            // Only a real release is a "click"; firing on every ACTION_MOVE
-            // spams TalkBack with a click event per drag sample.
-            if (ev.action == android.view.MotionEvent.ACTION_UP) v.performClick()
+            handlePlayerTouch(v, ev, taps)
             true
         }
 
@@ -535,6 +593,7 @@ class PhonePlayerActivity : Activity() {
     /** Ask Dart for [index]'s stream, then play it. */
     private fun loadEpisode(index: Int) {
         if (index < 0 || index >= episodeCount || switching) return
+        resetZoom()
         val generation = ++mediaGeneration
         attemptedUrls.clear()
         val ch = PhonePlayerBridge.channel ?: return
@@ -1224,6 +1283,381 @@ class PhonePlayerActivity : Activity() {
         p.seekTo((p.currentPosition + deltaMs).coerceAtLeast(0L))
         bumpControls()
     }
+
+    // ── Gesture overlays + handling (MPV parity, Views only) ──────────────
+
+    /** Pill, time bubble and double-tap labels. Built in code so no layout
+     * file changes; all translucent dark like the chrome scrims. */
+    private fun createGestureOverlays() {
+        val root = findViewById<ViewGroup>(R.id.player_root)
+        val density = resources.displayMetrics.density
+        fun pill(): android.graphics.drawable.GradientDrawable =
+            android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                cornerRadius = 20f * density
+                setColor(0xCC0B0B0FL.toInt())
+            }
+
+        hudPill =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = pill()
+                setPadding(
+                    (14 * density).toInt(),
+                    (10 * density).toInt(),
+                    (14 * density).toInt(),
+                    (10 * density).toInt(),
+                )
+                visibility = View.GONE
+            }
+        hudLabel =
+            TextView(this).apply {
+                setTextColor(0xFFF9F4F5L.toInt())
+                textSize = 13f
+                typeface = android.graphics.Typeface.MONOSPACE
+                minWidth = (64 * density).toInt()
+            }
+        hudBar =
+            ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                max = 100
+                layoutParams =
+                    LinearLayout.LayoutParams((110 * density).toInt(), (4 * density).toInt()).apply {
+                        marginStart = (10 * density).toInt()
+                    }
+                progressTintList = ColorStateList.valueOf(0xFFFF626DL.toInt())
+                progressBackgroundTintList = ColorStateList.valueOf(0x40FFFFFFL.toInt())
+            }
+        hudPill.addView(hudLabel)
+        hudPill.addView(hudBar)
+        root.addView(
+            hudPill,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL,
+            ).apply { topMargin = (72 * density).toInt() },
+        )
+
+        seekBubble =
+            TextView(this).apply {
+                setTextColor(0xFFF9F4F5L.toInt())
+                textSize = 14f
+                typeface = android.graphics.Typeface.MONOSPACE
+                background = pill()
+                setPadding(
+                    (14 * density).toInt(),
+                    (8 * density).toInt(),
+                    (14 * density).toInt(),
+                    (8 * density).toInt(),
+                )
+                visibility = View.GONE
+            }
+        root.addView(
+            seekBubble,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL,
+            ).apply { topMargin = (72 * density).toInt() },
+        )
+
+        fun seekLabel(): TextView =
+            TextView(this).apply {
+                setTextColor(0xFFFFFFFFL.toInt())
+                textSize = 22f
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                visibility = View.GONE
+            }
+        dblLeft = seekLabel()
+        dblRight = seekLabel()
+        root.addView(
+            dblLeft,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER_VERTICAL or Gravity.START,
+            ).apply { marginStart = (64 * density).toInt() },
+        )
+        root.addView(
+            dblRight,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER_VERTICAL or Gravity.END,
+            ).apply { marginEnd = (64 * density).toInt() },
+        )
+    }
+
+    /** Routes a touch to swipe/pinch handling, falling back to the tap
+     * detector only while no custom gesture owns the stream. */
+    private fun handlePlayerTouch(
+        v: View,
+        ev: MotionEvent,
+        taps: android.view.GestureDetector,
+    ) {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                pointers.clear()
+                pointers[ev.getPointerId(0)] = ev.x to ev.y
+                downX = ev.x
+                downY = ev.y
+                gestureMode = 0
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                pointers[ev.getPointerId(ev.actionIndex)] = ev.getX(ev.actionIndex) to ev.getY(ev.actionIndex)
+                if (pointers.size == 2) startPinch()
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val id = ev.getPointerId(0)
+                if (pointers.containsKey(id)) pointers[id] = ev.x to ev.y
+                for (i in 1 until ev.pointerCount) {
+                    pointers[ev.getPointerId(i)] = ev.getX(i) to ev.getY(i)
+                }
+                if (pinchActive && pointers.size >= 2) {
+                    updatePinch()
+                } else if (gestureMode == 0 && pointers.size == 1) {
+                    val dx = ev.x - downX
+                    val dy = ev.y - downY
+                    val slop = 24f * resources.displayMetrics.density
+                    if (kotlin.math.max(kotlin.math.abs(dx), kotlin.math.abs(dy)) > slop) {
+                        gestureMode = if (kotlin.math.abs(dx) > kotlin.math.abs(dy)) 1 else 2
+                        if (gestureMode == 1) startHSeek() else startVSlide(ev.x)
+                    }
+                } else if (gestureMode == 1) {
+                    updateHSeek(ev.x)
+                } else if (gestureMode == 2) {
+                    updateVSlide(ev.y)
+                }
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                pointers.remove(ev.getPointerId(ev.actionIndex))
+                if (pinchActive && pointers.size < 2) endPinch()
+                // The remaining finger starts fresh so its drift can't inherit
+                // the pinch's travel as a swipe.
+                if (pointers.size == 1) {
+                    val (_, p) = pointers.entries.first()
+                    downX = p.first
+                    downY = p.second
+                    gestureMode = 0
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (gestureMode == 1 && ev.actionMasked == MotionEvent.ACTION_UP) commitHSeek()
+                if (gestureMode == 2) endVSlide()
+                if (pinchActive) endPinch()
+                pointers.clear()
+                gestureMode = 0
+                // Only a real release is a "click"; firing on every ACTION_MOVE
+                // spams TalkBack with a click event per drag sample.
+                if (ev.actionMasked == MotionEvent.ACTION_UP) v.performClick()
+            }
+        }
+        if (!pinchActive && gestureMode == 0 &&
+            android.os.SystemClock.uptimeMillis() - pinchEndAt > 300L
+        ) {
+            taps.onTouchEvent(ev)
+        }
+    }
+
+    /** Accumulating double-tap label, Dantotsu-style: "-20s", "+30s". */
+    private fun flashSeekLabel(dir: Int) {
+        if (dir < 0) {
+            dblAccumL -= seekMs
+            dblLeft.text = "-${dblAccumL / 1000}s"
+            dblLeft.visibility = View.VISIBLE
+            dblLeft.alpha = 1f
+        } else {
+            dblAccumR += seekMs
+            dblRight.text = "+${dblAccumR / 1000}s"
+            dblRight.visibility = View.VISIBLE
+            dblRight.alpha = 1f
+        }
+        handler.removeCallbacks(resetDbl)
+        handler.postDelayed(resetDbl, 800L)
+    }
+
+    // ── Horizontal scrub: full width maps to the whole duration ────────────
+    private fun startHSeek() {
+        val p = player ?: return
+        if (p.duration <= 0) {
+            gestureMode = 0
+            return
+        }
+        hSeekBase = p.currentPosition
+        hSeekTarget = hSeekBase
+        handler.removeCallbacks(hideHud)
+        updateSeekBubble()
+    }
+
+    private fun updateHSeek(x: Float) {
+        val p = player ?: return
+        val d = p.duration
+        if (d <= 0) return
+        val perPx = d.toFloat() / vWidth()
+        hSeekTarget = (hSeekBase + (x - downX) * perPx).toLong().coerceIn(0L, d)
+        updateSeekBubble()
+    }
+
+    private fun updateSeekBubble() {
+        val delta = (hSeekTarget - hSeekBase) / 1000
+        val sign = if (delta >= 0) "+" else "-"
+        seekBubble.text = "${fmt(hSeekTarget)}  ($sign${kotlin.math.abs(delta)}s)"
+        seekBubble.visibility = View.VISIBLE
+    }
+
+    private fun commitHSeek() {
+        player?.seekTo(hSeekTarget)
+        seekBubble.visibility = View.GONE
+        bumpControls()
+    }
+
+    // ── Vertical slide: left = brightness, right = volume (MX-style) ───────
+    private fun startVSlide(x: Float) {
+        val w = vWidth()
+        if (w <= 0) {
+            gestureMode = 0
+            return
+        }
+        vIsBrightness = x < w / 2f
+        lastHudPct = -1
+        vStart =
+            if (vIsBrightness) {
+                val attr = window.attributes.screenBrightness
+                if (attr >= 0) attr else systemBrightness()
+            } else {
+                val audio = getSystemService(AUDIO_SERVICE) as AudioManager
+                audio.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat() /
+                    audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+            }
+        handler.removeCallbacks(hideHud)
+    }
+
+    private fun systemBrightness(): Float =
+        runCatching {
+            Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS) / 255f
+        }.getOrDefault(0.5f)
+
+    private fun updateVSlide(y: Float) {
+        val h = vHeight()
+        if (h <= 0) return
+        // Drag up (negative delta) raises the value; ~70% of the height spans
+        // the full range, same feel as the MPV player.
+        val v = (vStart + (downY - y) / (h * 0.7f)).coerceIn(0f, 1f)
+        if (vIsBrightness) {
+            val lp = window.attributes
+            lp.screenBrightness = v
+            window.attributes = lp
+        } else {
+            val audio = getSystemService(AUDIO_SERVICE) as AudioManager
+            audio.setStreamVolume(
+                AudioManager.STREAM_MUSIC,
+                kotlin.math.max(0, Math.round(v * audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC))),
+                0, // no OS volume popup; the HUD below says it instead
+            )
+        }
+        val pct = Math.round(v * 100)
+        hudLabel.text = (if (vIsBrightness) "☀ " else "♫ ") + "$pct%"
+        hudBar.progress = pct
+        hudPill.visibility = View.VISIBLE
+        // Haptic tick on the landmarks, like the MPV player.
+        val marks = if (vIsBrightness) intArrayOf(0, 50, 100) else intArrayOf(0, 100)
+        if (lastHudPct >= 0) {
+            for (b in marks) {
+                if ((lastHudPct - b) * (pct - b) <= 0 && lastHudPct != pct) {
+                    hudPill.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                    break
+                }
+            }
+        }
+        lastHudPct = pct
+    }
+
+    private fun endVSlide() {
+        handler.removeCallbacks(hideHud)
+        handler.postDelayed(hideHud, 500L)
+    }
+
+    // ── Pinch-to-zoom on the TextureView ────────────────────────────────────
+    private fun resetZoom() {
+        zoom = 1f
+        panX = 0f
+        panY = 0f
+        pinchActive = false
+        val tex = textureView() ?: return
+        tex.setTransform(Matrix())
+        tex.invalidate()
+    }
+
+    private fun textureView(): TextureView? =
+        runCatching { playerView.videoSurfaceView as? TextureView }.getOrNull()
+
+    private fun startPinch() {
+        if (textureView() == null) return
+        // A pinch cancels any swipe in flight; the scrub never commits.
+        if (gestureMode == 1) seekBubble.visibility = View.GONE
+        gestureMode = 0
+        val pts = pointers.values.toList()
+        pinchBaseSpan = span(pts[0], pts[1])
+        pinchBaseZoom = zoom
+        pinchActive = pinchBaseSpan > 0f
+    }
+
+    private fun updatePinch() {
+        val tex = textureView() ?: return
+        val pts = pointers.values.toList()
+        if (pts.size < 2 || pinchBaseSpan <= 0f) return
+        val w = tex.width.toFloat()
+        val h = tex.height.toFloat()
+        if (w <= 0f || h <= 0f) return
+        val newZoom = (pinchBaseZoom * span(pts[0], pts[1]) / pinchBaseSpan).coerceIn(1f, 4f)
+        if (newZoom > 1f) {
+            // Focal-anchored: the content point under the fingers stays put,
+            // so the video grows around your grip instead of sliding away.
+            val f = focal(pts[0], pts[1])
+            val ratio = newZoom / zoom.coerceAtLeast(1f)
+            panX = f.first - (f.first - panX) * ratio
+            panY = f.second - (f.second - panY) * ratio
+            val maxX = w * (newZoom - 1f) / 2f
+            val maxY = h * (newZoom - 1f) / 2f
+            panX = panX.coerceIn(-maxX, maxX)
+            panY = panY.coerceIn(-maxY, maxY)
+        } else {
+            panX = 0f
+            panY = 0f
+        }
+        zoom = newZoom
+        val m = Matrix()
+        m.postTranslate(-w / 2f, -h / 2f)
+        m.postScale(zoom, zoom)
+        m.postTranslate(w / 2f + panX, h / 2f + panY)
+        tex.setTransform(m)
+        tex.invalidate()
+    }
+
+    private fun endPinch() {
+        pinchActive = false
+        pinchEndAt = android.os.SystemClock.uptimeMillis()
+        if (zoom <= 1.05f) resetZoom()
+        // Let a lingering finger start over instead of inheriting travel.
+        if (pointers.size == 1) {
+            val (_, p) = pointers.entries.first()
+            downX = p.first
+            downY = p.second
+        }
+        gestureMode = 0
+    }
+
+    private fun span(a: Pair<Float, Float>, b: Pair<Float, Float>): Float =
+        kotlin.math.hypot((a.first - b.first).toDouble(), (a.second - b.second).toDouble()).toFloat()
+
+    private fun focal(a: Pair<Float, Float>, b: Pair<Float, Float>): Pair<Float, Float> =
+        (a.first + b.first) / 2f to (a.second + b.second) / 2f
+
+    private fun vWidth(): Float = findViewById<View>(R.id.player_root).width.toFloat()
+
+    private fun vHeight(): Float = findViewById<View>(R.id.player_root).height.toFloat()
 
     private fun syncPlayIcon() {
         val playing = player?.isPlaying == true
