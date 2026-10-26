@@ -202,8 +202,11 @@ class _TvShowGroup extends StatelessWidget {
             // (Play/Pause/Resume/Cancel/Delete as applicable).
             onTap: () => showDialog<void>(
               context: context,
-              builder: (_) =>
-                  _TvDownloadActions(record: records[j], manager: manager),
+              builder: (_) => _TvDownloadActions(
+                record: records[j],
+                manager: manager,
+                screenContext: context,
+              ),
             ),
             // Reuse the phone's tile widget unchanged — only the interaction
             // model changes (D-pad vs touch). The tile's own ListTile.onTap
@@ -315,10 +318,19 @@ class _TvShowGroup extends StatelessWidget {
 /// for the record's current status, each D-pad focusable. Mirrors the
 /// `_TvOptionPicker` pattern in settings_tv_pickers.dart.
 class _TvDownloadActions extends StatelessWidget {
-  const _TvDownloadActions({required this.record, required this.manager});
+  const _TvDownloadActions({
+    required this.record,
+    required this.manager,
+    this.screenContext,
+  });
 
   final DownloadRecord record;
   final DownloadManager manager;
+
+  /// The Downloads screen's context. The dialog's own context dies with the
+  /// pop animation — awaiting file checks on it returns silently, so playback
+  /// launches from out here instead. Null in tests, which never pop.
+  final BuildContext? screenContext;
 
   List<(String, IconData, VoidCallback)> _actions(BuildContext context) {
     final l10n = context.l10n;
@@ -334,9 +346,10 @@ class _TvDownloadActions extends StatelessWidget {
             record: r,
             filePresent: manager.filePresent,
           );
-          if (!context.mounted) return;
+          final launchCtx = screenContext ?? context;
+          if (!launchCtx.mounted) return;
           await launchDownloadedEpisode(
-            context,
+            launchCtx,
             r,
             episodes: queue.episodes,
             startIndex: queue.startIndex,

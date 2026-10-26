@@ -84,6 +84,7 @@ class DownloadRecord {
     required this.episodeId,
     required this.episodeUrl,
     this.episodeNumber,
+    this.episodeSeason,
     required this.episodeTitle,
     required this.category,
     required this.quality,
@@ -109,6 +110,9 @@ class DownloadRecord {
   final String episodeId;
   final String episodeUrl;
   final double? episodeNumber;
+
+  /// Source-reported season for offline ordering; absent on older downloads.
+  final int? episodeSeason;
   final String episodeTitle;
   final String category; // sub/dub — kept for re-resolution + offline history
   final String quality; // requested quality label (e.g. '1080p' / 'best')
@@ -125,7 +129,8 @@ class DownloadRecord {
   final String? error;
   final List<OfflineSubtitle> subtitles; // soft-sub files saved for offline use
   final int? malId; // anime MAL id → AniList auto-scrobble on offline playback
-  final bool isTorrent; // downloaded via the torrent engine (not background_downloader)
+  // Downloaded via the torrent engine rather than background_downloader.
+  final bool isTorrent;
   final int createdAt;
 
   bool get isActive =>
@@ -154,6 +159,7 @@ class DownloadRecord {
     episodeId: episodeId,
     episodeUrl: episodeUrl,
     episodeNumber: episodeNumber,
+    episodeSeason: episodeSeason,
     episodeTitle: episodeTitle,
     category: category,
     quality: quality,
@@ -182,6 +188,7 @@ class DownloadRecord {
     'episodeId': episodeId,
     'episodeUrl': episodeUrl,
     'episodeNumber': episodeNumber,
+    'episodeSeason': episodeSeason,
     'episodeTitle': episodeTitle,
     'category': category,
     'quality': quality,
@@ -212,6 +219,7 @@ class DownloadRecord {
       episodeId: m['episodeId'] as String? ?? '',
       episodeUrl: m['episodeUrl'] as String? ?? '',
       episodeNumber: (m['episodeNumber'] as num?)?.toDouble(),
+      episodeSeason: (m['episodeSeason'] as num?)?.toInt(),
       episodeTitle: m['episodeTitle'] as String? ?? '',
       category: m['category'] as String? ?? 'sub',
       quality: m['quality'] as String? ?? 'best',
