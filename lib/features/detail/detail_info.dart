@@ -1,7 +1,6 @@
 // Credits line, description block, icon actions and the tab-bar header.
 part of 'detail_screen.dart';
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Muted credit line: "Starring: a, b, c… more" / "Creators: …" / "Genres: …".
 // The label is slightly dimmer than the value, matching Netflix's hierarchy.
@@ -159,8 +158,9 @@ class _IconAction extends StatelessWidget {
 // ─────────────────────────────────────────────────────────────────────────────
 
 class _TabBarDelegate extends SliverPersistentHeaderDelegate {
-  _TabBarDelegate(this.tabBar);
+  _TabBarDelegate(this.tabBar, {this.tint});
   final TabBar tabBar;
+  final ValueListenable<Color?>? tint;
 
   @override
   double get minExtent => tabBar.preferredSize.height;
@@ -174,10 +174,18 @@ class _TabBarDelegate extends SliverPersistentHeaderDelegate {
     bool overlapsContent,
   ) {
     // No divider line under the bar — just the left-aligned tabs (Sozo Read).
-    return Material(color: AppColors.bg, elevation: 0, child: tabBar);
+    final t = tint;
+    if (t == null) {
+      return Material(color: AppColors.bg, elevation: 0, child: tabBar);
+    }
+    return ValueListenableBuilder<Color?>(
+      valueListenable: t,
+      builder: (context, c, _) =>
+          Material(color: c ?? AppColors.bg, elevation: 0, child: tabBar),
+    );
   }
 
   @override
   bool shouldRebuild(covariant _TabBarDelegate oldDelegate) =>
-      tabBar != oldDelegate.tabBar;
+      tabBar != oldDelegate.tabBar || tint != oldDelegate.tint;
 }

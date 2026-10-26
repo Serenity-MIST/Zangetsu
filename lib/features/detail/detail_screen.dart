@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/cupertino.dart' show CupertinoPicker;
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
@@ -14,12 +15,14 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../core/zmode/season_chain.dart';
 import '../../core/zmode/metadata_provider_prefs.dart';
 import '../../core/ui/poster_card.dart';
+import '../../core/ui/poster_palette.dart';
 import '../../core/ui/mobile_hero_art.dart';
 import '../../core/metadata/synopsis.dart';
 import '../../core/mode/content_mode_cubit.dart';
 import '../../core/zmode/metadata_filters.dart';
 import '../../core/zmode/zmode_module.dart';
 import '../../core/zmode/zmode_prefs.dart';
+import '../../core/theme/theme_controller.dart';
 import '../../core/ui/app_dialog.dart';
 import '../../core/ui/app_toast.dart';
 import 'open_related.dart';
@@ -483,6 +486,11 @@ class _DetailViewState extends State<_DetailView>
   Future<String?>? _trailerFuture;
   String? _trailerId;
 
+  /// Poster-tinted background colour for the adaptive wash (null → normal
+  /// theme background). Extraction runs once per hero-art URL.
+  final ValueNotifier<Color?> _tint = ValueNotifier(null);
+  String? _tintUrl;
+
   /// Kick off (once) the YouTube-id lookup for the resolved detail. When it
   /// completes with a non-null id, store it in [_trailerId] and rebuild so the
   /// hero can mount the trailer player.
@@ -505,6 +513,7 @@ class _DetailViewState extends State<_DetailView>
   @override
   void initState() {
     super.initState();
+    _tint.addListener(_onTintChanged);
     // Discord Rich Presence: "Looking at <title>" while this detail is open.
     if (sl.isRegistered<DiscordRpc>()) {
       sl<DiscordRpc>().setBrowsing(
@@ -512,6 +521,12 @@ class _DetailViewState extends State<_DetailView>
         posterUrl: widget.item.cover,
       );
     }
+  }
+
+  /// Repaint the pinned app bar in the new tint: it paints the same wash as the
+  /// body, so the bar must follow the extracted colour to stay opaque.
+  void _onTintChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
@@ -522,6 +537,8 @@ class _DetailViewState extends State<_DetailView>
     // Back to generic "Browsing" when leaving the detail.
     if (sl.isRegistered<DiscordRpc>()) sl<DiscordRpc>().setBrowsing();
     _scrollController.dispose();
+    _tint.removeListener(_onTintChanged);
+    _tint.dispose();
     _tabController.dispose();
     super.dispose();
   }
@@ -1916,100 +1933,115 @@ class _DetailViewState extends State<_DetailView>
     if (sl<AppMode>().isTv) return DetailScreenTv(item: widget.item);
     return Scaffold(
       backgroundColor: AppColors.bg,
-      body: BlocBuilder<DetailCubit, DetailState>(
-        builder: (context, state) {
-          if (state.status == DetailStatus.loading) {
-            // The row that was tapped already carried a title, a cover and a
-            // year, and a full-screen skeleton throws all of that away to
-            // animate a blank page. Frames prove the app is NOT stuck here -
-            // 18ms median, 90th 23ms, while tapping through screens - it is
-            // responsive and simply showing nothing new, because the episodes
-            // are a source resolve that has not come back yet. The perceived
-            // hang is the empty screen, not the wait.
-            //
-            // So paint what we already know, immediately, and let the episode
-            // tab carry its own loading skeleton for the part genuinely still
-            // in flight. A viewer who backs out before the resolve returns sees
-            // the title they tapped either way, and nobody stares at a
-            // placeholder for a source sweep.
-            final partial = _detailFromItem(widget.item);
-            if (partial != null) {
-              return _buildBody(
-                context,
-                state.copyWith(
-                  status: DetailStatus.success,
-                  detail: partial,
-                  // Nothing is known yet, so the episode tab shows its skeleton
-                  // rather than an empty list reading as "this source has no
-                  // episodes".
-                  episodesLoading: true,
-                ),
-                partial,
-                sourceMetadataReady: false,
-              );
-            }
-            return const _DetailSkeleton(heroHeight: _expandedHeight);
-          }
-          if (state.cloudflareUrl != null) {
-            return _DetailCloudflareBlocked(
-              url: state.cloudflareUrl!,
-              isMangayomi:
-                  widget.item.sourceId.startsWith('mg:') ||
-                  (state.detail?.sourceId.startsWith('mg:') ?? false),
-            );
-          }
-          if (state.status == DetailStatus.error || state.detail == null) {
-            // The row you tapped already carried a title and a cover, so a
-            // failed fetch does not have to blank the page — keep what we
-            // have and say what is missing over it. A rate limit especially:
-            // it passes on its own, and the wait is the useful part.
-            final fallback = _detailFromItem(widget.item);
-            if (fallback != null) {
-              return Stack(
-                children: [
-                  _buildBody(
-                    context,
-                    state,
-                    fallback,
-                    sourceMetadataReady: false,
-                  ),
-                  Positioned(
-                    left: 0,
-                    right: 0,
-                    bottom: 0,
-                    child: _LoadFailureBanner(
-                      service: _sourceLabel(
-                        widget.item.sourceId,
-                        url: widget.item.url,
-                        savedFrom: widget.item.savedFrom,
+      body: Stack(
+        children: [
+          // Adaptive colour: poster-tinted wash behind the scroll view, only
+          // while the setting is on. The NestedScrollView's own background is
+          // transparent, so the tint shows through the body; the pinned bars
+          // paint that same tint themselves so content never shows through.
+          if (ThemeController.adaptiveColour) PosterTintLayer(notifier: _tint),
+          Material(
+            type: MaterialType.transparency,
+            child: BlocBuilder<DetailCubit, DetailState>(
+              builder: (context, state) {
+                if (state.status == DetailStatus.loading) {
+                  // The row that was tapped already carried a title, a cover and a
+                  // year, and a full-screen skeleton throws all of that away to
+                  // animate a blank page. Frames prove the app is NOT stuck here -
+                  // 18ms median, 90th 23ms, while tapping through screens - it is
+                  // responsive and simply showing nothing new, because the episodes
+                  // are a source resolve that has not come back yet. The perceived
+                  // hang is the empty screen, not the wait.
+                  //
+                  // So paint what we already know, immediately, and let the episode
+                  // tab carry its own loading skeleton for the part genuinely still
+                  // in flight. A viewer who backs out before the resolve returns sees
+                  // the title they tapped either way, and nobody stares at a
+                  // placeholder for a source sweep.
+                  final partial = _detailFromItem(widget.item);
+                  if (partial != null) {
+                    return _buildBody(
+                      context,
+                      state.copyWith(
+                        status: DetailStatus.success,
+                        detail: partial,
+                        // Nothing is known yet, so the episode tab shows its skeleton
+                        // rather than an empty list reading as "this source has no
+                        // episodes".
+                        episodesLoading: true,
                       ),
-                      // Same distinction Home draws: a metadata catalogue and
-                      // an installed source fail alike but read differently.
-                      isMetadataProvider:
-                          widget.item.sourceId == ZmodeIds.sourceId,
-                      error: state.error,
-                    ),
-                  ),
-                ],
-              );
-            }
-            // Offline is not the title failing: saying "failed to load this
-            // title" over a dropped connection sends people hunting a
-            // problem that isn't there.
-            final offline = state.error == 'offline';
-            return EmptyState(
-              icon: offline ? Icons.wifi_off_rounded : Icons.error_outline,
-              message: offline
-                  ? '${context.l10n.offlineTitle}\n${context.l10n.offlineBody}'
-                  : _limitSeconds(state.error) != null
-                  ? context.l10n.providerNeedsBreatherBody(
-                      _limitSeconds(state.error)!,
-                    )
-                  : context.l10n.failedToLoadThisTitle,
-            );
-          }
-          return _buildBody(context, state, state.detail!);
-        },
+                      partial,
+                      sourceMetadataReady: false,
+                    );
+                  }
+                  return const _DetailSkeleton(heroHeight: _expandedHeight);
+                }
+                if (state.cloudflareUrl != null) {
+                  return _DetailCloudflareBlocked(
+                    url: state.cloudflareUrl!,
+                    isMangayomi:
+                        widget.item.sourceId.startsWith('mg:') ||
+                        (state.detail?.sourceId.startsWith('mg:') ?? false),
+                  );
+                }
+                if (state.status == DetailStatus.error ||
+                    state.detail == null) {
+                  // The row you tapped already carried a title and a cover, so a
+                  // failed fetch does not have to blank the page — keep what we
+                  // have and say what is missing over it. A rate limit especially:
+                  // it passes on its own, and the wait is the useful part.
+                  final fallback = _detailFromItem(widget.item);
+                  if (fallback != null) {
+                    return Stack(
+                      children: [
+                        _buildBody(
+                          context,
+                          state,
+                          fallback,
+                          sourceMetadataReady: false,
+                        ),
+                        Positioned(
+                          left: 0,
+                          right: 0,
+                          bottom: 0,
+                          child: _LoadFailureBanner(
+                            service: _sourceLabel(
+                              widget.item.sourceId,
+                              url: widget.item.url,
+                              savedFrom: widget.item.savedFrom,
+                            ),
+                            // Same distinction Home draws: a metadata catalogue and
+                            // an installed source fail alike but read differently.
+                            isMetadataProvider:
+                                widget.item.sourceId == ZmodeIds.sourceId,
+                            error: state.error,
+                          ),
+                        ),
+                      ],
+                    );
+                  }
+                  // Offline is not the title failing: saying "failed to load this
+                  // title" over a dropped connection sends people hunting a
+                  // problem that isn't there.
+                  final offline = state.error == 'offline';
+                  return EmptyState(
+                    icon: offline
+                        ? Icons.wifi_off_rounded
+                        : Icons.error_outline,
+                    message: offline
+                        ? '${context.l10n.offlineTitle}\n${context.l10n.offlineBody}'
+                        : _limitSeconds(state.error) != null
+                        ? context.l10n.providerNeedsBreatherBody(
+                            _limitSeconds(state.error)!,
+                          )
+                        : context.l10n.failedToLoadThisTitle,
+                  );
+                }
+                return _buildBody(context, state, state.detail!);
+              },
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -2102,6 +2134,16 @@ class _DetailViewState extends State<_DetailView>
         '';
     final coverHeaders = detail.coverHeaders ?? item.coverHeaders;
     final hasCover = coverUrl.isNotEmpty;
+
+    if (ThemeController.adaptiveColour && hasCover && _tintUrl != coverUrl) {
+      _tintUrl = coverUrl;
+      unawaited(
+        extractDominantColor(coverUrl, coverHeaders).then((c) {
+          if (!mounted || _tintUrl != coverUrl) return;
+          _tint.value = c == null ? null : tintFromDominant(c);
+        }),
+      );
+    }
 
     // Kick off the trailer lookup (once). When it resolves, _trailerId is set
     // and the hero swaps its static backdrop for the autoplaying trailer.
@@ -2203,7 +2245,13 @@ class _DetailViewState extends State<_DetailView>
         SliverAppBar(
           expandedHeight: _expandedHeight,
           pinned: true,
-          backgroundColor: AppColors.bg,
+          // Opaque while adaptive colour is on, painted in the same wash as the
+          // body, so the pinned bar hides scrolled content instead of letting
+          // it show through (a transparent bar read as an unfinished page).
+          // Flat theme bg otherwise, exactly as before.
+          backgroundColor: ThemeController.adaptiveColour
+              ? (_tint.value ?? AppColors.bg)
+              : AppColors.bg,
           surfaceTintColor: Colors.transparent,
           shadowColor: Colors.transparent,
           centerTitle: false,
@@ -2227,6 +2275,7 @@ class _DetailViewState extends State<_DetailView>
                 coverUrl: coverUrl,
                 coverHeaders: coverHeaders,
                 hasCover: hasCover,
+                tint: ThemeController.adaptiveColour ? _tint : null,
                 trailerId: _trailerId,
                 // Pause the trailer once the hero has scrolled past (reuses
                 // the same signal that fades in the app-bar title).
@@ -2538,6 +2587,7 @@ class _DetailViewState extends State<_DetailView>
                 Tab(text: context.l10n.details),
               ],
             ),
+            tint: ThemeController.adaptiveColour ? _tint : null,
           ),
         ),
       ],

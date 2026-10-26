@@ -69,6 +69,8 @@ import '../../core/ui/featured_banner_edge.dart';
 import '../../core/ui/featured_banner_panels.dart';
 import '../../core/ui/featured_carousel.dart';
 import '../../core/ui/featured_hero.dart';
+import '../../core/theme/theme_controller.dart';
+import '../../core/ui/poster_palette.dart';
 import '../../core/metadata/title_logo_service.dart';
 import 'metadata_switch_sheet.dart';
 import 'home_banner_header.dart';
@@ -146,6 +148,10 @@ class _HomeViewState extends State<_HomeView>
   bool _resumePrewarmed = false;
   bool _openingSourceCatalogueItem = false;
 
+  /// Poster-tinted background colour for the hero-driven adaptive wash
+  /// (null → normal theme background). Fed by [FeaturedHero.onArtColor].
+  final ValueNotifier<Color?> _heroTint = ValueNotifier(null);
+
   // ── Logo-strike mode transition ──────────────────────────────────────────
   // Tapping a mode card runs a full-screen overlay: the Zangetsu mark springs
   // in at centre behind a scrim, a red glow pulses and a steel glint sweeps the
@@ -172,6 +178,7 @@ class _HomeViewState extends State<_HomeView>
         setState(() => _sourceCatalogueSections = const []);
       }
     });
+    ThemeController.revision.addListener(_onThemeRevision);
     // Swap the content mode at the slash's peak (hidden behind the scrim), then
     // tear the overlay down once it finishes.
     _slashCtrl =
@@ -229,7 +236,13 @@ class _HomeViewState extends State<_HomeView>
       _onSourceCatalogueSelectionChanged,
     );
     _slashCtrl.dispose();
+    ThemeController.revision.removeListener(_onThemeRevision);
+    _heroTint.dispose();
     super.dispose();
+  }
+
+  void _onThemeRevision() {
+    if (mounted) setState(() {});
   }
 
   void _onSourceCatalogueSelectionChanged() {
@@ -860,6 +873,14 @@ class _HomeViewState extends State<_HomeView>
     );
   }
 
+  /// Clears the adaptive tint after the current frame — [bannerBuilder] runs
+  /// during build, so the notifier must not be written synchronously there.
+  void _clearHeroTintSoon() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _heroTint.value = null;
+    });
+  }
+
   /// The banner for [bannerId], with the same items and the same callbacks
   /// whichever one is showing.
   ///
@@ -897,6 +918,7 @@ class _HomeViewState extends State<_HomeView>
 
     switch (bannerId) {
       case BannerStyle.panelsId:
+        _clearHeroTintSoon();
         return FeaturedBannerPanels(
           items: heroItems,
           reading: reading,
@@ -910,8 +932,13 @@ class _HomeViewState extends State<_HomeView>
         return FeaturedBannerEdge(
           items: heroItems,
           reading: reading,
+          isActive: widget.isTabActive,
           onInfo: onInfo,
           meta: _heroMeta,
+          onArtColor: ThemeController.adaptiveColour
+              ? (c) => _heroTint.value = c == null ? null : tintFromDominant(c)
+              : null,
+          backgroundTint: ThemeController.adaptiveColour ? _heroTint : null,
         );
       default:
         // Auto-rotating carousel (up to 6 trending items)
@@ -924,6 +951,10 @@ class _HomeViewState extends State<_HomeView>
           onToggleList: toggleList,
           meta: _heroMeta,
           style: HeroTransition.cinematic,
+          onArtColor: ThemeController.adaptiveColour
+              ? (c) => _heroTint.value = c == null ? null : tintFromDominant(c)
+              : null,
+          backgroundTint: ThemeController.adaptiveColour ? _heroTint : null,
           isActive: widget.isTabActive,
         );
     }
@@ -1928,6 +1959,10 @@ class _HomeViewState extends State<_HomeView>
         // its own SafeArea(bottom: false).
         body: Stack(
           children: [
+            // Adaptive colour: poster-tinted wash behind everything, only
+            // while the setting is on (Theme & colour → Adaptive colour).
+            if (ThemeController.adaptiveColour)
+              PosterTintLayer(notifier: _heroTint),
             RefreshIndicator(
               color: AppColors.accent,
               onRefresh: () {
@@ -1997,6 +2032,11 @@ class _HomeViewState extends State<_HomeView>
                                 : state.heroItems;
                             final hasHero = heroItems.isNotEmpty;
                             if (hasHero) _prewarmHeroMeta(heroItems);
+                            // No hero (loading / empty / no source): clear any
+                            // wash left over from the last poster.
+                            if (!hasHero || noSourceForMode) {
+                              _clearHeroTintSoon();
+                            }
 
                             return HomeBannerHeader(
                               bannerStyle: BannerStyle.current,

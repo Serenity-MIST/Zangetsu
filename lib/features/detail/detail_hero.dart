@@ -14,6 +14,7 @@ class _Hero extends StatelessWidget {
     this.trailerId,
     this.collapsed = false,
     this.onTapFullscreen,
+    this.tint,
   });
 
   final String coverUrl;
@@ -28,6 +29,9 @@ class _Hero extends StatelessWidget {
 
   /// Opens the fullscreen trailer when the banner is tapped. Null disables it.
   final VoidCallback? onTapFullscreen;
+
+  /// Current adaptive background tint (null → flat theme background).
+  final ValueListenable<Color?>? tint;
 
   /// The static cover backdrop — used as the base layer when there's no
   /// trailer, and as the placeholder/fallback underneath the player.
@@ -68,6 +72,7 @@ class _Hero extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final id = trailerId;
+    final t = tint;
     return Stack(
       fit: StackFit.expand,
       children: [
@@ -88,11 +93,36 @@ class _Hero extends StatelessWidget {
             decoration: BoxDecoration(gradient: AppColors.topScrim),
           ),
         ),
-        const IgnorePointer(
-          child: DecoratedBox(
-            decoration: BoxDecoration(gradient: AppColors.scrim),
+        if (t == null)
+          const IgnorePointer(
+            child: DecoratedBox(
+              decoration: BoxDecoration(gradient: AppColors.scrim),
+            ),
+          )
+        else
+          IgnorePointer(
+            child: ValueListenableBuilder<Color?>(
+              valueListenable: t,
+              builder: (context, c, _) => TweenAnimationBuilder<Color?>(
+                tween: ColorTween(end: c ?? AppColors.bg),
+                duration: const Duration(milliseconds: 800),
+                curve: Curves.easeOut,
+                builder: (context, page, _) {
+                  final bg = page ?? AppColors.bg;
+                  return DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.bottomCenter,
+                        end: Alignment.topCenter,
+                        colors: [bg, bg.withValues(alpha: 0)],
+                        stops: const [0.0, 0.65],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
           ),
-        ),
       ],
     );
   }

@@ -87,6 +87,7 @@ void main() {
       expect(hits('autoplay'), contains('Autoplay next episode'));
       expect(hits('autoplay'), contains('Autoplay trailer'));
       expect(hits('anime4k'), contains('Anime4K Enhancement'));
+      expect(hits('adaptive'), contains('Adaptive colour'));
     });
 
     test('matches synonyms nobody spells out', () {

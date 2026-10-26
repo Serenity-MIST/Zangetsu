@@ -14,7 +14,8 @@ import '../../l10n/l10n.dart';
 import '../../core/ui/animation_prefs.dart';
 
 /// Theme and colour: accent as preview cards (+ a Custom colour picker), the
-/// pure-black AMOLED toggle, the app font and how lists animate.
+/// pure-black AMOLED toggle, the adaptive poster tint, the app font and how
+/// lists animate.
 ///
 /// The app icon, splash and Home banner pickers used to live at the bottom of
 /// this page, below four other sections. They answer a different question —
@@ -175,6 +176,15 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
                 subtitle: context.l10n.trueBlackForOLED,
                 value: ThemeController.amoled,
                 onChanged: (value) => _updateProfileTheme(amoled: value),
+              ),
+              _switchTile(
+                icon: Icons.auto_awesome_outlined,
+                title: 'Adaptive colour',
+                subtitle:
+                    'Tints the background of Home and Detail from the poster colour',
+                value: ThemeController.adaptiveColour,
+                onChanged: ThemeController.setAdaptiveColour,
+                subtitleMaxLines: null,
               ),
             ],
           ),
@@ -338,6 +348,7 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
     required String subtitle,
     required bool value,
     required Future<void> Function(bool) onChanged,
+    int? subtitleMaxLines = 1,
   }) {
     Future<void> flip(bool v) async {
       await onChanged(v);
@@ -348,6 +359,7 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
       icon: icon,
       title: title,
       subtitle: subtitle,
+      subtitleMaxLines: subtitleMaxLines,
       onTap: () => flip(!value),
       trailing: Switch.adaptive(
         value: value,

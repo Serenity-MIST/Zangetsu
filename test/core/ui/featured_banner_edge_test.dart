@@ -1,8 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:watch_app/core/models/media_item.dart';
 import 'package:watch_app/core/models/provider_info.dart';
+import 'package:watch_app/core/theme/app_colors.dart';
 import 'package:watch_app/core/ui/featured_banner_edge.dart';
+import 'package:watch_app/core/ui/route_observer.dart';
 
 MediaItem _item(String id, String title) => MediaItem(
   id: id,
@@ -70,6 +74,206 @@ void main() {
     expect(find.text('Second Show'), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('edgeBannerViewButton')));
     expect(opened?.title, 'Second Show');
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('scrim melts into the adaptive background tint', (tester) async {
+    final tint = ValueNotifier<Color?>(null);
+    addTearDown(tint.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: FeaturedBannerEdge(
+            items: [_item('1', 'First Show')],
+            onInfo: (_) {},
+            backgroundTint: tint,
+          ),
+        ),
+      ),
+    );
+
+    Color scrimBottom() {
+      final box = tester.widget<DecoratedBox>(
+        find.byKey(const ValueKey('edgeBannerScrim')),
+      );
+      final gradient = (box.decoration as BoxDecoration).gradient!;
+      return (gradient as LinearGradient).colors.last;
+    }
+
+    expect(scrimBottom(), AppColors.bg);
+
+    tint.value = const Color(0xFF123456);
+    await tester.pump();
+    expect(scrimBottom(), const Color(0xFF123456));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('ignores a colour decoded after the banner list empties', (
+    tester,
+  ) async {
+    final pending = Completer<Color?>();
+    final colors = <Color?>[];
+    final item = MediaItem(
+      id: 'late',
+      title: 'Late Show',
+      cover: 'https://example.test/late.jpg',
+      url: 'https://example.test/late',
+      type: ProviderType.anime,
+      sourceId: 'test',
+    );
+
+    Widget banner(List<MediaItem> items) => MaterialApp(
+      home: Scaffold(
+        body: FeaturedBannerEdge(
+          items: items,
+          onInfo: (_) {},
+          onArtColor: colors.add,
+          paletteLoader: (_, _) => pending.future,
+        ),
+      ),
+    );
+
+    await tester.pumpWidget(banner([item]));
+    await tester.pumpWidget(banner([]));
+    pending.complete(Colors.red);
+    await tester.pump();
+
+    expect(tester.takeException(), isNull);
+    expect(colors, isNot(contains(Colors.red)));
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('does not extract colours without a tint listener', (
+    tester,
+  ) async {
+    var loads = 0;
+    final item = MediaItem(
+      id: 'off',
+      title: 'No Tint',
+      cover: 'https://example.test/off.jpg',
+      url: 'https://example.test/off',
+      type: ProviderType.anime,
+      sourceId: 'test',
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: FeaturedBannerEdge(
+            items: [item],
+            onInfo: (_) {},
+            paletteLoader: (_, _) {
+              loads++;
+              return Future.value(Colors.red);
+            },
+          ),
+        ),
+      ),
+    );
+    expect(loads, 0);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: FeaturedBannerEdge(
+            items: [item],
+            onInfo: (_) {},
+            onArtColor: (_) {},
+            paletteLoader: (_, _) {
+              loads++;
+              return Future.value(Colors.red);
+            },
+          ),
+        ),
+      ),
+    );
+    expect(loads, 1);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('pauses rotation and tint work while Home is inactive', (
+    tester,
+  ) async {
+    final pending = Completer<Color?>();
+    final colors = <Color?>[];
+    var loads = 0;
+    final items = [
+      for (final id in ['first', 'second'])
+        MediaItem(
+          id: id,
+          title: '$id show',
+          cover: 'https://example.test/$id.jpg',
+          url: 'https://example.test/$id',
+          type: ProviderType.anime,
+          sourceId: 'test',
+        ),
+    ];
+    Widget banner(bool active) => MaterialApp(
+      home: Scaffold(
+        body: FeaturedBannerEdge(
+          items: items,
+          onInfo: (_) {},
+          isActive: active,
+          onArtColor: colors.add,
+          paletteLoader: (_, _) {
+            loads++;
+            return loads == 1 ? pending.future : Future.value(Colors.blue);
+          },
+        ),
+      ),
+    );
+
+    await tester.pumpWidget(banner(true));
+    expect(loads, 1);
+    await tester.pumpWidget(banner(false));
+    pending.complete(Colors.red);
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 6));
+    expect(colors, isNot(contains(Colors.red)));
+    expect(loads, 1);
+    expect(find.text('first show'), findsOneWidget);
+
+    await tester.pumpWidget(banner(true));
+    await tester.pump();
+    expect(colors.last, Colors.blue);
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(milliseconds: 700));
+    expect(find.text('second show'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('pauses rotation while another route covers Home', (
+    tester,
+  ) async {
+    final navigator = GlobalKey<NavigatorState>();
+    await tester.pumpWidget(
+      MaterialApp(
+        navigatorKey: navigator,
+        navigatorObservers: [appRouteObserver],
+        home: Scaffold(
+          body: FeaturedBannerEdge(
+            items: [_item('1', 'First Show'), _item('2', 'Second Show')],
+            onInfo: (_) {},
+          ),
+        ),
+      ),
+    );
+
+    navigator.currentState!.push(
+      MaterialPageRoute<void>(
+        builder: (_) => const Scaffold(body: Text('Detail')),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.pump(const Duration(seconds: 6));
+    navigator.currentState!.pop();
+    await tester.pumpAndSettle();
+    expect(find.text('First Show'), findsOneWidget);
+
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(milliseconds: 700));
+    expect(find.text('Second Show'), findsOneWidget);
     await tester.pumpWidget(const SizedBox.shrink());
   });
 }

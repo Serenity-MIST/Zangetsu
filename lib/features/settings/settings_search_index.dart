@@ -405,6 +405,11 @@ final settingsLeaves = <SettingsLeaf>[
   ),
   SettingsLeaf(
     LeafParent.appearance,
+    (_) => 'Adaptive colour',
+    keywords: 'poster background tint color theme',
+  ),
+  SettingsLeaf(
+    LeafParent.appearance,
     (l) => l.animateLists,
     keywords: 'fade scroll animation',
   ),

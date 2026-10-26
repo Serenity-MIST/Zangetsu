@@ -1,6 +1,7 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart' show listEquals;
+import 'package:flutter/foundation.dart'
+    show ValueListenable, listEquals, visibleForTesting;
 import 'package:flutter/material.dart';
 
 import '../models/media_item.dart';
@@ -11,6 +12,8 @@ import 'featured_hero.dart' show HeroMeta;
 import 'image_fade.dart';
 import 'mobile_hero_art.dart';
 import 'native_cover_provider.dart';
+import 'poster_palette.dart';
+import 'route_observer.dart';
 
 /// Full-bleed Home banner with centered title art and one details action.
 class FeaturedBannerEdge extends StatefulWidget {
@@ -20,32 +23,107 @@ class FeaturedBannerEdge extends StatefulWidget {
     required this.onInfo,
     this.meta,
     this.reading = false,
+    this.isActive = true,
+    this.onArtColor,
+    this.backgroundTint,
+    this.paletteLoader,
   });
 
   final List<MediaItem> items;
   final void Function(MediaItem) onInfo;
   final Future<HeroMeta?> Function(MediaItem)? meta;
   final bool reading;
+  final bool isActive;
+
+  /// Reports the visible artwork's dominant colour (null when there is none),
+  /// so Home can tint its background. Mirrors [FeaturedCarousel].
+  final ValueChanged<Color?>? onArtColor;
+
+  /// Background tint Home is currently painting behind the banner. The bottom
+  /// gradient melts into it so the banner and the page never form a seam.
+  final ValueListenable<Color?>? backgroundTint;
+
+  @visibleForTesting
+  final Future<Color?> Function(String, Map<String, String>?)? paletteLoader;
 
   @override
   State<FeaturedBannerEdge> createState() => _FeaturedBannerEdgeState();
 }
 
-class _FeaturedBannerEdgeState extends State<FeaturedBannerEdge> {
+class _FeaturedBannerEdgeState extends State<FeaturedBannerEdge>
+    with RouteAware {
   late List<MediaItem> _pages;
   int _index = 0;
   Timer? _timer;
+  PageRoute<dynamic>? _route;
+  bool _routeIsCurrent = true;
+
+  bool get _isVisible => widget.isActive && _routeIsCurrent;
+
+  /// Current background tint from [widget.backgroundTint] (null → theme bg).
+  Color? _bgTint;
 
   @override
   void initState() {
     super.initState();
     _pages = widget.items.take(6).toList();
+    _bgTint = widget.backgroundTint?.value;
+    widget.backgroundTint?.addListener(_onBackgroundTint);
     _startTimer();
+    _syncTintAfterFrame();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route == _route) return;
+    appRouteObserver.unsubscribe(this);
+    if (route is PageRoute<dynamic>) {
+      _route = route;
+      _routeIsCurrent = route.isCurrent;
+      appRouteObserver.subscribe(this, route);
+    } else {
+      _route = null;
+      _routeIsCurrent = true;
+    }
+    _startTimer();
+  }
+
+  @override
+  void didPush() => _setRouteCurrent(true);
+
+  @override
+  void didPopNext() => _setRouteCurrent(true);
+
+  @override
+  void didPushNext() => _setRouteCurrent(false);
+
+  @override
+  void didPop() => _setRouteCurrent(false);
+
+  void _setRouteCurrent(bool current) {
+    if (_routeIsCurrent == current) return;
+    _routeIsCurrent = current;
+    _startTimer();
+    if (_isVisible) _syncTintAfterFrame();
+  }
+
+  void _syncTintAfterFrame() {
+    // The notifier must not be written during this build phase.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _syncTint();
+    });
   }
 
   @override
   void didUpdateWidget(FeaturedBannerEdge oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.backgroundTint != widget.backgroundTint) {
+      oldWidget.backgroundTint?.removeListener(_onBackgroundTint);
+      _bgTint = widget.backgroundTint?.value;
+      widget.backgroundTint?.addListener(_onBackgroundTint);
+    }
     final next = widget.items.take(6).toList();
     final changed = !listEquals(next, _pages);
     if (changed) {
@@ -53,26 +131,66 @@ class _FeaturedBannerEdgeState extends State<FeaturedBannerEdge> {
         _pages = next;
         _index = 0;
       });
-      _startTimer();
     }
+    if (changed || oldWidget.isActive != widget.isActive) _startTimer();
+    if (changed ||
+        (!oldWidget.isActive && widget.isActive) ||
+        (oldWidget.onArtColor == null && widget.onArtColor != null)) {
+      _syncTintAfterFrame();
+    }
+  }
+
+  void _onBackgroundTint() {
+    if (!mounted) return;
+    setState(() => _bgTint = widget.backgroundTint?.value);
   }
 
   @override
   void dispose() {
+    appRouteObserver.unsubscribe(this);
+    widget.backgroundTint?.removeListener(_onBackgroundTint);
     _timer?.cancel();
     super.dispose();
   }
 
   void _startTimer() {
     _timer?.cancel();
-    if (_pages.length > 1) {
+    if (_isVisible && _pages.length > 1) {
       _timer = Timer.periodic(const Duration(seconds: 5), (_) => _go(1));
     }
   }
 
   void _go(int delta) {
-    if (!mounted || _pages.isEmpty) return;
+    if (!mounted || !_isVisible || _pages.isEmpty) return;
     setState(() => _index = (_index + delta + _pages.length) % _pages.length);
+    _syncTint();
+  }
+
+  /// Extracts the visible item's artwork colour for the caller's background
+  /// tint. A slow decode that resolves after the banner moved on is discarded.
+  Future<void> _syncTint() async {
+    if (!_isVisible || widget.onArtColor == null) return;
+    if (_pages.isEmpty) {
+      widget.onArtColor?.call(null);
+      return;
+    }
+    final item = _pages[_index];
+    final art = mobileHeroArt(item.cover, item.banner);
+    if (art == null || art.isEmpty) {
+      widget.onArtColor?.call(null);
+      return;
+    }
+    final c = await (widget.paletteLoader ?? extractDominantColor)(
+      art,
+      item.coverHeaders,
+    );
+    if (!mounted ||
+        !_isVisible ||
+        _pages.isEmpty ||
+        !identical(_pages[_index], item)) {
+      return;
+    }
+    widget.onArtColor?.call(c);
   }
 
   @override
@@ -81,6 +199,7 @@ class _FeaturedBannerEdgeState extends State<FeaturedBannerEdge> {
     if (_pages.isEmpty) return SizedBox(height: height);
 
     final item = _pages[_index];
+    final pageColor = _bgTint ?? AppColors.bg;
     return RepaintBoundary(
       child: SizedBox(
         key: const ValueKey('featuredEdgeBanner'),
@@ -115,17 +234,18 @@ class _FeaturedBannerEdgeState extends State<FeaturedBannerEdge> {
               ),
               IgnorePointer(
                 child: DecoratedBox(
+                  key: const ValueKey('edgeBannerScrim'),
                   decoration: BoxDecoration(
                     gradient: LinearGradient(
                       begin: Alignment.topCenter,
                       end: Alignment.bottomCenter,
                       colors: [
-                        Color(0x66000000),
-                        Color(0x33000000),
-                        Color(0xCC0B0B0F),
-                        AppColors.bg,
+                        const Color(0x66000000),
+                        const Color(0x33000000),
+                        const Color(0xCC0B0B0F),
+                        pageColor,
                       ],
-                      stops: [0, 0.28, 0.74, 1],
+                      stops: const [0, 0.28, 0.74, 1],
                     ),
                   ),
                 ),

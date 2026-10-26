@@ -17,6 +17,7 @@ class ThemeController {
   static const String _key = 'accent';
   static const String _amoledKey = 'amoled';
   static const String _materialYouKey = 'materialYou';
+  static const String _adaptiveKey = 'adaptiveColour';
 
   /// Near-black palette used when AMOLED is on (bg + card surfaces).
   static const Color amoledBg = Color(0xFF000000);
@@ -169,6 +170,21 @@ class ThemeController {
   static Future<void> setAmoled(bool on) async {
     await _box.put(_amoledKey, on);
     _applyColors();
+    revision.value++;
+  }
+
+  /// Whether the poster-tinted background (Home + Detail) is on. Off by
+  /// default. Device-wide, not per-profile — see the appearance screen.
+  static bool get adaptiveColour {
+    // Screens are pumped in tests without opening the theme box — treat that
+    // as off rather than throwing during build.
+    if (!Hive.isBoxOpen(boxName)) return false;
+    return _box.get(_adaptiveKey, defaultValue: false) as bool;
+  }
+
+  /// Persist the poster-tint toggle and rebuild listeners.
+  static Future<void> setAdaptiveColour(bool on) async {
+    await _box.put(_adaptiveKey, on);
     revision.value++;
   }
 
