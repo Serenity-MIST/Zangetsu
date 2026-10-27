@@ -783,11 +783,27 @@ class _SavedChapterTile extends StatelessWidget {
       minLeadingWidth: compact ? 28 : null,
       onTap: onTap,
       contentPadding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
-      leading: Icon(
-        chapterIcon(chapter.mode),
-        color: AppColors.accent,
-        size: compact ? 21 : 26,
-      ),
+      leading: (chapter.thumbnail?.trim().isNotEmpty ?? false)
+          ? ClipRRect(
+              borderRadius: BorderRadius.circular(5),
+              child: SizedBox(
+                width: compact ? 30 : 36,
+                height: compact ? 40 : 48,
+                child: CachedNetworkImage(
+                  imageUrl: chapter.thumbnail!,
+                  fit: BoxFit.cover,
+                  memCacheWidth: 110,
+                  placeholder: (c, u) => ColoredBox(color: AppColors.surface2),
+                  errorWidget: (c, u, e) =>
+                      ColoredBox(color: AppColors.surface2),
+                ),
+              ),
+            )
+          : Icon(
+              chapterIcon(chapter.mode),
+              color: AppColors.accent,
+              size: compact ? 21 : 26,
+            ),
       title: Text(
         chapter.chapterTitle.trim().isEmpty
             ? l10n.chapter

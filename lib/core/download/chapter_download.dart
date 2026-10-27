@@ -21,6 +21,7 @@ class ChapterDownload {
     required this.mode,
     required this.status,
     this.cover,
+    this.thumbnail,
     this.pageCount = 0,
     this.pagesDone = 0,
     this.bytes = 0,
@@ -39,6 +40,10 @@ class ChapterDownload {
   final String showId;
   final String showTitle;
   final String? cover;
+
+  /// The chapter's own image when the source has one (Mangayomi/Aniyomi
+  /// previews); most manga sources and every novel leave it null.
+  final String? thumbnail;
   final String chapterId;
   final String chapterUrl;
   final String chapterTitle;
@@ -113,6 +118,7 @@ class ChapterDownload {
     showId: showId,
     showTitle: showTitle,
     cover: cover,
+    thumbnail: thumbnail,
     chapterId: chapterId,
     chapterUrl: chapterUrl,
     chapterTitle: chapterTitle,
@@ -133,6 +139,7 @@ class ChapterDownload {
     'showId': showId,
     'showTitle': showTitle,
     'cover': cover,
+    'thumbnail': thumbnail,
     'chapterId': chapterId,
     'chapterUrl': chapterUrl,
     'chapterTitle': chapterTitle,
@@ -160,6 +167,7 @@ class ChapterDownload {
       showId: '${m['showId'] ?? ''}',
       showTitle: '${m['showTitle'] ?? ''}',
       cover: m['cover'] as String?,
+      thumbnail: m['thumbnail'] as String?,
       chapterId: '${m['chapterId'] ?? ''}',
       chapterUrl: '${m['chapterUrl'] ?? ''}',
       chapterTitle: '${m['chapterTitle'] ?? ''}',

@@ -86,6 +86,7 @@ class DownloadRecord {
     this.episodeNumber,
     this.episodeSeason,
     required this.episodeTitle,
+    this.episodeThumbnail,
     required this.category,
     required this.quality,
     this.status = DownloadStatus.queued,
@@ -114,6 +115,10 @@ class DownloadRecord {
   /// Source-reported season for offline ordering; absent on older downloads.
   final int? episodeSeason;
   final String episodeTitle;
+
+  /// This episode's own still, when the source or TMDB had one. Falls back to
+  /// [cover] in the UI; null on records saved before it was captured.
+  final String? episodeThumbnail;
   final String category; // sub/dub — kept for re-resolution + offline history
   final String quality; // requested quality label (e.g. '1080p' / 'best')
   final DownloadStatus status;
@@ -161,6 +166,7 @@ class DownloadRecord {
     episodeNumber: episodeNumber,
     episodeSeason: episodeSeason,
     episodeTitle: episodeTitle,
+    episodeThumbnail: episodeThumbnail,
     category: category,
     quality: quality,
     status: status ?? this.status,
@@ -190,6 +196,7 @@ class DownloadRecord {
     'episodeNumber': episodeNumber,
     'episodeSeason': episodeSeason,
     'episodeTitle': episodeTitle,
+    'episodeThumbnail': episodeThumbnail,
     'category': category,
     'quality': quality,
     'status': status.name,
@@ -221,6 +228,7 @@ class DownloadRecord {
       episodeNumber: (m['episodeNumber'] as num?)?.toDouble(),
       episodeSeason: (m['episodeSeason'] as num?)?.toInt(),
       episodeTitle: m['episodeTitle'] as String? ?? '',
+      episodeThumbnail: m['episodeThumbnail'] as String?,
       category: m['category'] as String? ?? 'sub',
       quality: m['quality'] as String? ?? 'best',
       status: _statusFromName(m['status'] as String?),

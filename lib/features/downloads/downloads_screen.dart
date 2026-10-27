@@ -1,7 +1,9 @@
 import 'dart:async';
 
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import '../../core/cache/app_image_cache.dart';
 import '../../core/ui/app_dialog.dart';
 import '../../core/ui/app_toast.dart';
 import '../../core/ui/settings_widgets.dart';
@@ -852,7 +854,7 @@ class _DownloadedShowScreenState extends State<_DownloadedShowScreen> {
                     ),
                   ),
                 ),
-                SliverList.separated(
+                SliverList.builder(
                   itemCount: episodes.length,
                   itemBuilder: (context, index) {
                     final record = episodes[index];
@@ -868,12 +870,6 @@ class _DownloadedShowScreenState extends State<_DownloadedShowScreen> {
                       onLongPress: () => _toggleSelection(record.id),
                     );
                   },
-                  separatorBuilder: (_, _) => const Divider(
-                    height: 12,
-                    indent: 56,
-                    endIndent: 20,
-                    color: AppColors.hairline,
-                  ),
                 ),
                 SliverToBoxAdapter(
                   child: SizedBox(
@@ -1119,71 +1115,377 @@ class DownloadTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final l10n = context.l10n;
     final isDone = record.status == DownloadStatus.done;
-    return ListTile(
-      dense: compact,
-      minLeadingWidth: compact ? 28 : null,
-      contentPadding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
-      onTap: onSelect ?? (isDone ? () => _play(context) : null),
-      onLongPress: onLongPress,
-      selected: selected && onSelect != null,
-      selectedTileColor: AppColors.accentSoft,
-      leading: onSelect != null
-          ? SizedBox(
-              width: 28,
-              height: 32,
-              child: Checkbox(
-                value: selected,
-                activeColor: AppColors.accent,
-                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                onChanged: (_) => onSelect!(),
+    final active =
+        record.status == DownloadStatus.downloading ||
+        record.status == DownloadStatus.paused;
+    final selecting = onSelect != null;
+    final thumb = (record.episodeThumbnail?.trim().isNotEmpty ?? false)
+        ? record.episodeThumbnail!
+        : record.cover;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onSelect ?? (isDone ? () => _play(context) : null),
+        onLongPress: onLongPress,
+        splashColor: AppColors.accentSoft,
+        highlightColor: AppColors.surface,
+        child: Container(
+          decoration: BoxDecoration(
+            color: selected && selecting
+                ? AppColors.accentSoft
+                : AppColors.surface,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: selected && selecting
+                  ? AppColors.accent
+                  : AppColors.hairline,
+            ),
+          ),
+          padding: const EdgeInsets.fromLTRB(10, 10, 6, 10),
+          child: Row(
+            children: [
+              _TileThumb(
+                url: thumb,
+                headers: record.coverHeaders,
+                record: record,
+                resume: resume,
+                width: compact ? 64 : 68,
+                selecting: selecting,
+                selected: selected,
+                onSelect: onSelect,
               ),
-            )
-          : compact
-          ? SizedBox(
-              width: 28,
-              height: 32,
-              child: FittedBox(
-                fit: BoxFit.scaleDown,
-                child: _StatusGlyph(record: record),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(
+                      _epLabel(l10n),
+                      style: AppText.body.copyWith(
+                        color: AppColors.textPrimary,
+                        fontSize: compact ? 13 : 13.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      _subtitle(l10n),
+                      style: AppText.caption.copyWith(
+                        color: isDone
+                            ? AppColors.textSecondary
+                            : AppColors.accent,
+                        fontWeight: isDone ? null : FontWeight.w600,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    if (isDone) ...[
+                      const SizedBox(height: 4),
+                      _WatchMeta(record: record, resume: resume),
+                    ],
+                    if (active) ...[
+                      const SizedBox(height: 8),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(2),
+                        child: LinearProgressIndicator(
+                          value: record.progress > 0 ? record.progress : null,
+                          minHeight: 3,
+                          color: AppColors.accent,
+                          backgroundColor: AppColors.surface2,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
               ),
-            )
-          : _StatusGlyph(record: record),
-      title: Text(
-        _epLabel(l10n),
-        style: AppText.body.copyWith(
-          color: AppColors.textPrimary,
-          fontSize: compact ? 13 : null,
-          fontWeight: compact ? FontWeight.w600 : null,
+              if (selecting)
+                Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: Icon(
+                    selected
+                        ? Icons.check_circle_rounded
+                        : Icons.circle_outlined,
+                    color: selected ? AppColors.accent : AppColors.textTertiary,
+                    size: 22,
+                  ),
+                )
+              else
+                _TileMenu(record: record, manager: manager),
+            ],
+          ),
         ),
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
       ),
-      subtitle: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(_subtitle(l10n), style: AppText.caption),
-          if (isDone) ...[
-            const SizedBox(height: 3),
-            _WatchMeta(record: record, resume: resume),
-          ],
-          if (record.status == DownloadStatus.downloading ||
-              record.status == DownloadStatus.paused) ...[
-            const SizedBox(height: 6),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(2),
-              child: LinearProgressIndicator(
-                value: record.progress > 0 ? record.progress : null,
-                minHeight: 3,
-                color: AppColors.accent,
-                backgroundColor: AppColors.surface2,
+    );
+  }
+}
+
+/// Square episode still with quality and progress pills plus a status veil.
+/// Falls back to the show cover for records saved before stills were
+/// captured; dims when selected.
+class _TileThumb extends StatelessWidget {
+  const _TileThumb({
+    required this.url,
+    required this.headers,
+    required this.record,
+    required this.resume,
+    required this.width,
+    required this.selecting,
+    required this.selected,
+    required this.onSelect,
+  });
+
+  final String? url;
+  final Map<String, String>? headers;
+  final DownloadRecord record;
+  final ResumeStore? resume;
+  final double width;
+  final bool selecting;
+  final bool selected;
+  final VoidCallback? onSelect;
+
+  @override
+  Widget build(BuildContext context) {
+    final done = record.status == DownloadStatus.done;
+    final active =
+        record.status == DownloadStatus.downloading ||
+        record.status == DownloadStatus.paused;
+    final pct = (record.progress * 100).round();
+    return SizedBox(
+      width: width,
+      height: width,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: ColoredBox(
+          color: AppColors.surface2,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              if (url != null && url!.isNotEmpty)
+                CachedNetworkImage(
+                  imageUrl: url!,
+                  cacheManager: AppImageCache.cacheManagerOrDefault,
+                  httpHeaders: headers,
+                  fit: BoxFit.cover,
+                  memCacheWidth: 260,
+                  placeholder: (c, u) => ColoredBox(color: AppColors.surface2),
+                  errorWidget: (c, u, e) =>
+                      ColoredBox(color: AppColors.surface2),
+                ),
+              if (selected)
+                const DecoratedBox(
+                  decoration: BoxDecoration(color: Color(0x8C000000)),
+                ),
+              if (!done && !selecting) Center(child: _veil(active, pct)),
+              if (done && !selecting)
+                _ThumbWatchBadge(record: record, resume: resume),
+              if (done && !selecting)
+                _ThumbDuration(record: record, resume: resume),
+              if (active && pct > 0 && !selecting)
+                Align(
+                  alignment: Alignment.bottomRight,
+                  child: Padding(
+                    padding: const EdgeInsets.all(5),
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: const Color(0xD2000000),
+                        borderRadius: BorderRadius.circular(5),
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 5,
+                          vertical: 2,
+                        ),
+                        child: Text(
+                          '$pct%',
+                          style: const TextStyle(
+                            fontSize: 9.5,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              if (selecting)
+                Center(
+                  child: Checkbox(
+                    value: selected,
+                    activeColor: AppColors.accent,
+                    checkColor: Colors.white,
+                    side: const BorderSide(color: Colors.white, width: 2),
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    onChanged: (_) => onSelect?.call(),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Center badge while the row still carries state: % ring for active
+  /// downloads, the status glyph for everything else. Finished episodes show
+  /// nothing here — the watch badge owns that corner.
+  Widget _veil(bool active, int pct) {
+    if (active && pct > 0) {
+      return DecoratedBox(
+        decoration: const BoxDecoration(
+          color: Color(0x99000000),
+          shape: BoxShape.circle,
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(7),
+          child: Text(
+            '$pct%',
+            style: const TextStyle(
+              fontSize: 10.5,
+              fontWeight: FontWeight.w800,
+              color: Colors.white,
+            ),
+          ),
+        ),
+      );
+    }
+    return DecoratedBox(
+      decoration: const BoxDecoration(
+        color: Color(0x99000000),
+        shape: BoxShape.circle,
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(6),
+        child: SizedBox(
+          width: 14,
+          height: 14,
+          child: FittedBox(
+            fit: BoxFit.contain,
+            child: _StatusGlyph(record: record),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Watch state on a finished thumbnail: red check when done, white play ring
+/// when resumed mid-episode. Reads the same resume box [_WatchMeta] does.
+class _ThumbWatchBadge extends StatelessWidget {
+  const _ThumbWatchBadge({required this.record, required this.resume});
+
+  final DownloadRecord record;
+  final ResumeStore? resume;
+
+  @override
+  Widget build(BuildContext context) {
+    final resume = this.resume;
+    if (resume == null) return const SizedBox.shrink();
+    return ValueListenableBuilder<Box<Map>>(
+      valueListenable: Hive.box<Map>(ResumeStore.boxName).listenable(),
+      builder: (context, _, __) {
+        final mark = resume.get(
+          record.sourceId,
+          record.showUrl,
+          record.episodeId,
+        );
+        if (mark?.finished ?? false) {
+          return Align(
+            alignment: Alignment.topRight,
+            child: Padding(
+              padding: const EdgeInsets.all(5),
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: AppColors.accent,
+                  shape: BoxShape.circle,
+                ),
+                child: const Padding(
+                  padding: EdgeInsets.all(4),
+                  child: Icon(
+                    Icons.check_rounded,
+                    color: Colors.white,
+                    size: 10,
+                  ),
+                ),
               ),
             ),
-          ],
-        ],
-      ),
-      trailing: onSelect == null
-          ? _TileMenu(record: record, manager: manager)
-          : null,
+          );
+        }
+        final hasPos = (mark?.duration.inMilliseconds ?? 0) > 0;
+        if (!hasPos) return const SizedBox.shrink();
+        return const Center(
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: Color(0x99000000),
+              shape: BoxShape.circle,
+            ),
+            child: Padding(
+              padding: EdgeInsets.all(9),
+              child: Icon(
+                Icons.play_arrow_rounded,
+                color: Colors.white,
+                size: 12,
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Total runtime chip on a finished thumbnail, bottom-right. Only there when
+/// the resume box actually knows the duration — never guessed.
+class _ThumbDuration extends StatelessWidget {
+  const _ThumbDuration({required this.record, required this.resume});
+
+  final DownloadRecord record;
+  final ResumeStore? resume;
+
+  @override
+  Widget build(BuildContext context) {
+    final resume = this.resume;
+    if (resume == null) return const SizedBox.shrink();
+    return ValueListenableBuilder<Box<Map>>(
+      valueListenable: Hive.box<Map>(ResumeStore.boxName).listenable(),
+      builder: (context, _, __) {
+        final total = resume
+            .get(record.sourceId, record.showUrl, record.episodeId)
+            ?.duration;
+        if (total == null || total.inMilliseconds <= 0) {
+          return const SizedBox.shrink();
+        }
+        return Align(
+          alignment: Alignment.bottomRight,
+          child: Padding(
+            padding: const EdgeInsets.all(5),
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: const Color(0xD2000000),
+                borderRadius: BorderRadius.circular(5),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 5,
+                  vertical: 2,
+                ),
+                child: Text(
+                  _clock(total),
+                  style: const TextStyle(
+                    fontSize: 9.5,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }
