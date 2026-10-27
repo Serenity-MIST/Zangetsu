@@ -18,6 +18,8 @@ import '../../core/ui/states.dart';
 import '../../l10n/l10n.dart';
 import '../reader/manga_reader_screen.dart';
 import '../reader/novel_reader_screen.dart';
+import '../../core/ui/poster_card.dart' show posterGridColumns;
+import 'download_library_widgets.dart';
 
 /// Saved chapters for one reading mode.
 ///
@@ -25,9 +27,16 @@ import '../reader/novel_reader_screen.dart';
 /// are text, they're browsed in different places, and mixing them under the
 /// episode downloads made the video screen read like a dumping ground.
 class ChapterDownloadsScreen extends StatefulWidget {
-  const ChapterDownloadsScreen({super.key, required this.mode});
+  const ChapterDownloadsScreen({
+    super.key,
+    required this.mode,
+    this.embedded = false,
+    this.query,
+  });
 
   final ContentMode mode;
+  final bool embedded;
+  final String? query;
 
   @override
   State<ChapterDownloadsScreen> createState() => _ChapterDownloadsScreenState();
@@ -36,6 +45,7 @@ class ChapterDownloadsScreen extends StatefulWidget {
 class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
   final TextEditingController _searchCtrl = TextEditingController();
   String _query = '';
+  String get _effectiveQuery => widget.query ?? _query;
 
   /// Show keys the user has expanded. Empty = all collapsed.
   final Set<String> _expanded = <String>{};
@@ -51,7 +61,7 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
   });
 
   bool _matchesQuery(ChapterDownload c) {
-    final q = _query.trim().toLowerCase();
+    final q = _effectiveQuery.trim().toLowerCase();
     return q.isEmpty ||
         c.showTitle.toLowerCase().contains(q) ||
         c.chapterTitle.toLowerCase().contains(q);
@@ -62,45 +72,49 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
     final store = sl<ChapterDownloadStore>();
     final isNovel = widget.mode == ContentMode.novel;
     final l10n = context.l10n;
-    return Scaffold(
-      backgroundColor: AppColors.bg,
-      appBar: settingsAppBar(
-        isNovel ? l10n.novelDownloads : l10n.mangaDownloads,
-      ),
-      // Only the box is watched here. The downloader fires per page, and
-      // rebuilding a few thousand rows twice a second for a progress bar on one
-      // of them is what made this screen crawl — the progress tiles subscribe
-      // to it themselves instead.
-      body: ValueListenableBuilder<Box<Map>>(
-        valueListenable: store.listenable(),
-        builder: (context, box, _) {
-          final all = store.all();
-          if (!all.any((c) => c.mode == widget.mode)) {
-            return EmptyState(
-              icon: isNovel ? Icons.article_outlined : Icons.menu_book_outlined,
-              message: isNovel
-                  ? l10n.novelChaptersYouDownloadAppearHere
-                  : l10n.mangaChaptersYouDownloadAppearHere,
-            );
-          }
-          final sections = _sections(all, l10n);
-          return Column(
-            children: [
-              _searchField(),
-              Expanded(
-                // Lazily — a saved series can be thousands of rows, and the
-                // eager ListView built every one of them before the first
-                // frame.
-                child: ListView.builder(
-                  itemCount: sections.length,
-                  itemBuilder: (context, i) => sections[i](),
-                ),
-              ),
-            ],
+    // Only the box is watched here. The downloader fires per page, and
+    // rebuilding a few thousand rows twice a second for a progress bar on one
+    // of them is what made this screen crawl — the progress tiles subscribe
+    // to it themselves instead.
+    final content = ValueListenableBuilder<Box<Map>>(
+      valueListenable: store.listenable(),
+      builder: (context, box, _) {
+        final all = store.all();
+        if (!all.any((c) => c.mode == widget.mode)) {
+          return EmptyState(
+            icon: isNovel ? Icons.article_outlined : Icons.menu_book_outlined,
+            message: isNovel
+                ? l10n.novelChaptersYouDownloadAppearHere
+                : l10n.mangaChaptersYouDownloadAppearHere,
           );
-        },
-      ),
+        }
+        if (widget.embedded) return _embeddedLibrary(all, l10n);
+        final sections = _sections(all, l10n);
+        return Column(
+          children: [
+            _searchField(),
+            Expanded(
+              // Lazily — a saved series can be thousands of rows, and the
+              // eager ListView built every one of them before the first
+              // frame.
+              child: ListView.builder(
+                itemCount: sections.length,
+                itemBuilder: (context, i) => sections[i](),
+              ),
+            ),
+          ],
+        );
+      },
     );
+    return widget.embedded
+        ? content
+        : Scaffold(
+            backgroundColor: AppColors.bg,
+            appBar: settingsAppBar(
+              isNovel ? l10n.novelDownloads : l10n.mangaDownloads,
+            ),
+            body: content,
+          );
   }
 
   /// What's running (plus anything that failed, so it can be cleared), then
@@ -109,8 +123,9 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
   /// group first for free.
   List<Widget Function()> _sections(
     List<ChapterDownload> all,
-    AppLocalizations l10n,
-  ) {
+    AppLocalizations l10n, {
+    bool activeOnly = false,
+  }) {
     final downloader = sl<ChapterDownloader>();
     final live = Map<String, ChapterDownload>.fromEntries(
       downloader.inFlight.entries.where((e) => e.value.mode == widget.mode),
@@ -151,20 +166,114 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
           onExtra: failed > 0 ? () => _clearFailed(l10n) : null,
         ),
         for (final c in active)
-          () => _ChapterProgressTile(id: c.id, fallback: c),
+          () => _ChapterProgressTile(
+            id: c.id,
+            fallback: c,
+            compact: widget.embedded,
+          ),
       ],
-      if (byShow.isNotEmpty) ...[
+      if (!activeOnly && byShow.isNotEmpty) ...[
         () => _sectionHeader(l10n.downloaded),
         for (final e in byShow.entries)
           () => _ChapterGroup(
             chapters: e.value,
             // Searching reveals the matches instead of making the user expand
             // every group.
-            expanded: _query.trim().isNotEmpty || _expanded.contains(e.key),
+            expanded:
+                _effectiveQuery.trim().isNotEmpty || _expanded.contains(e.key),
             onToggle: () => _toggle(e.key),
           ),
       ],
     ];
+  }
+
+  Widget _embeddedLibrary(List<ChapterDownload> all, AppLocalizations l10n) {
+    final active = _sections(all, l10n, activeOnly: true);
+    final byShow = <String, List<ChapterDownload>>{};
+    for (final chapter in all) {
+      if (chapter.mode != widget.mode ||
+          chapter.status != ChapterDownloadStatus.done ||
+          !_matchesQuery(chapter)) {
+        continue;
+      }
+      (byShow['${chapter.sourceId}|${chapter.showId}'] ??= []).add(chapter);
+    }
+    final groups = byShow.values.toList();
+    if (active.isEmpty && groups.isEmpty) {
+      return EmptyState(
+        icon: Icons.search_off_rounded,
+        message: l10n.noDownloadsMatchYourSearch,
+      );
+    }
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final columns = posterGridColumns(context);
+        final cellWidth =
+            (constraints.maxWidth - 32 - 12 * (columns - 1)) / columns;
+        return CustomScrollView(
+          key: PageStorageKey('chapter-downloads-${widget.mode.name}'),
+          slivers: [
+            SliverList.builder(
+              itemCount: active.length,
+              itemBuilder: (context, index) => active[index](),
+            ),
+            if (groups.isNotEmpty) ...[
+              SliverToBoxAdapter(child: _sectionHeader(l10n.downloaded)),
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                sliver: SliverGrid(
+                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: columns,
+                    crossAxisSpacing: 12,
+                    mainAxisSpacing: 16,
+                    mainAxisExtent:
+                        cellWidth * 1.5 +
+                        MediaQuery.textScalerOf(context).scale(12) * 6.5,
+                  ),
+                  delegate: SliverChildBuilderDelegate((context, index) {
+                    final chapters = groups[index];
+                    final head = chapters.first;
+                    final bytes = chapters.fold<int>(
+                      0,
+                      (sum, chapter) => sum + chapter.bytes,
+                    );
+                    return DownloadLibraryPoster(
+                      title: head.showTitle,
+                      heroTag: (
+                        'download-chapter',
+                        widget.mode,
+                        head.sourceId,
+                        head.showId,
+                      ),
+                      cover: head.cover,
+                      countLabel: '${chapters.length}',
+                      sizeLabel: fmtDownloadSize(bytes),
+                      deleteTooltip: l10n.deleteAllChaptersTooltip,
+                      onDelete: () => _confirmDeleteChapters(context, chapters),
+                      onOpen: () => Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => _DownloadedChaptersScreen(
+                            sourceId: head.sourceId,
+                            showId: head.showId,
+                            mode: widget.mode,
+                            query: _effectiveQuery,
+                          ),
+                        ),
+                      ),
+                    );
+                  }, childCount: groups.length),
+                ),
+              ),
+            ],
+            SliverToBoxAdapter(
+              child: SizedBox(
+                height: MediaQuery.paddingOf(context).bottom + 16,
+              ),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   Widget _sectionHeader(
@@ -269,7 +378,12 @@ IconData chapterIcon(ContentMode mode) =>
 /// One chapter that's running, queued, or dead. The X cancels a live one and
 /// clears a failed one — both end up dropping the record and its files.
 class _ChapterProgressTile extends StatelessWidget {
-  const _ChapterProgressTile({required this.id, required this.fallback});
+  const _ChapterProgressTile({
+    required this.id,
+    required this.fallback,
+    this.compact = false,
+  });
+  final bool compact;
 
   final String id;
 
@@ -317,15 +431,20 @@ class _ChapterProgressTile extends StatelessWidget {
   Widget _tile(BuildContext context, ChapterDownload chapter, bool live) {
     final l10n = context.l10n;
     return ListTile(
+      dense: compact,
+      minLeadingWidth: compact ? 28 : null,
       contentPadding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
       leading: Icon(
         live ? chapterIcon(chapter.mode) : Icons.error_outline_rounded,
         color: AppColors.accent,
-        size: 26,
+        size: compact ? 21 : 26,
       ),
       title: Text(
         _titleOf(l10n, chapter),
-        style: AppText.body.copyWith(color: AppColors.textPrimary),
+        style: AppText.body.copyWith(
+          color: AppColors.textPrimary,
+          fontSize: compact ? 13 : null,
+        ),
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
       ),
@@ -382,16 +501,7 @@ class _ChapterGroup extends StatelessWidget {
   /// Reading order, not download order. Sources that give a chapter number get
   /// sorted by it; the rest fall back to the order they were saved in, oldest
   /// first, which is the closest thing to reading order we have.
-  List<ChapterDownload> get ordered {
-    final out = [...chapters];
-    final numbered = out.every((c) => c.number != null);
-    out.sort(
-      numbered
-          ? (a, b) => a.number!.compareTo(b.number!)
-          : (a, b) => a.createdAt.compareTo(b.createdAt),
-    );
-    return out;
-  }
+  List<ChapterDownload> get ordered => _orderedChapters(chapters);
 
   @override
   Widget build(BuildContext context) {
@@ -454,7 +564,7 @@ class _ChapterGroup extends StatelessWidget {
                     size: 22,
                   ),
                   tooltip: l10n.deleteAllChaptersTooltip,
-                  onPressed: () => _confirmDeleteAll(context, l10n),
+                  onPressed: () => _confirmDeleteChapters(context, chapters),
                 ),
                 AnimatedRotation(
                   turns: expanded ? 0.25 : 0.0,
@@ -478,24 +588,136 @@ class _ChapterGroup extends StatelessWidget {
       ],
     );
   }
+}
 
-  Future<void> _confirmDeleteAll(
-    BuildContext context,
-    AppLocalizations l10n,
-  ) async {
-    final n = chapters.length;
-    final ok = await AppDialog.confirm(
-      context,
-      title: l10n.deleteAllChapters2,
-      message: l10n.removeAllChaptersOfShow(n, chapters.first.showTitle),
-      confirmLabel: l10n.deleteAll,
-      destructive: true,
-    );
-    if (ok != true) return;
+List<ChapterDownload> _orderedChapters(List<ChapterDownload> chapters) {
+  final out = [...chapters];
+  final numbered = out.every((c) => c.number != null);
+  out.sort(
+    numbered
+        ? (a, b) => a.number!.compareTo(b.number!)
+        : (a, b) => a.createdAt.compareTo(b.createdAt),
+  );
+  return out;
+}
+
+Future<void> _confirmDeleteChapters(
+  BuildContext context,
+  List<ChapterDownload> chapters,
+) async {
+  final l10n = context.l10n;
+  final ok = await AppDialog.confirm(
+    context,
+    title: l10n.deleteAllChapters2,
+    message: l10n.removeAllChaptersOfShow(
+      chapters.length,
+      chapters.first.showTitle,
+    ),
+    confirmLabel: l10n.deleteAll,
+    destructive: true,
+  );
+  if (ok != true) return;
+  final store = sl<ChapterDownloadStore>();
+  for (final c in chapters) {
+    await store.remove(c.id);
+  }
+}
+
+class _DownloadedChaptersScreen extends StatelessWidget {
+  const _DownloadedChaptersScreen({
+    required this.sourceId,
+    required this.showId,
+    required this.mode,
+    required this.query,
+  });
+  final String sourceId;
+  final String showId;
+  final ContentMode mode;
+  final String query;
+
+  @override
+  Widget build(BuildContext context) {
     final store = sl<ChapterDownloadStore>();
-    for (final c in chapters) {
-      await store.remove(c.id);
-    }
+    final l10n = context.l10n;
+    return Scaffold(
+      backgroundColor: AppColors.bg,
+      appBar: AppBar(
+        backgroundColor: AppColors.bg,
+        surfaceTintColor: Colors.transparent,
+        title: Text(
+          mode == ContentMode.novel ? l10n.novelDownloads : l10n.mangaDownloads,
+          style: AppText.headline,
+        ),
+      ),
+      body: ValueListenableBuilder<Box<Map>>(
+        valueListenable: store.listenable(),
+        builder: (context, _, _) {
+          final q = query.trim().toLowerCase();
+          final chapters = _orderedChapters(
+            store
+                .all()
+                .where(
+                  (c) =>
+                      c.sourceId == sourceId &&
+                      c.showId == showId &&
+                      c.mode == mode &&
+                      c.status == ChapterDownloadStatus.done &&
+                      (q.isEmpty ||
+                          c.showTitle.toLowerCase().contains(q) ||
+                          c.chapterTitle.toLowerCase().contains(q)),
+                )
+                .toList(),
+          );
+          if (chapters.isEmpty) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (context.mounted &&
+                  ModalRoute.of(context)?.isCurrent == true) {
+                Navigator.of(context).pop();
+              }
+            });
+            return const SizedBox.shrink();
+          }
+          final head = chapters.first;
+          final bytes = chapters.fold<int>(0, (sum, c) => sum + c.bytes);
+          return CustomScrollView(
+            slivers: [
+              SliverToBoxAdapter(
+                child: DownloadTitleSummary(
+                  title: head.showTitle,
+                  heroTag: ('download-chapter', mode, sourceId, showId),
+                  cover: head.cover,
+                  subtitle: l10n.chaptersWithSize(
+                    chapters.length,
+                    fmtDownloadSize(bytes),
+                  ),
+                  deleteTooltip: l10n.deleteAllChaptersTooltip,
+                  onDelete: () => _confirmDeleteChapters(context, chapters),
+                ),
+              ),
+              SliverList.separated(
+                itemCount: chapters.length,
+                itemBuilder: (context, index) => _SavedChapterTile(
+                  chapter: chapters[index],
+                  compact: true,
+                  onTap: () => _openReader(context, chapters, chapters[index]),
+                ),
+                separatorBuilder: (_, _) => const Divider(
+                  height: 12,
+                  indent: 56,
+                  endIndent: 20,
+                  color: AppColors.hairline,
+                ),
+              ),
+              SliverToBoxAdapter(
+                child: SizedBox(
+                  height: MediaQuery.paddingOf(context).bottom + 24,
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
   }
 }
 
@@ -543,7 +765,12 @@ void _openReader(
 
 /// One saved chapter — tapping reads it offline.
 class _SavedChapterTile extends StatelessWidget {
-  const _SavedChapterTile({required this.chapter, required this.onTap});
+  const _SavedChapterTile({
+    required this.chapter,
+    required this.onTap,
+    this.compact = false,
+  });
+  final bool compact;
 
   final ChapterDownload chapter;
   final VoidCallback onTap;
@@ -552,18 +779,24 @@ class _SavedChapterTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final l10n = context.l10n;
     return ListTile(
+      dense: compact,
+      minLeadingWidth: compact ? 28 : null,
       onTap: onTap,
       contentPadding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
       leading: Icon(
         chapterIcon(chapter.mode),
         color: AppColors.accent,
-        size: 26,
+        size: compact ? 21 : 26,
       ),
       title: Text(
         chapter.chapterTitle.trim().isEmpty
             ? l10n.chapter
             : chapter.chapterTitle,
-        style: AppText.body.copyWith(color: AppColors.textPrimary),
+        style: AppText.body.copyWith(
+          color: AppColors.textPrimary,
+          fontSize: compact ? 13 : null,
+          fontWeight: compact ? FontWeight.w600 : null,
+        ),
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
       ),

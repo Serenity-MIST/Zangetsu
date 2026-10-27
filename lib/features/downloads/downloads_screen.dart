@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import '../../core/ui/app_dialog.dart';
@@ -22,6 +21,7 @@ import '../../core/playback/watch_history.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/ui/states.dart';
+import '../../core/ui/poster_card.dart' show posterGridColumns;
 import '../../l10n/l10n.dart';
 import '../settings/download_location_screen.dart';
 import '../player/player_screen.dart';
@@ -29,11 +29,9 @@ import '../player/tv_playback_launch.dart';
 import 'downloaded_episode_playback.dart';
 import 'chapter_downloads_screen.dart';
 import 'downloads_screen_tv.dart';
+import 'download_library_widgets.dart';
 
-/// Offline library — downloads grouped by show, with per-episode progress and
-/// actions (play / pause / resume / cancel / delete). Shows collapse by default
-/// into a scannable list; a search box filters by show or episode title, and a
-/// summary strip shows the total downloaded count + storage used.
+/// Poster library for saved shows, opening the existing episode controls.
 class DownloadsScreen extends StatefulWidget {
   const DownloadsScreen({super.key, this.showBack = true});
 
@@ -45,16 +43,17 @@ class DownloadsScreen extends StatefulWidget {
 }
 
 class _DownloadsScreenState extends State<DownloadsScreen>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   final TextEditingController _searchCtrl = TextEditingController();
   String _query = '';
-
-  /// Show ids the user has expanded. Empty = all collapsed (the default).
-  final Set<String> _expanded = <String>{};
+  bool _searching = false;
+  ContentMode _kind = ContentMode.anime;
+  late final TabController _tabs;
 
   @override
   void initState() {
     super.initState();
+    _tabs = TabController(length: 3, vsync: this)..addListener(_onTabChanged);
     WidgetsBinding.instance.addObserver(this);
     _prune();
   }
@@ -62,6 +61,8 @@ class _DownloadsScreenState extends State<DownloadsScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _tabs.removeListener(_onTabChanged);
+    _tabs.dispose();
     _searchCtrl.dispose();
     super.dispose();
   }
@@ -76,9 +77,102 @@ class _DownloadsScreenState extends State<DownloadsScreen>
   /// Drop downloads whose file was deleted outside the app. Non-blocking.
   void _prune() => unawaited(sl<DownloadManager>().pruneMissing());
 
-  void _toggle(String showId) => setState(() {
-    if (!_expanded.remove(showId)) _expanded.add(showId);
+  void _toggleSearch() => setState(() {
+    _searching = !_searching;
+    if (!_searching) {
+      _searchCtrl.clear();
+      _query = '';
+    }
   });
+
+  Widget _header() {
+    final l10n = context.l10n;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: AppColors.surface.withValues(alpha: .72),
+          borderRadius: BorderRadius.circular(26),
+          border: Border.all(color: AppColors.hairline, width: .5),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(8, 6, 8, 6),
+          child: Row(
+            children: [
+              if (widget.showBack)
+                IconButton(
+                  style: IconButton.styleFrom(
+                    fixedSize: const Size.square(36),
+                    minimumSize: const Size.square(36),
+                    padding: EdgeInsets.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  tooltip: MaterialLocalizations.of(context).backButtonTooltip,
+                  icon: const Icon(Icons.arrow_back_rounded, size: 20),
+                  onPressed: _searching
+                      ? _toggleSearch
+                      : () => Navigator.of(context).maybePop(),
+                )
+              else
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 12),
+                  child: Icon(Icons.download_rounded, size: 22),
+                ),
+              Expanded(
+                child: _searching
+                    ? _searchField()
+                    : Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            l10n.downloads,
+                            style: AppText.headline.copyWith(fontSize: 15.5),
+                          ),
+                          Text(
+                            l10n.downloadsSubtitleTv,
+                            style: AppText.caption.copyWith(fontSize: 11),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
+                      ),
+              ),
+              _headerButton(
+                icon: _searching ? Icons.close_rounded : Icons.search_rounded,
+                tooltip: l10n.search,
+                onTap: _toggleSearch,
+              ),
+              const SizedBox(width: 8),
+              _headerButton(
+                icon: Icons.tune_rounded,
+                tooltip: l10n.downloadSettings,
+                onTap: _openDownloadSettings,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _headerButton({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onTap,
+  }) => IconButton(
+    tooltip: tooltip,
+    onPressed: onTap,
+    icon: Icon(icon, size: 18),
+    color: AppColors.accent,
+    style: IconButton.styleFrom(
+      backgroundColor: AppColors.surface2,
+      fixedSize: const Size.square(36),
+      minimumSize: const Size.square(36),
+      padding: EdgeInsets.zero,
+      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+    ),
+  );
 
   /// "Saving to: `folder` · Change" — surfaces the download location right here
   /// (opens the existing picker) instead of only burying it in Settings.
@@ -91,7 +185,7 @@ class _DownloadsScreenState extends State<DownloadsScreen>
       publicFallback: l10n.downloadsZangetsu,
     );
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 6, 8, 2),
+      padding: const EdgeInsets.fromLTRB(20, 0, 12, 4),
       child: Row(
         children: [
           const Icon(
@@ -101,23 +195,11 @@ class _DownloadsScreenState extends State<DownloadsScreen>
           ),
           const SizedBox(width: 10),
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  l10n.savingTo,
-                  style: AppText.caption.copyWith(
-                    color: AppColors.textTertiary,
-                  ),
-                ),
-                Text(
-                  label,
-                  style: AppText.body,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ],
+            child: Text(
+              label,
+              style: AppText.caption.copyWith(fontSize: 11),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
             ),
           ),
           TextButton(
@@ -269,273 +351,229 @@ class _DownloadsScreenState extends State<DownloadsScreen>
     final store = sl<ChapterDownloadStore>();
     return Scaffold(
       backgroundColor: AppColors.bg,
-      appBar: settingsAppBar(
-        showBack: widget.showBack,
-        context.l10n.downloads,
-        actions: [
-          IconButton(
-            tooltip: context.l10n.downloadSettings,
-            icon: const Icon(Icons.tune_rounded),
-            onPressed: _openDownloadSettings,
-          ),
-        ],
-      ),
       body: ListenableBuilder(
         listenable: manager,
         builder: (context, _) {
           final groups = manager.byShow;
-          return Column(
-            children: [
-              _locationHeader(),
-              _chapterLinks(store),
-              if (groups.isEmpty)
+          return SafeArea(
+            bottom: false,
+            child: Column(
+              children: [
+                _header(),
+                _chapterLinks(store),
+                _locationHeader(),
                 Expanded(
-                  child: EmptyState(
-                    icon: Icons.download_outlined,
-                    message: context.l10n.episodesYouDownloadAppearHere,
+                  child: TabBarView(
+                    controller: _tabs,
+                    children: [
+                      DownloadEntrance(
+                        child: groups.isEmpty
+                            ? EmptyState(
+                                icon: Icons.download_outlined,
+                                message:
+                                    context.l10n.episodesYouDownloadAppearHere,
+                              )
+                            : _list(groups, manager),
+                      ),
+                      for (final mode in const [
+                        ContentMode.manga,
+                        ContentMode.novel,
+                      ])
+                        DownloadEntrance(
+                          key: ValueKey(mode),
+                          child: ChapterDownloadsScreen(
+                            key: PageStorageKey(mode),
+                            mode: mode,
+                            embedded: true,
+                            query: _query,
+                          ),
+                        ),
+                    ],
                   ),
-                )
-              else ...[
-                _searchField(),
-                Expanded(child: _list(groups, manager)),
+                ),
               ],
-            ],
+            ),
           );
         },
       ),
     );
   }
 
-  /// Manga and novel downloads get their own screens — they're chapters, not
-  /// episodes, and listing them here made this screen a dumping ground. These
-  /// two rows are just the way in, with a count so you can see there's
-  /// something there without opening it.
-  ///
-  /// Only these rows watch the chapter box. It's written twice a second while
-  /// a chapter downloads, and the video list below has no reason to rebuild
-  /// for that.
+  // Chapter counts update independently of the video library.
   Widget _chapterLinks(ChapterDownloadStore store) {
     return ValueListenableBuilder<Box<Map>>(
       valueListenable: store.listenable(),
       builder: (context, box, _) => Padding(
-        padding: const EdgeInsets.fromLTRB(16, 6, 16, 10),
-        child: Row(
-          children: [
-            for (final m in const [ContentMode.manga, ContentMode.novel]) ...[
-              Expanded(child: _chapterCard(m, store.countDone(m))),
-              if (m == ContentMode.manga) const SizedBox(width: 10),
-            ],
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        child: TabBar(
+          controller: _tabs,
+          labelColor: AppColors.accent,
+          unselectedLabelColor: AppColors.textSecondary,
+          labelStyle: AppText.body.copyWith(
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+          ),
+          unselectedLabelStyle: AppText.body.copyWith(fontSize: 13),
+          labelPadding: const EdgeInsets.symmetric(horizontal: 4),
+          indicatorColor: AppColors.accent,
+          indicatorWeight: 2,
+          indicatorSize: TabBarIndicatorSize.label,
+          dividerColor: AppColors.hairline,
+          tabs: [
+            Tab(height: 34, text: context.l10n.episodes),
+            for (final mode in const [ContentMode.manga, ContentMode.novel])
+              Tab(
+                height: 34,
+                child: Text.rich(
+                  TextSpan(
+                    children: [
+                      TextSpan(
+                        text: mode == ContentMode.novel
+                            ? context.l10n.novels
+                            : context.l10n.modeManga,
+                      ),
+                      if (store.countDone(mode) > 0)
+                        TextSpan(
+                          text: '  ${store.countDone(mode)}',
+                          style: const TextStyle(fontSize: 10),
+                        ),
+                    ],
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
           ],
         ),
       ),
     );
   }
 
-  /// Side by side rather than two full-width rows: they're a way into the other
-  /// two screens, not content, and stacked they pushed the episode list most of
-  /// a screen down.
-  Widget _chapterCard(ContentMode mode, int count) {
-    final novel = mode == ContentMode.novel;
-    final l10n = context.l10n;
-    return Material(
-      color: AppColors.surface,
-      borderRadius: BorderRadius.circular(12),
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: () => Navigator.of(context).push(
-          MaterialPageRoute<void>(
-            builder: (_) => ChapterDownloadsScreen(mode: mode),
-          ),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 11, 10, 11),
-          child: Row(
-            children: [
-              Icon(chapterIcon(mode), color: AppColors.accent, size: 20),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      novel ? l10n.novels : l10n.modeManga,
-                      style: AppText.body.copyWith(
-                        color: AppColors.textPrimary,
-                        fontWeight: FontWeight.w600,
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    Text(
-                      l10n.chapterCount(count),
-                      style: AppText.caption,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ],
-                ),
-              ),
-              const Icon(
-                Icons.chevron_right_rounded,
-                color: AppColors.textTertiary,
-                size: 20,
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
+  void _onTabChanged() => _selectKind(ContentMode.values[_tabs.index]);
+
+  void _selectKind(ContentMode mode) {
+    if (_kind == mode) return;
+    setState(() {
+      _kind = mode;
+      _query = '';
+      _searchCtrl.clear();
+    });
   }
 
-  Widget _searchField() {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 4, 16, 6),
-      child: TextField(
-        controller: _searchCtrl,
-        onChanged: (v) => setState(() => _query = v),
-        style: AppText.body.copyWith(color: AppColors.textPrimary),
-        decoration: InputDecoration(
-          isDense: true,
-          hintText: context.l10n.searchDownloads,
-          hintStyle: AppText.body.copyWith(color: AppColors.textTertiary),
-          prefixIcon: const Icon(
-            Icons.search_rounded,
-            color: AppColors.textTertiary,
-          ),
-          suffixIcon: _query.isEmpty
-              ? null
-              : IconButton(
-                  icon: const Icon(
-                    Icons.close_rounded,
-                    color: AppColors.textTertiary,
-                  ),
-                  onPressed: () {
-                    _searchCtrl.clear();
-                    setState(() => _query = '');
-                  },
-                ),
-          filled: true,
-          fillColor: AppColors.surface,
-          contentPadding: const EdgeInsets.symmetric(vertical: 12),
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: BorderSide.none,
-          ),
-        ),
+  Widget _searchField() => TextField(
+    controller: _searchCtrl,
+    autofocus: true,
+    onChanged: (value) => setState(() => _query = value),
+    style: AppText.body.copyWith(fontSize: 13, color: AppColors.textPrimary),
+    decoration: InputDecoration(
+      isDense: true,
+      hintText: context.l10n.searchDownloads,
+      hintStyle: AppText.body.copyWith(
+        fontSize: 13,
+        color: AppColors.textTertiary,
       ),
-    );
-  }
+      border: InputBorder.none,
+      enabledBorder: InputBorder.none,
+      focusedBorder: InputBorder.none,
+      contentPadding: const EdgeInsets.symmetric(vertical: 8),
+    ),
+  );
 
   Widget _list(
     Map<String, List<DownloadRecord>> groups,
     DownloadManager manager,
   ) {
     final q = _query.trim().toLowerCase();
-    final all = manager.all;
-    final done = all.where((r) => r.status == DownloadStatus.done).toList();
+    final done = manager.all.where((r) => r.status == DownloadStatus.done);
     final totalBytes = done.fold<int>(0, (s, r) => s + r.bytesTotal);
-
-    final showIds = groups.keys.toList();
-    final rows = <Widget>[];
-    for (final id in showIds) {
-      final recs = [
-        ...groups[id]!,
+    final shown =
+        <
+          ({
+            String id,
+            List<DownloadRecord> records,
+            List<DownloadRecord> episodes,
+          })
+        >[];
+    for (final entry in groups.entries) {
+      if (entry.value.isEmpty) continue;
+      final records = [
+        ...entry.value,
       ]..sort((a, b) => (a.episodeNumber ?? 0).compareTo(b.episodeNumber ?? 0));
-      final head = recs.first;
-
-      List<DownloadRecord> episodes = recs;
-      var forceExpand = false;
-      if (q.isNotEmpty) {
-        final showMatch = head.showTitle.toLowerCase().contains(q);
-        if (!showMatch) {
-          episodes = recs
-              .where((r) => _episodeSearchText(r).contains(q))
-              .toList();
-          if (episodes.isEmpty) continue; // this show has no match — hide it
-        }
-        forceExpand = true; // reveal matches while searching
+      final showMatch = records.first.showTitle.toLowerCase().contains(q);
+      final episodes = q.isEmpty || showMatch
+          ? records
+          : records.where((r) => _episodeSearchText(r).contains(q)).toList();
+      if (episodes.isNotEmpty) {
+        shown.add((id: entry.key, records: records, episodes: episodes));
       }
-
-      rows.add(
-        _ShowGroup(
-          records: recs,
-          episodes: episodes,
-          manager: manager,
-          expanded: forceExpand || _expanded.contains(id),
-          onToggle: () => _toggle(id),
-        ),
-      );
     }
-
-    if (rows.isEmpty) {
-      return EmptyState(
-        icon: Icons.search_off_rounded,
-        message: context.l10n.noDownloadsMatchYourSearch,
-      );
-    }
-
-    final anyExpanded = showIds.any(_expanded.contains);
-    return ListView(
-      // Clear the floating dock, which overlays content (this tab has no
-      // reserved space of its own for it).
-      padding: EdgeInsets.only(bottom: MediaQuery.paddingOf(context).bottom),
-      children: [
-        _summaryStrip(
-          count: done.length,
-          bytes: totalBytes,
-          anyExpanded: anyExpanded,
-          onToggleAll: () => setState(() {
-            if (anyExpanded) {
-              _expanded.clear();
-            } else {
-              _expanded.addAll(showIds);
-            }
-          }),
-        ),
-        ...rows,
-      ],
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final columns = posterGridColumns(context);
+        final cellWidth =
+            (constraints.maxWidth - 32 - 12 * (columns - 1)) / columns;
+        final textHeight = MediaQuery.textScalerOf(context).scale(12);
+        return CustomScrollView(
+          key: const PageStorageKey('downloads-grid'),
+          slivers: [
+            SliverToBoxAdapter(
+              child: _summaryStrip(count: done.length, bytes: totalBytes),
+            ),
+            if (shown.isEmpty)
+              SliverFillRemaining(
+                hasScrollBody: false,
+                child: EmptyState(
+                  icon: Icons.search_off_rounded,
+                  message: context.l10n.noDownloadsMatchYourSearch,
+                ),
+              )
+            else ...[
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                sliver: SliverGrid(
+                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: columns,
+                    crossAxisSpacing: 12,
+                    mainAxisSpacing: 16,
+                    mainAxisExtent: cellWidth * 1.5 + textHeight * 6.5,
+                  ),
+                  delegate: SliverChildBuilderDelegate((context, index) {
+                    final group = shown[index];
+                    return _DownloadPoster(
+                      records: group.records,
+                      onOpen: () => Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => _DownloadedShowScreen(
+                            showId: group.id,
+                            query: _query,
+                          ),
+                        ),
+                      ),
+                      onDelete: () =>
+                          _confirmDeleteShow(context, group.records, manager),
+                    );
+                  }, childCount: shown.length),
+                ),
+              ),
+            ],
+            SliverToBoxAdapter(
+              child: SizedBox(
+                height: MediaQuery.paddingOf(context).bottom + 16,
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 
-  Widget _summaryStrip({
-    required int count,
-    required int bytes,
-    required bool anyExpanded,
-    required VoidCallback onToggleAll,
-  }) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 8, 2),
-      child: Row(
-        children: [
-          const Icon(
-            Icons.folder_outlined,
-            size: 15,
-            color: AppColors.textTertiary,
-          ),
-          const SizedBox(width: 6),
-          Text(
-            context.l10n.downloadedSummary(count, fmtDownloadSize(bytes)),
-            style: AppText.caption,
-          ),
-          const Spacer(),
-          TextButton(
-            onPressed: onToggleAll,
-            style: TextButton.styleFrom(
-              foregroundColor: AppColors.accent,
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              minimumSize: const Size(0, 0),
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            ),
-            child: Text(
-              anyExpanded ? context.l10n.collapseAll : context.l10n.expandAll,
-              style: AppText.caption.copyWith(color: AppColors.accent),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+  Widget _summaryStrip({required int count, required int bytes}) => Padding(
+    padding: const EdgeInsets.fromLTRB(20, 8, 20, 4),
+    child: Text(
+      context.l10n.downloadedSummary(count, fmtDownloadSize(bytes)),
+      style: AppText.caption.copyWith(fontSize: 11),
+    ),
+  );
 }
 
 /// Lowercased text a download is matched against when searching.
@@ -544,132 +582,181 @@ String _episodeSearchText(DownloadRecord r) {
   return 'e${n ?? ''} ${r.episodeTitle}'.toLowerCase();
 }
 
-class _ShowGroup extends StatelessWidget {
-  const _ShowGroup({
+class _DownloadPoster extends StatelessWidget {
+  const _DownloadPoster({
     required this.records,
-    required this.episodes,
-    required this.manager,
-    required this.expanded,
-    required this.onToggle,
+    required this.onOpen,
+    required this.onDelete,
   });
 
-  /// The full group — drives the "done of total" count and the group size.
   final List<DownloadRecord> records;
-
-  /// The episodes to render when expanded (a filtered subset while searching).
-  final List<DownloadRecord> episodes;
-
-  final DownloadManager manager;
-  final bool expanded;
-  final VoidCallback onToggle;
+  final VoidCallback onOpen;
+  final VoidCallback onDelete;
 
   @override
   Widget build(BuildContext context) {
     final l10n = context.l10n;
     final head = records.first;
-    final doneRecs = records
-        .where((r) => r.status == DownloadStatus.done)
-        .toList();
-    final groupBytes = doneRecs.fold<int>(0, (s, r) => s + r.bytesTotal);
-    final sizeSuffix = groupBytes > 0
-        ? ' · ${fmtDownloadSize(groupBytes)}'
-        : '';
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        InkWell(
-          onTap: onToggle,
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 12, 8),
-            child: Row(
-              children: [
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(6),
-                  child: SizedBox(
-                    width: 44,
-                    height: 62,
-                    child: (head.cover != null && head.cover!.isNotEmpty)
-                        ? CachedNetworkImage(
-                            imageUrl: head.cover!,
-                            httpHeaders: head.coverHeaders,
-                            fit: BoxFit.cover,
-                            // 44x62 thumb: decode small, not full poster.
-                            memCacheWidth: 132,
-                            errorWidget: (c, u, e) =>
-                                ColoredBox(color: AppColors.surface2),
-                          )
-                        : ColoredBox(color: AppColors.surface2),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        head.showTitle,
-                        style: AppText.headline,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        l10n.ofTotalDownloaded(
-                              doneRecs.length,
-                              records.length,
-                            ) +
-                            sizeSuffix,
-                        style: AppText.caption,
-                      ),
-                    ],
-                  ),
-                ),
-                IconButton(
-                  visualDensity: VisualDensity.compact,
-                  icon: const Icon(
-                    Icons.delete_outline_rounded,
-                    color: AppColors.textTertiary,
-                    size: 22,
-                  ),
-                  tooltip: l10n.deleteAllEpisodesTooltip,
-                  onPressed: () => _confirmDeleteAll(context),
-                ),
-                AnimatedRotation(
-                  turns: expanded ? 0.25 : 0.0,
-                  duration: const Duration(milliseconds: 180),
-                  child: const Icon(
-                    Icons.chevron_right_rounded,
-                    color: AppColors.textTertiary,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-        if (expanded)
-          for (final r in episodes)
-            DownloadTile(
-              record: r,
-              manager: manager,
-              resume: sl<ResumeStore>(),
-            ),
-        const SizedBox(height: 6),
-      ],
+    final done = records.where((r) => r.status == DownloadStatus.done);
+    final bytes = done.fold<int>(0, (sum, r) => sum + r.bytesTotal);
+    final pending = records.where((r) => r.status != DownloadStatus.done);
+    final active = pending.where((r) => r.status == DownloadStatus.downloading);
+    final current = active.isNotEmpty
+        ? active.first
+        : (pending.isEmpty ? null : pending.first);
+    final status = switch (current?.status) {
+      DownloadStatus.downloading => l10n.downloadProgressPercent(
+        (current!.progress * 100).round(),
+      ),
+      DownloadStatus.paused => l10n.downloadPausedProgress(
+        (current!.progress * 100).round(),
+      ),
+      DownloadStatus.finalizing => l10n.downloadFinalizing,
+      DownloadStatus.queued => l10n.downloadQueued,
+      DownloadStatus.resolving => l10n.downloadPreparing,
+      DownloadStatus.failed => l10n.downloadFailedStatus,
+      DownloadStatus.unsupported => l10n.notAvailableOfflineYet,
+      DownloadStatus.canceled => l10n.downloadCanceled,
+      _ => null,
+    };
+    return DownloadLibraryPoster(
+      title: head.showTitle,
+      heroTag: ('download-video', head.showId),
+      cover: head.cover,
+      coverHeaders: head.coverHeaders,
+      countLabel: '${done.length}/${records.length}',
+      sizeLabel: fmtDownloadSize(bytes),
+      status: status,
+      progress:
+          current?.status == DownloadStatus.downloading ||
+              current?.status == DownloadStatus.paused
+          ? current!.progress
+          : null,
+      isDownloading: active.isNotEmpty,
+      onOpen: onOpen,
+      onDelete: onDelete,
+      deleteTooltip: l10n.deleteAllEpisodesTooltip,
     );
   }
+}
 
-  /// Confirm, then wipe every episode of this show in one go.
-  Future<void> _confirmDeleteAll(BuildContext context) async {
+Future<void> _confirmDeleteShow(
+  BuildContext context,
+  List<DownloadRecord> records,
+  DownloadManager manager,
+) async {
+  final l10n = context.l10n;
+  final ok = await AppDialog.confirm(
+    context,
+    title: l10n.deleteAllDownloads,
+    message: l10n.removeAllEpisodesOfShow(
+      records.length,
+      records.first.showTitle,
+    ),
+    confirmLabel: l10n.deleteAll,
+    destructive: true,
+  );
+  if (ok == true) await manager.deleteAll(records);
+}
+
+class _DownloadedShowScreen extends StatelessWidget {
+  const _DownloadedShowScreen({required this.showId, required this.query});
+  final String showId;
+  final String query;
+
+  @override
+  Widget build(BuildContext context) {
+    final manager = sl<DownloadManager>();
     final l10n = context.l10n;
-    final n = records.length;
-    final ok = await AppDialog.confirm(
-      context,
-      title: l10n.deleteAllDownloads,
-      message: l10n.removeAllEpisodesOfShow(n, records.first.showTitle),
-      confirmLabel: l10n.deleteAll,
-      destructive: true,
+    return Scaffold(
+      backgroundColor: AppColors.bg,
+      appBar: AppBar(
+        backgroundColor: AppColors.bg,
+        surfaceTintColor: Colors.transparent,
+        title: Text(l10n.downloads, style: AppText.headline),
+        leading: IconButton(
+          key: const ValueKey('downloads-back-to-grid'),
+          tooltip: MaterialLocalizations.of(context).backButtonTooltip,
+          icon: const Icon(Icons.arrow_back_rounded),
+          onPressed: () => Navigator.of(context).pop(),
+        ),
+      ),
+      body: ListenableBuilder(
+        listenable: manager,
+        builder: (context, _) {
+          final records = [...?manager.byShow[showId]]
+            ..sort(
+              (a, b) => (a.episodeNumber ?? 0).compareTo(b.episodeNumber ?? 0),
+            );
+          if (records.isEmpty) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (context.mounted &&
+                  ModalRoute.of(context)?.isCurrent == true) {
+                Navigator.of(context).pop();
+              }
+            });
+            return const SizedBox.shrink();
+          }
+          final head = records.first;
+          final q = query.trim().toLowerCase();
+          final episodes = q.isEmpty || head.showTitle.toLowerCase().contains(q)
+              ? records
+              : records
+                    .where((r) => _episodeSearchText(r).contains(q))
+                    .toList();
+          final done = records.where((r) => r.status == DownloadStatus.done);
+          final bytes = done.fold<int>(0, (sum, r) => sum + r.bytesTotal);
+          return CustomScrollView(
+            slivers: [
+              SliverToBoxAdapter(
+                child: DownloadTitleSummary(
+                  title: head.showTitle,
+                  heroTag: ('download-video', showId),
+                  cover: head.cover,
+                  coverHeaders: head.coverHeaders,
+                  subtitle:
+                      '${l10n.ofTotalDownloaded(done.length, records.length)} · ${fmtDownloadSize(bytes)}',
+                  deleteTooltip: l10n.deleteAllEpisodesTooltip,
+                  onDelete: () => _confirmDeleteShow(context, records, manager),
+                ),
+              ),
+              SliverPadding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 20,
+                  vertical: 12,
+                ),
+                sliver: SliverToBoxAdapter(
+                  child: Text(
+                    l10n.episodes,
+                    style: AppText.body.copyWith(fontWeight: FontWeight.w700),
+                  ),
+                ),
+              ),
+              SliverList.separated(
+                itemCount: episodes.length,
+                itemBuilder: (context, index) => DownloadTile(
+                  record: episodes[index],
+                  manager: manager,
+                  resume: sl<ResumeStore>(),
+                  compact: true,
+                ),
+                separatorBuilder: (_, _) => const Divider(
+                  height: 12,
+                  indent: 56,
+                  endIndent: 20,
+                  color: AppColors.hairline,
+                ),
+              ),
+              SliverToBoxAdapter(
+                child: SizedBox(
+                  height: MediaQuery.paddingOf(context).bottom + 24,
+                ),
+              ),
+            ],
+          );
+        },
+      ),
     );
-    if (ok == true) await manager.deleteAll(records);
   }
 }
 
@@ -802,7 +889,9 @@ class DownloadTile extends StatelessWidget {
     required this.record,
     required this.manager,
     this.resume,
+    this.compact = false,
   });
+  final bool compact;
   final DownloadRecord record;
   final DownloadManager manager;
 
@@ -896,12 +985,27 @@ class DownloadTile extends StatelessWidget {
     final l10n = context.l10n;
     final isDone = record.status == DownloadStatus.done;
     return ListTile(
+      dense: compact,
+      minLeadingWidth: compact ? 28 : null,
       contentPadding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
       onTap: isDone ? () => _play(context) : null,
-      leading: _StatusGlyph(record: record),
+      leading: compact
+          ? SizedBox(
+              width: 28,
+              height: 32,
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: _StatusGlyph(record: record),
+              ),
+            )
+          : _StatusGlyph(record: record),
       title: Text(
         _epLabel(l10n),
-        style: AppText.body.copyWith(color: AppColors.textPrimary),
+        style: AppText.body.copyWith(
+          color: AppColors.textPrimary,
+          fontSize: compact ? 13 : null,
+          fontWeight: compact ? FontWeight.w600 : null,
+        ),
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
       ),
