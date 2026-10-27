@@ -593,8 +593,26 @@ class _LiquidNavDock extends StatelessWidget {
     final glassTabs = [
       for (final tab in tabs)
         GlassTab(
-          icon: _icon(tab),
-          activeIcon: _icon(tab, selected: true),
+          icon: tab == DockTab.profile
+              // The package tab bar has no per-tab long-press, so the
+              // gesture lives inside our own icon widget: the inner tap
+              // forwards selection unchanged, the inner long-press wins
+              // the arena and opens the switcher without selecting.
+              ? GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => onSelected(tab),
+                  onLongPress: () => unawaited(openProfileSwitcher(context)),
+                  child: _icon(tab),
+                )
+              : _icon(tab),
+          activeIcon: tab == DockTab.profile
+              ? GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => onSelected(tab),
+                  onLongPress: () => unawaited(openProfileSwitcher(context)),
+                  child: _icon(tab, selected: true),
+                )
+              : _icon(tab, selected: true),
           label: tab.localizedLabel(context),
           semanticLabel: tab.localizedLabel(context),
         ),
@@ -1097,6 +1115,54 @@ class _DockItem extends StatelessWidget {
   }
 }
 
+/// Profile switcher sheet, shared by both docks: the old floating dock's
+/// profile item and the liquid dock's profile tab both long-press into this.
+Future<void> openProfileSwitcher(BuildContext context) async {
+  if (!sl.isRegistered<ViewerProfileStore>()) return;
+  final profiles = sl<ViewerProfileStore>();
+  if (profiles.profiles.length < 2) return;
+
+  final addProfile = await showModalBottomSheet<bool>(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    showDragHandle: true,
+    backgroundColor: AppColors.surface,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+    ),
+    builder: (sheetContext) => _ProfileSwitcherSheet(
+      profiles: profiles,
+      onSelected: (profile) {
+        Navigator.of(sheetContext).pop();
+        unawaited(_switchProfile(context, profiles, profile));
+      },
+      onAddProfile: () => Navigator.of(sheetContext).pop(true),
+    ),
+  );
+  if (addProfile == true && context.mounted) {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(builder: (_) => const ViewerProfilesScreen()),
+    );
+  }
+}
+
+Future<void> _switchProfile(
+  BuildContext context,
+  ViewerProfileStore profiles,
+  ViewerProfile profile,
+) async {
+  try {
+    await profiles.switchTo(profile.id);
+  } catch (_) {
+    if (context.mounted) {
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        const SnackBar(content: Text("Couldn't switch profile. Try again.")),
+      );
+    }
+  }
+}
+
 /// The Profile tab — the user's avatar when signed in (accent ring while
 /// active), a plain person glyph otherwise. Opens the same Settings screen
 /// the gear used to.
@@ -1113,52 +1179,6 @@ class _ProfileDockItem extends StatelessWidget {
   final bool selected;
   final VoidCallback onTap;
 
-  Future<void> _openProfileSwitcher(BuildContext context) async {
-    if (!sl.isRegistered<ViewerProfileStore>()) return;
-    final profiles = sl<ViewerProfileStore>();
-    if (profiles.profiles.length < 2) return;
-
-    final addProfile = await showModalBottomSheet<bool>(
-      context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
-      showDragHandle: true,
-      backgroundColor: AppColors.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
-      ),
-      builder: (sheetContext) => _ProfileSwitcherSheet(
-        profiles: profiles,
-        onSelected: (profile) {
-          Navigator.of(sheetContext).pop();
-          unawaited(_switchProfile(context, profiles, profile));
-        },
-        onAddProfile: () => Navigator.of(sheetContext).pop(true),
-      ),
-    );
-    if (addProfile == true && context.mounted) {
-      await Navigator.of(context).push<void>(
-        MaterialPageRoute<void>(builder: (_) => const ViewerProfilesScreen()),
-      );
-    }
-  }
-
-  Future<void> _switchProfile(
-    BuildContext context,
-    ViewerProfileStore profiles,
-    ViewerProfile profile,
-  ) async {
-    try {
-      await profiles.switchTo(profile.id);
-    } catch (_) {
-      if (context.mounted) {
-        ScaffoldMessenger.maybeOf(context)?.showSnackBar(
-          const SnackBar(content: Text("Couldn't switch profile. Try again.")),
-        );
-      }
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final color = selected ? AppColors.accent : AppColors.textSecondary;
@@ -1173,10 +1193,10 @@ class _ProfileDockItem extends StatelessWidget {
         selected: selected,
         container: true,
         hint: 'Long-press to switch profiles',
-        onLongPress: () => unawaited(_openProfileSwitcher(context)),
+        onLongPress: () => unawaited(openProfileSwitcher(context)),
         child: InkWell(
           onTap: onTap,
-          onLongPress: () => unawaited(_openProfileSwitcher(context)),
+          onLongPress: () => unawaited(openProfileSwitcher(context)),
           borderRadius: BorderRadius.circular(18),
           child: ConstrainedBox(
             constraints: const BoxConstraints(minHeight: _FloatingDock._tapMin),
