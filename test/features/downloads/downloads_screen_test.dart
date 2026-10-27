@@ -25,6 +25,7 @@ class _Manager extends ChangeNotifier implements DownloadManager {
   DownloadRecord? resumed;
   DownloadRecord? retried;
   DownloadRecord? deleted;
+  List<DownloadRecord> deletedBatch = [];
 
   @override
   List<DownloadRecord> get all => records;
@@ -60,7 +61,8 @@ class _Manager extends ChangeNotifier implements DownloadManager {
 
   @override
   Future<void> deleteAll(Iterable<DownloadRecord> group) async {
-    final ids = group.map((r) => r.id).toSet();
+    deletedBatch = group.toList();
+    final ids = deletedBatch.map((r) => r.id).toSet();
     records.removeWhere((r) => ids.contains(r.id));
     notifyListeners();
   }
@@ -440,5 +442,94 @@ void main() {
     await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
     expect(find.byType(SliverGrid), findsOneWidget);
+  });
+
+  testWidgets('selection deletes only chosen episodes after confirmation', (
+    tester,
+  ) async {
+    await open(tester);
+    await tester.tap(find.text('Show A'));
+    await tester.pumpAndSettle();
+    await tester.longPress(find.byType(DownloadTile).last);
+    await tester.pumpAndSettle();
+    expect(find.byType(Checkbox), findsNWidgets(2));
+    expect(tester.widget<Checkbox>(find.byType(Checkbox).first).value, isFalse);
+    expect(tester.widget<Checkbox>(find.byType(Checkbox).last).value, isTrue);
+    expect(find.byType(PopupMenuButton<String>), findsNothing);
+    await tester.tap(find.byTooltip('Delete'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(manager.records.length, 3);
+    await tester.tap(find.byTooltip('Delete'));
+    await tester.pumpAndSettle();
+    final index = manager.records.indexWhere((record) => record.id == 'a2');
+    manager.records[index] = manager.records[index].copyWith(
+      status: DownloadStatus.done,
+      filePath: () => '/finished-while-confirming.mp4',
+    );
+    manager.notifyListeners();
+    await tester.tap(find.text('Delete').last);
+    await tester.pumpAndSettle();
+    expect(manager.records.map((r) => r.id), ['a1', 'b1']);
+    expect(
+      manager.deletedBatch.single.filePath,
+      '/finished-while-confirming.mp4',
+    );
+    expect(find.byType(DownloadTile), findsOneWidget);
+    expect(find.byType(Checkbox), findsNothing);
+  });
+
+  testWidgets(
+    'select all can clear selection and Back restores normal controls',
+    (tester) async {
+      await open(tester);
+      await tester.tap(find.text('Show A'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Select episodes'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Select all'));
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widgetList<Checkbox>(find.byType(Checkbox))
+            .every((checkbox) => checkbox.value == true),
+        isTrue,
+      );
+      await tester.tap(find.byTooltip('Clear'));
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widgetList<Checkbox>(find.byType(Checkbox))
+            .every((checkbox) => checkbox.value == false),
+        isTrue,
+      );
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+      expect(find.byType(DownloadTile), findsNWidgets(2));
+      expect(find.byType(Checkbox), findsNothing);
+      expect(find.byType(PopupMenuButton<String>), findsNWidgets(2));
+      expect(manager.records.length, 3);
+    },
+  );
+
+  testWidgets('Select all respects the visible search results', (tester) async {
+    await open(tester);
+    await tester.tap(find.byTooltip('Search'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), 'Hidden treasure');
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Show A'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Select episodes'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Select all'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Delete'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Delete').last);
+    await tester.pumpAndSettle();
+    expect(manager.records.map((record) => record.id), ['a1', 'b1']);
+    expect(find.text('No downloads match your search'), findsOneWidget);
   });
 }

@@ -255,7 +255,7 @@ class DownloadTitleSummary extends StatelessWidget {
   final String subtitle;
   final String? cover;
   final Map<String, String>? coverHeaders;
-  final VoidCallback onDelete;
+  final VoidCallback? onDelete;
   final String deleteTooltip;
 
   @override
@@ -289,15 +289,16 @@ class DownloadTitleSummary extends StatelessWidget {
             ],
           ),
         ),
-        IconButton(
-          onPressed: onDelete,
-          tooltip: deleteTooltip,
-          icon: const Icon(
-            Icons.delete_outline_rounded,
-            size: 21,
-            color: AppColors.textSecondary,
+        if (onDelete != null)
+          IconButton(
+            onPressed: onDelete,
+            tooltip: deleteTooltip,
+            icon: const Icon(
+              Icons.delete_outline_rounded,
+              size: 21,
+              color: AppColors.textSecondary,
+            ),
           ),
-        ),
       ],
     ),
   );

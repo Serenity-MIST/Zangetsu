@@ -659,103 +659,232 @@ Future<void> _confirmDeleteShow(
   if (ok == true) await manager.deleteAll(records);
 }
 
-class _DownloadedShowScreen extends StatelessWidget {
+class _DownloadedShowScreen extends StatefulWidget {
   const _DownloadedShowScreen({required this.showId, required this.query});
   final String showId;
   final String query;
 
   @override
+  State<_DownloadedShowScreen> createState() => _DownloadedShowScreenState();
+}
+
+class _DownloadedShowScreenState extends State<_DownloadedShowScreen> {
+  final Set<String> _selected = {};
+  bool _selecting = false;
+  bool _busy = false;
+
+  void _clearSelection() {
+    if (_busy) return;
+    setState(() {
+      _selecting = false;
+      _selected.clear();
+    });
+  }
+
+  void _toggleSelection(String id) {
+    if (_busy) return;
+    setState(() {
+      _selecting = true;
+      if (!_selected.remove(id)) _selected.add(id);
+    });
+  }
+
+  Future<void> _deleteSelected(List<DownloadRecord> selected, int total) async {
+    if (_busy || selected.isEmpty) return;
+    final l10n = context.l10n;
+    try {
+      final confirmed = await AppDialog.confirm(
+        context,
+        title: l10n.delete,
+        message:
+            '${l10n.selectedEpisodesOfTotal(selected.length, total)}\n${selected.first.showTitle}',
+        confirmLabel: l10n.delete,
+        destructive: true,
+      );
+      if (!confirmed || !mounted || _busy) return;
+      setState(() => _busy = true);
+      final manager = sl<DownloadManager>();
+      final ids = selected.map((r) => r.id).toSet();
+      // Refresh records after the dialog: active downloads may have finished.
+      await manager.deleteAll(
+        manager.all.where((r) => ids.contains(r.id)).toList(),
+      );
+      if (mounted) {
+        setState(() {
+          _selected.clear();
+          _selecting = false;
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     final manager = sl<DownloadManager>();
     final l10n = context.l10n;
-    return Scaffold(
-      backgroundColor: AppColors.bg,
-      appBar: AppBar(
-        backgroundColor: AppColors.bg,
-        surfaceTintColor: Colors.transparent,
-        title: Text(l10n.downloads, style: AppText.headline),
-        leading: IconButton(
-          key: const ValueKey('downloads-back-to-grid'),
-          tooltip: MaterialLocalizations.of(context).backButtonTooltip,
-          icon: const Icon(Icons.arrow_back_rounded),
-          onPressed: () => Navigator.of(context).pop(),
-        ),
-      ),
-      body: ListenableBuilder(
-        listenable: manager,
-        builder: (context, _) {
-          final records = [...?manager.byShow[showId]]
-            ..sort(
-              (a, b) => (a.episodeNumber ?? 0).compareTo(b.episodeNumber ?? 0),
-            );
-          if (records.isEmpty) {
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (context.mounted &&
-                  ModalRoute.of(context)?.isCurrent == true) {
-                Navigator.of(context).pop();
-              }
-            });
-            return const SizedBox.shrink();
-          }
-          final head = records.first;
-          final q = query.trim().toLowerCase();
-          final episodes = q.isEmpty || head.showTitle.toLowerCase().contains(q)
-              ? records
-              : records
-                    .where((r) => _episodeSearchText(r).contains(q))
-                    .toList();
-          final done = records.where((r) => r.status == DownloadStatus.done);
-          final bytes = done.fold<int>(0, (sum, r) => sum + r.bytesTotal);
-          return CustomScrollView(
-            slivers: [
-              SliverToBoxAdapter(
-                child: DownloadTitleSummary(
-                  title: head.showTitle,
-                  heroTag: ('download-video', showId),
-                  cover: head.cover,
-                  coverHeaders: head.coverHeaders,
-                  subtitle:
-                      '${l10n.ofTotalDownloaded(done.length, records.length)} · ${fmtDownloadSize(bytes)}',
-                  deleteTooltip: l10n.deleteAllEpisodesTooltip,
-                  onDelete: () => _confirmDeleteShow(context, records, manager),
-                ),
+    return ListenableBuilder(
+      listenable: manager,
+      builder: (context, _) {
+        final records = [...?manager.byShow[widget.showId]]
+          ..sort(
+            (a, b) => (a.episodeNumber ?? 0).compareTo(b.episodeNumber ?? 0),
+          );
+        final q = widget.query.trim().toLowerCase();
+        final episodes = records.isEmpty
+            ? <DownloadRecord>[]
+            : q.isEmpty || records.first.showTitle.toLowerCase().contains(q)
+            ? records
+            : records.where((r) => _episodeSearchText(r).contains(q)).toList();
+        if (episodes.isEmpty) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (context.mounted && ModalRoute.of(context)?.isCurrent == true) {
+              Navigator.of(context).pop();
+            }
+          });
+          return const SizedBox.shrink();
+        }
+        final head = records.first;
+        final chosen = episodes.where((r) => _selected.contains(r.id)).toList();
+        final allSelected = chosen.length == episodes.length;
+        final done = records.where((r) => r.status == DownloadStatus.done);
+        final bytes = done.fold<int>(0, (sum, r) => sum + r.bytesTotal);
+        return PopScope<Object?>(
+          canPop: !_selecting && !_busy,
+          onPopInvokedWithResult: (didPop, _) {
+            if (!didPop) _clearSelection();
+          },
+          child: Scaffold(
+            backgroundColor: AppColors.bg,
+            appBar: AppBar(
+              backgroundColor: AppColors.bg,
+              surfaceTintColor: Colors.transparent,
+              title: Text(
+                _selecting
+                    ? l10n.selectedEpisodesOfTotal(
+                        chosen.length,
+                        episodes.length,
+                      )
+                    : l10n.downloads,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: AppText.headline,
               ),
-              SliverPadding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 20,
-                  vertical: 12,
+              leading: IconButton(
+                key: const ValueKey('downloads-back-to-grid'),
+                tooltip: _selecting
+                    ? l10n.cancel
+                    : MaterialLocalizations.of(context).backButtonTooltip,
+                icon: Icon(
+                  _selecting ? Icons.close_rounded : Icons.arrow_back_rounded,
                 ),
-                sliver: SliverToBoxAdapter(
-                  child: Text(
-                    l10n.episodes,
-                    style: AppText.body.copyWith(fontWeight: FontWeight.w700),
+                onPressed: _busy
+                    ? null
+                    : _selecting
+                    ? _clearSelection
+                    : () => Navigator.of(context).pop(),
+              ),
+              actions: [
+                if (_selecting) ...[
+                  IconButton(
+                    tooltip: allSelected ? l10n.clear : l10n.selectAll,
+                    icon: Icon(
+                      allSelected
+                          ? Icons.deselect_rounded
+                          : Icons.select_all_rounded,
+                    ),
+                    onPressed: _busy
+                        ? null
+                        : () => setState(() {
+                            if (allSelected) {
+                              _selected.clear();
+                            } else {
+                              _selected.addAll(episodes.map((r) => r.id));
+                            }
+                          }),
+                  ),
+                  IconButton(
+                    tooltip: l10n.delete,
+                    icon: _busy
+                        ? const SizedBox.square(
+                            dimension: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.delete_outline_rounded),
+                    onPressed: _busy || chosen.isEmpty
+                        ? null
+                        : () => _deleteSelected(chosen, episodes.length),
+                  ),
+                ] else
+                  IconButton(
+                    tooltip: l10n.selectEpisodes,
+                    icon: const Icon(Icons.checklist_rounded),
+                    onPressed: () => setState(() => _selecting = true),
+                  ),
+              ],
+            ),
+            body: CustomScrollView(
+              slivers: [
+                SliverToBoxAdapter(
+                  child: DownloadTitleSummary(
+                    title: head.showTitle,
+                    heroTag: ('download-video', widget.showId),
+                    cover: head.cover,
+                    coverHeaders: head.coverHeaders,
+                    subtitle:
+                        '${l10n.ofTotalDownloaded(done.length, records.length)} · ${fmtDownloadSize(bytes)}',
+                    deleteTooltip: l10n.deleteAllEpisodesTooltip,
+                    onDelete: _selecting || _busy
+                        ? null
+                        : () => _confirmDeleteShow(context, records, manager),
                   ),
                 ),
-              ),
-              SliverList.separated(
-                itemCount: episodes.length,
-                itemBuilder: (context, index) => DownloadTile(
-                  record: episodes[index],
-                  manager: manager,
-                  resume: sl<ResumeStore>(),
-                  compact: true,
+                SliverPadding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 12,
+                  ),
+                  sliver: SliverToBoxAdapter(
+                    child: Text(
+                      l10n.episodes,
+                      style: AppText.body.copyWith(fontWeight: FontWeight.w700),
+                    ),
+                  ),
                 ),
-                separatorBuilder: (_, _) => const Divider(
-                  height: 12,
-                  indent: 56,
-                  endIndent: 20,
-                  color: AppColors.hairline,
+                SliverList.separated(
+                  itemCount: episodes.length,
+                  itemBuilder: (context, index) {
+                    final record = episodes[index];
+                    return DownloadTile(
+                      record: record,
+                      manager: manager,
+                      resume: sl<ResumeStore>(),
+                      compact: true,
+                      selected: _selected.contains(record.id),
+                      onSelect: _selecting
+                          ? () => _toggleSelection(record.id)
+                          : null,
+                      onLongPress: () => _toggleSelection(record.id),
+                    );
+                  },
+                  separatorBuilder: (_, _) => const Divider(
+                    height: 12,
+                    indent: 56,
+                    endIndent: 20,
+                    color: AppColors.hairline,
+                  ),
                 ),
-              ),
-              SliverToBoxAdapter(
-                child: SizedBox(
-                  height: MediaQuery.paddingOf(context).bottom + 24,
+                SliverToBoxAdapter(
+                  child: SizedBox(
+                    height: MediaQuery.paddingOf(context).bottom + 24,
+                  ),
                 ),
-              ),
-            ],
-          );
-        },
-      ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 }
@@ -890,8 +1019,14 @@ class DownloadTile extends StatelessWidget {
     required this.manager,
     this.resume,
     this.compact = false,
+    this.selected = false,
+    this.onSelect,
+    this.onLongPress,
   });
   final bool compact;
+  final bool selected;
+  final VoidCallback? onSelect;
+  final VoidCallback? onLongPress;
   final DownloadRecord record;
   final DownloadManager manager;
 
@@ -988,8 +1123,22 @@ class DownloadTile extends StatelessWidget {
       dense: compact,
       minLeadingWidth: compact ? 28 : null,
       contentPadding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
-      onTap: isDone ? () => _play(context) : null,
-      leading: compact
+      onTap: onSelect ?? (isDone ? () => _play(context) : null),
+      onLongPress: onLongPress,
+      selected: selected && onSelect != null,
+      selectedTileColor: AppColors.accentSoft,
+      leading: onSelect != null
+          ? SizedBox(
+              width: 28,
+              height: 32,
+              child: Checkbox(
+                value: selected,
+                activeColor: AppColors.accent,
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                onChanged: (_) => onSelect!(),
+              ),
+            )
+          : compact
           ? SizedBox(
               width: 28,
               height: 32,
@@ -1032,7 +1181,9 @@ class DownloadTile extends StatelessWidget {
           ],
         ],
       ),
-      trailing: _TileMenu(record: record, manager: manager),
+      trailing: onSelect == null
+          ? _TileMenu(record: record, manager: manager)
+          : null,
     );
   }
 }
