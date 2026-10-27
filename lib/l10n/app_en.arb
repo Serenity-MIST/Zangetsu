@@ -1424,6 +1424,30 @@
 			}
 		}
 	},
+	"downloadSizeEstimate": "{perEpisode} / episode · {total} total",
+	"@downloadSizeEstimate": {
+		"placeholders": {
+			"perEpisode": {
+				"type": "String"
+			},
+			"total": {
+				"type": "String"
+			}
+		}
+	},
+	"storageLowTitle": "Not enough space?",
+	"storageLowBody": "This needs about {need} but only {free} is free. Download anyway?",
+	"@storageLowBody": {
+		"placeholders": {
+			"need": {
+				"type": "String"
+			},
+			"free": {
+				"type": "String"
+			}
+		}
+	},
+	"downloadAnyway": "Download anyway",
 	"chapterOneAtATimeWarning": "This runs one chapter at a time and can take a long while. You can stop it from Downloads.",
 	"queuedChapters": "Queued {count, plural, one{1 chapter} other{{count} chapters}}",
 	"@queuedChapters": {

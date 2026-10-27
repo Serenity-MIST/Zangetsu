@@ -475,25 +475,28 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
     String category,
   ) async {
     final item = widget.item;
-    final res =
-        await showModalBottomSheet<
-          ({VideoSource chosen, List<VideoSource> all})
-        >(
-          context: context,
-          backgroundColor: AppColors.surface,
-          isScrollControlled: true,
-          shape: const RoundedRectangleBorder(
-            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-          ),
-          builder: (_) => _SourcePickerSheet(
-            title: ep.title.trim().isNotEmpty ? ep.title : detail.title,
-            category: category,
-            resolve: () => sl<CatalogueRepository>().sources(
-              ep.url,
-              sourceId: item.sourceId,
-            ),
-          ),
-        );
+    final res = await showModalBottomSheet<_SingleDownloadChoice>(
+      context: context,
+      backgroundColor: AppColors.surface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => _SourcePickerSheet(
+        title: ep.title.trim().isNotEmpty ? ep.title : detail.title,
+        category: category,
+        episode: ep,
+        availableCategories: [
+          if ((detail.subCount ?? 0) > 0) 'sub',
+          if ((detail.dubCount ?? 0) > 0) 'dub',
+        ],
+        resolveEpisodes: _episodesByCategory,
+        resolve: (episode) => sl<CatalogueRepository>().sources(
+          episode.url,
+          sourceId: item.sourceId,
+        ),
+      ),
+    );
     if (res == null || !mounted) return;
     unawaited(
       sl<DownloadManager>().enqueueSource(
@@ -503,8 +506,8 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
         cover: detail.cover ?? item.cover,
         coverHeaders: detail.coverHeaders ?? item.coverHeaders,
         showUrl: item.url,
-        category: category,
-        episode: ep,
+        category: res.category,
+        episode: res.episode,
         source: res.chosen,
         qualityLabel: res.chosen.quality ?? 'auto',
         fallbacks: res.all,

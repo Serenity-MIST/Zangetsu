@@ -495,6 +495,42 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
                 }
             }
 
+        // Unknown document providers return null rather than measuring a different drive.
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "zangetsu/storage")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "freeBytes" -> {
+                        try {
+                            val destination = call.argument<String>("destination")
+                            val privateStorage = call.argument<Boolean>("privateStorage") == true
+                            val storagePath = when {
+                                privateStorage -> applicationContext.filesDir.path
+                                destination.isNullOrBlank() -> android.os.Environment.getExternalStorageDirectory().path
+                                destination.startsWith("/") -> destination
+                                destination.startsWith("content://") -> {
+                                    val root = android.provider.DocumentsContract
+                                        .getTreeDocumentId(Uri.parse(destination)).substringBefore(':')
+                                    val sm = getSystemService(STORAGE_SERVICE) as StorageManager
+                                    getExternalFilesDirs(null).firstOrNull { file ->
+                                        if (file == null) false else {
+                                            val volume = sm.getStorageVolume(file)
+                                            if (root.equals("primary", ignoreCase = true)) volume?.isPrimary == true
+                                            else volume?.uuid?.equals(root, ignoreCase = true) == true
+                                        }
+                                    }?.path
+                                }
+                                else -> null
+                            }
+                            result.success(storagePath?.let { android.os.StatFs(it).availableBytes })
+                        } catch (e: Exception) {
+                            android.util.Log.w("storage", "freeBytes failed: ${e.message}")
+                            result.success(null)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
         // Volume-key paging: the reader turns this on while it's open and off
         // when it closes. Bidirectional — Dart sets the flag, native pushes
         // "volumeKey" back with the direction.

@@ -3287,6 +3287,22 @@ class AppLocalizationsFr extends AppLocalizations {
   }
 
   @override
+  String downloadSizeEstimate(String perEpisode, String total) {
+    return '$perEpisode / episode · $total total';
+  }
+
+  @override
+  String get storageLowTitle => 'Not enough space?';
+
+  @override
+  String storageLowBody(String need, String free) {
+    return 'This needs about $need but only $free is free. Download anyway?';
+  }
+
+  @override
+  String get downloadAnyway => 'Download anyway';
+
+  @override
   String get chapterOneAtATimeWarning =>
       'Le téléchargement se fait chapitre par chapitre et peut prendre beaucoup de temps. Vous pouvez l\'interrompre depuis la section Téléchargements.';
 

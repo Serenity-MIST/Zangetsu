@@ -1,7 +1,6 @@
 // Source picker and download sheets.
 part of 'detail_screen.dart';
 
-
 /// A readable name for a source row. Providers like 4khdhub set a rich [label];
 /// AllAnime sets neither label nor quality, so fall back to the host (or a
 /// numbered server) instead of rendering a blank row.
@@ -19,16 +18,29 @@ String _sourceName(AppLocalizations l10n, VideoSource s, int index) {
 // Server/mirror picker (CloudStream-style) — resolves the episode's sources
 // and lists them so the user downloads a specific, real link. Returns the
 // chosen VideoSource via pop. HLS sources are shown disabled (phase 2).
+typedef _SingleDownloadChoice = ({
+  VideoSource chosen,
+  List<VideoSource> all,
+  Episode episode,
+  String category,
+});
+
 class _SourcePickerSheet extends StatefulWidget {
   const _SourcePickerSheet({
     required this.title,
     required this.category,
     required this.resolve,
+    required this.episode,
+    required this.availableCategories,
+    required this.resolveEpisodes,
   });
 
   final String title;
   final String category;
-  final Future<List<VideoSource>> Function() resolve;
+  final Episode episode;
+  final List<String> availableCategories;
+  final Future<Map<int, List<Episode>>> Function(String) resolveEpisodes;
+  final Future<List<VideoSource>> Function(Episode) resolve;
 
   @override
   State<_SourcePickerSheet> createState() => _SourcePickerSheetState();
@@ -38,28 +50,58 @@ class _SourcePickerSheetState extends State<_SourcePickerSheet> {
   List<VideoSource>? _sources;
   bool _loading = true;
   bool _loadFailed = false;
+  late String _category;
+  Episode? _episode;
+  int _request = 0;
 
   @override
   void initState() {
     super.initState();
-    _load();
+    _category = widget.category;
+    _load(_category);
   }
 
-  Future<void> _load() async {
+  Future<void> _load(String category) async {
+    final request = ++_request;
+    setState(() {
+      _category = category;
+      _episode = null;
+      _sources = null;
+      _loading = true;
+      _loadFailed = false;
+    });
     try {
-      final sources = await widget.resolve();
-      if (mounted) {
-        setState(
-          () => _sources = DownloadManager.sourcesForDownloadCategory(
-            sources,
-            widget.category,
-          ),
-        );
+      Episode? episode = widget.episode;
+      if (category != widget.category) {
+        final seasons = await widget.resolveEpisodes(category);
+        if (!mounted || request != _request) return;
+        final original = widget.episode;
+        final pool = seasons[seasonOf(original) ?? 1] ?? <Episode>[];
+        final matches = pool
+            .where(
+              (candidate) => original.number != null
+                  ? candidate.number == original.number
+                  : candidate.url == original.url ||
+                        (original.title.trim().isNotEmpty &&
+                            candidate.title.trim() == original.title.trim()),
+            )
+            .toList();
+        episode = matches.length == 1 ? matches.single : null;
       }
+      if (episode == null) return;
+      final sources = await widget.resolve(episode);
+      if (!mounted || request != _request) return;
+      setState(() {
+        _episode = episode;
+        _sources = DownloadManager.sourcesForDownloadCategory(
+          sources,
+          category,
+        );
+      });
     } catch (_) {
-      if (mounted) setState(() => _loadFailed = true);
+      if (mounted && request == _request) setState(() => _loadFailed = true);
     } finally {
-      if (mounted) setState(() => _loading = false);
+      if (mounted && request == _request) setState(() => _loading = false);
     }
   }
 
@@ -91,7 +133,10 @@ class _SourcePickerSheetState extends State<_SourcePickerSheet> {
             ),
             Padding(
               padding: const EdgeInsetsDirectional.only(end: 8),
-              child: Text(context.l10n.downloadChooseServer, style: AppText.title),
+              child: Text(
+                context.l10n.downloadChooseServer,
+                style: AppText.title,
+              ),
             ),
             const SizedBox(height: 4),
             Padding(
@@ -104,6 +149,27 @@ class _SourcePickerSheetState extends State<_SourcePickerSheet> {
               ),
             ),
             const SizedBox(height: 12),
+            if (widget.availableCategories.length > 1)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Wrap(
+                  spacing: 8,
+                  children: [
+                    for (final category in widget.availableCategories)
+                      ChoiceChip(
+                        label: Text(
+                          category == 'dub'
+                              ? context.l10n.dub
+                              : context.l10n.sub,
+                        ),
+                        selected: _category == category,
+                        onSelected: (_) {
+                          if (_category != category) _load(category);
+                        },
+                      ),
+                  ],
+                ),
+              ),
             if (_loading)
               Padding(
                 padding: EdgeInsets.symmetric(vertical: 28),
@@ -150,8 +216,16 @@ class _SourcePickerSheetState extends State<_SourcePickerSheet> {
       if (s.quality != null && s.quality!.trim().isNotEmpty) s.quality!.trim(),
       hls ? context.l10n.hls : context.l10n.direct,
     ].join(' · ');
-    void onTap() =>
-        Navigator.pop(context, (chosen: s, all: _sources ?? <VideoSource>[s]));
+    void onTap() {
+      if (_loading || _episode == null) return;
+      Navigator.pop(context, (
+        chosen: s,
+        all: _sources ?? <VideoSource>[s],
+        episode: _episode!,
+        category: _category,
+      ));
+    }
+
     if (sl<AppMode>().isTv) {
       return TvListFocusable(
         autofocus: i == 0,
@@ -191,8 +265,8 @@ class _SourcePickerSheetState extends State<_SourcePickerSheet> {
 
 // Download sheet — season dropdown (multi-season) + a real SOURCE/quality list
 // (resolved from the season's first episode, like the player) + tappable
-// thumbnail episode rows you multi-select. Returns the chosen (quality,
-// episodes) via pop; the quality drives per-episode source selection.
+// thumbnail episode rows you multi-select. The selected quality is applied
+// separately to each episode; single downloads use the server picker above.
 class _DownloadSheet extends StatefulWidget {
   const _DownloadSheet({
     required this.title,
@@ -242,6 +316,17 @@ class _DownloadSheetState extends State<_DownloadSheet> {
   List<VideoSource>? _sources; // null = loading, [] = none found
   bool _loadingSources = true;
   int _selectedSourceIdx = 0;
+
+  // ~size for the selected source (first episode only; totals scale by
+  // episode count). Keyed so a stale fetch can't overwrite a newer pick.
+  int? _sizePerEpisode;
+  bool _sizeSolid = false;
+  Object? _sizeKey;
+  Episode? _sourceEpisode;
+  int _sourceRequest = 0;
+  int _categoryRequest = 0;
+  bool _submitting = false;
+  bool get _downloadBusy => _submitting;
 
   // Episode search/filter (phone + TV). No autofocus so the TV leanback
   // keyboard doesn't pop the moment the sheet opens.
@@ -334,7 +419,9 @@ class _DownloadSheetState extends State<_DownloadSheet> {
   /// different URLs), keep the season if it still exists, then re-resolve the
   /// source/quality options.
   Future<void> _setCategory(String cat) async {
-    if (cat == _category) return;
+    if (cat == _category || _submitting) return;
+    final request = ++_categoryRequest;
+    _sourceRequest++;
     setState(() {
       _category = cat;
       _loadingSources = true;
@@ -342,7 +429,7 @@ class _DownloadSheetState extends State<_DownloadSheet> {
     });
     try {
       final byS = await widget.resolveEpisodes(cat);
-      if (!mounted) return;
+      if (!mounted || request != _categoryRequest) return;
       final seasons = byS.keys.toList()..sort();
       final season = byS.containsKey(_season)
           ? _season
@@ -363,10 +450,14 @@ class _DownloadSheetState extends State<_DownloadSheet> {
       await _resolveSources();
       _syncWheel();
     } catch (_) {
-      if (mounted) {
+      if (mounted && request == _categoryRequest) {
         setState(() {
           _loadingSources = false;
           _sources = [];
+          _episodesBySeason = {};
+          _byId = {};
+          _selectedIds.clear();
+          _count = 0;
         });
       }
     }
@@ -381,6 +472,7 @@ class _DownloadSheetState extends State<_DownloadSheet> {
   /// server/quality options (the batch download applies the chosen quality to
   /// every selected episode).
   Future<void> _resolveSources() async {
+    final request = ++_sourceRequest;
     setState(() {
       _loadingSources = true;
       _sources = null;
@@ -395,10 +487,14 @@ class _DownloadSheetState extends State<_DownloadSheet> {
     }
     try {
       final all = await widget.resolve(eps.first);
-      if (!mounted) return;
+      if (!mounted || request != _sourceRequest) return;
       // HLS + direct are both downloadable now; show them all, best first.
-      final ranked = all.toList()..sort((a, b) => _h(b).compareTo(_h(a)));
+      final ranked = DownloadManager.sourcesForDownloadCategory(
+        all,
+        _category,
+      ).toList()..sort((a, b) => _h(b).compareTo(_h(a)));
       setState(() {
+        _sourceEpisode = eps.first;
         _sources = ranked;
         _selectedSourceIdx = 0;
         _quality = ranked.isNotEmpty
@@ -407,12 +503,104 @@ class _DownloadSheetState extends State<_DownloadSheet> {
         _loadingSources = false;
       });
     } catch (_) {
-      if (mounted) {
+      if (mounted && request == _sourceRequest) {
         setState(() {
           _loadingSources = false;
           _sources = [];
         });
       }
+    }
+  }
+
+  /// Refresh the ~size for the selected source. Cheap no-op unless the
+  /// source or first episode changed (key guard); safe to call from build.
+  /// Only the first episode is fetched — per-episode sizes vary, so every
+  /// number shown wears a "~".
+  void _refreshSize() {
+    final srcs = _sources;
+    VideoSource? src;
+    if (srcs != null && srcs.isNotEmpty && _selectedSourceIdx < srcs.length) {
+      src = srcs[_selectedSourceIdx];
+    }
+    final first = _sourceEpisode;
+    final key = (
+      src?.url,
+      src?.quality,
+      src?.headers?.toString(),
+      first?.url,
+      first?.runtimeMinutes,
+    );
+    if (key == _sizeKey) return;
+    _sizeKey = key;
+    _sizePerEpisode = null;
+    _sizeSolid = false;
+    if (src == null) return;
+    estimateEpisodeBytes(src, runtimeMinutes: first?.runtimeMinutes).then((
+      est,
+    ) {
+      if (!mounted || key != _sizeKey) return;
+      setState(() {
+        _sizePerEpisode = est?.bytes;
+        _sizeSolid = est?.solid ?? false;
+      });
+    });
+  }
+
+  Widget _sizeLine(int count, {bool centered = false}) {
+    final perEp = _sizePerEpisode;
+    if (perEp == null || count == 0) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Text(
+        context.l10n.downloadSizeEstimate(
+          formatApproxBytes(perEp),
+          formatApproxBytes(perEp * count),
+        ),
+        textAlign: centered ? TextAlign.center : TextAlign.start,
+        style: AppText.caption.copyWith(color: AppColors.textSecondary),
+      ),
+    );
+  }
+
+  /// Pop with the chosen episodes, warning first when a SOLID estimate
+  /// exceeds free storage. Guesses and unknowns skip the warning silently —
+  /// no false alarms.
+  Future<void> _popDownload(List<Episode> episodes) async {
+    if (_downloadBusy || episodes.isEmpty) return;
+    final choice = (
+      quality: _quality,
+      category: _category,
+      episodes: List<Episode>.of(episodes),
+    );
+    final perEp = _sizePerEpisode;
+    setState(() => _submitting = true);
+    try {
+      if (perEp != null && _sizeSolid) {
+        final prefs = sl<DownloadPrefs>();
+        final total = perEp * episodes.length;
+        final free = await StorageInfo.freeBytes(
+          destination: prefs.locationUri,
+          privateStorage: prefs.keepPrivate,
+        );
+        if (!mounted || ModalRoute.of(context)?.isCurrent != true) return;
+        if (free != null && total > free) {
+          final go = await AppDialog.confirm(
+            context,
+            title: context.l10n.storageLowTitle,
+            message: context.l10n.storageLowBody(
+              formatApproxBytes(total),
+              formatApproxBytes(free),
+            ),
+            confirmLabel: context.l10n.downloadAnyway,
+          );
+          if (!go || !mounted) return;
+        }
+      }
+      if (mounted && ModalRoute.of(context)?.isCurrent == true) {
+        Navigator.pop(context, choice);
+      }
+    } finally {
+      if (mounted) setState(() => _submitting = false);
     }
   }
 
@@ -481,6 +669,7 @@ class _DownloadSheetState extends State<_DownloadSheet> {
   Widget build(BuildContext context) {
     if (widget.minimal) return _buildMinimal(context);
     final count = _selectedIds.length;
+    _refreshSize();
     return SafeArea(
       top: false,
       child: Padding(
@@ -538,6 +727,7 @@ class _DownloadSheetState extends State<_DownloadSheet> {
             Text(context.l10n.playerInfoSource, style: AppText.overline),
             const SizedBox(height: 8),
             _sourceSection(),
+            _sizeLine(count),
 
             // ── Episode multi-select (horizontal thumbnail cards) ──────────
             const SizedBox(height: 20),
@@ -612,13 +802,9 @@ class _DownloadSheetState extends State<_DownloadSheet> {
             if (sl<AppMode>().isTv)
               TvFocusable(
                 autofocus: true,
-                onTap: count == 0
+                onTap: count == 0 || _downloadBusy
                     ? () {}
-                    : () => Navigator.pop(context, (
-                        quality: _quality,
-                        category: _category,
-                        episodes: _selectedEpisodes,
-                      )),
+                    : () => _popDownload(_selectedEpisodes),
                 semanticLabel: count == 0
                     ? context.l10n.selectEpisodes
                     : context.l10n.downloadCountEpisodes(count),
@@ -654,13 +840,9 @@ class _DownloadSheetState extends State<_DownloadSheet> {
                 borderRadius: BorderRadius.circular(10),
                 clipBehavior: Clip.antiAlias,
                 child: InkWell(
-                  onTap: count == 0
+                  onTap: count == 0 || _downloadBusy
                       ? null
-                      : () => Navigator.pop(context, (
-                          quality: _quality,
-                          category: _category,
-                          episodes: _selectedEpisodes,
-                        )),
+                      : () => _popDownload(_selectedEpisodes),
                   child: SizedBox(
                     height: 50,
                     width: double.infinity,
@@ -775,7 +957,10 @@ class _DownloadSheetState extends State<_DownloadSheet> {
                     padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
                     child: Align(
                       alignment: AlignmentDirectional.centerStart,
-                      child: Text(context.l10n.startFrom, style: AppText.headline),
+                      child: Text(
+                        context.l10n.startFrom,
+                        style: AppText.headline,
+                      ),
                     ),
                   ),
                   if (pool.length > 8)
@@ -821,7 +1006,8 @@ class _DownloadSheetState extends State<_DownloadSheet> {
                         final idx = pool.indexOf(ep);
                         final n = ep.number?.toInt() ?? (idx + 1);
                         final title = ep.title.trim();
-                        final hasTitle = title.isNotEmpty &&
+                        final hasTitle =
+                            title.isNotEmpty &&
                             title != context.l10n.episodeLabel(n);
                         return ListTile(
                           title: Text(
@@ -833,7 +1019,10 @@ class _DownloadSheetState extends State<_DownloadSheet> {
                             overflow: TextOverflow.ellipsis,
                           ),
                           trailing: idx == _startIdx
-                              ? Icon(Icons.check_rounded, color: AppColors.accent)
+                              ? Icon(
+                                  Icons.check_rounded,
+                                  color: AppColors.accent,
+                                )
                               : null,
                           onTap: () => Navigator.pop(ctx, idx),
                         );
@@ -884,7 +1073,10 @@ class _DownloadSheetState extends State<_DownloadSheet> {
               padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
               child: Align(
                 alignment: AlignmentDirectional.centerStart,
-                child: Text(context.l10n.playerInfoSource, style: AppText.headline),
+                child: Text(
+                  context.l10n.playerInfoSource,
+                  style: AppText.headline,
+                ),
               ),
             ),
             const Divider(color: AppColors.hairline, height: 1),
@@ -975,11 +1167,15 @@ class _DownloadSheetState extends State<_DownloadSheet> {
       );
     }
     if (_multiSeason) {
-      add(_minimalMetaSeg(context.l10n.seasonNumber(_season), onTap: _pickSeason));
+      add(
+        _minimalMetaSeg(context.l10n.seasonNumber(_season), onTap: _pickSeason),
+      );
     }
     // "From E{n}" — the movable start point (searchable picker).
     if (_minimalPool.length > 1) {
-      add(_minimalMetaSeg(context.l10n.fromEpisode(_startNum), onTap: _pickStart));
+      add(
+        _minimalMetaSeg(context.l10n.fromEpisode(_startNum), onTap: _pickStart),
+      );
     }
     final srcs = _sources ?? const <VideoSource>[];
     add(
@@ -989,10 +1185,7 @@ class _DownloadSheetState extends State<_DownloadSheet> {
       ),
     );
 
-    return Wrap(
-      crossAxisAlignment: WrapCrossAlignment.center,
-      children: segs,
-    );
+    return Wrap(crossAxisAlignment: WrapCrossAlignment.center, children: segs);
   }
 
   Widget _wheelPicker() {
@@ -1074,7 +1267,11 @@ class _DownloadSheetState extends State<_DownloadSheet> {
     final count = eps.length;
     final preview = eps.isEmpty
         ? ''
-        : context.l10n.episodeCountWithRange(count, _rangeLabel(context.l10n, eps));
+        : context.l10n.episodeCountWithRange(
+            count,
+            _rangeLabel(context.l10n, eps),
+          );
+    _refreshSize();
     return SafeArea(
       top: false,
       child: Padding(
@@ -1127,6 +1324,7 @@ class _DownloadSheetState extends State<_DownloadSheet> {
                 style: AppText.caption.copyWith(color: AppColors.textTertiary),
               ),
             ),
+            Center(child: _sizeLine(count, centered: true)),
             const SizedBox(height: 12),
             Row(
               mainAxisAlignment: MainAxisAlignment.end,
@@ -1138,13 +1336,9 @@ class _DownloadSheetState extends State<_DownloadSheet> {
                 const SizedBox(width: 26),
                 _minimalTextBtn(
                   context.l10n.download,
-                  onTap: count == 0
+                  onTap: count == 0 || _downloadBusy
                       ? null
-                      : () => Navigator.pop(context, (
-                          quality: _quality,
-                          category: _category,
-                          episodes: _minimalEpisodes,
-                        )),
+                      : () => _popDownload(_minimalEpisodes),
                 ),
               ],
             ),
@@ -1231,6 +1425,9 @@ class _DownloadSheetState extends State<_DownloadSheet> {
   }
 
   Widget _sourceSection() {
+    if (!_loadingSources && _seasonEps.isEmpty) {
+      return Text(context.l10n.noEpisodesToDownload, style: AppText.caption);
+    }
     if (_loadingSources) {
       return Padding(
         padding: EdgeInsets.symmetric(vertical: 16),
@@ -1272,10 +1469,14 @@ class _DownloadSheetState extends State<_DownloadSheet> {
     final sel = i == _selectedSourceIdx;
     final label = _sourceName(context.l10n, s, i);
     final hasQuality = s.quality != null && s.quality!.trim().isNotEmpty;
-    void onTap() => setState(() {
-      _selectedSourceIdx = i;
-      _quality = hasQuality ? s.quality!.trim() : 'best';
-    });
+    void onTap() {
+      if (_submitting) return;
+      setState(() {
+        _selectedSourceIdx = i;
+        _quality = hasQuality ? s.quality!.trim() : 'best';
+      });
+    }
+
     final content = Row(
       children: [
         Icon(
@@ -1309,7 +1510,8 @@ class _DownloadSheetState extends State<_DownloadSheet> {
       // checked radio; focus = TvFocusable's ring.
       return Padding(
         padding: const EdgeInsets.only(bottom: 8),
-        child: TvListFocusable( // full-width row — scaling overflows the sheet edges
+        child: TvListFocusable(
+          // full-width row — scaling overflows the sheet edges
           onTap: onTap,
           semanticLabel: hasQuality ? '$label, ${s.quality!.trim()}' : label,
           child: Material(
@@ -1368,7 +1570,12 @@ class _DownloadSheetState extends State<_DownloadSheet> {
       padding: const EdgeInsets.fromLTRB(16, 12, 12, 12),
       child: Row(
         children: [
-          Expanded(child: Text('${context.l10n.season} $_season', style: AppText.headline)),
+          Expanded(
+            child: Text(
+              '${context.l10n.season} $_season',
+              style: AppText.headline,
+            ),
+          ),
           const Icon(
             Icons.keyboard_arrow_down_rounded,
             color: AppColors.textPrimary,

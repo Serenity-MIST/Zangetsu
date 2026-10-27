@@ -5992,6 +5992,30 @@ abstract class AppLocalizations {
   /// **'{count, plural, one{Download 1 episode} other{Download {count} episodes}}'**
   String downloadCountEpisodes(int count);
 
+  /// No description provided for @downloadSizeEstimate.
+  ///
+  /// In en, this message translates to:
+  /// **'{perEpisode} / episode · {total} total'**
+  String downloadSizeEstimate(String perEpisode, String total);
+
+  /// No description provided for @storageLowTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Not enough space?'**
+  String get storageLowTitle;
+
+  /// No description provided for @storageLowBody.
+  ///
+  /// In en, this message translates to:
+  /// **'This needs about {need} but only {free} is free. Download anyway?'**
+  String storageLowBody(String need, String free);
+
+  /// No description provided for @downloadAnyway.
+  ///
+  /// In en, this message translates to:
+  /// **'Download anyway'**
+  String get downloadAnyway;
+
   /// No description provided for @chapterOneAtATimeWarning.
   ///
   /// In en, this message translates to:

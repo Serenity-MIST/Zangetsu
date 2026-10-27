@@ -22,6 +22,7 @@ import 'package:watch_app/core/download/chapter_downloader.dart';
 import 'package:watch_app/core/download/download_manager.dart';
 import 'package:watch_app/core/download/download_record.dart';
 import 'package:watch_app/core/models/episode.dart';
+import 'package:watch_app/core/metadata/episode_metadata_service.dart';
 import 'package:watch_app/core/models/media_detail.dart';
 import 'package:watch_app/core/models/media_item.dart';
 import 'package:watch_app/core/models/provider_info.dart';
@@ -358,6 +359,54 @@ class _FakePlaybackPrefs extends PlaybackPrefs {
 
   @override
   String get batchDownloadStyle => batchStyle;
+}
+
+class _DownloadRepository extends _StubSourceRepository {
+  _DownloadRepository(this.sub, this.dub, {this.failDub = false}) : super(sub);
+  final bool failDub;
+  final MediaDetail sub;
+  final MediaDetail dub;
+  @override
+  Future<MediaDetail> detail(
+    String url, {
+    String category = 'sub',
+    String? sourceId,
+    void Function(MediaDetail partial)? onPartial,
+    bool Function()? abandoned,
+  }) async {
+    if (category == 'dub' && failDub) throw StateError('Dub unavailable');
+    return category == 'dub' ? dub : sub;
+  }
+
+  @override
+  Future<List<VideoSource>> sources(
+    String url, {
+    String? sourceId,
+    bool fast = false,
+  }) async => const [
+    VideoSource(url: 'https://test/a.mp4', label: 'Mirror A', quality: '720p'),
+    VideoSource(
+      url: 'https://test/b.mp4',
+      label: 'Mirror B',
+      quality: '720p',
+      headers: {'Referer': 'https://test/'},
+    ),
+  ];
+}
+
+class _RecordingDownloads extends _FakeDownloadManager {
+  Symbol? method;
+  Map<Symbol, dynamic> arguments = {};
+  @override
+  dynamic noSuchMethod(Invocation invocation) {
+    if (invocation.memberName == #enqueueSource ||
+        invocation.memberName == #enqueueEpisodes) {
+      method = invocation.memberName;
+      arguments = invocation.namedArguments;
+      return Future<void>.value();
+    }
+    return super.noSuchMethod(invocation);
+  }
 }
 
 // ── Test data ────────────────────────────────────────────────────────────────
@@ -816,6 +865,198 @@ void main() {
 
     expect(find.byTooltip('Custom range'), findsNothing);
     expect(find.text('From E1'), findsOneWidget);
+  });
+
+  testWidgets('single download keeps the original server-picker sheet', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 2400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    sl.registerSingleton<EpisodeMetadataService>(EpisodeMetadataService(Dio()));
+    final sub = _animeDetail.copyWith(subCount: 2, dubCount: 2);
+    final dub = sub.copyWith(
+      episodes: const [
+        Episode(id: 'd1', title: 'Dub 1', url: '/dub1', number: 1),
+        Episode(id: 'd2', title: 'Dub 2', url: '/dub2', number: 2),
+      ],
+    );
+    sl.registerSingleton<SourceRepository>(_DownloadRepository(sub, dub));
+    sl.registerSingleton<CatalogueRepository>(sl<SourceRepository>());
+    final downloads = _RecordingDownloads();
+    await sl.unregister<DownloadManager>();
+    sl.registerSingleton<DownloadManager>(downloads);
+    await tester.pumpWidget(
+      const MaterialApp(home: DetailScreen(item: _animeItem)),
+    );
+    await tester.pump();
+    await tester.pump();
+    await tester.tap(find.byTooltip('Download episode').last);
+    await tester.pumpAndSettle();
+    expect(find.text('Download 1 episode'), findsNothing);
+    await tester.tap(find.text('Mirror B').last);
+    await tester.pumpAndSettle();
+    expect(downloads.method, #enqueueSource);
+    expect((downloads.arguments[#episode] as Episode).url, '/e2');
+    expect(downloads.arguments[#category], 'sub');
+    final chosen = downloads.arguments[#source] as VideoSource;
+    expect(chosen.url, 'https://test/b.mp4');
+    expect(chosen.headers?['Referer'], 'https://test/');
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets(
+    'compact single picker switches only the selected episode to Dub',
+    (tester) async {
+      tester.view.physicalSize = const Size(800, 2400);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      sl.registerSingleton<EpisodeMetadataService>(
+        EpisodeMetadataService(Dio()),
+      );
+      final sub = _animeDetail.copyWith(subCount: 2, dubCount: 2);
+      final dub = sub.copyWith(
+        episodes: const [
+          Episode(id: 'd1', title: 'Dub 1', url: '/dub1', number: 1),
+          Episode(id: 'd2', title: 'Dub 2', url: '/dub2', number: 2),
+        ],
+      );
+      sl.registerSingleton<SourceRepository>(_DownloadRepository(sub, dub));
+      sl.registerSingleton<CatalogueRepository>(sl<SourceRepository>());
+      final downloads = _RecordingDownloads();
+      await sl.unregister<DownloadManager>();
+      sl.registerSingleton<DownloadManager>(downloads);
+      await tester.pumpWidget(
+        const MaterialApp(home: DetailScreen(item: _animeItem)),
+      );
+      await tester.pump();
+      await tester.pump();
+      await tester.tap(find.byTooltip('Download episode').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Dub').last);
+      await tester.pumpAndSettle();
+      expect(find.text('Download 1 episode'), findsNothing);
+      await tester.tap(find.text('Mirror B').last);
+      await tester.pumpAndSettle();
+      expect(downloads.method, #enqueueSource);
+      expect((downloads.arguments[#episode] as Episode).url, '/dub2');
+      expect(downloads.arguments[#category], 'dub');
+      expect(
+        (downloads.arguments[#source] as VideoSource).url,
+        'https://test/b.mp4',
+      );
+      await tester.pump(const Duration(seconds: 3));
+      await tester.pumpAndSettle();
+    },
+  );
+
+  testWidgets('compact single picker clears servers when Dub is unavailable', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 2400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    sl.registerSingleton<EpisodeMetadataService>(EpisodeMetadataService(Dio()));
+    final sub = _animeDetail.copyWith(subCount: 2, dubCount: 2);
+    final dub = sub.copyWith(
+      episodes: const [
+        Episode(id: 'd1', title: 'Dub 1', url: '/dub1', number: 1),
+        Episode(id: 'd2', title: 'Dub 2', url: '/dub2', number: 2),
+      ],
+    );
+    sl.registerSingleton<SourceRepository>(
+      _DownloadRepository(sub, dub, failDub: true),
+    );
+    sl.registerSingleton<CatalogueRepository>(sl<SourceRepository>());
+    final downloads = _RecordingDownloads();
+    await sl.unregister<DownloadManager>();
+    sl.registerSingleton<DownloadManager>(downloads);
+    await tester.pumpWidget(
+      const MaterialApp(home: DetailScreen(item: _animeItem)),
+    );
+    await tester.pump();
+    await tester.pump();
+    await tester.tap(find.byTooltip('Download episode').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Dub').last);
+    await tester.pumpAndSettle();
+    expect(find.text('Download 1 episode'), findsNothing);
+    expect(find.text('Mirror B'), findsNothing);
+    expect(downloads.method, isNull);
+    await tester.tap(find.text('Sub').last);
+    await tester.pumpAndSettle();
+    expect(find.text('Mirror B'), findsOneWidget);
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pumpAndSettle();
+  });
+
+  testWidgets(
+    'compact single picker never substitutes a different Dub episode',
+    (tester) async {
+      tester.view.physicalSize = const Size(800, 2400);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      sl.registerSingleton<EpisodeMetadataService>(
+        EpisodeMetadataService(Dio()),
+      );
+      final sub = _animeDetail.copyWith(subCount: 2, dubCount: 2);
+      final dub = sub.copyWith(
+        episodes: const [
+          Episode(id: 'd1', title: 'Dub 1', url: '/dub1', number: 1),
+          Episode(id: 'd2', title: 'Dub 2', url: '/dub2', number: 2),
+        ],
+      );
+      sl.registerSingleton<SourceRepository>(
+        _DownloadRepository(sub, dub.copyWith(episodes: [dub.episodes.first])),
+      );
+      sl.registerSingleton<CatalogueRepository>(sl<SourceRepository>());
+      final downloads = _RecordingDownloads();
+      await sl.unregister<DownloadManager>();
+      sl.registerSingleton<DownloadManager>(downloads);
+      await tester.pumpWidget(
+        const MaterialApp(home: DetailScreen(item: _animeItem)),
+      );
+      await tester.pump();
+      await tester.pump();
+      await tester.tap(find.byTooltip('Download episode').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Dub').last);
+      await tester.pumpAndSettle();
+      expect(find.text('Download 1 episode'), findsNothing);
+      expect(find.text('Mirror B'), findsNothing);
+      expect(downloads.method, isNull);
+      await tester.tap(find.text('Sub').last);
+      await tester.pumpAndSettle();
+      expect(find.text('Mirror B'), findsOneWidget);
+      await tester.pump(const Duration(seconds: 3));
+      await tester.pumpAndSettle();
+    },
+  );
+
+  testWidgets('a failed language switch never keeps the old episode selected', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(800, 2400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    sl.registerSingleton<EpisodeMetadataService>(EpisodeMetadataService(Dio()));
+    final detail = _animeDetail.copyWith(subCount: 2, dubCount: 2);
+    sl.registerSingleton<SourceRepository>(
+      _DownloadRepository(detail, detail, failDub: true),
+    );
+    sl.registerSingleton<CatalogueRepository>(sl<SourceRepository>());
+    await tester.pumpWidget(
+      const MaterialApp(home: DetailScreen(item: _animeItem)),
+    );
+    await tester.pump();
+    await tester.pump();
+    await tester.tap(find.text('Download E1'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Dub').last);
+    await tester.pumpAndSettle();
+    expect(find.text('No episodes to download'), findsOneWidget);
+    expect(find.text('Download 1 episode'), findsNothing);
   });
 
   testWidgets(

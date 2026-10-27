@@ -27,6 +27,9 @@ import '../../core/zmode/zmode_prefs.dart';
 import '../../core/theme/theme_controller.dart';
 import '../../core/ui/app_dialog.dart';
 import '../../core/ui/app_toast.dart';
+import '../../core/download/download_size_estimate.dart';
+import '../../core/download/download_prefs.dart';
+import '../../core/storage/storage_info.dart';
 import 'open_related.dart';
 import '../../core/ui/episode_unavailable_dialog.dart';
 import '../../core/zmode/playback_resolver.dart';
@@ -1940,25 +1943,28 @@ class _DetailViewState extends State<_DetailView>
     String category,
   ) async {
     final item = widget.item;
-    final res =
-        await showModalBottomSheet<
-          ({VideoSource chosen, List<VideoSource> all})
-        >(
-          context: context,
-          backgroundColor: AppColors.surface,
-          isScrollControlled: true,
-          shape: const RoundedRectangleBorder(
-            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-          ),
-          builder: (_) => _SourcePickerSheet(
-            title: ep.title.trim().isNotEmpty ? ep.title : detail.title,
-            category: category,
-            resolve: () => sl<CatalogueRepository>().sources(
-              ep.url,
-              sourceId: item.sourceId,
-            ),
-          ),
-        );
+    final res = await showModalBottomSheet<_SingleDownloadChoice>(
+      context: context,
+      backgroundColor: AppColors.surface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => _SourcePickerSheet(
+        title: ep.title.trim().isNotEmpty ? ep.title : detail.title,
+        category: category,
+        episode: ep,
+        availableCategories: [
+          if ((detail.subCount ?? 0) > 0) 'sub',
+          if ((detail.dubCount ?? 0) > 0) 'dub',
+        ],
+        resolveEpisodes: _episodesByCategory,
+        resolve: (episode) => sl<CatalogueRepository>().sources(
+          episode.url,
+          sourceId: item.sourceId,
+        ),
+      ),
+    );
     if (res == null || !mounted) return;
     unawaited(
       sl<DownloadManager>().enqueueSource(
@@ -1968,8 +1974,8 @@ class _DetailViewState extends State<_DetailView>
         cover: detail.cover ?? item.cover,
         coverHeaders: detail.coverHeaders ?? item.coverHeaders,
         showUrl: item.url,
-        category: category,
-        episode: ep,
+        category: res.category,
+        episode: res.episode,
         source: res.chosen,
         qualityLabel: res.chosen.quality ?? 'auto',
         fallbacks: res.all,
