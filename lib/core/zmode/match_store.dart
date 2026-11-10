@@ -178,7 +178,7 @@ class MatchStore {
   ///
   /// One pass over the title's own keys, same cheap prefix scan as
   /// [pinnedFor].
-  SourceMatch? bestFor(ZCanonical c) {
+  SourceMatch? bestFor(ZCanonical c, {bool Function(String sourceId)? available}) {
     final prefix = '${c.key}@';
     final last = lastPlayed(c);
     SourceMatch? played;
@@ -186,7 +186,9 @@ class MatchStore {
     for (final k in _box.keys) {
       if (k is! String || !k.startsWith(prefix)) continue;
       final m = _repairMatch(c, SourceMatch.fromMap(_box.get(k)));
-      if (m == null) continue;
+      // Current UI/requests can ignore uninstalled providers without deleting
+      // their historical matches or pins, which remain useful after reinstall.
+      if (m == null || (available != null && !available(m.sourceId))) continue;
       if (m.pinned) return m;
       if (last != null && m.sourceId == last) played ??= m;
       any ??= m;

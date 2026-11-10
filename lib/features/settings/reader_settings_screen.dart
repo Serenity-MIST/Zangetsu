@@ -13,6 +13,7 @@ import '../../core/theme/app_text.dart';
 import '../../core/ui/app_toast.dart';
 import '../../l10n/l10n.dart';
 import '../../core/ui/settings_widgets.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import '../reader/manga_page_translation_settings_sheet.dart';
 import '../reader/manga_translation_appearance_sheet.dart';
 import 'tap_zones_screen.dart';
@@ -132,6 +133,18 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
     String current,
     Future<void> Function(String) onPicked,
   ) async {
+    if (DesktopSettingsScope.contains(context)) {
+      final picked = await showGraphiteSettingsChoice<String>(
+        context,
+        title: title,
+        options: options,
+        current: current,
+      );
+      if (picked == null || !mounted) return;
+      await onPicked(picked);
+      if (mounted) setState(() {});
+      return;
+    }
     final picked = await showModalBottomSheet<String>(
       context: context,
       backgroundColor: AppColors.surface,
@@ -235,6 +248,28 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
 
   Future<void> _openMangaTranslationAppearanceSettings() async {
     final prefs = _prefs;
+    if (DesktopSettingsScope.contains(context)) {
+      await showDialog<void>(
+        context: context,
+        useRootNavigator: false,
+        builder: (context) => Dialog(
+          backgroundColor: const Color(0xFF1A1B20),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+            side: const BorderSide(color: Color(0xFF36373E)),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxWidth: 640,
+              maxHeight: MediaQuery.sizeOf(context).height * 0.8,
+            ),
+            child: MangaTranslationAppearanceSheet(prefs: prefs),
+          ),
+        ),
+      );
+      return;
+    }
     await showModalBottomSheet<void>(
       context: context,
       backgroundColor: AppColors.surface,

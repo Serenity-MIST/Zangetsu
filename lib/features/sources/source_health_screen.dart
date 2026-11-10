@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import 'manage_source_route.dart';
 import '../../core/ui/settings_widgets.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 
 import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
@@ -129,7 +130,9 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
     setState(() {
       _testing = true;
       _deep = deep;
-      _results = [for (final s in sources) _ProbeResult(id: s.id, name: s.name)];
+      _results = [
+        for (final s in sources) _ProbeResult(id: s.id, name: s.name),
+      ];
     });
 
     // Fixed-size worker pool over a shared cursor, so at most
@@ -243,9 +246,7 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
       }
     }
     if (!ok) {
-      note = opened
-          ? 'opens, but lists nothing to play'
-          : "can't open titles";
+      note = opened ? 'opens, but lists nothing to play' : "can't open titles";
     }
     if (!mounted || gen != _runGen) return;
     setState(() {
@@ -319,25 +320,29 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
       appBar: settingsAppBar(
         context.l10n.sourceHealth,
         actions: [
-          IconButton(
-            tooltip: 'Deep test (opens a title from each source)',
-            icon: const Icon(Icons.biotech_outlined),
-            color: _deep ? AppColors.accent : AppColors.textPrimary,
-            // Live even mid-run. The screen kicks off a test on open, and
-            // disabling this until that finished meant waiting out the whole
-            // list before you could ask for the deeper one. Safe now that a new
-            // run supersedes the old via [_runGen] instead of racing it.
-            onPressed: () => _runTests(deep: true),
-          ),
-          IconButton(
-            tooltip: context.l10n.reTest,
-            icon: const Icon(Icons.refresh_rounded),
-            color: AppColors.textPrimary,
-            onPressed: _testing ? null : () => _runTests(),
-          ),
+          if (!DesktopSettingsScope.contains(context)) ...[
+            IconButton(
+              tooltip: 'Deep test (opens a title from each source)',
+              icon: const Icon(Icons.biotech_outlined),
+              color: _deep ? AppColors.accent : AppColors.textPrimary,
+              // Live even mid-run. The screen kicks off a test on open, and
+              // disabling this until that finished meant waiting out the whole
+              // list before you could ask for the deeper one. Safe now that a new
+              // run supersedes the old via [_runGen] instead of racing it.
+              onPressed: () => _runTests(deep: true),
+            ),
+            IconButton(
+              tooltip: context.l10n.reTest,
+              icon: const Icon(Icons.refresh_rounded),
+              color: AppColors.textPrimary,
+              onPressed: _testing ? null : () => _runTests(),
+            ),
+          ],
         ],
       ),
-      body: _results.isEmpty
+      body: DesktopSettingsScope.contains(context)
+          ? _desktopBody(working: working, done: done, unusable: unusable)
+          : _results.isEmpty
           ? Center(
               child: Text(
                 context.l10n.noEnabledSourcesToTest,
@@ -356,13 +361,13 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
                     child: Text(
                       _testing
                           ? '${_deep ? 'Deep t' : 'T'}esting '
-                              '${_results.length} source'
-                              '${_results.length == 1 ? '' : 's'}…'
+                                '${_results.length} source'
+                                '${_results.length == 1 ? '' : 's'}…'
                           : '$working of $done returned results.'
-                              '${unusable > 0 ? ' $unusable opened nothing '
-                                  'playable.' : ''}'
-                              ' Amber answered but may give you nothing;'
-                              ' only red is treated as dead.',
+                                '${unusable > 0 ? ' $unusable opened nothing '
+                                          'playable.' : ''}'
+                                ' Amber answered but may give you nothing;'
+                                ' only red is treated as dead.',
                       style: AppText.caption,
                     ),
                   ),
@@ -387,16 +392,15 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
                             onDisable: _results[i].isCloudStream
                                 ? null
                                 : () => _disableForSearch(_results[i]),
-                            searchIncluded:
-                                _searchPrefs.isIncluded(_results[i].id),
+                            searchIncluded: _searchPrefs.isIncluded(
+                              _results[i].id,
+                            ),
                             playbackFails: _health.playbackFailures(
                               _results[i].id,
                             ),
                             onManage: canManageSource(_results[i].id)
-                                ? () => openManageSource(
-                                    context,
-                                    _results[i].id,
-                                  )
+                                ? () =>
+                                      openManageSource(context, _results[i].id)
                                 : null,
                           ),
                         ],
@@ -409,6 +413,106 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
     );
   }
 
+  /// Desktop diagnostics use labeled actions and lazy rows. Search success
+  /// remains distinct from opening a title or obtaining a playable stream.
+  Widget _desktopBody({
+    required int working,
+    required int done,
+    required int unusable,
+  }) => ListView.builder(
+    padding: const EdgeInsets.fromLTRB(22, 18, 22, 32),
+    itemCount: _results.length + 1,
+    itemBuilder: (context, index) {
+      if (index == 0) {
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 16),
+          child: GraphiteSettingsPanel(
+            margin: EdgeInsets.zero,
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _testing ? 'Testing sources…' : 'Source diagnostics',
+                      style: AppText.headline,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Quick test checks search responses. Deep test also opens a title. '
+                      'Playback is not tested here.',
+                      style: AppText.caption,
+                    ),
+                    const SizedBox(height: 16),
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 10,
+                      children: [
+                        FilledButton.icon(
+                          key: const ValueKey('health-quick-test'),
+                          onPressed: _testing ? null : () => _runTests(),
+                          icon: const Icon(Icons.refresh_rounded, size: 18),
+                          label: const Text('Quick test'),
+                        ),
+                        OutlinedButton.icon(
+                          key: const ValueKey('health-deep-test'),
+                          onPressed: () => _runTests(deep: true),
+                          icon: const Icon(Icons.biotech_outlined, size: 18),
+                          label: const Text('Deep test'),
+                        ),
+                      ],
+                    ),
+                    if (_results.isEmpty) ...[
+                      const SizedBox(height: 16),
+                      Text(
+                        context.l10n.noEnabledSourcesToTest,
+                        style: AppText.body,
+                      ),
+                    ] else ...[
+                      const SizedBox(height: 18),
+                      Text(
+                        '$done / ${_results.length} completed · $working returned results'
+                        '${unusable > 0 ? ' · $unusable could not open a title' : ''}',
+                        style: AppText.caption,
+                      ),
+                      if (_testing) ...[
+                        const SizedBox(height: 10),
+                        LinearProgressIndicator(value: done / _results.length),
+                      ],
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      }
+      final result = _results[index - 1];
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 10),
+        child: GraphiteSettingsPanel(
+          margin: EdgeInsets.zero,
+          children: [
+            _HealthRow(
+              key: ValueKey('health-row-${result.id}'),
+              result: result,
+              present: _present,
+              onDisable: result.isCloudStream
+                  ? null
+                  : () => _disableForSearch(result),
+              searchIncluded: _searchPrefs.isIncluded(result.id),
+              playbackFails: _health.playbackFailures(result.id),
+              onManage: canManageSource(result.id)
+                  ? () => openManageSource(context, result.id)
+                  : null,
+            ),
+          ],
+        ),
+      );
+    },
+  );
+
   /// Inline action for a dead source: drop it from cross-source search (the same
   /// search-only toggle the source picker uses). Reversible from search settings.
   Future<void> _disableForSearch(_ProbeResult r) async {
@@ -417,9 +521,7 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
     setState(() {});
     ScaffoldMessenger.of(context)
       ..clearSnackBars()
-      ..showSnackBar(
-        SnackBar(content: Text('${r.name} removed from search')),
-      );
+      ..showSnackBar(SnackBar(content: Text('${r.name} removed from search')));
   }
 }
 
@@ -428,6 +530,7 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
 /// a dead JS source.
 class _HealthRow extends StatelessWidget {
   const _HealthRow({
+    super.key,
     required this.result,
     required this.present,
     required this.searchIncluded,
@@ -438,7 +541,7 @@ class _HealthRow extends StatelessWidget {
 
   final _ProbeResult result;
   final ({Color color, IconData icon, String label}) Function(SourceOutcome)
-      present;
+  present;
   final bool searchIncluded;
   final VoidCallback? onDisable;
 
@@ -451,8 +554,7 @@ class _HealthRow extends StatelessWidget {
   /// Null when the source has no such screen (Z-Mode).
   final VoidCallback? onManage;
 
-  bool get _playbackDead =>
-      playbackFails >= SourceHealthStore.deadAfterTitles;
+  bool get _playbackDead => playbackFails >= SourceHealthStore.deadAfterTitles;
 
   String? get _meta {
     if (result.running) return null;
@@ -488,9 +590,7 @@ class _HealthRow extends StatelessWidget {
         icon: Icons.error_outline_rounded,
         label: context.l10n.notUsable,
       );
-    } else if (p != null &&
-        result.deepOk == null &&
-        o == SourceOutcome.ok) {
+    } else if (p != null && result.deepOk == null && o == SourceOutcome.ok) {
       // Only the SEARCH probe has run — the deep check is opt-in behind the
       // microscope because it runs the JS engine on the UI isolate. So all this
       // green actually proves is that search answered. Saying "Working" claims
@@ -498,6 +598,78 @@ class _HealthRow extends StatelessWidget {
       // is how a rotted source keeps a green tick. Stays green: search really
       // did work. Upgrades to the full label once the deep check has run.
       p = (color: p.color, icon: p.icon, label: context.l10n.searchOk);
+    }
+    if (DesktopSettingsScope.contains(context)) {
+      return Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(
+                  p?.icon ?? Icons.hourglass_top_rounded,
+                  color: p?.color ?? AppColors.textSecondary,
+                  size: 23,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    result.name,
+                    style: AppText.body.copyWith(fontWeight: FontWeight.w600),
+                  ),
+                ),
+                if (result.running)
+                  const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              result.running
+                  ? context.l10n.testing
+                  : [
+                      ?p?.label,
+                      ?_meta,
+                      if (!searchIncluded) context.l10n.notSearched,
+                    ].join(' · '),
+              style: AppText.caption.copyWith(
+                color: p?.color ?? AppColors.textSecondary,
+              ),
+            ),
+            if (!result.running &&
+                _isDead &&
+                onDisable != null &&
+                searchIncluded) ...[
+              const SizedBox(height: 10),
+              Align(
+                alignment: AlignmentDirectional.centerEnd,
+                child: TextButton.icon(
+                  onPressed: onDisable,
+                  icon: const Icon(Icons.search_off_rounded, size: 18),
+                  label: const Text('Remove from search'),
+                ),
+              ),
+            ] else if (!result.running &&
+                (_isDead || _playbackDead) &&
+                onManage != null) ...[
+              const SizedBox(height: 10),
+              Align(
+                alignment: AlignmentDirectional.centerEnd,
+                child: OutlinedButton.icon(
+                  onPressed: onManage,
+                  icon: const Icon(Icons.extension_outlined, size: 18),
+                  label: const Text('Manage source'),
+                ),
+              ),
+            ],
+          ],
+        ),
+      );
     }
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 12, 12),
@@ -570,7 +742,9 @@ class _HealthRow extends StatelessWidget {
                     onTap: onDisable!,
                     child: Padding(
                       padding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 8),
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
                       child: Text(
                         context.l10n.removeDownloadTooltip,
                         style: AppText.body.copyWith(color: AppColors.accent),
@@ -580,7 +754,8 @@ class _HealthRow extends StatelessWidget {
                 : TextButton(
                     onPressed: onDisable,
                     style: TextButton.styleFrom(
-                        foregroundColor: AppColors.accent),
+                      foregroundColor: AppColors.accent,
+                    ),
                     child: Text(context.l10n.navTabsRemove),
                   )
           // Anything dead that the branch above could not offer an action for.
@@ -598,7 +773,9 @@ class _HealthRow extends StatelessWidget {
                     onTap: onManage!,
                     child: Padding(
                       padding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 8),
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
                       child: Text(
                         context.l10n.uninstall,
                         style: AppText.body.copyWith(color: AppColors.accent),
@@ -608,7 +785,8 @@ class _HealthRow extends StatelessWidget {
                 : TextButton(
                     onPressed: onManage,
                     style: TextButton.styleFrom(
-                        foregroundColor: AppColors.accent),
+                      foregroundColor: AppColors.accent,
+                    ),
                     child: Text(context.l10n.uninstall),
                   ),
         ],

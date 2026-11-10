@@ -3,9 +3,17 @@ import 'package:flutter/foundation.dart';
 
 /// One selectable quality from an HLS master playlist.
 class HlsVariant {
-  HlsVariant({required this.quality, required this.url, this.bandwidth = 0});
+  HlsVariant({
+    required this.quality,
+    required this.url,
+    this.bandwidth = 0,
+    this.audioGroup,
+  });
   final String quality; // e.g. '1080p'
   final String url;
+
+  /// Audio group linked by this variant, needed to retain matching renditions.
+  final String? audioGroup;
 
   /// The variant's `BANDWIDTH` (bits/s), 0 when the master omits it. Used to
   /// pin the quality via mpv's `hls-bitrate` while keeping the master open
@@ -57,6 +65,7 @@ List<HlsVariant> parseHlsMaster(String playlist, String masterUrl) {
         url: _resolve(uri, masterUrl),
         rank: rank,
         bandwidth: bandwidth,
+        audioGroup: hlsAttr(line, 'AUDIO'),
       ),
     );
   }
@@ -70,6 +79,7 @@ class _RankedVariant extends HlsVariant {
     required super.url,
     required this.rank,
     required super.bandwidth,
+    super.audioGroup,
   });
   final int rank;
 }
@@ -82,8 +92,12 @@ class HlsAudioRendition {
     required this.name,
     required this.isDefault,
     this.channels = '',
+    this.groupId = '',
   });
   final String uri;
+
+  /// Renditions from another video group must never be substituted.
+  final String groupId;
   final String lang;
   final String name;
   final bool isDefault;
@@ -128,6 +142,7 @@ List<HlsAudioRendition> parseHlsAudioRenditions(
         lang: hlsAttr(line, 'LANGUAGE') ?? '',
         name: hlsAttr(line, 'NAME') ?? '',
         channels: hlsAttr(line, 'CHANNELS') ?? '',
+        groupId: hlsAttr(line, 'GROUP-ID') ?? '',
         isDefault: (hlsAttr(line, 'DEFAULT') ?? '').toUpperCase() == 'YES',
       ),
     );
@@ -192,17 +207,13 @@ Future<List<HlsVariant>> fetchHlsVariants(
       Uri.parse(masterUrl),
       options: Options(
         responseType: ResponseType.plain,
-        headers: sniff
-            ? {...?headers, 'Range': 'bytes=0-65535'}
-            : headers,
+        headers: sniff ? {...?headers, 'Range': 'bytes=0-65535'} : headers,
         receiveTimeout: const Duration(seconds: 8),
         validateStatus: (s) => s != null && s < 500,
       ),
     );
     final body = resp.data ?? '';
-    debugPrint(
-      '[quality] fetch status=${resp.statusCode} len=${body.length}',
-    );
+    debugPrint('[quality] fetch status=${resp.statusCode} len=${body.length}');
     if (sniff && !body.trimLeft().startsWith('#EXTM3U')) return const [];
     return parseHlsMaster(body, masterUrl);
   } catch (e) {

@@ -168,6 +168,7 @@ class ScheduleCubit extends Cubit<ScheduleState> {
   }) : _retryDelays = retryDelays ?? _defaultRetryDelays,
        _trackerHub = trackerHub,
        super(const ScheduleState()) {
+    _myList.revision.addListener(_onLibraryChanged);
     final hub = _trackerHub;
     if (hub != null) {
       _syncConnectedTrackers();
@@ -373,8 +374,20 @@ class ScheduleCubit extends Cubit<ScheduleState> {
     );
   }
 
+  /// Retained calendars must reflect local edits and asynchronous cloud pulls
+  /// without another network fetch or resetting the user's calendar selection.
+  void _onLibraryChanged() {
+    if (isClosed) return;
+    final followed = _followedShows();
+    emit(state.copyWith(
+      followed: followed,
+      myListByDay: groupByLocalDay(filterByFollowed(state.airingAll, followed)),
+    ));
+  }
+
   @override
   Future<void> close() {
+    _myList.revision.removeListener(_onLibraryChanged);
     _trackerListeners.forEach((tracker, listener) {
       tracker.removeListener(listener);
     });

@@ -108,6 +108,7 @@ class ChapterDownloader extends ChangeNotifier {
     required String showId,
     required String showTitle,
     String? cover,
+    Map<String, String>? coverHeaders,
     required ContentMode mode,
   }) => enqueueMany(
     chapters: [chapter],
@@ -115,6 +116,7 @@ class ChapterDownloader extends ChangeNotifier {
     showId: showId,
     showTitle: showTitle,
     cover: cover,
+    coverHeaders: coverHeaders,
     mode: mode,
   );
 
@@ -129,6 +131,7 @@ class ChapterDownloader extends ChangeNotifier {
     required String showId,
     required String showTitle,
     String? cover,
+    Map<String, String>? coverHeaders,
     required ContentMode mode,
   }) async {
     if (sl.isRegistered<DownloadPrefs>() &&
@@ -153,6 +156,8 @@ class ChapterDownloader extends ChangeNotifier {
         showId: showId,
         showTitle: showTitle,
         cover: cover,
+        coverHeaders: coverHeaders,
+        thumbnail: chapter.thumbnail,
         chapterId: chapter.id,
         chapterUrl: chapter.url,
         chapterTitle: chapter.title,

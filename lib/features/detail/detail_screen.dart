@@ -1,3 +1,7 @@
+import 'desktop_existing_downloads.dart';
+import 'desktop_single_download_dialog.dart';
+import '../downloads/download_size_preview.dart';
+import '../../core/download/download_server_preference.dart';
 import 'dart:async';
 import 'dart:io';
 
@@ -654,7 +658,7 @@ class _DetailViewState extends State<_DetailView>
     if (!sl.isRegistered<MatchStore>()) return null;
     final c = ZmodeIds.parseShow(widget.item.url);
     if (c == null) return null;
-    return sl<MatchStore>().bestFor(c);
+    return sl<MatchStore>().bestFor(c, available: sl<SourceRepository>().hasSource);
   }
 
   // ── Scroll-driven app-bar title fade. PRESERVED EFFECT — reads the outer
@@ -914,7 +918,7 @@ class _DetailViewState extends State<_DetailView>
   /// third-party extension.
   String? _matchedSourceWebUrl(ZCanonical c) {
     if (!sl.isRegistered<MatchStore>()) return null;
-    final m = sl<MatchStore>().bestFor(c);
+    final m = sl<MatchStore>().bestFor(c, available: sl<SourceRepository>().hasSource);
     if (m == null) return null;
     return source_actions.joinChapterUrl(
       sl<SourceRepository>().baseUrlFor(m.sourceId),
@@ -1335,6 +1339,8 @@ class _DetailViewState extends State<_DetailView>
         episodeUrl: ep.url,
         malId: detail.malId ?? widget.item.malId,
         episodeNumber: ep.number,
+        category: category,
+        season: ep.season,
       );
       if (dl != null) {
         if (!mounted) return;
@@ -1894,7 +1900,12 @@ class _DetailViewState extends State<_DetailView>
     ];
     final res =
         await showModalBottomSheet<
-          ({String quality, String category, List<Episode> episodes})
+          ({
+            String quality,
+            String category,
+            List<Episode> episodes,
+            VideoSource? server,
+          })
         >(
           context: context,
           backgroundColor: AppColors.surface,
@@ -1923,7 +1934,13 @@ class _DetailViewState extends State<_DetailView>
           ),
         );
     if (res == null || !mounted) return;
-    _startDownload(detail, res.category, res.quality, res.episodes);
+    _startDownload(
+      detail,
+      res.category,
+      res.quality,
+      res.episodes,
+      server: res.server,
+    );
   }
 
   /// Re-resolve a title's episodes for a given sub/dub [category] (without
@@ -1986,6 +2003,7 @@ class _DetailViewState extends State<_DetailView>
       showId: item.id,
       showTitle: detail.title,
       cover: detail.cover ?? item.cover,
+      coverHeaders: detail.coverHeaders ?? item.coverHeaders,
       mode: detail.type == ProviderType.novel
           ? ContentMode.novel
           : ContentMode.manga,
@@ -1998,8 +2016,34 @@ class _DetailViewState extends State<_DetailView>
     String category,
   ) async {
     final item = widget.item;
-    final res =
-        await showModalBottomSheet<
+    Episode selectedEpisode = ep;
+    String selectedCategory = category;
+    ({VideoSource chosen, List<VideoSource> all})? res;
+    if (Platform.isWindows) {
+      final choice = await showDialog<DesktopSingleDownloadChoice>(context: context,
+        builder: (_) => DesktopSingleDownloadDialog(episode: ep, season: seasonOf(ep) ?? 1,
+          initialCategory: category, availableCategories: [
+            if ((detail.subCount ?? 0) > 0) 'sub', if ((detail.dubCount ?? 0) > 0) 'dub'],
+          resolveEpisodes: _episodesByCategory,
+          resolveSources: (episode, cut) {
+            final repo = sl<CatalogueRepository>();
+            // Metadata episode URLs are shared across cuts; pass intent directly.
+            // Ordinary source URLs already identify their sub/dub episode.
+            final metadata = repo is MetadataRepository ? repo
+                : ZmodeIds.isZ(episode.url) && sl.isRegistered<MetadataRepository>()
+                    ? sl<MetadataRepository>() : null;
+            return metadata != null
+                ? metadata.sources(episode.url, sourceId: item.sourceId, category: cut)
+                : repo.sources(episode.url, sourceId: item.sourceId);
+          }));
+      if (choice == null || !mounted) return;
+      selectedEpisode = choice.episode;
+      selectedCategory = choice.category;
+      final pending = await _confirmExistingDownloads(detail, selectedCategory, [selectedEpisode]);
+      if (!mounted || pending.isEmpty) return;
+      res = (chosen: choice.chosen, all: choice.all);
+    } else {
+      res = await showModalBottomSheet<
           ({VideoSource chosen, List<VideoSource> all})
         >(
           context: context,
@@ -2017,6 +2061,7 @@ class _DetailViewState extends State<_DetailView>
             ),
           ),
         );
+    }
     if (res == null || !mounted) return;
     unawaited(
       sl<DownloadManager>().enqueueSource(
@@ -2026,8 +2071,8 @@ class _DetailViewState extends State<_DetailView>
         cover: detail.cover ?? item.cover,
         coverHeaders: detail.coverHeaders ?? item.coverHeaders,
         showUrl: item.url,
-        category: category,
-        episode: ep,
+        category: selectedCategory,
+        episode: selectedEpisode,
         source: res.chosen,
         qualityLabel: res.chosen.quality ?? 'auto',
         fallbacks: res.all,
@@ -2038,12 +2083,52 @@ class _DetailViewState extends State<_DetailView>
     _snack(context.l10n.addedToDownloads);
   }
 
-  void _startDownload(
+  /// Unknown-language recovered files require an explicit reuse choice. This
+  /// only filters this request; it never relabels media or changes its owner.
+  Future<List<Episode>> _confirmExistingDownloads(MediaDetail detail,
+      String category, List<Episode> episodes) async {
+    if (!Platform.isWindows) return episodes;
+    final manager = sl<DownloadManager>();
+    final remaining = <Episode>[];
+    final recovered = <Episode, DownloadRecord>{};
+    final suggestions = recoveredDownloadSuggestions(title: detail.title,
+        episodes: episodes, records: manager.all);
+    for (final ep in episodes) {
+      final saved = await manager.finishedForEpisode(sourceId: widget.item.sourceId,
+        showId: widget.item.id, episodeId: ep.id, episodeUrl: ep.url,
+        episodeNumber: ep.number, malId: detail.malId ?? widget.item.malId,
+        category: category, season: ep.season);
+      if (saved != null) continue;
+      remaining.add(ep);
+      final candidate = suggestions[ep];
+      if (candidate != null && await manager.filePresent(candidate)) recovered[ep] = candidate;
+    }
+    if (!mounted) return const [];
+    if (recovered.isEmpty) {
+      if (remaining.isEmpty) _snack('These episodes are already downloaded.');
+      return remaining;
+    }
+    final reuse = await showDialog<bool>(context: context, builder: (context) => AlertDialog(
+      title: const Text('Existing downloaded episodes'),
+      content: Text('${recovered.length} selected episodes already have recovered local files. '
+        'Their audio language is unknown. Use those files, or download the selected $category version?'),
+      actions: [TextButton(onPressed: () => Navigator.pop(context, false),
+          child: const Text('Download selected version')),
+        FilledButton(onPressed: () => Navigator.pop(context, true),
+          child: const Text('Use existing files'))]));
+    if (!mounted || reuse == null) return const [];
+    return reuse ? omitReusableDownloads(remaining, recovered, manager.filePresent) : remaining;
+  }
+
+  Future<void> _startDownload(
     MediaDetail detail,
     String category,
     String quality,
-    List<Episode> episodes,
-  ) {
+    List<Episode> episodes, {
+    VideoSource? server,
+  }) async {
+    episodes = await _confirmExistingDownloads(detail, category, episodes);
+    if (!mounted || episodes.isEmpty) return;
     final item = widget.item;
     unawaited(
       sl<DownloadManager>().enqueueEpisodes(
@@ -2056,6 +2141,9 @@ class _DetailViewState extends State<_DetailView>
         category: category,
         quality: quality,
         episodes: episodes,
+        serverPreference: server == null
+            ? null
+            : DownloadServerPreference.fromSource(server),
         nowMs: DateTime.now().millisecondsSinceEpoch,
         malId: detail.malId ?? item.malId,
       ),
@@ -2771,6 +2859,7 @@ class _DetailViewState extends State<_DetailView>
       children: [
         // ── Episodes ──────────────────────────────────────────────────────
         _EpisodesTab(
+          category: category,
           loading: state.episodesLoading,
           eps: eps,
           seasonEps: seasonEps,

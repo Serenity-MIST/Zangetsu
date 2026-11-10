@@ -1,0 +1,17 @@
+Upstream: background_downloader 9.5.5
+Repository: https://github.com/781flyingdutchman/background_downloader
+License: upstream LICENSE included unchanged.
+Scope: runtime Dart, Android and iOS sources copied from the pinned Pub package.
+Examples, upstream development tests and documentation are excluded.
+
+Desktop resume repair:
+Capture ParallelDownloadTask parent ResumeData before enqueue. The desktop
+worker reads/removes this data when it starts; looking it up after enqueue
+can return null and prevent child tasks from resuming.
+Android and iOS native runtime sources are unchanged.
+
+Shared retry policy repair:
+HTTP429 failures are emitted to the application instead of entering the generic
+two-second exponential retry loop. Applies to Dart base dispatcher on all
+platforms; native platform sources remain unchanged. Server cooldown handling
+is owned by application policy; no protection bypass or automatic mirror storm.

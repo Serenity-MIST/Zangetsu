@@ -21,6 +21,8 @@ class ChapterDownload {
     required this.mode,
     required this.status,
     this.cover,
+    this.coverHeaders,
+    this.thumbnail,
     this.pageCount = 0,
     this.pagesDone = 0,
     this.bytes = 0,
@@ -39,6 +41,10 @@ class ChapterDownload {
   final String showId;
   final String showTitle;
   final String? cover;
+  /// Source image headers, scoped to cover origin when reused for a thumbnail.
+  final Map<String, String>? coverHeaders;
+  /// Optional chapter artwork; old records and most novel sources have none.
+  final String? thumbnail;
   final String chapterId;
   final String chapterUrl;
   final String chapterTitle;
@@ -113,6 +119,8 @@ class ChapterDownload {
     showId: showId,
     showTitle: showTitle,
     cover: cover,
+    coverHeaders: coverHeaders,
+    thumbnail: thumbnail,
     chapterId: chapterId,
     chapterUrl: chapterUrl,
     chapterTitle: chapterTitle,
@@ -133,6 +141,8 @@ class ChapterDownload {
     'showId': showId,
     'showTitle': showTitle,
     'cover': cover,
+    'coverHeaders': coverHeaders,
+    'thumbnail': thumbnail,
     'chapterId': chapterId,
     'chapterUrl': chapterUrl,
     'chapterTitle': chapterTitle,
@@ -160,6 +170,8 @@ class ChapterDownload {
       showId: '${m['showId'] ?? ''}',
       showTitle: '${m['showTitle'] ?? ''}',
       cover: m['cover'] as String?,
+      coverHeaders: m['coverHeaders'] is Map ? (m['coverHeaders'] as Map).map((k,v) => MapEntry('$k', '$v')) : null,
+      thumbnail: m['thumbnail'] is String ? m['thumbnail'] as String : null,
       chapterId: '${m['chapterId'] ?? ''}',
       chapterUrl: '${m['chapterUrl'] ?? ''}',
       chapterTitle: '${m['chapterTitle'] ?? ''}',

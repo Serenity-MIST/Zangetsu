@@ -34,6 +34,47 @@ bool FlutterWindow::OnCreate() {
       flutter_controller_->engine()->messenger(), "com.spyou.zangetsu/window",
       &flutter::StandardMethodCodec::GetInstance());
   window_channel.SetMethodCallHandler([this](const auto& call, auto result) {
+    // Client-drawn desktop titlebar keeps the OS resize frame and system menu.
+    // The Dart side shows it only after this handshake succeeds.
+    const HWND window = GetHandle();
+    if (call.method_name() == "setTitlebarHidden") {
+      const auto* hidden = call.arguments() ? std::get_if<bool>(call.arguments()) : nullptr;
+      if (!hidden) { result->Error("ARGUMENT", "Expected a boolean"); return; }
+      LONG_PTR style = fullscreen_ ? window_style_ : GetWindowLongPtr(window, GWL_STYLE);
+      if (*hidden && !custom_caption_) {
+        caption_style_ = style;
+        style &= ~WS_CAPTION;
+      } else if (!*hidden && custom_caption_) {
+        style = caption_style_;
+      }
+      // A chrome change during fullscreen updates the restoration style only;
+      // it must never reintroduce a frame on the current fullscreen surface.
+      if (fullscreen_) window_style_ = style;
+      else SetWindowLongPtr(window, GWL_STYLE, style);
+      custom_caption_ = *hidden;
+      SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+      result->Success(flutter::EncodableValue(true));
+      return;
+    }
+    if (call.method_name() == "startWindowDrag") {
+      ReleaseCapture();
+      SendMessage(window, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+      result->Success(); return;
+    }
+    if (call.method_name() == "minimizeWindow") {
+      ShowWindow(window, SW_MINIMIZE); result->Success(); return;
+    }
+    if (call.method_name() == "isMaximizedWindow") {
+      result->Success(flutter::EncodableValue(IsZoomed(window) != FALSE)); return;
+    }
+    if (call.method_name() == "toggleMaximizeWindow") {
+      ShowWindow(window, IsZoomed(window) ? SW_RESTORE : SW_MAXIMIZE);
+      result->Success(flutter::EncodableValue(IsZoomed(window) != FALSE)); return;
+    }
+    if (call.method_name() == "closeWindow") {
+      PostMessage(window, WM_CLOSE, 0, 0); result->Success(); return;
+    }
     if (call.method_name() == "registerOAuthProtocol") {
       // Register only our own scheme for the current user when connecting an
       // account. Quote both executable and URI; never invoke a command shell.
@@ -112,18 +153,28 @@ bool FlutterWindow::OnCreate() {
         result->Error("WINDOW", "Could not read monitor bounds");
         return;
       }
-      SetWindowLongPtr(hwnd, GWL_STYLE, window_style_ & ~WS_OVERLAPPEDWINDOW);
+      // Set the transition state before synchronous window messages fire.
+      // Otherwise maximize constraints can clamp fullscreen to the work area.
+      fullscreen_ = true;
+      // Clear Windows' zoom state after saving placement. Leaving WS_MAXIMIZE
+      // set makes SetWindowPlacement on exit think maximization already happened
+      // and keeps the fullscreen-sized outer rectangle behind the restored UI.
+      if (IsZoomed(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+      SetWindowLongPtr(hwnd, GWL_STYLE,
+                       window_style_ & ~(WS_OVERLAPPEDWINDOW | WS_MAXIMIZE |
+                                         WS_MINIMIZE));
       SetWindowPos(hwnd, HWND_TOP, monitor.rcMonitor.left, monitor.rcMonitor.top,
                    monitor.rcMonitor.right - monitor.rcMonitor.left,
                    monitor.rcMonitor.bottom - monitor.rcMonitor.top,
                    SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
-      fullscreen_ = true;
     } else {
-      SetWindowLongPtr(hwnd, GWL_STYLE, window_style_);
+      // Placement restoration can synchronously ask for maximized bounds.
+      fullscreen_ = false;
+      SetWindowLongPtr(hwnd, GWL_STYLE,
+                       window_style_ & ~(WS_MAXIMIZE | WS_MINIMIZE));
       SetWindowPlacement(hwnd, &window_placement_);
       SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
-      fullscreen_ = false;
     }
     result->Success(exit_only ? flutter::EncodableValue(true) : flutter::EncodableValue());
   });
@@ -153,6 +204,32 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  // The maximized outer bounds already equal rcWork. Do not let DefWindowProc
+  // reserve an invisible resize border inside them, exposing the app behind us.
+  if (message == WM_NCCALCSIZE && wparam && custom_caption_ &&
+      !fullscreen_ && IsZoomed(hwnd)) {
+    MONITORINFO monitor = {sizeof(MONITORINFO)};
+    if (GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                       &monitor)) {
+      reinterpret_cast<NCCALCSIZE_PARAMS*>(lparam)->rgrc[0] = monitor.rcWork;
+      return 0;
+    }
+  }
+  // A custom caption removes the standard maximized-frame adjustment. Bound
+  // ordinary maximize to this monitor's work area so the taskbar stays visible.
+  // Explicit player fullscreen continues to use the complete monitor bounds.
+  if (message == WM_GETMINMAXINFO && custom_caption_ && !fullscreen_) {
+    MONITORINFO monitor = {sizeof(MONITORINFO)};
+    if (GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                       &monitor)) {
+      auto* limits = reinterpret_cast<MINMAXINFO*>(lparam);
+      limits->ptMaxPosition.x = monitor.rcWork.left - monitor.rcMonitor.left;
+      limits->ptMaxPosition.y = monitor.rcWork.top - monitor.rcMonitor.top;
+      limits->ptMaxSize.x = monitor.rcWork.right - monitor.rcWork.left;
+      limits->ptMaxSize.y = monitor.rcWork.bottom - monitor.rcWork.top;
+      return 0;
+    }
+  }
   // Give Flutter, including plugins, an opportunity to handle window messages.
   if (flutter_controller_) {
     std::optional<LRESULT> result =

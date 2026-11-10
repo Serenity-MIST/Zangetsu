@@ -16,6 +16,8 @@ import 'package:watch_app/core/state/active_source_cubit.dart';
 import 'package:watch_app/features/search/browse_source_screen.dart';
 
 class _EmptyRepo implements SourceRepository {
+  @override
+  bool hasSource(String id) => true;
   int homeCalls = 0;
 
   @override
@@ -54,6 +56,8 @@ class _FakeCloudStreamManager extends ChangeNotifier
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   @override
   BaseProvider? get(String sourceId) => null;
+  @override
+  BaseProvider? resolveCompatible(String sourceId) => get(sourceId);
   @override
   String? repoNameForSourceId(String sourceId) => null;
 }

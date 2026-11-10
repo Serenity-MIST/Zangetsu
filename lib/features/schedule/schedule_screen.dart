@@ -168,6 +168,7 @@ class _ScheduleBodyState extends State<ScheduleBody>
     with SingleTickerProviderStateMixin {
   late final TabController _tabs;
   Timer? _tick; // refreshes the live countdowns
+  late StreamKind _streamKind;
 
   int get _tab => _tabs.index;
 
@@ -177,16 +178,18 @@ class _ScheduleBodyState extends State<ScheduleBody>
     // Open on the tab for the kind you were browsing: Schedule is reached from
     // the Home card now, and arriving on Anime after tapping it from a
     // Movies/TV Home meant a tab switch every single time.
+    _streamKind = ZModePrefs.streamKind;
     _tabs =
         TabController(
           length: 2,
           vsync: this,
-          initialIndex: ZModePrefs.streamKind == StreamKind.movie ? 1 : 0,
+          initialIndex: _streamKind == StreamKind.movie ? 1 : 0,
         )..addListener(() {
           if (mounted) {
             setState(() {}); // header (filter / busy state) follows the tab
           }
         });
+    ZModePrefs.revision.addListener(_streamKindChanged);
     // Re-render every 30s so countdowns/“LIVE” stay current. Cancelled in
     // dispose, so no timer leaks in tests.
     _tick = Timer.periodic(const Duration(seconds: 30), (_) {
@@ -194,8 +197,18 @@ class _ScheduleBodyState extends State<ScheduleBody>
     });
   }
 
+  /// Retained desktop pages must follow the shell selector after first entry.
+  /// Other preference writes must not override a tab chosen inside Schedule.
+  void _streamKindChanged() {
+    final kind = ZModePrefs.streamKind;
+    if (!mounted || kind == _streamKind) return;
+    _streamKind = kind;
+    _tabs.animateTo(kind == StreamKind.movie ? 1 : 0);
+  }
+
   @override
   void dispose() {
+    ZModePrefs.revision.removeListener(_streamKindChanged);
     _tabs.dispose();
     _tick?.cancel();
     super.dispose();

@@ -1,4 +1,3 @@
-
 import 'dart:math' as math;
 
 import 'package:cached_network_image/cached_network_image.dart';
@@ -36,10 +35,18 @@ double heroTopReserve(double topInset) =>
 /// Lightweight metadata shown under the hero title: a few genres + episode
 /// count (or year for movies). Lazily fetched, so it never blocks the banner.
 class HeroMeta {
-  const HeroMeta({this.genres = const [], this.episodeCount = 0, this.year});
+  const HeroMeta({
+    this.genres = const [],
+    this.episodeCount = 0,
+    this.year,
+    this.description,
+  });
   final List<String> genres;
   final int episodeCount;
   final String? year;
+
+  /// Optional synopsis already loaded for the hero; no separate request.
+  final String? description;
 }
 
 /// Apple-TV+-style cinematic hero: a rounded inset artwork card floating on the
@@ -93,7 +100,7 @@ class FeaturedHero extends StatefulWidget {
   ///
   /// Defaults to null — the phone render is byte-identical when null.
   final Widget Function(Widget child, VoidCallback onTap, {bool autofocus})?
-      wrapButton;
+  wrapButton;
 
   @override
   State<FeaturedHero> createState() => _FeaturedHeroState();
@@ -356,9 +363,7 @@ class _FeaturedHeroState extends State<FeaturedHero> {
                     const SizedBox(width: 10),
                     _wrap(
                       _circleBtn(
-                        widget.inList
-                            ? Icons.check_rounded
-                            : Icons.add_rounded,
+                        widget.inList ? Icons.check_rounded : Icons.add_rounded,
                         widget.onToggleList,
                         active: widget.inList,
                         semanticLabel: widget.inList
@@ -462,7 +467,7 @@ class _FeaturedHeroState extends State<FeaturedHero> {
                 widget.reading ? 'Read' : 'Play',
                 style: TextStyle(
                   fontFamily: AppText.fontFamily,
-          fontFamilyFallback: AppText.fontFamilyFallback,
+                  fontFamilyFallback: AppText.fontFamilyFallback,
                   color: AppColors.bg,
                   fontWeight: FontWeight.w700,
                   fontSize: 15,

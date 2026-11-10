@@ -542,7 +542,8 @@ class SourceRepository implements CatalogueRepository {
         _isAniyomi(sourceId) ||
         _isMihon(sourceId) ||
         _isLnReader(sourceId)) {
-      return true; // non-JS sources are always available
+      // An ecosystem being supported does not mean this plugin is installed.
+      return hasSource(sourceId);
     }
     if (_manager.get(sourceId) != null) return true; // already loaded
     if (!sl.isRegistered<ProviderRegistry>()) return false;

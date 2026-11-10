@@ -1,4 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:hive_flutter/hive_flutter.dart';
+import '../../core/lnreader/lnreader_extension_service.dart';
+import '../../core/provider/provider_registry.dart';
 
 import '../../core/di/injector.dart';
 import '../../core/mihon/mihon_manager.dart';
@@ -110,6 +113,13 @@ class BrowseSourcesList extends StatelessWidget {
       if (sl.isRegistered<CloudStreamManager>()) sl<CloudStreamManager>(),
       if (sl.isRegistered<AniyomiManager>()) sl<AniyomiManager>(),
       if (sl.isRegistered<MihonManager>()) sl<MihonManager>(),
+      // These engines persist inventory directly rather than notifying a
+      // manager. Observe metadata only: redrawing must not load plugin JS.
+      // Startup opens both boxes before the shell; lightweight hosts may omit them.
+      if (Hive.isBoxOpen(ProviderRegistry.boxName))
+        Hive.box<Map>(ProviderRegistry.boxName).listenable(),
+      if (Hive.isBoxOpen(LnReaderExtensionService.boxName))
+        Hive.box<Map>(LnReaderExtensionService.boxName).listenable(),
       // The language prefs too. Turning a language back on changes which
       // sources belong here, and without these the list kept the answer it
       // had — the only way to see the new ones was to pin something, because

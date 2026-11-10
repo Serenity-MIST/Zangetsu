@@ -9,6 +9,7 @@ part of 'detail_screen.dart';
 class _EpisodesTab extends StatefulWidget {
   const _EpisodesTab({
     required this.loading,
+    required this.category,
     required this.eps,
     required this.seasonEps,
     required this.fillerEps,
@@ -47,6 +48,7 @@ class _EpisodesTab extends StatefulWidget {
   /// rather than the "no episodes" empty state (see
   /// [DetailState.episodesLoading]).
   final bool loading;
+  final String category;
 
   final List<Episode> eps;
   final List<Episode> seasonEps;
@@ -648,6 +650,7 @@ class _EpisodesTabState extends State<_EpisodesTab> {
         }
         return RepaintBoundary(
           child: _EpisodeRow(
+            category: widget.category,
             ep: ep,
             epNum: epNum,
             displayTitle: displayTitle,
@@ -1453,6 +1456,7 @@ class _ChapterRow extends StatelessWidget {
 class _EpisodeRow extends StatelessWidget {
   const _EpisodeRow({
     required this.ep,
+    required this.category,
     required this.epNum,
     required this.displayTitle,
     required this.coverUrl,
@@ -1470,6 +1474,7 @@ class _EpisodeRow extends StatelessWidget {
   });
 
   final Episode ep;
+  final String category;
   final int epNum;
   final String displayTitle;
   final bool filler;
@@ -1714,6 +1719,7 @@ class _EpisodeRow extends StatelessWidget {
                 if (!sl<AppMode>().isTv) ...[
                   const SizedBox(width: 8),
                   _EpisodeDownloadIcon(
+                    category: category,
                     sourceId: sourceId,
                     showId: showId,
                     episodeId: ep.id,
@@ -1863,12 +1869,14 @@ class _EpisodeDownloadIcon extends StatelessWidget {
     required this.sourceId,
     required this.showId,
     required this.episodeId,
+    required this.category,
     required this.onTap,
   });
 
   final String sourceId;
   final String showId;
   final String episodeId;
+  final String category;
   final VoidCallback onTap;
 
   @override
@@ -1877,7 +1885,7 @@ class _EpisodeDownloadIcon extends StatelessWidget {
     return ListenableBuilder(
       listenable: manager,
       builder: (context, _) {
-        final rec = manager.recordFor(sourceId, showId, episodeId);
+        final rec = manager.recordFor(sourceId, showId, episodeId, category: category);
         final s = rec?.status;
         // While a download is live (or paused/queued/resolving), tapping the ring
         // opens a Pause/Cancel menu instead of re-opening the server picker.

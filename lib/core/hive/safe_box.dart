@@ -1,3 +1,4 @@
+import 'package:crypto/crypto.dart';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -78,6 +79,8 @@ Future<Box<E>> openBoxSafely<E>(String name) async {
   try {
     return await Hive.openBox<E>(name);
   } catch (e) {
+    // Permission/lock failure or an incompatible live box is not corruption.
+    if (e is FileSystemException || Hive.isBoxOpen(name)) rethrow;
     debugPrint('[Hive] box "$name" is unreadable ($e) — quarantining it.');
     await _quarantine(name);
     quarantinedBoxes.add(name);
@@ -106,8 +109,7 @@ Future<void> migrateLegacyBox(String name, String from, String to) async {
   }
 }
 
-/// Renames the unreadable file to `<name>.hive.corrupt`, falling back to the
-/// old delete if it can't be moved — booting still matters more than the bytes.
+/// Preserve every unreadable generation;verify copies before resetting bytes.
 Future<void> _quarantine(String name) async {
   final dir = hiveBoxDir;
   if (dir != null) {
@@ -117,16 +119,26 @@ Future<void> _quarantine(String name) async {
     final file = File('$dir/${name.toLowerCase()}.hive');
     try {
       if (file.existsSync()) {
-        final kept = '${file.path}.corrupt';
-        // One kept copy per box, so repeated failures can't fill the disk.
-        final previous = File(kept);
-        if (previous.existsSync()) previous.deleteSync();
+        var kept = '${file.path}.corrupt';
+        // Earlier backups may be the only surviving library;never overwrite them.
+        var suffix = 0;
+        final stamp = DateTime.now().microsecondsSinceEpoch;
+        while (await File(kept).exists()) {
+          kept = '${file.path}.corrupt.$stamp.${suffix++}';
+        }
         try {
           await file.rename(kept);
         } on FileSystemException {
           // Windows can keep the failed read handle open without delete sharing.
           // Copy first, then reset in place; the user's bytes stay recoverable.
-          await file.copy(kept);
+          final before = await file.stat();
+          final copy = await file.copy(kept);
+          final originalHash = await sha256.bind(file.openRead()).first;
+          final copiedHash = await sha256.bind(copy.openRead()).first;
+          final after = await file.stat();
+          if (before.size != after.size || before.modified != after.modified || originalHash != copiedHash) {
+            throw FileSystemException('Database backup verification failed', file.path);
+          }
           await file.writeAsBytes(const [], flush: true);
         }
         debugPrint('[Hive] kept the unreadable "$name" at $kept');
@@ -138,16 +150,6 @@ Future<void> _quarantine(String name) async {
   }
   if (dir == null)
     throw StateError('Initialize app storage before recovering a database');
-  try {
-    await Hive.deleteBoxFromDisk(name);
-  } catch (deleteError) {
-    // deleteBoxFromDisk removes the data (.hive) file first, then the .lock —
-    // and its exists()/delete() on the .lock is a TOCTOU race: the lock can be
-    // released in the gap, throwing PathNotFoundException even though the data
-    // file is already gone. Don't let that abort recovery; the reopen above is
-    // what actually matters.
-    debugPrint(
-      '[Hive] cleanup of "$name" hit $deleteError — reopening anyway.',
-    );
-  }
+  // No file means no safe recovery;do not remove another process's lock.
+  throw FileSystemException('Database file unavailable for safe recovery', '$dir/$name.hive');
 }

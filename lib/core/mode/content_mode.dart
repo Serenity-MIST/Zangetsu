@@ -1,9 +1,31 @@
 import 'package:flutter/material.dart';
 import '../models/provider_info.dart';
+import '../mangayomi/mangayomi_source_id.dart';
+import 'package:zangetsu_source_bridge/zangetsu_source_bridge.dart';
 
 /// The app-wide content mode. Anime is the default and covers the whole
 /// existing video app (anime + movie sources); manga/novel are reading modes.
 enum ContentMode { anime, manga, novel }
+
+/// Matches stable extension identities to the selected reading/streaming mode.
+/// Malformed Mangayomi keys fail closed instead of falling into legacy video.
+bool sourceIdMatchesContentMode(String sourceId, ContentMode mode) {
+  final type = mangayomiContentTypeOf(sourceId);
+  if (type != null) {
+    return switch (mode) {
+      ContentMode.anime => type == MangayomiContentType.video,
+      ContentMode.manga => type == MangayomiContentType.manga,
+      ContentMode.novel => type == MangayomiContentType.novel,
+    };
+  }
+  if (sourceId.startsWith('mg:')) return false;
+  return switch (mode) {
+    ContentMode.anime =>
+      !sourceId.startsWith('mihon:') && !sourceId.startsWith('lnr:'),
+    ContentMode.manga => sourceId.startsWith('mihon:'),
+    ContentMode.novel => sourceId.startsWith('lnr:'),
+  };
+}
 
 extension ContentModeX on ContentMode {
   String get label => switch (this) {

@@ -1,3 +1,5 @@
+import 'package:flutter/foundation.dart' show defaultTargetPlatform, TargetPlatform;
+import 'download_thumbnail.dart';
 import 'dart:async';
 
 import 'package:cached_network_image/cached_network_image.dart';
@@ -25,9 +27,13 @@ import '../reader/novel_reader_screen.dart';
 /// are text, they're browsed in different places, and mixing them under the
 /// episode downloads made the video screen read like a dumping ground.
 class ChapterDownloadsScreen extends StatefulWidget {
-  const ChapterDownloadsScreen({super.key, required this.mode});
+  const ChapterDownloadsScreen({super.key, required this.mode, this.sourceId, this.showId});
 
   final ContentMode mode;
+
+  /// Optional exact title scope from the Windows unified offline library.
+  final String? sourceId;
+  final String? showId;
 
   @override
   State<ChapterDownloadsScreen> createState() => _ChapterDownloadsScreenState();
@@ -49,6 +55,10 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
   void _toggle(String key) => setState(() {
     if (!_expanded.remove(key)) _expanded.add(key);
   });
+
+  bool _inScope(ChapterDownload c) => c.mode == widget.mode &&
+      (widget.sourceId == null || c.sourceId == widget.sourceId) &&
+      (widget.showId == null || c.showId == widget.showId);
 
   bool _matchesQuery(ChapterDownload c) {
     final q = _query.trim().toLowerCase();
@@ -75,7 +85,7 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
         valueListenable: store.listenable(),
         builder: (context, box, _) {
           final all = store.all();
-          if (!all.any((c) => c.mode == widget.mode)) {
+          if (!all.any(_inScope)) {
             return EmptyState(
               icon: isNovel ? Icons.article_outlined : Icons.menu_book_outlined,
               message: isNovel
@@ -113,10 +123,10 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
   ) {
     final downloader = sl<ChapterDownloader>();
     final live = Map<String, ChapterDownload>.fromEntries(
-      downloader.inFlight.entries.where((e) => e.value.mode == widget.mode),
+      downloader.inFlight.entries.where((e) => _inScope(e.value)),
     );
     final saved = all
-        .where((c) => c.mode == widget.mode)
+        .where(_inScope)
         .where(_matchesQuery)
         .toList();
 
@@ -160,7 +170,7 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
             chapters: e.value,
             // Searching reveals the matches instead of making the user expand
             // every group.
-            expanded: _query.trim().isNotEmpty || _expanded.contains(e.key),
+            expanded: widget.showId != null || _query.trim().isNotEmpty || _expanded.contains(e.key),
             onToggle: () => _toggle(e.key),
           ),
       ],
@@ -211,11 +221,33 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
       destructive: true,
     );
     if (ok != true) return;
-    await sl<ChapterDownloader>().cancelAll();
+    final downloader = sl<ChapterDownloader>();
+    if (widget.sourceId == null && widget.showId == null) {
+      await downloader.cancelAll();
+    } else {
+      // A title-scoped desktop view must never cancel unrelated reading jobs.
+      final ids = downloader.inFlight.values.where(_inScope).map((c) => c.id).toList();
+      for (final id in ids) { await downloader.cancel(id); }
+    }
   }
 
   Future<void> _clearFailed(AppLocalizations l10n) async {
-    final n = await sl<ChapterDownloader>().clearFailed();
+    final downloader = sl<ChapterDownloader>();
+    int n;
+    if (widget.sourceId == null && widget.showId == null) {
+      n = await downloader.clearFailed();
+    } else {
+      final store = sl<ChapterDownloadStore>();
+      final failed = store.all().where(_inScope)
+          .where((c) => c.status == ChapterDownloadStatus.failed).toList();
+      n = 0;
+      for (final c in failed) {
+        // A retry started since the snapshot still owns its files.
+        if (downloader.isBusy(c.id)) continue;
+        await store.remove(c.id);
+        n++;
+      }
+    }
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..clearSnackBars()
@@ -554,11 +586,11 @@ class _SavedChapterTile extends StatelessWidget {
     return ListTile(
       onTap: onTap,
       contentPadding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
-      leading: Icon(
-        chapterIcon(chapter.mode),
-        color: AppColors.accent,
-        size: 26,
-      ),
+      leading: defaultTargetPlatform == TargetPlatform.windows
+          ? SizedBox(width: 72, height: 48, child: DownloadThumbnail(
+              thumbnail: chapter.thumbnail, cover: chapter.cover, headers: chapter.coverHeaders,
+              fallback: Center(child: Icon(chapterIcon(chapter.mode), color: AppColors.accent, size: 26))))
+          : Icon(chapterIcon(chapter.mode), color: AppColors.accent, size: 26),
       title: Text(
         chapter.chapterTitle.trim().isEmpty
             ? l10n.chapter

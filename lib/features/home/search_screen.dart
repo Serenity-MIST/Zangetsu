@@ -1820,10 +1820,10 @@ class _SearchViewState extends State<_SearchView>
   /// Horizontal (CloudStream-style) poster row for one source. Capped to
   /// [_kSourcePreviewCap]; the header's "See all" opens the full grid.
   Widget _sourceRow(SourceResultGroup g, double cellW) {
-    final itemW = posterLayout(context) == PosterCardLayout.wide
+    final itemW = defaultTargetPlatform==TargetPlatform.windows ? posterRowWidth(context) : posterLayout(context) == PosterCardLayout.wide
         ? 184.0
         : 124.0;
-    final itemH = posterLayout(context) == PosterCardLayout.wide
+    final itemH = defaultTargetPlatform==TargetPlatform.windows ? posterRowHeight(context) : posterLayout(context) == PosterCardLayout.wide
         ? 146.0
         : 210.0;
     final overflows = g.items.length > _kSourcePreviewCap;

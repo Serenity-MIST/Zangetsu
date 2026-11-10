@@ -13,6 +13,7 @@ import '../../core/theme/app_text.dart';
 import '../../core/tracker/tracker_hub.dart';
 import '../../core/ui/home_rows_prefs.dart';
 import '../../core/ui/settings_widgets.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import '../../core/zmode/home_layouts.dart';
 import '../../core/zmode/metadata_provider_prefs.dart';
 import '../../core/zmode/zmode_ids.dart';
@@ -180,43 +181,60 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
   /// one you are about to switch to shouldn't require switching first.
   Future<void> _pickLayout() async {
     final layouts = allHomeLayouts();
-    final picked = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: AppColors.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (ctx) => SafeArea(
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
-                child: Row(
+    // The desktop editor changes only the layout being edited; selecting a
+    // metadata layout must not silently change the active Home provider.
+    final picked = DesktopSettingsScope.contains(context)
+        ? await showGraphiteSettingsChoice<String>(
+            context,
+            title: context.l10n.homeRowsLayout,
+            current: _layoutKey,
+            options: [
+              for (final layout in layouts)
+                (layout.key, _layoutLabel(context, layout)),
+            ],
+          )
+        : await showModalBottomSheet<String>(
+            context: context,
+            backgroundColor: AppColors.surface,
+            shape: const RoundedRectangleBorder(
+              borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+            ),
+            builder: (ctx) => SafeArea(
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    Text(ctx.l10n.homeRowsLayout, style: AppText.headline),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+                      child: Row(
+                        children: [
+                          Text(
+                            ctx.l10n.homeRowsLayout,
+                            style: AppText.headline,
+                          ),
+                        ],
+                      ),
+                    ),
+                    const Divider(color: AppColors.hairline, height: 1),
+                    for (final l in layouts)
+                      ListTile(
+                        onTap: () => Navigator.pop(ctx, l.key),
+                        title: Text(
+                          _layoutLabel(ctx, l),
+                          style: AppText.body.copyWith(
+                            color: AppColors.textPrimary,
+                          ),
+                        ),
+                        trailing: l.key == _layoutKey
+                            ? Icon(Icons.check, color: AppColors.accent)
+                            : null,
+                      ),
+                    const SizedBox(height: 8),
                   ],
                 ),
               ),
-              const Divider(color: AppColors.hairline, height: 1),
-              for (final l in layouts)
-                ListTile(
-                  onTap: () => Navigator.pop(ctx, l.key),
-                  title: Text(
-                    _layoutLabel(ctx, l),
-                    style: AppText.body.copyWith(color: AppColors.textPrimary),
-                  ),
-                  trailing: l.key == _layoutKey
-                      ? Icon(Icons.check, color: AppColors.accent)
-                      : null,
-                ),
-              const SizedBox(height: 8),
-            ],
-          ),
-        ),
-      ),
-    );
+            ),
+          );
     if (picked == null || !mounted || picked == _layoutKey) return;
     setState(() => _select(picked));
   }
@@ -252,11 +270,7 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
     if (kind == null || !sl.isRegistered<TrackerHub>()) {
       return provider ?? 'AniList';
     }
-    final pick = pickHomeTracker(
-      sl<TrackerHub>(),
-      kind,
-      preferred: provider,
-    );
+    final pick = pickHomeTracker(sl<TrackerHub>(), kind, preferred: provider);
     return pick?.displayName ?? provider ?? 'AniList';
   }
 
@@ -264,10 +278,9 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
   /// exactly like the rows do on Home.
   bool get _reading => _kind == ZKind.manga || _kind == ZKind.novel;
 
-  Future<void> _save() => HomeRowsPrefs.save(
-    _layoutKey,
-    [for (final e in _layout) encodeRowEntry(e)],
-  );
+  Future<void> _save() => HomeRowsPrefs.save(_layoutKey, [
+    for (final e in _layout) encodeRowEntry(e),
+  ]);
 
   void _toggle(HomeRowEntry entry, bool shown) {
     setState(() {
@@ -310,7 +323,10 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
     final moved = items.removeAt(oldIndex);
     items.insert(newIndex < 1 ? 1 : newIndex, moved);
     setState(() {
-      _layout = [for (final o in items) if (o is HomeRowEntry) o];
+      _layout = [
+        for (final o in items)
+          if (o is HomeRowEntry) o,
+      ];
     });
     _save();
   }
@@ -337,66 +353,65 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
           ),
         ],
       ),
-      body:
-          _ready
-              ? ListView(
-                // SettingsCard brings its own 16px side margin; adding more
-                // here would inset these cards past every other settings page.
-                padding: const EdgeInsets.fromLTRB(0, 8, 0, 32),
-                children: [
-                  // Which arrangement is on screen, and the ONLY provider
-                  // choice here: the layout's provider is also the tracker
-                  // behind its list rows, so one control decides both.
-                  if (info != null)
-                    SettingsCard(
-                      children: [
-                        SettingsTile(
-                          icon: Icons.dashboard_customize_outlined,
-                          title: l10n.homeRowsLayout,
-                          trailing: Text(
-                            _layoutLabel(context, info),
-                            style: AppText.caption,
-                          ),
-                          onTap: _pickLayout,
-                        ),
-                      ],
-                    ),
-                  // Cards are normally spaced by the section label between
-                  // them; there is no heading to put here, just the gap.
-                  if (info != null) const SizedBox(height: 14),
+      body: _ready
+          ? ListView(
+              // SettingsCard brings its own 16px side margin; adding more
+              // here would inset these cards past every other settings page.
+              padding: const EdgeInsets.fromLTRB(0, 8, 0, 32),
+              children: [
+                // Which arrangement is on screen, and the ONLY provider
+                // choice here: the layout's provider is also the tracker
+                // behind its list rows, so one control decides both.
+                if (info != null)
                   SettingsCard(
                     children: [
-                      ReorderableListView(
-                        shrinkWrap: true,
-                        physics: const NeverScrollableScrollPhysics(),
-                        buildDefaultDragHandles: false,
-                        onReorderItem: _reorder,
-                        children: [
-                          for (var i = 0; i < arrangement.length; i++)
-                            if (arrangement[i] is _GroupTag)
-                              _groupLabel(arrangement[i] as _GroupTag, i)
-                            else
-                              _row(arrangement[i] as HomeRowEntry, i),
-                        ],
+                      SettingsTile(
+                        icon: Icons.dashboard_customize_outlined,
+                        title: l10n.homeRowsLayout,
+                        trailing: Text(
+                          _layoutLabel(context, info),
+                          style: AppText.caption,
+                        ),
+                        onTap: _pickLayout,
                       ),
                     ],
                   ),
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(28, 14, 22, 0),
-                    child: Text(
-                      l10n.homeRowsHelp,
-                      style: AppText.caption.copyWith(
-                        color: AppColors.textTertiary,
-                      ),
+                // Cards are normally spaced by the section label between
+                // them; there is no heading to put here, just the gap.
+                if (info != null) const SizedBox(height: 14),
+                SettingsCard(
+                  children: [
+                    ReorderableListView(
+                      shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      buildDefaultDragHandles: false,
+                      onReorderItem: _reorder,
+                      children: [
+                        for (var i = 0; i < arrangement.length; i++)
+                          if (arrangement[i] is _GroupTag)
+                            _groupLabel(arrangement[i] as _GroupTag, i)
+                          else
+                            _row(arrangement[i] as HomeRowEntry, i),
+                      ],
+                    ),
+                  ],
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(28, 14, 22, 0),
+                  child: Text(
+                    l10n.homeRowsHelp,
+                    style: AppText.caption.copyWith(
+                      color: AppColors.textTertiary,
                     ),
                   ),
-                ],
-              )
-              : Center(
-                // Home hasn't finished a load; its sections are half of what
-                // this editor edits, so wait rather than offer half a list.
-                child: Text(l10n.loading, style: AppText.caption),
-              ),
+                ),
+              ],
+            )
+          : Center(
+              // Home hasn't finished a load; its sections are half of what
+              // this editor edits, so wait rather than offer half a list.
+              child: Text(l10n.loading, style: AppText.caption),
+            ),
     );
   }
 
@@ -475,9 +490,8 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
     if (id == newEpisodesRowId) return l10n.homeRowNewEpisodes;
     if (id == streamingServicesRowId) return l10n.streamingServices;
     if (id.startsWith('section:')) return id.substring('section:'.length);
-    final status = WatchStatus.values.asNameMap()[id.substring(
-      'tracker:'.length,
-    )];
+    final status = WatchStatus.values
+        .asNameMap()[id.substring('tracker:'.length)];
     return status == null
         ? id
         : trackerStatusLabel(context, status, reading: _reading);

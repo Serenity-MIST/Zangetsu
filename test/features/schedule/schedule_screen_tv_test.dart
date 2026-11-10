@@ -23,7 +23,9 @@ class _FS implements ComingSoonService {
   @override
   bool lastFailureOffline = false;
  @override noSuchMethod(Invocation i) => super.noSuchMethod(i); }
-class _FMyList implements MyListStore { @override noSuchMethod(Invocation i) => super.noSuchMethod(i); }
+class _FMyList implements MyListStore {
+  @override
+  final ValueNotifier<int> revision = ValueNotifier<int>(0); @override noSuchMethod(Invocation i) => super.noSuchMethod(i); }
 
 void main() {
   testWidgets('TV schedule renders focusable airing cards', (tester) async {

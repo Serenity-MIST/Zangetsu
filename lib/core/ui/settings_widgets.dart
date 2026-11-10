@@ -6,6 +6,7 @@ import '../theme/app_colors.dart';
 import '../theme/app_text.dart';
 import '../tv/tv_back_button.dart';
 import '../tv/tv_list_focusable.dart';
+import 'desktop_settings_surface.dart';
 
 /// Compact, flat app bar for pushed settings screens — an 18px title with a
 /// bottom hairline, matching the in-tab section header so drilling deeper keeps
@@ -19,7 +20,7 @@ PreferredSizeWidget settingsAppBar(
   VoidCallback? onBack,
 }) {
   final tvBack = showBack && _isTvDevice();
-  return AppBar(
+  final fallback = AppBar(
     titleSpacing: tvBack ? 8 : (showBack ? 4 : 16),
     automaticallyImplyLeading: showBack && !tvBack && onBack == null,
     toolbarHeight: tvBack ? 72 : kToolbarHeight,
@@ -52,6 +53,79 @@ PreferredSizeWidget settingsAppBar(
       child: Divider(height: 1, thickness: 1, color: AppColors.hairline),
     ),
   );
+  return _ScopedSettingsAppBar(
+    fallback: fallback,
+    title: title,
+    actions: actions,
+    showBack: showBack,
+    onBack: onBack,
+  );
+}
+
+/// Resolves the nested desktop header at build time, where the workspace scope
+/// is available. Outside that scope the original phone/TV app bar is retained.
+class _ScopedSettingsAppBar extends StatelessWidget
+    implements PreferredSizeWidget {
+  const _ScopedSettingsAppBar({
+    required this.fallback,
+    required this.title,
+    required this.showBack,
+    this.actions,
+    this.onBack,
+  });
+
+  final AppBar fallback;
+  final String title;
+  final bool showBack;
+  final List<Widget>? actions;
+  final VoidCallback? onBack;
+
+  @override
+  Size get preferredSize => fallback.preferredSize;
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isTvDevice() || !DesktopSettingsScope.contains(context)) {
+      return fallback;
+    }
+    return AppBar(
+      backgroundColor: const Color(0xFF101114),
+      surfaceTintColor: Colors.transparent,
+      elevation: 0,
+      scrolledUnderElevation: 0,
+      automaticallyImplyLeading: false,
+      titleSpacing: showBack ? 10 : 24,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(bottom: Radius.circular(18)),
+      ),
+      leading: showBack
+          ? Padding(
+              padding: const EdgeInsets.all(6),
+              child: IconButton(
+                tooltip: MaterialLocalizations.of(context).backButtonTooltip,
+                onPressed: onBack ?? () => Navigator.of(context).maybePop(),
+                style: IconButton.styleFrom(
+                  backgroundColor: const Color(0xFF24252D),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                icon: const Icon(Icons.arrow_back_rounded, size: 20),
+              ),
+            )
+          : null,
+      title: Text(
+        title,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: AppText.headline.copyWith(
+          fontSize: 23,
+          color: AppColors.textPrimary,
+        ),
+      ),
+      actions: actions,
+    );
+  }
 }
 
 bool _isTvDevice() => sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
@@ -111,6 +185,20 @@ class SettingsTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final isTv = _isTvDevice();
     final tap = onTap;
+
+    if (!isTv && DesktopSettingsScope.contains(context)) {
+      return GraphiteSettingsControl(
+        icon: icon,
+        title: title,
+        subtitle: subtitle,
+        trailing: trailing,
+        leading: iconHeroTag == null
+            ? leading
+            : Hero(tag: iconHeroTag!, child: leading ?? Icon(icon)),
+        destructive: destructive,
+        onTap: tap,
+      );
+    }
 
     if (isTv && tap != null) {
       return TvListFocusable(
@@ -242,6 +330,12 @@ class SettingsCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isTv = _isTvDevice();
+    if (!isTv && DesktopSettingsScope.contains(context)) {
+      return GraphiteSettingsPanel(
+        margin: margin ?? const EdgeInsets.symmetric(horizontal: 22),
+        children: children,
+      );
+    }
     final rows = <Widget>[];
     for (var i = 0; i < children.length; i++) {
       if (i > 0) {
@@ -295,6 +389,19 @@ class SettingsSectionLabel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (!_isTvDevice() && DesktopSettingsScope.contains(context)) {
+      return Padding(
+        padding: EdgeInsets.fromLTRB(24, first ? 12 : 24, 24, 12),
+        child: Text(
+          label,
+          style: AppText.body.copyWith(
+            color: AppColors.textPrimary,
+            fontSize: 18,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      );
+    }
     return Padding(
       padding: EdgeInsets.fromLTRB(28, first ? 4 : 22, 22, 9),
       child: Text(

@@ -1,5 +1,8 @@
 import 'dart:io';
+import 'package:watch_app/features/settings/desktop_settings_workspace.dart';
 import 'package:watch_app/core/ui/nav_prefs.dart';
+import 'package:watch_app/core/ui/desktop_settings_surface.dart';
+import 'package:watch_app/core/ui/streaming_prefs.dart';
 import 'package:watch_app/core/profiles/viewer_profile.dart';
 
 import 'package:flutter/material.dart';
@@ -28,6 +31,7 @@ import 'package:watch_app/features/auth/auth_screens.dart';
 import 'package:watch_app/features/auth/auth_cubit.dart';
 import 'package:watch_app/features/auth/migration_bridge.dart';
 import 'package:watch_app/features/settings/settings_screen.dart';
+import 'package:watch_app/features/settings/desktop_settings_category_grid.dart';
 import 'package:watch_app/l10n/app_localizations.dart';
 
 MigrationBridge _fakeBridge() => MigrationBridge(
@@ -41,6 +45,38 @@ MigrationBridge _fakeBridge() => MigrationBridge(
 class _StubSearchPrefs extends SearchPrefs {
   @override
   SearchLayout get layout => SearchLayout.vertical;
+}
+
+/// UI selection tests use immediate writes; real disk persistence is verified
+/// separately outside Flutter's fake animation clock below.
+class _WidgetBatchPrefs extends PlaybackPrefs {
+  String _style = 'classic';
+  int saves = 0;
+
+  @override
+  String get batchDownloadStyle => _style;
+
+  @override
+  Future<void> setBatchDownloadStyle(String value) async {
+    _style = value;
+    saves++;
+  }
+}
+
+/// Keeps the My List dialog test independent of real I/O and animation time.
+class _WidgetListStylePrefs extends NavPrefs {
+  String _style = 'classic';
+  int saves = 0;
+
+  @override
+  String get myListStyle => _style;
+
+  @override
+  Future<void> setMyListStyle(String value) async {
+    _style = value;
+    saves++;
+    notifyListeners();
+  }
 }
 
 class _StubProviderRegistry implements ProviderRegistry {
@@ -150,6 +186,7 @@ void main() {
   Future<void> pumpSettings(
     WidgetTester tester, {
     bool fromPlayer = false,
+    bool routed = false,
   }) async {
     _mockPathProvider(tester);
     await tester.binding.setSurfaceSize(const Size(1000, 2200));
@@ -172,13 +209,13 @@ void main() {
         child: MaterialApp(
           localizationsDelegates: AppLocalizations.localizationsDelegates,
           supportedLocales: AppLocalizations.supportedLocales,
-          home: fromPlayer
+          home: fromPlayer || routed
               ? Builder(
                   builder: (context) => TextButton(
                     onPressed: () => Navigator.of(context).push(
                       MaterialPageRoute<void>(
                         builder: (_) =>
-                            const SettingsScreen(returnToPlayer: true),
+                            SettingsScreen(returnToPlayer: fromPlayer),
                       ),
                     ),
                     child: const Text('Open player settings'),
@@ -189,46 +226,76 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
-    if (fromPlayer) {
+    if (fromPlayer || routed) {
       await tester.tap(find.text('Open player settings'));
       await tester.pumpAndSettle();
     }
   }
 
+  testWidgets('desktop workspace keeps category and embedded search routes', (
+    tester,
+  ) async {
+    await pumpSettings(tester);
+    expect(find.byType(DesktopSettingsWorkspace), findsOneWidget);
+    expect(find.byType(DesktopSettingsCategoryGrid), findsNothing);
+    expect(find.text('Settings appearance'), findsNothing);
+
+    // The new cards retain real existing routes rather than placeholder pages.
+    await tester.tap(find.text('Sources'));
+    await tester.pumpAndSettle();
+    expect(find.text('Providers'), findsOneWidget);
+    await tester.tap(find.byTooltip('Back'));
+    await tester.pumpAndSettle();
+
+    // The new presentation also keeps the existing leaf-search destination.
+    await tester.enterText(find.byType(TextField), 'autoplay next');
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Autoplay next episode'));
+    await tester.pumpAndSettle();
+    expect(find.byType(PlaybackSettingsScreen), findsOneWidget);
+    expect(find.byKey(const ValueKey('desktop-nav-playback')), findsOneWidget);
+    // The destination's Back pops only the leaf, preserving the sidebar.
+    await tester.tap(find.byTooltip('Back').last);
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), '');
+    await tester.pumpAndSettle();
+    expect(find.byType(DesktopSettingsWorkspace), findsOneWidget);
+    expect(find.byKey(const ValueKey('desktop-nav-account')), findsOneWidget);
+  });
+
   testWidgets('player settings has a visible return button after drill-down', (
     tester,
   ) async {
     await pumpSettings(tester, fromPlayer: true);
-    expect(find.text('Back to player'), findsOneWidget);
+    expect(find.byType(DesktopSettingsWorkspace), findsOneWidget);
     await tester.tap(find.text('Sources'));
     await tester.pumpAndSettle();
-    await tester.tap(
-      find.descendant(
-        of: find.byType(AppBar),
-        matching: find.byTooltip('Back'),
-      ),
-    );
+    await tester.tap(find.byTooltip('Back'));
     await tester.pumpAndSettle();
     expect(find.text('Open player settings'), findsOneWidget);
     expect(find.byType(SettingsScreen), findsNothing);
   });
 
-  testWidgets('top level shows one tappable row per section, not the tiles', (
+  testWidgets('workspace exposes every category and defaults to Account', (
     tester,
   ) async {
     await pumpSettings(tester);
 
     // Each section is now a single drill-down row.
     for (final section in const [
-      'Account & sync',
-      'Sources',
-      'Playback',
-      'Downloads',
-      'Interface',
-      'Advanced',
-      'About',
+      'account',
+      'sources',
+      'playback',
+      'downloads',
+      'interface',
+      'advanced',
+      'about',
     ]) {
-      expect(find.text(section), findsOneWidget, reason: 'category: $section');
+      expect(
+        find.byKey(ValueKey('desktop-nav-$section')),
+        findsOneWidget,
+        reason: 'category: $section',
+      );
     }
     // Notifications is Android-only (its sole entry), so its category is absent
     // on the non-Android test host.
@@ -236,7 +303,8 @@ void main() {
     // The individual settings live INSIDE their section now, not up top.
     expect(find.text('Providers'), findsNothing);
     expect(find.text('Storage'), findsNothing);
-    expect(find.text('Backup & Restore'), findsNothing);
+    expect(find.text('Backup & Restore'), findsOneWidget);
+    expect(find.text('Manage profiles'), findsOneWidget);
   });
 
   testWidgets('tapping a category drills into its settings', (tester) async {
@@ -250,27 +318,33 @@ void main() {
       expect(find.text(t), findsOneWidget, reason: 'tile: $t');
     }
     expect(find.text('Active source'), findsNothing);
-    // Other sections' rows are gone (we're on the Sources sub-page).
-    expect(find.text('Downloads'), findsNothing);
-    expect(find.text('About'), findsNothing);
+    // The sidebar persists while the content pane changes categories.
+    expect(find.byKey(const ValueKey('desktop-nav-downloads')), findsOneWidget);
+    expect(find.byKey(const ValueKey('desktop-nav-about')), findsOneWidget);
+    expect(find.text('Backup & Restore'), findsNothing);
   });
 
-  testWidgets(
-    'desktop settings have one header and section back returns to hub',
-    (tester) async {
-      await pumpSettings(tester);
-      expect(find.text('Settings.'), findsNothing);
-      expect(find.byType(AppBar), findsOneWidget);
-      await tester.tap(find.text('Sources'));
+  for (final section in ['sources', 'interface', 'advanced']) {
+    testWidgets('one Back exits desktop $section without an Account hop', (tester) async {
+      await pumpSettings(tester, routed: true);
+      await tester.tap(find.byKey(ValueKey('desktop-nav-$section')));
       await tester.pumpAndSettle();
-      expect(find.text('Settings'), findsNothing);
-      expect(find.text('Sources'), findsOneWidget);
-      expect(find.byTooltip('Back'), findsOneWidget);
-      await tester.tap(find.byTooltip('Back'));
+      expect(find.byType(DesktopSettingsWorkspace), findsOneWidget);
+      await tester.tap(find.byTooltip('Back').first);
       await tester.pumpAndSettle();
-      expect(find.text('Account & sync'), findsOneWidget);
-    },
-  );
+      expect(find.byType(SettingsScreen), findsNothing);
+      expect(find.text('Open player settings'), findsOneWidget);
+    });
+  }
+
+  testWidgets('system Back exits a desktop category in one action', (tester) async {
+    await pumpSettings(tester, routed: true);
+    await tester.tap(find.byKey(const ValueKey('desktop-nav-advanced')));
+    await tester.pumpAndSettle();
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(find.byType(SettingsScreen), findsNothing);
+  });
 
   testWidgets('desktop playback exposes working control-bar customization', (
     tester,
@@ -281,7 +355,7 @@ void main() {
     await tester.scrollUntilVisible(
       find.text('Player controls'),
       250,
-      scrollable: find.byType(Scrollable).first,
+      scrollable: find.byType(Scrollable).last,
     );
     await tester.tap(find.text('Player controls'));
     await tester.pumpAndSettle();
@@ -297,7 +371,7 @@ void main() {
     (sl<SimklService>() as _StubSimkl).connected = true;
     (sl<MangaBakaService>() as _StubMangaBaka).connected = true;
     await pumpSettings(tester);
-    await tester.tap(find.text('Account & sync'));
+    await tester.tap(find.byKey(const ValueKey('desktop-nav-account')));
     await tester.pumpAndSettle();
     expect(find.text('4 connected'), findsOneWidget);
   });
@@ -306,7 +380,7 @@ void main() {
     tester,
   ) async {
     await pumpSettings(tester);
-    await tester.tap(find.text('Account & sync'));
+    await tester.tap(find.byKey(const ValueKey('desktop-nav-account')));
     await tester.pumpAndSettle();
     expect(find.text('Connections'), findsOneWidget);
     expect(find.text('Pair this PC'), findsNothing);
@@ -318,7 +392,7 @@ void main() {
   ) async {
     await pumpSettings(tester);
     tester
-        .state<NavigatorState>(find.byType(Navigator))
+        .state<NavigatorState>(find.byType(Navigator).first)
         .push(MaterialPageRoute<void>(builder: (_) => const LoginScreen()));
     await tester.pumpAndSettle();
     expect(find.byType(TextField), findsNWidgets(2));
@@ -330,7 +404,7 @@ void main() {
     tester,
   ) async {
     await pumpSettings(tester);
-    await tester.tap(find.text('Account & sync'));
+    await tester.tap(find.byKey(const ValueKey('desktop-nav-account')));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Connections'));
     await tester.pumpAndSettle();
@@ -362,8 +436,210 @@ void main() {
     await tester.tap(find.text('Reader'));
     await tester.pumpAndSettle();
 
-    expect(find.text('MANGA'), findsOneWidget);
-    expect(find.text('NOVEL'), findsOneWidget);
+    // Desktop section headings preserve readable localized case.
+    final l10n = lookupAppLocalizations(const Locale('en'));
+    expect(find.text(l10n.modeManga), findsOneWidget);
+    expect(find.text(l10n.modeNovel), findsOneWidget);
+  });
+
+  testWidgets(
+    'desktop batch style keeps descriptions and saves only selection',
+    (tester) async {
+      Future<void> settle(String step) async {
+        await tester.pumpAndSettle(
+          const Duration(milliseconds: 100),
+          EnginePhase.sendSemanticsUpdate,
+          const Duration(seconds: 5),
+        );
+      }
+
+      final prefs = _WidgetBatchPrefs();
+      await GetIt.instance.unregister<PlaybackPrefs>();
+      GetIt.instance.registerSingleton<PlaybackPrefs>(prefs);
+      await pumpSettings(tester);
+      final l10n = lookupAppLocalizations(const Locale('en'));
+      await tester.tap(find.byKey(const ValueKey('desktop-nav-interface')));
+      await settle('Interface selected');
+      await tester.ensureVisible(find.text(l10n.batchDownloadStyle));
+      await settle('batch row visible');
+      await tester.tap(find.text(l10n.batchDownloadStyle));
+      await settle('dialog open');
+      expect(find.byType(Dialog), findsOneWidget);
+      expect(find.byType(BottomSheet), findsNothing);
+      expect(find.text(l10n.batchDownloadStyleBlurb), findsOneWidget);
+      expect(find.text(l10n.batchDownloadMinimalBlurb), findsOneWidget);
+      await tester.tap(
+        find.descendant(
+          of: find.byType(Dialog),
+          matching: find.text(l10n.batchDownloadMinimal),
+        ),
+      );
+      await settle('minimal chosen');
+      expect(prefs.batchDownloadStyle, 'minimal');
+      expect(prefs.saves, 1);
+      expect(find.byType(Dialog), findsNothing);
+      await tester.ensureVisible(find.text(l10n.batchDownloadStyle));
+      await settle('batch row visible again');
+      await tester.tap(find.text(l10n.batchDownloadStyle));
+      await settle('dialog reopened');
+      await tester.tap(find.byTooltip('Close'));
+      await settle('dialog cancelled');
+      expect(prefs.batchDownloadStyle, 'minimal');
+      expect(prefs.saves, 1);
+      expect(tester.takeException(), isNull);
+    },
+    timeout: const Timeout(Duration(seconds: 30)),
+  );
+
+  test(
+    'batch style persists through closing and reopening its real Hive box',
+    () async {
+      final prefs = GetIt.instance<PlaybackPrefs>();
+      await prefs.setBatchDownloadStyle('minimal');
+      await Hive.box(PlaybackPrefs.boxName).close();
+      await Hive.openBox(PlaybackPrefs.boxName);
+      expect(prefs.batchDownloadStyle, 'minimal');
+    },
+  );
+
+  testWidgets('desktop region dialog opens and cancellation preserves region', (
+    tester,
+  ) async {
+    await pumpSettings(tester);
+    final l10n = lookupAppLocalizations(const Locale('en'));
+    final before = StreamingPrefs.region;
+    await tester.tap(find.byKey(const ValueKey('desktop-nav-sources')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(l10n.streamingRegion));
+    await tester.pumpAndSettle();
+    expect(find.byType(Dialog), findsOneWidget);
+    expect(find.byType(BottomSheet), findsNothing);
+    expect(find.text(l10n.streamingRegionSubtitle), findsOneWidget);
+    expect(
+      find.descendant(of: find.byType(Dialog), matching: find.text('US')),
+      findsOneWidget,
+    );
+    await tester.tap(find.byTooltip('Close'));
+    await tester.pumpAndSettle();
+    expect(StreamingPrefs.region, before);
+    expect(find.byType(Dialog), findsNothing);
+  });
+
+  testWidgets(
+    'Reader translation appearance keeps desktop scope in its dialog',
+    (tester) async {
+      await pumpSettings(tester);
+      await tester.tap(find.text('Reading'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Reader'));
+      await tester.pumpAndSettle();
+      final label = lookupAppLocalizations(
+        const Locale('en'),
+      ).mangaTranslationAppearance;
+      await tester.ensureVisible(find.text(label));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(label));
+      await tester.pumpAndSettle();
+      expect(find.byType(Dialog), findsOneWidget);
+      expect(find.byType(BottomSheet), findsNothing);
+      expect(
+        find.descendant(
+          of: find.byType(Dialog),
+          matching: find.byType(GraphiteSettingsPanel),
+        ),
+        findsOneWidget,
+      );
+      await tester.tap(find.byTooltip('Close'));
+      await tester.pumpAndSettle();
+      expect(find.byType(Dialog), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('Appearance font and animation choices use desktop dialogs', (
+    tester,
+  ) async {
+    await pumpSettings(tester);
+    await tester.tap(find.byKey(const ValueKey('desktop-nav-interface')));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('Theme & colour'));
+    await tester.tap(find.text('Theme & colour'));
+    await tester.pumpAndSettle();
+    final l10n = lookupAppLocalizations(const Locale('en'));
+    // Cancel both pickers: opening settings must not download a font or save
+    // an animation preference before the user has selected anything.
+    for (final label in ['App font', l10n.animationStyle]) {
+      await tester.ensureVisible(find.text(label));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(label));
+      await tester.pumpAndSettle();
+      expect(find.byType(Dialog), findsOneWidget);
+      expect(find.byType(BottomSheet), findsNothing);
+      if (label == 'App font') {
+        expect(find.text('Downloads on first use'), findsWidgets);
+      } else {
+        for (final description in [
+          l10n.animRiseDesc,
+          l10n.animFadeDesc,
+          l10n.animZoomDesc,
+        ]) {
+          expect(
+            find.descendant(
+              of: find.byType(Dialog),
+              matching: find.text(description),
+            ),
+            findsOneWidget,
+          );
+        }
+      }
+      await tester.tap(find.byTooltip('Close'));
+      await tester.pumpAndSettle();
+      expect(find.byType(Dialog), findsNothing);
+    }
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('desktop My List choice saves once and cancellation is inert', (
+    tester,
+  ) async {
+    final prefs = _WidgetListStylePrefs();
+    await GetIt.instance.unregister<NavPrefs>();
+    GetIt.instance.registerSingleton<NavPrefs>(prefs);
+    await pumpSettings(tester);
+    await tester.tap(find.byKey(const ValueKey('desktop-nav-interface')));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('My List style'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('My List style'));
+    await tester.pumpAndSettle();
+    expect(find.byType(Dialog), findsOneWidget);
+    expect(find.byType(BottomSheet), findsNothing);
+    expect(
+      find.text('Switch between Streaming, Manga and Novel inside My List.'),
+      findsOneWidget,
+    );
+    await tester.tap(
+      find.descendant(of: find.byType(Dialog), matching: find.text('New')),
+    );
+    await tester.pumpAndSettle();
+    expect(prefs.myListStyle, 'new');
+    expect(prefs.saves, 1);
+    await tester.ensureVisible(find.text('My List style'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('My List style'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Close'));
+    await tester.pumpAndSettle();
+    expect(prefs.myListStyle, 'new');
+    expect(prefs.saves, 1);
+  });
+
+  test('My List style survives reopening its real preference box', () async {
+    final prefs = GetIt.instance<NavPrefs>();
+    await prefs.setMyListStyle('new');
+    await Hive.box(NavPrefs.boxName).close();
+    await Hive.openBox(NavPrefs.boxName);
+    expect(prefs.myListStyle, 'new');
   });
 
   testWidgets('search cuts across every section (flat filtered list)', (
@@ -378,6 +654,6 @@ void main() {
     expect(find.text('Backup & Restore'), findsOneWidget);
     // …and non-matching tiles/categories are filtered out.
     expect(find.text('Providers'), findsNothing);
-    expect(find.text('Sources'), findsNothing);
+    expect(find.byKey(const ValueKey('desktop-nav-sources')), findsOneWidget);
   });
 }

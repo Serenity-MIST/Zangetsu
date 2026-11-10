@@ -23,6 +23,9 @@ class FlutterWindow : public Win32Window {
                          LPARAM const lparam) noexcept override;
 
  private:
+  // Original caption style is restored when leaving desktop chrome.
+  bool custom_caption_ = false;
+  LONG_PTR caption_style_ = 0;
   bool fullscreen_ = false;
   LONG_PTR window_style_ = 0;
   WINDOWPLACEMENT window_placement_ = {sizeof(WINDOWPLACEMENT)};

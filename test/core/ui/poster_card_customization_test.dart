@@ -14,6 +14,7 @@ import 'package:watch_app/core/playback/playback_prefs.dart';
 import 'package:watch_app/core/ui/poster_card.dart';
 import 'package:watch_app/core/tv/tv_poster_tile.dart';
 import 'package:watch_app/core/ui/settings_widgets.dart';
+import 'package:watch_app/core/ui/desktop_settings_surface.dart';
 import 'package:watch_app/features/home/home_screen_tv.dart';
 import 'package:watch_app/features/settings/poster_card_settings_screen.dart';
 
@@ -43,6 +44,98 @@ void main() {
     await GetIt.I.reset();
     await Hive.close();
     await temp.delete(recursive: true);
+  });
+
+  testWidgets(
+    'desktop poster preview uses row width and live independent choices',
+    (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      try {
+        await tester.binding.setSurfaceSize(const Size(1366, 900));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await tester.pumpWidget(
+          MaterialApp(
+            home: PosterCardScope(
+              child: const DesktopSettingsScope(
+                child: PosterCardSettingsScreen(),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        final preview = find.byKey(const ValueKey('desktop-poster-preview'));
+        expect(tester.getSize(preview).width, 166);
+        expect(
+          tester.widget<PosterCard>(find.byType(PosterCard)).qualityBadge,
+          'HD',
+        );
+        await tester.runAsync(() async {
+          await tester.tap(find.byKey(const ValueKey('Shape-Landscape')));
+          await Hive.box(PlaybackPrefs.boxName).flush();
+        });
+        await tester.pumpAndSettle();
+        expect(PlaybackPrefs().posterCardLayout, PosterCardLayout.wide);
+        expect(tester.getSize(preview).width, 248);
+        final size = find.byKey(const ValueKey('Portrait card size-Large'));
+        await tester.ensureVisible(size);
+        await tester.runAsync(() async {
+          await tester.tap(size);
+          await Hive.box(PlaybackPrefs.boxName).flush();
+        });
+        await tester.pumpAndSettle();
+        expect(PlaybackPrefs().posterPortraitSize, PosterCardSize.large);
+        expect(PlaybackPrefs().posterLandscapeSize, PosterCardSize.standard);
+        expect(tester.getSize(preview).width, 248);
+        await tester.ensureVisible(
+          find.byKey(const ValueKey('poster-preview-catalogue')),
+        );
+        await tester.tap(
+          find.byKey(const ValueKey('poster-preview-catalogue')),
+        );
+        await tester.pumpAndSettle();
+        final sample = tester.widget<PosterCard>(find.byType(PosterCard));
+        expect(sample.scoreBadge, 87);
+        expect(sample.qualityBadge, isNull);
+        expect(sample.dubBadge, isNull);
+        expect(tester.takeException(), isNull);
+        // Network-image cache schedules a10s cleanup after its async DB read.
+        // Unmount images, let that read settle, then drain the virtual timer.
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)),
+        );
+        await tester.pump(const Duration(seconds: 11));
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    },
+    timeout: const Timeout(Duration(seconds: 30)),
+  );
+
+  testWidgets('desktop poster choices wrap at narrow enlarged text', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    try {
+      await tester.binding.setSurfaceSize(const Size(360, 800));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: MediaQuery(
+            data: MediaQueryData(textScaler: TextScaler.linear(2)),
+            child: DesktopSettingsScope(child: PosterCardSettingsScreen()),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final choice = find.byKey(const ValueKey('Title placement-Below image'));
+      await tester.ensureVisible(choice);
+      await tester.pumpAndSettle();
+      expect(choice.hitTestable(), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
   });
 
   test('poster options preserve the existing look by default', () {

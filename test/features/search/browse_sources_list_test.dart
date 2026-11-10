@@ -1,4 +1,7 @@
 import 'dart:io';
+import 'package:watch_app/core/lnreader/lnreader_extension_service.dart';
+import 'package:watch_app/core/lnreader/lnreader_manager.dart';
+import 'package:watch_app/core/provider/provider_registry.dart';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -25,6 +28,46 @@ void main() {
     await sl.reset();
     await Hive.close();
     await dir.delete(recursive: true);
+  });
+
+  testWidgets('retained list follows registry install and removal', (t) async {
+    await t.pumpWidget(MaterialApp(home:Scaffold(body:BrowseSourcesList(
+      kind:SourceListKind.streaming,onBrowse:(_,_) {},
+    ))));
+    await t.pumpAndSettle();
+    expect(find.textContaining('Registry Fixture'),findsNothing);
+    final box=Hive.box<Map>(ProviderRegistry.boxName);
+    await t.runAsync(()=>box.put('fixture',ProviderRegistryEntry(
+      name:'fixture',url:'https://example.invalid/fixture.js',
+      displayName:'Registry Fixture',
+    ).toJson()));
+    await t.pumpAndSettle();
+    expect(find.textContaining('Registry Fixture'),findsOneWidget);
+    await t.runAsync(()=>box.delete('fixture')); await t.pumpAndSettle();
+    expect(find.textContaining('Registry Fixture'),findsNothing);
+  });
+
+  testWidgets('retained novel list follows LNReader metadata without runtime', (t) async {
+    final service=LnReaderExtensionService(httpGet:(_) async=>'fixture JS');
+    final manager=LnReaderManager(service:service,fetch:(_,_) async=>throw StateError('No runtime expected'));
+    await t.runAsync(()=>manager.init());
+    sl.registerSingleton<LnReaderManager>(manager);
+    await t.pumpWidget(MaterialApp(home:Scaffold(body:BrowseSourcesList(
+      kind:SourceListKind.novel,onBrowse:(_,_) {},
+    ))));
+    await t.pumpAndSettle();
+    const meta=LnReaderPluginMeta(id:'fixture',name:'Novel Fixture',
+      site:'https://example.invalid',lang:'en',version:'1',
+      url:'https://example.invalid/fixture.js',iconUrl:'');
+    await t.runAsync(()=>service.install(meta)); await t.pumpAndSettle();
+    expect(find.textContaining('Novel Fixture'),findsOneWidget);
+    expect(manager.runtimeBuilt,isFalse);
+    await t.runAsync(()=>manager.uninstall(meta.id)); await t.pumpAndSettle();
+    expect(find.textContaining('Novel Fixture'),findsNothing);
+    expect(manager.runtimeBuilt,isFalse);
+    await t.pumpWidget(const SizedBox());
+    await t.runAsync(()=>service.install(meta)); await t.pump();
+    expect(t.takeException(),isNull);
   });
 
   testWidgets('lists installed sources and reports the one tapped', (t) async {

@@ -21,6 +21,7 @@ class StreamingPrefs {
 
   static const String boxName = 'streaming_prefs';
   static const String _regionKey = 'region';
+
   /// Bumped on every write so Home reloads without resetting its scroll — same
   /// contract as `HomeRowsPrefs.revision`.
   static final ValueNotifier<int> revision = ValueNotifier<int>(0);
@@ -55,11 +56,11 @@ class StreamingPrefs {
     return (v is String && _valid(v)) ? v.toUpperCase() : deviceRegion();
   }
 
-  static Future<void> setRegion(String r) {
+  static Future<void> setRegion(String r) async {
     final box = _boxOrNull;
-    if (box == null || !_valid(r)) return Future.value();
-    box.put(_regionKey, r.toUpperCase());
+    if (box == null || !_valid(r)) return;
+    // Notify consumers only after the preference has been durably saved.
+    await box.put(_regionKey, r.toUpperCase());
     revision.value++;
-    return Future.value();
   }
 }

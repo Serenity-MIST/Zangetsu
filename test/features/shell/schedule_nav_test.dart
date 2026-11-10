@@ -42,6 +42,7 @@ import 'package:watch_app/core/schedule/schedule_models.dart';
 import 'package:watch_app/core/search/title_suggestion_service.dart';
 import 'package:watch_app/core/state/active_source_cubit.dart';
 import 'package:watch_app/core/supabase/supabase_service.dart';
+import 'package:watch_app/core/supabase/auth_user.dart';
 import 'package:watch_app/core/theme/app_colors.dart';
 import 'package:watch_app/core/theme/theme_controller.dart';
 import 'package:watch_app/core/tracker/mal_service.dart';
@@ -462,7 +463,7 @@ void main() {
 
     expect(dockLabel('Schedule'), findsNothing);
     expect(dockLabel('Sources'), findsOneWidget);
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   testWidgets('the phone Profile tab opens the viewer overview', (
     tester,
@@ -471,13 +472,19 @@ void main() {
     await tester.pumpWidget(wrap(const RootShell()));
     await tester.pumpAndSettle();
 
+    // Resolve the fixture's initially unknown session before testing the
+    // authenticated overview menu; no real account is accessed.
+    authCubit.emit(const AuthState(status: AuthStatus.authenticated,
+      user:AuthUser(id:'fixture',name:'Fixture',email:'fixture@example.invalid')));
     await tester.tap(dockLabel('Profile'));
-    await tester.pumpAndSettle();
+    // Route entry is bounded; the profile's animated image need not stop.
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
 
     expect(find.byType(ViewerProfileHomeScreen), findsOneWidget);
     expect(find.byTooltip('Profile menu'), findsOneWidget);
     expect(find.text('About'), findsNothing);
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   testWidgets('profile launch gate hides the entire phone shell', (
     tester,
@@ -495,7 +502,7 @@ void main() {
       ),
       findsOneWidget,
     );
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   // The dock collapses to icons on scroll (DockScrollCollapse). Two things a
   // purely visual change quietly broke, and would break again:
@@ -544,7 +551,7 @@ void main() {
         reason: '"$name" must be announced by the dock',
       );
     }
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   // Task 17: Search moved from the dock to the Home header (HomeSearchAction
   // — see home_search_action_test.dart). The dock itself should never offer
@@ -555,7 +562,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(dockLabel('Search'), findsNothing);
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   testWidgets('long-pressing the Profile dock item switches viewer profiles', (
     tester,
@@ -587,7 +594,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(profiles.activeId, 'kids');
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   testWidgets('profile switcher brands the sheet and opens profile manager', (
     tester,
@@ -660,7 +667,7 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('profile-switcher-add')));
     await tester.pumpAndSettle();
     expect(find.byType(ViewerProfilesScreen), findsOneWidget);
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   testWidgets('TV shell keeps Downloads and gains a Schedule rail item', (
     tester,
@@ -678,7 +685,7 @@ void main() {
 
     expect(find.text('Downloads'), findsOneWidget);
     expect(find.text('Schedule'), findsOneWidget);
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   // Home's mode-cards row carries the Schedule card alongside the Manga/Novel
   // switcher cards. Since Schedule left the dock this is the ONLY way in, so
@@ -703,7 +710,7 @@ void main() {
         reason: 'Schedule has no other entry point in $m',
       );
     }
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   // The row used to be hidden entirely under Z Mode (`if (!ZModePrefs.enabled)`),
   // which was survivable while Schedule also had a dock tab. It doesn't, so the
@@ -722,7 +729,7 @@ void main() {
 
     expect(find.byKey(const ValueKey('home_lists_hub_card')), findsOneWidget);
     expect(tester.takeException(), isNull);
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   // The row above only ever holds one card, because no MetadataRepository is
   // registered so Genres is hidden. Two cards splitting 320dp is the case
@@ -743,7 +750,7 @@ void main() {
     // An overflow paints an exception rather than throwing, so this is what
     // catches the row getting too tight.
     expect(tester.takeException(), isNull);
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   // Nothing watched and nothing loaded: the last-resort fill. Pins that it is
   // tinted rather than the old surface2 -> surface grey, and that the two
@@ -762,7 +769,7 @@ void main() {
 
     expect(hub, isNot([AppColors.surface2, AppColors.surface]));
     expect(hub, isNot(genres));
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   testWidgets('no Genres card when the catalogue cannot filter', (
     tester,
@@ -774,7 +781,7 @@ void main() {
 
     expect(find.byKey(const ValueKey('home_lists_hub_card')), findsOneWidget);
     expect(find.byKey(const ValueKey('home_genres_card')), findsNothing);
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   testWidgets('Home keeps the hub card with Z Mode on', (tester) async {
     sl.registerSingleton<AppMode>(const AppMode(isTv: false));
@@ -788,7 +795,7 @@ void main() {
 
     await tester.runAsync(() => ZModePrefs.setEnabled(false));
     await tester.pumpAndSettle();
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   // Task 11 added a full-width "Search" bar to Home while Z Mode was on
   // (Search having left the dock); task 17 replaced that with a header icon
@@ -814,7 +821,7 @@ void main() {
     // The old bar's tell was a caption reading "Search" beside its icon; the
     // header's icon-only action has a tooltip (not rendered as Text) instead.
     expect(find.text('Search'), findsNothing);
-  });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 }
 
 /// Home reads only [MetadataRepository.supportsFilters] to decide whether the

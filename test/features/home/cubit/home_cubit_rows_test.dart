@@ -153,6 +153,33 @@ void main() {
     List<HomeSection> sections = const [],
   }) => HomeCubit(_StubRepo(sections), trackerHub: TrackerHub([t]));
 
+  test(
+    'desktop releases use cached matching tracker without extra requests',
+    () async {
+      final tracker = _FakeTracker(
+        library: [
+          _entry('Fresh series', progress: 2, totalEpisodes: 12),
+          _entry('Caught up', progress: 12, totalEpisodes: 12),
+          _entry('Unknown release', progress: 1),
+        ],
+      );
+      final cubit = cubitWith(tracker, sections: [_zmSection('Trending')]);
+      addTearDown(cubit.close);
+      await cubit.load();
+      expect(cubit.desktopReleaseRow?.items.map((e) => e.item.title), [
+        'Fresh series',
+      ]);
+      final requests = tracker.fetchCount;
+      cubit.desktopReleaseRow;
+      expect(tracker.fetchCount, requests);
+      await ZModePrefs.setStreamKind(StreamKind.movie);
+      expect(cubit.desktopReleaseRow, isNull);
+      await ZModePrefs.setStreamKind(StreamKind.anime);
+      expect(cubit.desktopReleaseRow?.items.single.item.title, 'Fresh series');
+      expect(tracker.fetchCount, requests);
+    },
+  );
+
   test('relayout re-merges a saved arrangement without refetching', () async {
     final t = _FakeTracker(library: [_entry('One Piece', progress: 100)]);
     final repo = _StubRepo([_zmSection('Trending'), _zmSection('Popular')]);

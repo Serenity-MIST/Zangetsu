@@ -1,3 +1,5 @@
+import 'download_failure.dart';
+import 'hls_audio_selection.dart';
 import 'subtitle_selection.dart';
 import 'dart:io';
 
@@ -7,6 +9,16 @@ import 'package:pointycastle/export.dart';
 
 import '../playback/hls.dart';
 import 'webvtt_merge.dart';
+
+/// Platform merge capability for already-downloaded files, never remote URLs.
+typedef HlsAudioMux =
+    Future<String?> Function(
+      String video,
+      String audio,
+      String output,
+      String? language,
+      bool Function() canceled,
+    );
 
 /// Downloads an HLS (m3u8) stream to a single local file by fetching every
 /// segment, decrypting AES-128 if needed, and concatenating into one .mp4.
@@ -18,7 +30,55 @@ import 'webvtt_merge.dart';
 /// background_downloader equivalent for segmented HLS. Progress is reported via
 /// [onProgress]; [canceled] is polled between segments to abort.
 class HlsDownloader {
-  HlsDownloader(this._dio);
+  HlsDownloader(this._dio, {
+    this.muxAudio,
+    this.isHostCoolingDown,
+    this.onRateLimited,
+  });
+  final HlsAudioMux? muxAudio;
+
+  /// Optional device-local policy; absent for existing background/mobile callers.
+  final bool Function(Uri url)? isHostCoolingDown;
+
+  /// Persist a server hint before this job returns its transfer capacity.
+  final Future<void> Function(Uri url, String? retryAfter)? onRateLimited;
+  bool _rateLimited = false;
+  Uri? _rateLimitedUri;
+  bool _receivedRateLimitResponse = false;
+
+  /// A cached cooldown is not another server rejection and must not extend it.
+  bool get receivedRateLimitResponse => _receivedRateLimitResponse;
+
+  /// Ephemeral final host for the manager's host-only persisted retry metadata.
+  Uri? get rateLimitedUri => _rateLimitedUri;
+
+  /// Separates host throttling from a missing playlist, segment or audio track.
+  bool get rateLimited => _rateLimited;
+
+  /// Keep response bodies and signed URLs out of user-visible error messages.
+  String? get _rateLimitMessage => _rateLimited
+      ? downloadFailureMessage(null, statusCode: 429)
+      : null;
+
+  /// Stop new requests after throttling; already in-flight segments may settle.
+  bool _mayRequest(Uri url) {
+    if (_rateLimited) return false;
+    if (isHostCoolingDown?.call(url) == true) {
+      _rateLimited = true;
+      _rateLimitedUri = url;
+      return false;
+    }
+    return true;
+  }
+
+  /// Observe the final redirect host, retaining no response body or credentials.
+  Future<void> _observeRateLimit(Response<dynamic> response) async {
+    if (response.statusCode != 429 || onRateLimited == null) return;
+    _rateLimited = true;
+    _receivedRateLimitResponse = true;
+    _rateLimitedUri = response.realUri;
+    await onRateLimited!(response.realUri, response.headers.value('retry-after'));
+  }
 
   final Dio _dio;
 
@@ -46,6 +106,7 @@ class HlsDownloader {
     required void Function(double progress) onProgress,
     required bool Function() canceled,
     int? connections,
+    String? preferredAudioLanguage,
   }) async {
     // Segment-fetch parallelism for THIS download (clamped); defaults to 4.
     final concurrency = (connections ?? _concurrency).clamp(
@@ -53,8 +114,28 @@ class HlsDownloader {
       _concurrency * 4,
     );
     // 1. Resolve a master playlist down to a media (segment) playlist.
-    final media = await _resolveMediaPlaylist(url, headers, preferredQuality);
-    if (media == null) return 'playlist unreachable';
+    HlsAudioRendition? selectedAudio;
+    (String, String)? media;
+    try {
+      media = await _resolveMediaPlaylist(
+        url,
+        headers,
+        preferredQuality,
+        preferredAudioLanguage: preferredAudioLanguage,
+        onAudio:
+            Platform.isWindows ||
+                muxAudio != null ||
+                preferredAudioLanguage != null
+            ? (audio) => selectedAudio = audio
+            : null,
+      );
+    } on HlsAudioSelectionException catch (error) {
+      return error.toString();
+    }
+    if (media == null) return _rateLimitMessage ?? 'playlist unreachable';
+    if (selectedAudio != null && muxAudio == null) {
+      return 'This stream requires the bundled audio merge engine';
+    }
     final mediaUrl = media.$1;
     final playlist = media.$2;
 
@@ -66,7 +147,7 @@ class HlsDownloader {
     Uint8List? key;
     if (pl.keyUrl != null) {
       key = await _fetchBytes(pl.keyUrl!, headers);
-      if (key == null || key.length != 16) return 'AES key fetch failed';
+      if (key == null || key.length != 16) return _rateLimitMessage ?? 'AES key fetch failed';
     }
 
     // 4. Download segments with bounded parallelism, writing strictly in order.
@@ -125,7 +206,7 @@ class HlsDownloader {
           sink.add(pending.remove(nextWrite)!);
           nextWrite++;
           done++;
-          onProgress(done / total);
+          onProgress((done / total) * (selectedAudio == null ? 1 : .8));
         }
       }
     }
@@ -141,7 +222,7 @@ class HlsDownloader {
         try {
           if (await file.exists()) await file.delete();
         } catch (_) {}
-        return 'init segment fetch failed';
+        return _rateLimitMessage ?? 'init segment fetch failed';
       }
       sink.add(init);
     }
@@ -155,7 +236,56 @@ class HlsDownloader {
         if (await file.exists()) await file.delete();
       } catch (_) {}
       if (canceled()) return 'canceled';
-      return failReason ?? 'incomplete ($nextWrite/$total segments)';
+      return _rateLimitMessage ?? failReason ?? 'incomplete ($nextWrite/$total segments)';
+    }
+    if (selectedAudio != null) {
+      final audio = selectedAudio!;
+      final scratch = await file.parent.createTemp('.zangetsu-audio-');
+      try {
+        final audioPath = '${scratch.path}/audio.media';
+        final mergedPath = '${scratch.path}/merged.ts';
+        final audioDownloader = HlsDownloader(_dio,
+          isHostCoolingDown: isHostCoolingDown,
+          onRateLimited: onRateLimited,
+        );
+        final error = await audioDownloader.download(
+          url: audio.uri,
+          headers: headers,
+          outputPath: audioPath,
+          preferredQuality: 'best',
+          connections: connections,
+          onProgress: (value) => onProgress(.8 + value * .19),
+          canceled: canceled,
+        );
+        if (audioDownloader.rateLimited) {
+          _rateLimited = true;
+          _rateLimitedUri = audioDownloader.rateLimitedUri;
+          _receivedRateLimitResponse = audioDownloader.receivedRateLimitResponse;
+        }
+        if (error != null) {
+          await file.delete();
+          return _rateLimitMessage ?? 'Selected audio download failed: $error';
+        }
+        final mergeError = await muxAudio!(
+          outputPath,
+          audioPath,
+          mergedPath,
+          preferredAudioLanguage ?? audio.lang,
+          canceled,
+        );
+        if (mergeError != null || canceled()) {
+          await file.delete();
+          return canceled() ? 'canceled' : mergeError;
+        }
+        await file.delete();
+        await File(mergedPath).rename(outputPath);
+        onProgress(1);
+      } catch (_) {
+        if (await file.exists()) await file.delete();
+        return 'The selected audio could not be saved';
+      } finally {
+        if (await scratch.exists()) await scratch.delete(recursive: true);
+      }
     }
     return null;
   }
@@ -272,15 +402,25 @@ class HlsDownloader {
   Future<(String, String)?> _resolveMediaPlaylist(
     String url,
     Map<String, String> headers,
-    String preferredQuality,
-  ) async {
+    String preferredQuality, {
+    String? preferredAudioLanguage,
+    void Function(HlsAudioRendition audio)? onAudio,
+  }) async {
     var current = url;
     for (var depth = 0; depth < 3; depth++) {
       final text = await _fetchText(current, headers);
       if (text == null) return null;
       final variants = parseHlsMaster(text, current);
       if (variants.isEmpty) return (current, text); // it's a media playlist
-      current = _pickVariant(variants, preferredQuality).url;
+      final variant = _pickVariant(variants, preferredQuality);
+      final audio = selectDownloadAudio(
+        text,
+        current,
+        variant,
+        preferredLanguage: preferredAudioLanguage,
+      );
+      if (audio != null) onAudio?.call(audio);
+      current = variant.url;
     }
     return null;
   }
@@ -344,6 +484,8 @@ class HlsDownloader {
   // ── HTTP ──────────────────────────────────────────────────────────────────
 
   Future<String?> _fetchText(String url, Map<String, String> headers) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null || !_mayRequest(uri)) return null;
     try {
       final r = await _dio.getUri<String>(
         Uri.parse(url),
@@ -353,7 +495,11 @@ class HlsDownloader {
           validateStatus: (s) => s != null && s < 500,
         ),
       );
+      await _observeRateLimit(r);
       return r.statusCode == 200 ? r.data : null;
+    } on DioException catch (error) {
+      if (error.response != null) await _observeRateLimit(error.response!);
+      return null;
     } catch (_) {
       return null;
     }
@@ -375,6 +521,8 @@ class HlsDownloader {
     Map<String, String> headers,
   ) async {
     for (var attempt = 1; attempt <= _segmentAttempts; attempt++) {
+      final uri = Uri.tryParse(url);
+      if (uri == null || !_mayRequest(uri)) return null;
       try {
         final r = await _dio.getUri<List<int>>(
           Uri.parse(url),
@@ -384,11 +532,16 @@ class HlsDownloader {
             validateStatus: (s) => s != null && s < 500,
           ),
         );
+        await _observeRateLimit(r);
         if (r.statusCode == 200 && r.data != null) {
           return Uint8List.fromList(r.data!);
         }
         // Answered, but not with the segment. 4xx won't change on a retry.
         if (r.statusCode != null && r.statusCode! >= 400) return null;
+      } on DioException catch (error) {
+        if (error.response != null) await _observeRateLimit(error.response!);
+        if (_rateLimited) return null;
+        // Transient transport failures retain the bounded segment retry policy.
       } catch (_) {
         // Timeout, reset connection, DNS — exactly what a retry is for.
       }

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import '../../core/ui/settings_widgets.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
 
 import '../../core/theme/app_colors.dart';
@@ -46,40 +47,47 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
 
   Future<void> _pickCustom() async {
     var temp = AppColors.accent;
-    final result = await showDialog<Color>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppColors.surface,
-        title: Text(context.l10n.customColour, style: AppText.headline),
-        content: SingleChildScrollView(
-          child: ColorPicker(
-            pickerColor: temp,
-            onColorChanged: (c) => temp = c,
-            enableAlpha: false,
-            displayThumbColor: true,
-            paletteType: PaletteType.hueWheel,
-            labelTypes: const [],
-            pickerAreaBorderRadius: BorderRadius.circular(12),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: Text(
-              context.l10n.cancel,
-              style: TextStyle(color: AppColors.textSecondary),
+    final result = DesktopSettingsScope.contains(context)
+        ? await showGraphiteSettingsColorChoice(
+            context,
+            title: context.l10n.customColour,
+            current: temp,
+            applyLabel: context.l10n.apply,
+          )
+        : await showDialog<Color>(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              backgroundColor: AppColors.surface,
+              title: Text(context.l10n.customColour, style: AppText.headline),
+              content: SingleChildScrollView(
+                child: ColorPicker(
+                  pickerColor: temp,
+                  onColorChanged: (c) => temp = c,
+                  enableAlpha: false,
+                  displayThumbColor: true,
+                  paletteType: PaletteType.hueWheel,
+                  labelTypes: const [],
+                  pickerAreaBorderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: Text(
+                    context.l10n.cancel,
+                    style: TextStyle(color: AppColors.textSecondary),
+                  ),
+                ),
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, temp),
+                  child: Text(
+                    context.l10n.apply,
+                    style: TextStyle(color: AppColors.accent),
+                  ),
+                ),
+              ],
             ),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, temp),
-            child: Text(
-              context.l10n.apply,
-              style: TextStyle(color: AppColors.accent),
-            ),
-          ),
-        ],
-      ),
-    );
+          );
     if (result != null) {
       await _updateProfileTheme(accentColor: result.toARGB32());
     }
@@ -119,7 +127,11 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
             // and tapping one takes you back to picking by hand.
             opacity: ThemeController.materialYou ? 0.4 : 1,
             child: SizedBox(
-              height: 100,
+              // Desktop preview labels need room at the user's text scale;
+              // the fixed phone strip clips their baseline in this workspace.
+              height: DesktopSettingsScope.contains(context)
+                  ? 90 + MediaQuery.textScalerOf(context).scale(24)
+                  : 100,
               child: ListView.separated(
                 scrollDirection: Axis.horizontal,
                 // Align with SettingsCard's margin so the strip lines up with
@@ -251,63 +263,88 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
   /// Every choice previewed in its OWN face — a list of names all set in the
   /// current font tells you nothing about what you are picking.
   Future<void> _pickFont() async {
-    final picked = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: AppColors.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (ctx) => SafeArea(
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
-                child: Row(
-                  children: [Text('App font', style: AppText.headline)],
+    // Desktop keeps the same fetch-before-save contract and bundled previews,
+    // using the shared bounded dialog instead of a phone bottom sheet.
+    final picked = DesktopSettingsScope.contains(context)
+        ? await showGraphiteSettingsChoice<String>(
+            context,
+            title: 'App font',
+            current: AppFontPrefs.family,
+            options: [
+              for (final font in AppFontPrefs.fonts) (font.family, font.label),
+            ],
+            optionDescriptions: {
+              for (final font in AppFontPrefs.fonts)
+                font.family: font.bundled
+                    ? 'Watch anime, movies and series'
+                    : 'Downloads on first use',
+            },
+            previewFontFamilies: {
+              for (final font in AppFontPrefs.fonts)
+                if (font.bundled) font.family: font.family,
+            },
+            downloadableOptions: {
+              for (final font in AppFontPrefs.fonts)
+                if (!font.bundled) font.family,
+            },
+          )
+        : await showModalBottomSheet<String>(
+            context: context,
+            backgroundColor: AppColors.surface,
+            shape: const RoundedRectangleBorder(
+              borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+            ),
+            builder: (ctx) => SafeArea(
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+                      child: Row(
+                        children: [Text('App font', style: AppText.headline)],
+                      ),
+                    ),
+                    const Divider(color: AppColors.hairline, height: 1),
+                    for (final f in AppFontPrefs.fonts)
+                      ListTile(
+                        onTap: () => Navigator.pop(ctx, f.family),
+                        // Previewed in its OWN face — but only once it is on the
+                        // device. Naming an unfetched font in a family Flutter has
+                        // never loaded just draws the platform default, so the row
+                        // would advertise a face you aren't going to get.
+                        title: Text(
+                          f.label,
+                          style: AppText.body.copyWith(
+                            fontFamily: f.bundled ? f.family : null,
+                            color: AppColors.textPrimary,
+                            fontSize: 16,
+                          ),
+                        ),
+                        subtitle: Text(
+                          f.bundled
+                              ? 'Watch anime, movies and series'
+                              : 'Downloads on first use',
+                          style: AppText.caption.copyWith(
+                            fontFamily: f.bundled ? f.family : null,
+                          ),
+                        ),
+                        trailing: f.family == AppFontPrefs.family
+                            ? Icon(Icons.check, color: AppColors.accent)
+                            : (f.bundled
+                                  ? null
+                                  : Icon(
+                                      Icons.download_outlined,
+                                      size: 18,
+                                      color: AppColors.textTertiary,
+                                    )),
+                      ),
+                    const SizedBox(height: 8),
+                  ],
                 ),
               ),
-              const Divider(color: AppColors.hairline, height: 1),
-              for (final f in AppFontPrefs.fonts)
-                ListTile(
-                  onTap: () => Navigator.pop(ctx, f.family),
-                  // Previewed in its OWN face — but only once it is on the
-                  // device. Naming an unfetched font in a family Flutter has
-                  // never loaded just draws the platform default, so the row
-                  // would advertise a face you aren't going to get.
-                  title: Text(
-                    f.label,
-                    style: AppText.body.copyWith(
-                      fontFamily: f.bundled ? f.family : null,
-                      color: AppColors.textPrimary,
-                      fontSize: 16,
-                    ),
-                  ),
-                  subtitle: Text(
-                    f.bundled
-                        ? 'Watch anime, movies and series'
-                        : 'Downloads on first use',
-                    style: AppText.caption.copyWith(
-                      fontFamily: f.bundled ? f.family : null,
-                    ),
-                  ),
-                  trailing: f.family == AppFontPrefs.family
-                      ? Icon(Icons.check, color: AppColors.accent)
-                      : (f.bundled
-                            ? null
-                            : Icon(
-                                Icons.download_outlined,
-                                size: 18,
-                                color: AppColors.textTertiary,
-                              )),
-                ),
-              const SizedBox(height: 8),
-            ],
-          ),
-        ),
-      ),
-    );
+            ),
+          );
     if (picked == null || !mounted || picked == AppFontPrefs.family) return;
     // Fetch BEFORE saving. Saving first would restart the app into a family
     // Flutter has never loaded, which draws the platform default and reads as
@@ -376,42 +413,63 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
   /// Style picker. Was three rows always on the page; a sheet keeps the screen
   /// short and matches how the other settings pickers behave.
   Future<void> _pickAnimStyle() async {
-    final picked = await showModalBottomSheet<ListAnimStyle>(
-      context: context,
-      backgroundColor: AppColors.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
-              child: Row(
+    // Reuse the desktop choice surface while preserving localized descriptions
+    // and the existing animation preference owner.
+    final picked = DesktopSettingsScope.contains(context)
+        ? await showGraphiteSettingsChoice<ListAnimStyle>(
+            context,
+            title: context.l10n.animationStyle,
+            current: AnimationPrefs.style,
+            options: [
+              for (final (style, name, _) in _animStyles(context))
+                (style, name),
+            ],
+            optionDescriptions: {
+              for (final (style, _, blurb) in _animStyles(context))
+                style: blurb,
+            },
+          )
+        : await showModalBottomSheet<ListAnimStyle>(
+            context: context,
+            backgroundColor: AppColors.surface,
+            shape: const RoundedRectangleBorder(
+              borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+            ),
+            builder: (ctx) => SafeArea(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text(context.l10n.animationStyle, style: AppText.headline),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+                    child: Row(
+                      children: [
+                        Text(
+                          context.l10n.animationStyle,
+                          style: AppText.headline,
+                        ),
+                      ],
+                    ),
+                  ),
+                  const Divider(color: AppColors.hairline, height: 1),
+                  for (final (style, name, blurb) in _animStyles(context))
+                    ListTile(
+                      onTap: () => Navigator.pop(ctx, style),
+                      title: Text(
+                        name,
+                        style: AppText.body.copyWith(
+                          color: AppColors.textPrimary,
+                        ),
+                      ),
+                      subtitle: Text(blurb, style: AppText.caption),
+                      trailing: AnimationPrefs.style == style
+                          ? Icon(Icons.check, color: AppColors.accent)
+                          : null,
+                    ),
+                  const SizedBox(height: 8),
                 ],
               ),
             ),
-            const Divider(color: AppColors.hairline, height: 1),
-            for (final (style, name, blurb) in _animStyles(context))
-              ListTile(
-                onTap: () => Navigator.pop(ctx, style),
-                title: Text(
-                  name,
-                  style: AppText.body.copyWith(color: AppColors.textPrimary),
-                ),
-                subtitle: Text(blurb, style: AppText.caption),
-                trailing: AnimationPrefs.style == style
-                    ? Icon(Icons.check, color: AppColors.accent)
-                    : null,
-              ),
-            const SizedBox(height: 8),
-          ],
-        ),
-      ),
-    );
+          );
     if (picked == null) return;
     await AnimationPrefs.setStyle(picked);
     if (mounted) setState(() {});

@@ -39,6 +39,16 @@ void main() {
     expect(store.get(fma, 'allanime')?.pinned, isFalse);
   });
 
+  test('available match lookup ignores removed pin without deleting history', () async {
+    final store=await MatchStore.open();
+    await store.pin(fma,allanime); await store.save(fma,hianime);
+    await store.rememberLastPlayed(fma,'allanime');
+    expect(store.bestFor(fma,available:(id)=>id=='hianime')?.sourceId,'hianime');
+    expect(store.bestFor(fma,available:(_)=>false),isNull);
+    expect(store.get(fma,'allanime')?.pinned,isTrue);
+    expect(store.bestFor(fma)?.sourceId,'allanime');
+  });
+
   test('per-source matches do not collide', () async {
     final store = await MatchStore.open();
     final prefs = await ZSourcePrefs.open();

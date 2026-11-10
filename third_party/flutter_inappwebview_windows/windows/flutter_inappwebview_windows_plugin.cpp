@@ -34,10 +34,12 @@ namespace flutter_inappwebview_plugin
 
   FlutterInappwebviewWindowsPlugin::~FlutterInappwebviewWindowsPlugin()
   {
-    webViewEnvironmentManager = nullptr;
-    inAppWebViewManager = nullptr;
+    // Views and cookie services depend on their environments/composition.
+    // Destroy consumers first, then release shared UI-apartment resources.
     inAppBrowserManager = nullptr;
     headlessInAppWebViewManager = nullptr;
     cookieManager = nullptr;
+    inAppWebViewManager = nullptr;
+    webViewEnvironmentManager = nullptr;
   }
 }

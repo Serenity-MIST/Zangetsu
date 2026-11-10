@@ -83,3 +83,6 @@ supabase/.temp/
 # Local desktop integration backups, verification logs, and release packages.
 /merge-work/
 /outputs/
+
+# Locally staged, hash-pinned portable media engine (not source code).
+/windows/engines/

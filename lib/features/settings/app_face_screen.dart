@@ -9,6 +9,7 @@ import '../../core/theme/app_text.dart';
 import '../../core/ui/app_dialog.dart';
 import '../../core/ui/banner_style.dart';
 import '../../core/ui/settings_widgets.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import '../../core/ui/splash_style.dart';
 import '../../l10n/l10n.dart';
 
@@ -26,7 +27,33 @@ class AppFaceScreen extends StatefulWidget {
   State<AppFaceScreen> createState() => _AppFaceScreenState();
 }
 
-class _AppFaceScreenState extends State<AppFaceScreen> {
+class _AppFaceScreenState extends State<AppFaceScreen>
+    with SingleTickerProviderStateMixin {
+  AnimationController? _desktopSplash;
+
+  /// Created only by the desktop preview; mobile keeps its own existing cards.
+  AnimationController get _desktopAnimation =>
+      _desktopSplash ??= AnimationController(
+        vsync: this,
+        value: 1,
+        duration: const Duration(milliseconds: 1600),
+      );
+
+  @override
+  void dispose() {
+    _desktopSplash?.dispose();
+    super.dispose();
+  }
+
+  /// Preview once, without leaving idle repeating animations on a settings page.
+  void _playDesktopSplash() {
+    if (MediaQuery.disableAnimationsOf(context)) {
+      _desktopAnimation.value = 1;
+    } else {
+      _desktopAnimation.forward(from: 0);
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -38,37 +65,238 @@ class _AppFaceScreenState extends State<AppFaceScreen> {
     return Scaffold(
       backgroundColor: AppColors.bg,
       appBar: settingsAppBar('Icon, splash & banner'),
-      body: ListView(
-        padding: const EdgeInsets.only(top: 4, bottom: 32),
+      body: DesktopSettingsScope.contains(context)
+          ? _desktopBody()
+          : ListView(
+              padding: const EdgeInsets.only(top: 4, bottom: 32),
+              children: [
+                // ── App icon ──────────────────────────────────────────────────────
+                // Android-only: iOS has an unrelated API and TV has no icon picker.
+                if (_icons.supported) ...[
+                  SettingsSectionLabel(context.l10n.appIcon),
+                  _blurb(context.l10n.appIconBlurb),
+                  const SizedBox(height: 10),
+                  _iconPicker(),
+                ],
+
+                // ── Splash ────────────────────────────────────────────────────────
+                // Every platform: this one is drawn by us, with no OS involvement.
+                SettingsSectionLabel(context.l10n.splashStyle),
+                _blurb(context.l10n.splashStyleBlurb),
+                const SizedBox(height: 10),
+                _splashPicker(),
+
+                // ── Home banner ───────────────────────────────────────────────────
+                // Phone only: the TV home draws its own banner and doesn't read this.
+                if (!sl<AppMode>().isTv) ...[
+                  SettingsSectionLabel('Home banner'),
+                  _blurb('How the featured title shows on Home.'),
+                  const SizedBox(height: 10),
+                  _bannerPicker(),
+                ],
+              ],
+            ),
+    );
+  }
+
+  /// Desktop identity settings use grouped controls and a single live preview,
+  /// with no phone-sized carousel or Android launcher action on Windows.
+  Widget _desktopBody() {
+    final splash = GraphiteSettingsPanel(
+      margin: EdgeInsets.zero,
+      children: [
+        Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(context.l10n.splashStyle, style: AppText.headline),
+              const SizedBox(height: 8),
+              Text(context.l10n.splashStyleBlurb, style: AppText.caption),
+              const SizedBox(height: 16),
+              Container(
+                width: double.infinity,
+                height: 150,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF101114),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: AnimatedBuilder(
+                  animation: _desktopAnimation,
+                  builder: (context, _) {
+                    final progress = MediaQuery.disableAnimationsOf(context)
+                        ? 1.0
+                        : _desktopAnimation.value;
+                    return Center(
+                      child: SplashStyle.selectedId == 'bankai'
+                          ? BankaiSplash(progress: progress, size: 120)
+                          : Opacity(
+                              opacity: progress,
+                              child: Image.asset(
+                                'assets/icon/wordmark.png',
+                                width: 220,
+                                fit: BoxFit.contain,
+                              ),
+                            ),
+                    );
+                  },
+                ),
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                key: const ValueKey('desktop-splash-preview'),
+                onPressed: _playDesktopSplash,
+                icon: const Icon(Icons.play_arrow_rounded),
+                label: const Text('Preview animation'),
+              ),
+            ],
+          ),
+        ),
+        for (final option in SplashStyle.options)
+          Semantics(
+            checked: SplashStyle.selectedId == option.id,
+            inMutuallyExclusiveGroup: true,
+            child: GraphiteSettingsControl(
+              key: ValueKey('desktop-splash-${option.id}'),
+              icon: SplashStyle.selectedId == option.id
+                  ? Icons.radio_button_checked_rounded
+                  : Icons.radio_button_unchecked_rounded,
+              title: option.label,
+              subtitle: option.id == 'bankai'
+                  ? 'Animated crest reveal'
+                  : 'Animated wordmark reveal',
+              onTap: () async {
+                await SplashStyle.select(option.id);
+                if (!mounted) return;
+                setState(() {});
+                _playDesktopSplash();
+              },
+            ),
+          ),
+      ],
+    );
+    final banner = GraphiteSettingsPanel(
+      margin: EdgeInsets.zero,
+      children: [
+        Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Home banner', style: AppText.headline),
+              const SizedBox(height: 8),
+              Text(
+                'How the featured title shows on Home.',
+                style: AppText.caption,
+              ),
+            ],
+          ),
+        ),
+        for (final option in BannerStyle.options)
+          Semantics(
+            checked: BannerStyle.current.value == option.id,
+            inMutuallyExclusiveGroup: true,
+            child: GraphiteSettingsControl(
+              key: ValueKey('desktop-banner-${option.id}'),
+              icon: Icons.panorama_outlined,
+              leading: _desktopBannerThumb(option.id),
+              title: option.label,
+              subtitle: option.blurb,
+              trailing: BannerStyle.current.value == option.id
+                  ? Icon(Icons.check_circle_rounded, color: AppColors.accent)
+                  : null,
+              onTap: () async {
+                await BannerStyle.select(option.id);
+                if (mounted) setState(() {});
+              },
+            ),
+          ),
+      ],
+    );
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(22),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // ── App icon ──────────────────────────────────────────────────────
-          // Android-only: iOS has an unrelated API and TV has no icon picker.
-          if (_icons.supported) ...[
-            SettingsSectionLabel(context.l10n.appIcon),
-            _blurb(context.l10n.appIconBlurb),
-            const SizedBox(height: 10),
-            _iconPicker(),
-          ],
-
-          // ── Splash ────────────────────────────────────────────────────────
-          // Every platform: this one is drawn by us, with no OS involvement.
-          SettingsSectionLabel(context.l10n.splashStyle),
-          _blurb(context.l10n.splashStyleBlurb),
-          const SizedBox(height: 10),
-          _splashPicker(),
-
-          // ── Home banner ───────────────────────────────────────────────────
-          // Phone only: the TV home draws its own banner and doesn't read this.
-          if (!sl<AppMode>().isTv) ...[
-            SettingsSectionLabel('Home banner'),
-            _blurb('How the featured title shows on Home.'),
-            const SizedBox(height: 10),
-            _bannerPicker(),
-          ],
+          GraphiteSettingsPanel(
+            margin: EdgeInsets.zero,
+            children: [
+              GraphiteSettingsControl(
+                icon: Icons.desktop_windows_outlined,
+                title: 'Windows app icon',
+                subtitle:
+                    'Windows uses the icon bundled with this desktop build. Launcher icon switching is available on Android.',
+              ),
+            ],
+          ),
+          const SizedBox(height: 20),
+          LayoutBuilder(
+            builder: (context, constraints) => constraints.maxWidth >= 1000
+                ? Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(child: splash),
+                      const SizedBox(width: 20),
+                      Expanded(child: banner),
+                    ],
+                  )
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [splash, const SizedBox(height: 20), banner],
+                  ),
+          ),
         ],
       ),
     );
   }
+
+  /// Compact diagrams distinguish banner geometry without fetching artwork or
+  /// introducing a second independently running Home carousel in settings.
+  Widget _desktopBannerThumb(String id) => Container(
+    width: 64,
+    height: 44,
+    padding: EdgeInsets.all(id == BannerStyle.edgeId ? 0 : 5),
+    decoration: BoxDecoration(
+      color: const Color(0xFF0E0F12),
+      borderRadius: BorderRadius.circular(8),
+    ),
+    clipBehavior: Clip.antiAlias,
+    child: id == BannerStyle.panelsId
+        ? Row(
+            children: [
+              for (var i = 0; i < 3; i++)
+                Expanded(
+                  child: Container(
+                    margin: const EdgeInsets.all(1),
+                    decoration: BoxDecoration(
+                      color: AppColors.accent.withValues(alpha: 0.2 + i * 0.15),
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                  ),
+                ),
+            ],
+          )
+        : Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [
+                  AppColors.accent.withValues(alpha: 0.5),
+                  const Color(0xFF292A31),
+                ],
+              ),
+              borderRadius: BorderRadius.circular(
+                id == BannerStyle.edgeId ? 0 : 5,
+              ),
+            ),
+            alignment: Alignment.bottomLeft,
+            padding: const EdgeInsets.all(5),
+            child: const Icon(
+              Icons.play_arrow_rounded,
+              size: 14,
+              color: Colors.white,
+            ),
+          ),
+  );
 
   /// Section description under a [SettingsSectionLabel], indented to match it.
   Widget _blurb(String text) => Padding(

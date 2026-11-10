@@ -240,6 +240,8 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
         episodeUrl: ep.url,
         malId: detail.malId ?? widget.item.malId,
         episodeNumber: ep.number,
+        category: category,
+        season: ep.season,
       );
       if (dl != null) {
         if (!mounted) return;
@@ -428,7 +430,12 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
     ];
     final res =
         await showModalBottomSheet<
-          ({String quality, String category, List<Episode> episodes})
+          ({
+            String quality,
+            String category,
+            List<Episode> episodes,
+            VideoSource? server,
+          })
         >(
           context: context,
           backgroundColor: AppColors.surface,
@@ -452,7 +459,13 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
           ),
         );
     if (res == null || !mounted) return;
-    _startDownload(detail, res.category, res.quality, res.episodes);
+    _startDownload(
+      detail,
+      res.category,
+      res.quality,
+      res.episodes,
+      server: res.server,
+    );
   }
 
   Future<Map<int, List<Episode>>> _episodesByCategory(String category) async {
@@ -519,8 +532,9 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
     MediaDetail detail,
     String category,
     String quality,
-    List<Episode> episodes,
-  ) {
+    List<Episode> episodes, {
+    VideoSource? server,
+  }) {
     final item = widget.item;
     unawaited(
       sl<DownloadManager>().enqueueEpisodes(
@@ -533,6 +547,9 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
         category: category,
         quality: quality,
         episodes: episodes,
+        serverPreference: server == null
+            ? null
+            : DownloadServerPreference.fromSource(server),
         nowMs: DateTime.now().millisecondsSinceEpoch,
         malId: detail.malId ?? item.malId,
       ),
@@ -1012,6 +1029,7 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
                               key: const ValueKey('tv-detail-episodes'),
                               eps: eps,
                               seasonEps: seasonEps,
+                                  category: category,
                               fillerEps: _fillerEps,
                               query: _epQuery,
                               hasMultipleSeasons: hasMultipleSeasons,
@@ -1086,6 +1104,7 @@ class _TvEpisodeList extends StatefulWidget {
     super.key,
     required this.eps,
     required this.seasonEps,
+    required this.category,
     required this.fillerEps,
     required this.hasMultipleSeasons,
     required this.seasonSet,
@@ -1106,6 +1125,7 @@ class _TvEpisodeList extends StatefulWidget {
 
   final List<Episode> eps;
   final List<Episode> seasonEps;
+  final String category;
   final Set<int> fillerEps;
   final bool hasMultipleSeasons;
   final Set<int> seasonSet;
@@ -1237,6 +1257,7 @@ class _TvEpisodeListState extends State<_TvEpisodeList> {
             child: ExcludeSemantics(
               child: RepaintBoundary(
                 child: _EpisodeRow(
+                  category: widget.category,
                   ep: ep,
                   epNum: epNum,
                   displayTitle: displayTitle,

@@ -9,6 +9,7 @@ import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/ui/nav_prefs.dart';
 import '../../core/ui/settings_widgets.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import '../../l10n/l10n.dart';
 import '../../core/zmode/zmode_prefs.dart';
 import '../../l10n/ui_strings.dart';
@@ -123,82 +124,384 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
           ),
         ],
       ),
-      body: ListView(
-        padding: const EdgeInsets.fromLTRB(12, 8, 12, 32),
-        children: [
-          _preview(),
-          const SizedBox(height: 4),
-          SettingsSectionLabel(
-            // The cap is visible before you hit it, rather than discovered as
-            // a greyed-out button.
-            l10n.navTabsOnBar(_shown.length, NavPrefs.maxTabs),
-            first: true,
-          ),
-          SettingsCard(
-            children: [
-              ReorderableListView(
-                shrinkWrap: true,
-                physics: const NeverScrollableScrollPhysics(),
-                buildDefaultDragHandles: false,
-                onReorderItem: _reorder,
-                children: [
-                  for (var i = 0; i < _shown.length; i++)
-                    _row(_shown[i], index: i),
-                ],
-              ),
-              // Listed but not editable: it explains the sixth icon in the
-              // preview, which otherwise looks like the count is wrong.
-              if (_hasSwitcher) _switcherRow(),
-            ],
-          ),
-          SettingsSectionLabel(l10n.navDockBehavior),
-          SettingsCard(
-            children: [
-              SettingsTile(
-                icon: Icons.unfold_more_rounded,
-                title: l10n.keepDockExpanded,
-                subtitle: l10n.keepDockExpandedSubtitle,
-                onTap: () => _setKeepDockExpanded(!_keepDockExpanded),
-                trailing: Switch.adaptive(
-                  key: const ValueKey('keep-dock-expanded-switch'),
-                  value: _keepDockExpanded,
-                  activeThumbColor: AppColors.accent,
-                  onChanged: _setKeepDockExpanded,
+      body: DesktopSettingsScope.contains(context)
+          ? _desktopBody()
+          : ListView(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 32),
+              children: [
+                _preview(),
+                const SizedBox(height: 4),
+                SettingsSectionLabel(
+                  // The cap is visible before you hit it, rather than discovered as
+                  // a greyed-out button.
+                  l10n.navTabsOnBar(_shown.length, NavPrefs.maxTabs),
+                  first: true,
                 ),
-              ),
-            ],
-          ),
-          SettingsSectionLabel(l10n.navTabsOpensOn),
-          SettingsCard(children: [for (final t in _shown) _startRow(t)]),
-          SettingsSectionLabel(l10n.navTabsNotShown),
-          SettingsCard(
-            children: hidden.isEmpty
-                ? [
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 18),
-                      child: Center(
-                        child: Text(
-                          l10n.navTabsEveryTabOnBar,
-                          style: AppText.caption.copyWith(
-                            color: AppColors.textTertiary,
-                          ),
-                        ),
+                SettingsCard(
+                  children: [
+                    ReorderableListView(
+                      shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      buildDefaultDragHandles: false,
+                      onReorderItem: _reorder,
+                      children: [
+                        for (var i = 0; i < _shown.length; i++)
+                          _row(_shown[i], index: i),
+                      ],
+                    ),
+                    // Listed but not editable: it explains the sixth icon in the
+                    // preview, which otherwise looks like the count is wrong.
+                    if (_hasSwitcher) _switcherRow(),
+                  ],
+                ),
+                SettingsSectionLabel(l10n.navDockBehavior),
+                SettingsCard(
+                  children: [
+                    SettingsTile(
+                      icon: Icons.unfold_more_rounded,
+                      title: l10n.keepDockExpanded,
+                      subtitle: l10n.keepDockExpandedSubtitle,
+                      onTap: () => _setKeepDockExpanded(!_keepDockExpanded),
+                      trailing: Switch.adaptive(
+                        key: const ValueKey('keep-dock-expanded-switch'),
+                        value: _keepDockExpanded,
+                        activeThumbColor: AppColors.accent,
+                        onChanged: _setKeepDockExpanded,
                       ),
                     ),
-                  ]
-                : [for (final t in hidden) _row(t)],
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(8, 14, 8, 0),
-            child: Text(
-              l10n.navTabsHelp(NavPrefs.minTabs, NavPrefs.maxTabs),
-              style: AppText.caption.copyWith(color: AppColors.textTertiary),
+                  ],
+                ),
+                SettingsSectionLabel(l10n.navTabsOpensOn),
+                SettingsCard(children: [for (final t in _shown) _startRow(t)]),
+                SettingsSectionLabel(l10n.navTabsNotShown),
+                SettingsCard(
+                  children: hidden.isEmpty
+                      ? [
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 18),
+                            child: Center(
+                              child: Text(
+                                l10n.navTabsEveryTabOnBar,
+                                style: AppText.caption.copyWith(
+                                  color: AppColors.textTertiary,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ]
+                      : [for (final t in hidden) _row(t)],
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(8, 14, 8, 0),
+                  child: Text(
+                    l10n.navTabsHelp(NavPrefs.minTabs, NavPrefs.maxTabs),
+                    style: AppText.caption.copyWith(
+                      color: AppColors.textTertiary,
+                    ),
+                  ),
+                ),
+              ],
             ),
+    );
+  }
+
+  /// Desktop composition keeps the preview and editing panels readable at
+  /// window scale. All actions delegate to the existing preference handlers.
+  Widget _desktopBody() {
+    final l10n = context.l10n;
+    final order = GraphiteSettingsPanel(
+      margin: EdgeInsets.zero,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 18, 20, 10),
+          child: Align(
+            alignment: AlignmentDirectional.centerStart,
+            child: Text(
+              l10n.navTabsOnBar(_shown.length, NavPrefs.maxTabs),
+              style: AppText.headline,
+            ),
+          ),
+        ),
+        ReorderableListView(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          buildDefaultDragHandles: false,
+          onReorderItem: _reorder,
+          children: [
+            for (var i = 0; i < _shown.length; i++) _desktopRow(_shown[i], i),
+          ],
+        ),
+        if (_hasSwitcher)
+          GraphiteSettingsControl(
+            icon: Icons.swap_horiz_rounded,
+            title: l10n.navTabsSwitcher,
+            subtitle: l10n.navTabsSwitcherWhy,
+            trailing: Text(l10n.pinned, style: AppText.caption),
+          ),
+      ],
+    );
+    final options = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        GraphiteSettingsPanel(
+          margin: EdgeInsets.zero,
+          children: [
+            SettingsTile(
+              icon: Icons.unfold_more_rounded,
+              title: l10n.keepDockExpanded,
+              subtitle: l10n.keepDockExpandedSubtitle,
+              onTap: () => _setKeepDockExpanded(!_keepDockExpanded),
+              trailing: Switch.adaptive(
+                key: const ValueKey('keep-dock-expanded-switch'),
+                value: _keepDockExpanded,
+                onChanged: _setKeepDockExpanded,
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(l10n.navTabsOpensOn, style: AppText.body),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (final tab in _shown)
+                        ChoiceChip(
+                          key: ValueKey('dock-start-${tab.name}'),
+                          label: Text(tab.localizedLabel(context)),
+                          selected: tab == _start,
+                          onSelected: (selected) {
+                            if (selected) _setStart(tab);
+                          },
+                        ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        GraphiteSettingsPanel(
+          margin: EdgeInsets.zero,
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(l10n.navTabsNotShown, style: AppText.body),
+                  const SizedBox(height: 12),
+                  if (_hidden.isEmpty)
+                    Text(l10n.navTabsEveryTabOnBar, style: AppText.caption)
+                  else
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final tab in _hidden)
+                          OutlinedButton.icon(
+                            key: ValueKey('dock-add-${tab.name}'),
+                            onPressed: _canAdd ? () => _add(tab) : null,
+                            icon: const Icon(Icons.add_rounded, size: 18),
+                            label: Text(tab.localizedLabel(context)),
+                          ),
+                      ],
+                    ),
+                  if (!_canAdd) ...[
+                    const SizedBox(height: 8),
+                    Text(l10n.navTabsBarFull, style: AppText.caption),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(22),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _desktopPreview(),
+          const SizedBox(height: 20),
+          LayoutBuilder(
+            builder: (context, constraints) => constraints.maxWidth >= 1000
+                ? Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(child: order),
+                      const SizedBox(width: 20),
+                      Expanded(child: options),
+                    ],
+                  )
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [order, const SizedBox(height: 16), options],
+                  ),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            l10n.navTabsHelp(NavPrefs.minTabs, NavPrefs.maxTabs),
+            style: AppText.caption,
           ),
         ],
       ),
     );
   }
+
+  /// Read-only dock preview with the shell's actual glyphs and centre slot.
+  /// Horizontal overflow scrolls rather than shrinking labels to phone size.
+  Widget _desktopPreview() => GraphiteSettingsPanel(
+    margin: EdgeInsets.zero,
+    children: [
+      Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          children: [
+            Align(
+              alignment: AlignmentDirectional.centerStart,
+              child: Text('Dock preview', style: AppText.headline),
+            ),
+            const SizedBox(height: 16),
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Container(
+                decoration: BoxDecoration(
+                  color: const Color(0xFF111216),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: AppColors.hairline),
+                ),
+                padding: const EdgeInsets.all(12),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (final tab in _shown.take(_shown.length ~/ 2))
+                      _desktopPreviewTab(tab),
+                    if (_hasSwitcher)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                        child: _previewFab(),
+                      ),
+                    for (final tab in _shown.skip(_shown.length ~/ 2))
+                      _desktopPreviewTab(tab),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    ],
+  );
+
+  /// Preview labels use normal desktop caption sizing and remain read-only.
+  Widget _desktopPreviewTab(DockTab tab) {
+    final glyph = dockGlyphFor(tab);
+    final active = tab == _start;
+    final color = active ? AppColors.accent : AppColors.textSecondary;
+    return SizedBox(
+      width: 76,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          glyph == null
+              ? Icon(_iconFor(tab, active), color: color, size: 24)
+              : DockIcon(glyph, color: color, filled: active, size: 24),
+          const SizedBox(height: 6),
+          Text(
+            tab.localizedLabel(context),
+            textAlign: TextAlign.center,
+            style: AppText.caption.copyWith(color: color),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Desktop rows have immediate drag handles and equivalent keyboard buttons.
+  /// Pinned means always present, matching NavPrefs; position remains editable.
+  Widget _desktopRow(DockTab tab, int index) => Padding(
+    key: ValueKey('on_${tab.name}'),
+    padding: const EdgeInsets.all(8),
+    child: LayoutBuilder(
+      builder: (context, constraints) {
+        final actions = Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton(
+              key: ValueKey('dock-up-${tab.name}'),
+              tooltip: 'Move ${tab.localizedLabel(context)} up',
+              onPressed: index > 0 ? () => _reorder(index, index - 1) : null,
+              icon: const Icon(Icons.arrow_upward_rounded, size: 20),
+            ),
+            IconButton(
+              key: ValueKey('dock-down-${tab.name}'),
+              tooltip: 'Move ${tab.localizedLabel(context)} down',
+              onPressed: index < _shown.length - 1
+                  ? () => _reorder(index, index + 1)
+                  : null,
+              icon: const Icon(Icons.arrow_downward_rounded, size: 20),
+            ),
+            if (!tab.isPinned)
+              IconButton(
+                key: ValueKey('dock-remove-${tab.name}'),
+                tooltip: context.l10n.navTabsRemove,
+                onPressed: _canRemove ? () => _remove(tab) : null,
+                icon: const Icon(Icons.remove_circle_outline_rounded, size: 20),
+              ),
+          ],
+        );
+        return Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            color: const Color(0xFF17181D),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  MouseRegion(
+                    cursor: SystemMouseCursors.grab,
+                    child: ReorderableDragStartListener(
+                      index: index,
+                      child: const Padding(
+                        padding: EdgeInsets.all(8),
+                        child: Icon(Icons.drag_indicator_rounded, size: 22),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(tab.localizedLabel(context), style: AppText.body),
+                        if (tab.isPinned)
+                          Text(context.l10n.pinned, style: AppText.caption),
+                      ],
+                    ),
+                  ),
+                  if (constraints.maxWidth >= 500) actions,
+                ],
+              ),
+              if (constraints.maxWidth < 500)
+                Align(
+                  alignment: AlignmentDirectional.centerEnd,
+                  child: actions,
+                ),
+            ],
+          ),
+        );
+      },
+    ),
+  );
 
   /// The dock as it will actually look — same frosted capsule, same glyphs,
   /// same outline→fill active state, redrawn as you edit.

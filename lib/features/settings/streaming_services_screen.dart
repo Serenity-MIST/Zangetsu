@@ -35,14 +35,38 @@ class StreamingServicesScreen extends StatefulWidget {
 
 class _StreamingServicesScreenState extends State<StreamingServicesScreen> {
   late Future<List<StreamingService>> _future;
+  late String _region;
+  int _openRequest = 0;
 
   @override
   void initState() {
     super.initState();
-    _future = sl<StreamingProvidersService>().list(StreamingPrefs.region);
+    _region = StreamingPrefs.region;
+    _future = sl<StreamingProvidersService>().list(_region);
+    StreamingPrefs.revision.addListener(_regionChanged);
+  }
+
+  /// Retained desktop tabs must follow the saved region just like a new page.
+  void _regionChanged() {
+    final region = StreamingPrefs.region;
+    if (region == _region) return;
+    _openRequest++;
+    setState(() {
+      _region = region;
+      _future = sl<StreamingProvidersService>().list(region);
+    });
+  }
+
+  @override
+  void dispose() {
+    _openRequest++;
+    StreamingPrefs.revision.removeListener(_regionChanged);
+    super.dispose();
   }
 
   Future<void> _open(StreamingService s) async {
+    final request = ++_openRequest;
+    final region = _region;
     final repo = sl<MetadataRepository>();
     final more = BrowseMore(
       sourceId: ZmodeIds.sourceId,
@@ -55,7 +79,7 @@ class _StreamingServicesScreenState extends State<StreamingServicesScreen> {
     } catch (_) {
       first = const [];
     }
-    if (!mounted) return;
+    if (!mounted || request != _openRequest || region != _region) return;
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => SeeAllScreen(
@@ -115,14 +139,13 @@ class _StreamingServicesScreenState extends State<StreamingServicesScreen> {
                   // Same proportions as the Home rail's cards, and the same
                   // widget — the two must not drift into different designs for
                   // the same thing.
-                  gridDelegate:
-                      const SliverGridDelegateWithMaxCrossAxisExtent(
-                        maxCrossAxisExtent: 150,
-                        // The card's own ratio plus room for the caption.
-                        childAspectRatio: 128 / 92,
-                        mainAxisSpacing: 14,
-                        crossAxisSpacing: 12,
-                      ),
+                  gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                    maxCrossAxisExtent: 150,
+                    // The card's own ratio plus room for the caption.
+                    childAspectRatio: 128 / 92,
+                    mainAxisSpacing: 14,
+                    crossAxisSpacing: 12,
+                  ),
                   delegate: SliverChildBuilderDelegate(
                     (context, i) => _tile(services[i]),
                     childCount: services.length,

@@ -1,3 +1,8 @@
+import 'package:flutter/foundation.dart';
+import 'package:watch_app/core/metadata/streaming_service.dart';
+import 'package:watch_app/core/zmode/metadata_repository.dart';
+import 'package:watch_app/core/models/media_item.dart';
+import 'package:watch_app/core/models/home_section.dart';
 import 'dart:io';
 import 'dart:async';
 import 'dart:typed_data';
@@ -15,10 +20,49 @@ import 'package:watch_app/l10n/app_localizations.dart';
 /// real HttpClient, which never completes under the test binding and hangs
 /// `pumpAndSettle` for the whole file.
 final _pixel = Uint8List.fromList([
-  0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x21, 0xF9, 0x04, 0x01, 0x00,
-  0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
-  0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3B,
+  0x47,
+  0x49,
+  0x46,
+  0x38,
+  0x39,
+  0x61,
+  0x01,
+  0x00,
+  0x01,
+  0x00,
+  0x80,
+  0x00,
+  0x00,
+  0x00,
+  0x00,
+  0x00,
+  0xFF,
+  0xFF,
+  0xFF,
+  0x21,
+  0xF9,
+  0x04,
+  0x01,
+  0x00,
+  0x00,
+  0x00,
+  0x00,
+  0x2C,
+  0x00,
+  0x00,
+  0x00,
+  0x00,
+  0x01,
+  0x00,
+  0x01,
+  0x00,
+  0x00,
+  0x02,
+  0x02,
+  0x44,
+  0x01,
+  0x00,
+  0x3B,
 ]);
 
 class _StubImageHttpOverrides extends HttpOverrides {
@@ -107,6 +151,39 @@ Widget harness() => const MaterialApp(
   home: StreamingServicesScreen(),
 );
 
+/// Deterministic provider data isolates region-consumer behavior from image
+/// decoding and from crossing real Hive I/O into the widget test's fake clock.
+class _ImmediateRegionProviders extends StreamingProvidersService {
+  _ImmediateRegionProviders() : super((_, __) async => null);
+  @override
+  Future<List<StreamingService>> list(String region) => SynchronousFuture([
+    region == 'US'
+        ? const StreamingService(
+            id: 8,
+            name: 'Netflix',
+            logoPath: null,
+            priority: 0,
+          )
+        : const StreamingService(
+            id: 283,
+            name: 'Crunchyroll',
+            logoPath: null,
+            priority: 0,
+          ),
+  ]);
+}
+
+/// Holds catalogue arrival so a region switch can retire the old open action.
+class _HeldRegionCatalogue extends Fake implements MetadataRepository {
+  final pending = Completer<List<MediaItem>>();
+  int calls = 0;
+  @override
+  Future<List<MediaItem>> browseMore(BrowseMore more, int page) {
+    calls++;
+    return pending.future;
+  }
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   late Directory dir;
@@ -130,6 +207,63 @@ void main() {
     if (await dir.exists()) await dir.delete(recursive: true);
   });
 
+  testWidgets(
+    'retained page follows region and releases its listener on disposal',
+    (t) async {
+      sl.unregister<StreamingProvidersService>();
+      sl.registerSingleton<StreamingProvidersService>(
+        _ImmediateRegionProviders(),
+      );
+      await t.pumpWidget(harness());
+      await t.pumpAndSettle();
+      expect(find.byKey(const ValueKey('service-283')), findsOneWidget);
+      expect(find.byKey(const ValueKey('service-8')), findsNothing);
+      await t.runAsync(() async {
+        await StreamingPrefs.setRegion('US');
+        await Future<void>.delayed(Duration.zero);
+      });
+      await t.pumpAndSettle();
+      expect(find.byKey(const ValueKey('service-8')), findsOneWidget);
+      expect(find.byKey(const ValueKey('service-283')), findsNothing);
+      await t.pumpWidget(const SizedBox());
+      await t.runAsync(() async {
+        await StreamingPrefs.setRegion('GB');
+        await Future<void>.delayed(Duration.zero);
+      });
+      await t.pump();
+      expect(t.takeException(), isNull);
+    },
+  );
+
+  testWidgets('old region catalogue cannot open after the region changes', (
+    t,
+  ) async {
+    final catalogue = _HeldRegionCatalogue();
+    sl.registerSingleton<MetadataRepository>(catalogue);
+    sl.unregister<StreamingProvidersService>();
+    sl.registerSingleton<StreamingProvidersService>(
+      _ImmediateRegionProviders(),
+    );
+    await t.pumpWidget(harness());
+    await t.pumpAndSettle();
+    await t.tap(find.byKey(const ValueKey('service-283')));
+    await t.pump();
+    expect(catalogue.calls, 1);
+    await t.runAsync(() async {
+      await StreamingPrefs.setRegion('US');
+      await Future<void>.delayed(Duration.zero);
+    });
+    await t.pumpAndSettle();
+    catalogue.pending.complete(const []);
+    await t.pumpAndSettle();
+    expect(find.byType(StreamingServicesScreen), findsOneWidget);
+    expect(
+      Navigator.of(t.element(find.byType(StreamingServicesScreen))).canPop(),
+      isFalse,
+    );
+    expect(t.takeException(), isNull);
+  });
+
   testWidgets('lists the services for the region', (t) async {
     await t.pumpWidget(harness());
     await t.pumpAndSettle();
@@ -146,18 +280,20 @@ void main() {
     );
   });
 
-  testWidgets('an empty provider list shows the empty state, not a blank page',
-      (t) async {
-    await sl.reset();
-    sl.registerSingleton<StreamingProvidersService>(
-      StreamingProvidersService(
-        (path, params) async => {'results': <dynamic>[]},
-      ),
-    );
-    await t.pumpWidget(harness());
-    await t.pumpAndSettle();
-    expect(find.textContaining('No services listed'), findsOneWidget);
-  });
+  testWidgets(
+    'an empty provider list shows the empty state, not a blank page',
+    (t) async {
+      await sl.reset();
+      sl.registerSingleton<StreamingProvidersService>(
+        StreamingProvidersService(
+          (path, params) async => {'results': <dynamic>[]},
+        ),
+      );
+      await t.pumpWidget(harness());
+      await t.pumpAndSettle();
+      expect(find.textContaining('No services listed'), findsOneWidget);
+    },
+  );
 
   // The provider list is cached per region. Changing the region without
   // clearing it would show the old country's services under the new name.
@@ -175,8 +311,9 @@ void main() {
     expect(hits, 4);
   });
 
-  testWidgets('the grid asks for the stored region, not the device one',
-      (t) async {
+  testWidgets('the grid asks for the stored region, not the device one', (
+    t,
+  ) async {
     await t.runAsync(() => StreamingPrefs.setRegion('GB'));
     final asked = <String>[];
     await sl.reset();

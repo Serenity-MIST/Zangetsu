@@ -780,6 +780,7 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
             : (child ?? const SizedBox.shrink());
         final isTv = sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
         return DesktopWindow(
+          enableChrome: shellFeatures && !isTv,
           child: PosterCardScope(
             child: isTv ? TvViewport(child: content) : content,
           ),

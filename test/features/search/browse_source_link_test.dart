@@ -4,6 +4,7 @@
 // be watchable.
 
 import 'dart:io';
+import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
@@ -66,6 +67,7 @@ void main() {
   Future<void> registerCatalogue({
     List<Map<String, dynamic>> results = const [],
     Duration delay = Duration.zero,
+    Completer<void>? gate,
   }) async {
     final src = _Src();
     final matcher = SourceMatcher(
@@ -81,6 +83,7 @@ void main() {
     sl.registerSingleton<MetadataRepository>(
       MetadataRepository(
         anilist: AniListCatalogue((q, v) async {
+          if (gate != null) await gate.future;
           if (delay > Duration.zero) await Future<void>.delayed(delay);
           return {'Page': {'media': results}};
         }),
@@ -106,6 +109,29 @@ void main() {
     await sl.reset();
     await Hive.close();
     await dir.delete(recursive: true);
+  });
+
+  test('nested source page rejects retired requests and late replies', () async {
+    var current=false; var calls=0;
+    Future<List<MediaItem>> load() async { calls++; return [_tapped]; }
+    await expectLater(loadCurrentSourcePage(isCurrent:()=>current,load:load),throwsStateError);
+    expect(calls,0);
+    current=true; final held=Completer<List<MediaItem>>();
+    final pending=loadCurrentSourcePage(isCurrent:()=>current,load:()=>held.future);
+    current=false; held.complete([_tapped]);
+    await expectLater(pending,throwsStateError);
+    current=true;
+    expect(await loadCurrentSourcePage(isCurrent:()=>current,load:load),[_tapped]);
+  });
+
+  test('abandoned metadata lookup cannot persist a new source pin', () async {
+    final gate=Completer<void>();
+    await registerCatalogue(results:[_al()],gate:gate);
+    var abandoned=false;
+    final lookup=canonicalTargetFor(_tapped,abandoned:()=>abandoned);
+    abandoned=true; gate.complete();
+    expect(await lookup,isNull);
+    expect(store.pinnedFor(const ZCanonical(ZKind.anime,'mal:100')),isNull);
   });
 
   test('a recognised title resolves to the catalogue show', () async {

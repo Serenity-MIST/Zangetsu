@@ -13,6 +13,7 @@ import '../../core/repository/source_actions.dart' as source_actions;
 import '../../core/provider/cf_solve_needed.dart';
 import '../../core/repository/source_domain_overrides.dart';
 import '../../core/repository/source_repository.dart';
+import '../../core/repository/source_inventory_events.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/ui/content_row.dart';
@@ -52,7 +53,10 @@ const Duration kLinkingIndicatorDelay = Duration(milliseconds: 350);
 ///
 /// Shared by the source browser and Home's source catalogue so both open the
 /// same title identity. The pin, timeout, and fallback live here.
-Future<MediaItem?> canonicalTargetFor(MediaItem item) async {
+Future<MediaItem?> canonicalTargetFor(MediaItem item, {
+  bool Function()? abandoned,
+}) async {
+  if (abandoned?.call() ?? false) return null;
   if (!ZModePrefs.enabled || !sl.isRegistered<MetadataRepository>()) {
     return null;
   }
@@ -62,6 +66,9 @@ Future<MediaItem?> canonicalTargetFor(MediaItem item) async {
     final hit = await sl<MetadataRepository>()
         .canonicalFor(item)
         .timeout(kCanonicalLookupTimeout);
+    // Metadata can outlive its route or the installed plugin. Check before
+    // committing a new pin, rather than only suppressing later navigation.
+    if (abandoned?.call() ?? false) return null;
     final c = hit == null ? null : ZmodeIds.parseShow(hit.url);
     if (c == null) return null;
     // Pin the source the user is standing in, for THIS title only — otherwise
@@ -74,6 +81,18 @@ Future<MediaItem?> canonicalTargetFor(MediaItem item) async {
   } catch (_) {
     return null;
   }
+}
+
+/// A nested source grid must not append results from an obsolete plugin.
+/// Throwing preserves the grid's retry path; an empty answer means real EOF.
+Future<List<MediaItem>> loadCurrentSourcePage({
+  required bool Function() isCurrent,
+  required Future<List<MediaItem>> Function() load,
+}) async {
+  if (!isCurrent()) throw StateError('Source catalogue is no longer current');
+  final items = await load();
+  if (!isCurrent()) throw StateError('Source catalogue changed during loading');
+  return items;
 }
 
 /// One source's catalogue — today's Home, pinned to a chosen source.
@@ -93,7 +112,9 @@ class BrowseSourceScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) => BlocProvider(
     create: (_) =>
-        BrowseSourceCubit(repo: sl<SourceRepository>(), sourceId: sourceId)
+        BrowseSourceCubit(repo: sl<SourceRepository>(), sourceId: sourceId,
+          sourceAvailable: () => sl<SourceRepository>().hasSource(sourceId),
+          inventoryChanges: sourceInventoryEvents(sourceId))
           ..load(),
     child: _BrowseSourceView(sourceId: sourceId, title: title),
   );
@@ -220,9 +241,12 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
   /// catalogue has simply never heard of all open the source's own item
   /// exactly as before — a source-only title stays fully watchable.
   Future<void> _openDetail(BuildContext context, MediaItem item) async {
-    if (_opening) return; // a tap is already resolving
+    if (!mounted) return;
+    final browser = context.read<BrowseSourceCubit>();
+    if (_opening || !browser.checkSourceAvailability()) return; // a tap is already resolving
     _opening = true;
     final nav = Navigator.of(context);
+    final acceptsResult = browser.retainSourceIntent();
     // A bar, not a barrier: the lookup is short and the screen stays usable —
     // scroll, tap Back, open the overflow. Covering it was what made a tap on
     // a title the catalogue doesn't know feel like the app had frozen.
@@ -230,8 +254,9 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
       if (mounted) setState(() => _linking = true);
     });
     try {
-      final canonical = await canonicalTargetFor(item);
-      if (!mounted) return;
+      final canonical = await canonicalTargetFor(item,
+        abandoned: () => !mounted || !acceptsResult());
+      if (!mounted || !acceptsResult()) return;
       nav.push(DetailScreen.route(canonical ?? item));
     } finally {
       show.cancel();
@@ -240,20 +265,25 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
     }
   }
 
-  void _openSeeAll(BuildContext context, HomeSection section) =>
-      Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => SeeAllScreen(
-            title: section.title,
-            items: section.items,
-            onTap: (i) => _openDetail(context, i),
-            onLoadMore: section.more == null
-                ? null
-                : (page) =>
-                      sl<SourceRepository>().browseMore(section.more!, page),
-          ),
+  void _openSeeAll(BuildContext context, HomeSection section) {
+    final browser = context.read<BrowseSourceCubit>();
+    if (!browser.checkSourceAvailability()) return;
+    final acceptsResult = browser.retainSourceIntent();
+    final repository = sl<SourceRepository>();
+    bool current() => mounted && acceptsResult();
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SeeAllScreen(
+          title: section.title,
+          items: section.items,
+          onTap: (item) { if (current()) _openDetail(context, item); },
+          onLoadMore: section.more == null ? null : (page) =>
+              loadCurrentSourcePage(isCurrent: current,
+                load: () => repository.browseMore(section.more!, page)),
         ),
-      );
+      ),
+    );
+  }
 
   void _startSearch() {
     setState(() => _searching = true);

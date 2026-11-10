@@ -77,10 +77,9 @@ bool looksLikeCloudflareBlock(int status, String body) {
 /// So Cloudflare has to actually say it is challenging: the `cf-mitigated`
 /// header it sets on a real one, or the interstitial's own markup.
 ///
-/// Scope is deliberately the JS providers only. CloudStream keeps its own
-/// predicate in PluginHost.kt, and Aniyomi/Mihon/LNReader theirs — none of
-/// them route through here.
-@visibleForTesting
+/// Shared by JS providers and the Windows LNReader Dio fallback. Mobile
+/// LNReader, CloudStream and Aniyomi/Mihon retain their native predicates.
+/// Public because both production HTTP adapters use the same classification.
 bool looksLikeCfChallenge({
   required int status,
   required String body,

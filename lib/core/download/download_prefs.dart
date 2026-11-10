@@ -1,3 +1,4 @@
+import 'download_host_cooldown.dart';
 import 'package:hive/hive.dart';
 import 'dart:io';
 import '../desktop/desktop_storage.dart';
@@ -64,6 +65,26 @@ class DownloadPrefs {
 
   Box get _box => Hive.box(boxName);
 
+  /// Read a host-only, device-local cooldown without retaining stream URLs.
+  DateTime? hostCooldownUntil(Uri url, {DateTime? now}) {
+    if (url.host.isEmpty || (url.scheme != 'http' && url.scheme != 'https')) return null;
+    final raw = _box.get('windowsHostCooldown:${url.host.toLowerCase()}');
+    if (raw is! int || raw <= (now ?? DateTime.now()).millisecondsSinceEpoch || raw > 8640000000000000) return null;
+    return DateTime.fromMillisecondsSinceEpoch(raw, isUtc: true);
+  }
+
+  /// Persist cooldown before another request; repeated hints cannot shorten it.
+  Future<DateTime?> rememberHostCooldown(Uri url, String? retryAfter, {DateTime? now}) async {
+    if (url.host.isEmpty || (url.scheme != 'http' && url.scheme != 'https')) return null;
+    final instant = now ?? DateTime.now();
+    final requested = downloadRetryDeadline(retryAfter, instant);
+    final previous = hostCooldownUntil(url, now: instant);
+    final deadline = previous != null && previous.isAfter(requested) ? previous : requested;
+    await _box.put('windowsHostCooldown:${url.host.toLowerCase()}', deadline.millisecondsSinceEpoch);
+    return deadline;
+  }
+
+
   /// The picked SAF directory tree URI, or null for the default location.
   String? get locationUri => _box.get('locationUri') as String?;
 
@@ -107,7 +128,8 @@ class DownloadPrefs {
   Future<void> setParallelDownloads(int n) =>
       _box.put('parallel', n.clamp(parallelMin, parallelMax));
 
-  /// How many segment connections a single HLS download uses. Default 4.
+  /// Connections for HLS segments and range-capable Windows files. Default 4.
+  /// Direct files use one connection when the host cannot safely split them.
   int get connectionsPerDownload => (_box.get('connections') as int? ?? 4)
       .clamp(connectionsMin, connectionsMax);
 

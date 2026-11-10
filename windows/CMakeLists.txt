@@ -119,3 +119,24 @@ install(DIRECTORY "${PROJECT_BUILD_DIR}/${FLUTTER_ASSET_DIR_NAME}"
 install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
   CONFIGURATIONS Profile;Release
   COMPONENT Runtime)
+
+# A staged engine is copied intact so installed and portable bundles use the
+# same relative path. Distribution staging/verification is handled by
+# tools/package_ffmpeg.py; never discover an arbitrary FFmpeg from system PATH.
+set(ZANGETSU_FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/engines/ffmpeg"
+  CACHE PATH "Verified portable FFmpeg distribution folder")
+option(ZANGETSU_REQUIRE_FFMPEG "Reject packages without the audio merge engine" OFF)
+if(EXISTS "${ZANGETSU_FFMPEG_DIR}/distribution.json")
+  file(READ "${ZANGETSU_FFMPEG_DIR}/distribution.json" ffmpeg_manifest)
+  string(JSON ffmpeg_expected_hash GET "${ffmpeg_manifest}" files "ffmpeg.exe")
+  file(SHA256 "${ZANGETSU_FFMPEG_DIR}/ffmpeg.exe" ffmpeg_actual_hash)
+  if(NOT ffmpeg_actual_hash STREQUAL ffmpeg_expected_hash)
+    message(FATAL_ERROR "Bundled FFmpeg checksum does not match distribution.json")
+  endif()
+  install(DIRECTORY "${ZANGETSU_FFMPEG_DIR}/"
+    DESTINATION "${CMAKE_INSTALL_PREFIX}/engines/ffmpeg" COMPONENT Runtime)
+elseif(ZANGETSU_REQUIRE_FFMPEG)
+  message(FATAL_ERROR "Stage the verified FFmpeg distribution before packaging")
+else()
+  message(STATUS "FFmpeg not staged: external-audio download merging unavailable in this build")
+endif()

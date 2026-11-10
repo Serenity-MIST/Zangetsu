@@ -20,6 +20,7 @@ namespace flutter_inappwebview_plugin
     : plugin(plugin),
     ChannelDelegate(plugin->registrar->messenger(), InAppWebViewManager::METHOD_CHANNEL_NAME)
   {
+    ++live_managers_;
     if (!rohelper_) {
       rohelper_ = std::make_unique<rx::RoHelper>(RO_INIT_SINGLETHREADED);
 
@@ -243,5 +244,14 @@ namespace flutter_inappwebview_plugin
     windowWebViews.clear();
     UnregisterClass(windowClass_.lpszClassName, nullptr);
     plugin = nullptr;
+    // Shared WinRT objects must release on their owning UI apartment, before
+    // the runner uninitializes COM, rather than during static DLL teardown.
+    if (--live_managers_ == 0) {
+      valid_ = false;
+      compositor_ = nullptr;
+      graphics_context_.reset();
+      dispatcher_queue_controller_ = nullptr;
+      rohelper_.reset();
+    }
   }
 }

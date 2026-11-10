@@ -2,13 +2,17 @@ import 'package:flutter/material.dart';
 
 import '../../l10n/l10n.dart';
 import '../tv/tv_alert_dialog.dart';
+import '../theme/app_colors.dart';
+import '../theme/app_text.dart';
+import 'desktop_settings_surface.dart';
 
 export '../tv/tv_alert_dialog.dart' show TvAlertAction, TvAlertDialog;
 
 /// App-wide OK / yes-no / custom-action popups.
 ///
-/// Always uses the TV-friendly chrome ([TvAlertDialog]) — compact on a phone,
-/// 10-foot + D-pad trapped on TV. Call sites never branch on [AppMode].
+/// Settings on Windows use scoped desktop chrome; other destinations keep
+/// [TvAlertDialog], including its TV focus behavior. Action ownership stays
+/// with callers and dialogs remain on the root navigator in both cases.
 abstract final class AppDialog {
   /// Lowest-level entry: title, body, actions. Prefer [alert] / [confirm]
   /// unless the buttons are not a plain OK or Cancel/Confirm pair.
@@ -19,6 +23,14 @@ abstract final class AppDialog {
     required List<TvAlertAction> actions,
     bool barrierDismissible = true,
   }) {
+    if (DesktopSettingsScope.contains(context)) {
+      return showDialog<T>(
+        context: context,
+        barrierDismissible: barrierDismissible,
+        builder: (_) =>
+            _DesktopSettingsAlert(title: title, body: body, actions: actions),
+      );
+    }
     return showTvAlertDialog<T>(
       context,
       title: title,
@@ -90,4 +102,64 @@ abstract final class AppDialog {
     );
     return result == true;
   }
+}
+
+/// Bounded desktop alerts use standard keyboard/mouse buttons. Overflowing
+/// copy scrolls and actions wrap; destructive callers retain Cancel autofocus.
+class _DesktopSettingsAlert extends StatelessWidget {
+  const _DesktopSettingsAlert({
+    required this.title,
+    required this.body,
+    required this.actions,
+  });
+
+  final String title;
+  final Widget body;
+  final List<TvAlertAction> actions;
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    backgroundColor: const Color(0xFF1A1B20),
+    surfaceTintColor: Colors.transparent,
+    constraints: const BoxConstraints(maxWidth: 560),
+    insetPadding: const EdgeInsets.all(24),
+    shape: RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(20),
+      side: const BorderSide(color: Color(0xFF36373E)),
+    ),
+    scrollable: true,
+    title: Text(title, style: AppText.headline.copyWith(fontSize: 23)),
+    content: DefaultTextStyle(
+      style: AppText.body.copyWith(color: AppColors.textSecondary, height: 1.5),
+      child: body,
+    ),
+    actions: [
+      for (final action in actions)
+        if (action.primary)
+          FilledButton(
+            autofocus: action.autofocus,
+            onPressed: action.onTap,
+            style: FilledButton.styleFrom(
+              backgroundColor: AppColors.accent,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+            ),
+            child: Text(action.label),
+          )
+        else
+          TextButton(
+            autofocus: action.autofocus,
+            onPressed: action.onTap,
+            style: TextButton.styleFrom(
+              foregroundColor: AppColors.textPrimary,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+            ),
+            child: Text(action.label),
+          ),
+    ],
+  );
 }

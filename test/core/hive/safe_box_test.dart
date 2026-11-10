@@ -32,7 +32,20 @@ void main() {
 
   tearDown(() async {
     await Hive.deleteFromDisk();
-    if (await dir.exists()) await dir.delete(recursive: true);
+    // Only this disposable fixture is removed. Windows scanners can briefly
+    // retain a handle after Hive closes;retry sharing violations within1.3s.
+    for (var attempt=0; attempt<6; attempt++) {
+      try {
+        await dir.delete(recursive:true);
+        break;
+      } on PathNotFoundException {
+        if (await dir.exists()) rethrow;
+        break;
+      } on FileSystemException catch (error) {
+        if (attempt==5 || ![32,33].contains(error.osError?.errorCode)) rethrow;
+        await Future<void>.delayed(Duration(milliseconds:40*(1<<attempt)));
+      }
+    }
   });
 
   /// Seeds a box on disk with a value only the typeId-116 adapter can read,
@@ -85,10 +98,13 @@ void main() {
     expect(quarantinedBoxes, contains('legacy'));
   });
 
-  test('keeps only one .corrupt copy per box', () async {
+  test('preserves earlier recovery copies on repeated corruption', () async {
     await writeUnreadableBox('legacy');
     await openIgnoringOrphanError('legacy');
     await Hive.box('legacy').close();
+    final firstBackup=File('${dir.path}/legacy.hive.corrupt');
+    final retained=[...await firstBackup.readAsBytes(),42];
+    await firstBackup.writeAsBytes(retained);
 
     await writeUnreadableBox('legacy'); // breaks again
     await openIgnoringOrphanError('legacy');
@@ -96,9 +112,11 @@ void main() {
     final kept = dir
         .listSync()
         .whereType<File>()
-        .where((f) => f.path.endsWith('.corrupt'))
+        .where((f) => f.path.contains('.hive.corrupt'))
         .toList();
-    expect(kept, hasLength(1)); // repeated failures can't fill the disk
+    expect(kept, hasLength(2));
+    expect(await firstBackup.readAsBytes(),retained);
+    expect(kept.every((file) => file.lengthSync() > 0),isTrue);
   });
 
   test('preserves data when the recovery directory is unavailable', () async {
@@ -108,6 +126,16 @@ void main() {
     await expectLater(openIgnoringOrphanError('legacy'), throwsStateError);
     expect(File('${dir.path}/legacy.hive').lengthSync(), greaterThan(0));
     expect(File('${dir.path}/legacy.hive.corrupt').existsSync(), isFalse);
+  });
+
+  test('incompatible live box type never triggers quarantine', () async {
+    final original=await Hive.openBox<int>('live');
+    await original.put('n',42);
+    final before=await File('${dir.path}/live.hive').readAsBytes();
+    await expectLater(openBoxSafely<String>('live'),throwsA(isA<HiveError>()));
+    expect(original.get('n'),42);
+    expect(await File('${dir.path}/live.hive').readAsBytes(),before);
+    expect(quarantinedBoxes,isEmpty);
   });
 
   test('leaves a healthy box (and its data) untouched', () async {

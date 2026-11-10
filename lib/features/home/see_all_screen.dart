@@ -73,6 +73,7 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
   bool _loading = false;
   bool _end = false;
   bool _showNextPage = false;
+  bool _pageFailed = false;
   bool _searching = false;
   int _queryGeneration = 0;
   late MetaFilters _filters;
@@ -101,7 +102,7 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
   String _keyOf(MediaItem m) => m.id.isNotEmpty ? m.id : m.url;
 
   void _onScroll() {
-    if (_loading || _end || !_controller.hasClients) return;
+    if (_loading || _pageFailed || _end || !_controller.hasClients) return;
     final pos = _controller.position;
     if (pos.pixels >= pos.maxScrollExtent * 0.8) {
       _loadMore();
@@ -116,6 +117,7 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
     final generation = _queryGeneration;
     setState(() {
       _loading = true;
+      _pageFailed = false;
       _showNextPage = false;
     });
     List<MediaItem> next = const [];
@@ -132,7 +134,11 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
         next = await loader!(_page + 1);
       }
     } catch (_) {
-      next = const [];
+      if (!mounted || generation != _queryGeneration) return;
+      // A failed request is not a successful empty page. Keep the same page
+      // number and expose a retry instead of permanently ending the list.
+      setState(() { _loading = false; _pageFailed = true; _showNextPage = true; });
+      return;
     }
     if (!mounted || generation != _queryGeneration) return;
     final fresh = <MediaItem>[];
@@ -167,6 +173,7 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
       _page = 1;
       _end = false;
       _loading = true;
+      _pageFailed = false;
       _showNextPage = false;
     });
     var first = const MediaItemPage(items: <MediaItem>[], hasMore: false);
@@ -299,12 +306,7 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
               controller: paginating ? _controller : null,
               padding: const EdgeInsets.all(16),
               cacheExtent: 800,
-              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: posterGridColumns(context),
-                childAspectRatio: posterGridAspect(context),
-                crossAxisSpacing: 12,
-                mainAxisSpacing: 16,
-              ),
+              gridDelegate: posterGridDelegate(context),
               itemCount: _items.length,
               itemBuilder: (context, i) {
                 final item = _items[i];
@@ -351,8 +353,8 @@ class _SeeAllScreenState extends State<SeeAllScreen> {
                 child: TextButton.icon(
                   key: const ValueKey('see-all-next-page'),
                   onPressed: _loadMore,
-                  icon: const Icon(Icons.arrow_forward_rounded),
-                  label: Text(context.l10n.next),
+                  icon: Icon(_pageFailed ? Icons.refresh_rounded : Icons.arrow_forward_rounded),
+                  label: Text(_pageFailed ? context.l10n.retry : context.l10n.next),
                 ),
               ),
             )

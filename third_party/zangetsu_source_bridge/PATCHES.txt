@@ -1,0 +1,8 @@
+Pinned source: https://github.com/Spyou/Zangetsu-Source-Bridge.git
+Commit: c006c8c33e21fb7cf844855e109d64ead977eeb8
+
+Local changes: optional request-specific root-isolate session-header callback in cloudflare_http.dart and runtime_worker.dart, bounded dedicated reply ports, retired-worker guards, and preservation of verified browser UA without cookies. Original mobile MethodChannel remains fallback.
+
+Review-only dependency overrides removed; consuming application must supply the tested local d4rt and analyzer resolution. Original LICENSES and notice retained; notice explicitly concerns upstream test fixtures, not a declaration of license for every bridge source file.
+
+No caches, build output, test content, SDK, credentials or Markdown reports copied. Source is not wired into the running application yet.

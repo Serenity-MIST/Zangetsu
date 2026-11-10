@@ -53,12 +53,21 @@ class SettingsLeaf {
 /// Every setting reachable one level below the category rows.
 final settingsLeaves = <SettingsLeaf>[
   // Keep newly merged sub-pages discoverable through the shared search entry.
-  SettingsLeaf(LeafParent.playback, (l) => l.tvDecoderMode,
-      keywords: 'decoder hardware software priority'),
-  SettingsLeaf(LeafParent.reader, (l) => l.mangaTranslationSettings,
-      keywords: 'translate ocr language manga pages'),
-  SettingsLeaf(LeafParent.reader, (l) => l.mangaTranslationAppearance,
-      keywords: 'translation font text overlay appearance'),
+  SettingsLeaf(
+    LeafParent.playback,
+    (l) => l.tvDecoderMode,
+    keywords: 'decoder hardware software priority',
+  ),
+  SettingsLeaf(
+    LeafParent.reader,
+    (l) => l.mangaTranslationSettings,
+    keywords: 'translate ocr language manga pages',
+  ),
+  SettingsLeaf(
+    LeafParent.reader,
+    (l) => l.mangaTranslationAppearance,
+    keywords: 'translation font text overlay appearance',
+  ),
   // Playback → PlaybackSettingsScreen
   SettingsLeaf(
     LeafParent.playback,
@@ -400,6 +409,12 @@ final settingsLeaves = <SettingsLeaf>[
   ),
 
   // Interface → AppearanceScreen
+  // Custom colour is a real nested control; retain its route in settings search.
+  SettingsLeaf(
+    LeafParent.appearance,
+    (l) => l.customColour,
+    keywords: 'accent color colour wheel palette',
+  ),
   SettingsLeaf(
     LeafParent.appearance,
     (l) => l.materialYou,

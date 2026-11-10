@@ -761,6 +761,16 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
           validateStatus: (_) => true,
         ),
       );
+      // Windows uses Dio rather than the mobile NovelHttp bridge. Preserve
+      // the response for the plugin, but expose genuine challenges to Home.
+      if (Platform.isWindows &&
+          looksLikeCfChallenge(
+            status: res.statusCode ?? 0,
+            body: res.data ?? '',
+            cfMitigated: res.headers.value('cf-mitigated'),
+          )) {
+        NovelCloudflare.needsSolve(res.realUri.toString());
+      }
       return LnReaderHttpResponse(
         status: res.statusCode ?? 0,
         body: res.data ?? '',

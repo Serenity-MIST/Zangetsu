@@ -17,6 +17,10 @@ import 'package:watch_app/core/repository/source_repository.dart';
 /// so the queue can be inspected mid-flight. The downloader runs chapters one
 /// at a time, so exactly one is ever in there.
 class _FakeSourceRepository implements SourceRepository {
+  final entered = Completer<void>();
+  void Function()? _release;
+  void release() { _release?.call(); _release = null; }
+  void _started() { if (!entered.isCompleted) entered.complete(); }
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
@@ -28,12 +32,20 @@ class _FakeSourceRepository implements SourceRepository {
   List<({String id, String name})> get pickableSources => loadedSources;
 
   @override
-  Future<List<PageImage>> pages(String chapterUrl, {String? sourceId}) =>
-      Completer<List<PageImage>>().future;
+  Future<List<PageImage>> pages(String chapterUrl, {String? sourceId}) {
+    _started();
+    final response = Completer<List<PageImage>>();
+    _release = () => response.complete(const []);
+    return response.future;
+  }
 
   @override
-  Future<ChapterText> chapterText(String chapterUrl, {String? sourceId}) =>
-      Completer<ChapterText>().future;
+  Future<ChapterText> chapterText(String chapterUrl, {String? sourceId}) {
+    _started();
+    final response = Completer<ChapterText>();
+    _release = () => response.completeError(StateError('Canceled fixture fetch'));
+    return response.future;
+  }
 }
 
 /// Counts writes so a regression back to one-write-per-chapter is caught.
@@ -41,6 +53,15 @@ class _CountingStore extends ChapterDownloadStore {
   int putCalls = 0;
   int putAllCalls = 0;
   int rowsWritten = 0;
+  final _removals = <String, Completer<void>>{};
+
+  /// Observe real cleanup completion, not an arbitrary delay before closing Hive.
+  Future<void> nextRemoval(String id) => (_removals[id] = Completer<void>()).future;
+  @override Future<void> remove(String id) async {
+    await super.remove(id);
+    final done = _removals.remove(id);
+    if (done != null && !done.isCompleted) done.complete();
+  }
 
   @override
   Future<void> put(ChapterDownload d) {
@@ -73,6 +94,7 @@ void main() {
   late Directory dir;
   late _CountingStore store;
   late ChapterDownloader downloader;
+  late _FakeSourceRepository repository;
 
   setUp(() async {
     dir = await Directory.systemTemp.createTemp('chapter_enqueue');
@@ -86,15 +108,23 @@ void main() {
     Hive.init(dir.path);
     await ChapterDownloadStore.init();
     store = _CountingStore();
-    downloader = ChapterDownloader(_FakeSourceRepository(), store);
+    repository = _FakeSourceRepository();
+    downloader = ChapterDownloader(repository, store);
   });
 
   tearDown(() async {
-    // The parked chapter is mid-`_download` with its first box write still
-    // ahead of it. Cancelling trips the guard in front of that write, and the
-    // empty-delay lets it unwind before the box goes away underneath it.
+    // Queue tests intentionally leave a source fetch pending. Wait until its
+    // startup disk work reaches that controlled boundary before closing Hive.
+    if (downloader.inFlight.isNotEmpty) {
+      await repository.entered.future.timeout(const Duration(seconds: 5));
+    }
+    final activeId = downloader.inFlight.values.firstOrNull?.id;
     await downloader.cancelAll();
-    await Future<void>.delayed(Duration.zero);
+    if (activeId != null) {
+      final cleaned = store.nextRemoval(activeId);
+      repository.release();
+      await cleaned.timeout(const Duration(seconds: 5));
+    }
     await Hive.deleteBoxFromDisk(ChapterDownloadStore.boxName);
     await Hive.close();
     // The parked chapter may still be creating its staging folder as this
@@ -108,6 +138,18 @@ void main() {
         await Future<void>.delayed(const Duration(milliseconds: 20));
       }
     }
+  });
+
+  test('chapter queue captures optional thumbnail and source cover headers', () async {
+    await downloader.enqueueMany(chapters: const [Episode(id: 'art', title: 'Chapter',
+      url: 'https://x/art', thumbnail: 'https://x/chapter-art')], sourceId: 'src', showId: 'show',
+      showTitle: 'Show', cover: 'https://x/cover', coverHeaders: const {'Referer': 'https://x'},
+      mode: ContentMode.manga);
+    final saved = store.all().single;
+    expect(saved.thumbnail, 'https://x/chapter-art');
+    expect(saved.coverHeaders, {'Referer': 'https://x'});
+    // Finish startup I/O before teardown cancels this intentionally parked fetch.
+    await repository.entered.future.timeout(const Duration(seconds: 5));
   });
 
   test('a batch is one write, not one per chapter', () async {
@@ -184,7 +226,12 @@ void main() {
       showTitle: 'Show',
       mode: ContentMode.manga,
     );
+    await repository.entered.future.timeout(const Duration(seconds: 5));
+    final runningId = downloader.inFlight.values.first.id;
     await downloader.cancelAll();
+    final cleaned = store.nextRemoval(runningId);
+    repository.release();
+    await cleaned.timeout(const Duration(seconds: 5));
     expect(downloader.inFlight, isEmpty);
     // Queued chapters had nothing on disk, so they go entirely — otherwise a
     // stopped batch leaves thousands of dead rows behind.
@@ -204,10 +251,17 @@ void main() {
       showTitle: 'Show',
       mode: ContentMode.manga,
     );
-    final reloaded = ChapterDownloader(_FakeSourceRepository(), store);
+    await repository.entered.future.timeout(const Duration(seconds: 5));
+    final restoredRepository = _FakeSourceRepository();
+    final reloaded = ChapterDownloader(restoredRepository, store);
     await reloaded.resumeInterrupted();
     expect(reloaded.inFlight.length, 200);
+    await restoredRepository.entered.future.timeout(const Duration(seconds: 5));
+    final restoredId = reloaded.inFlight.values.first.id;
     await reloaded.cancelAll();
+    final cleaned = store.nextRemoval(restoredId);
+    restoredRepository.release();
+    await cleaned.timeout(const Duration(seconds: 5));
   });
 
   test('a chapter that failed for a real reason is not retried', () async {
@@ -241,5 +295,7 @@ void main() {
     );
     expect(downloader.inFlight.length, 1);
     expect(store.all().single.mode, ContentMode.novel);
+    // Park the worker before teardown closes its disposable Hive box.
+    await repository.entered.future.timeout(const Duration(seconds: 5));
   });
 }

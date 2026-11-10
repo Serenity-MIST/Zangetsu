@@ -28,6 +28,10 @@ environment:
 # the latest version available on pub.dev. To see which dependencies have newer
 # versions available, run `flutter pub outdated`.
 dependencies:
+  # Pinned Mangayomi bridge with desktop isolate session transport.
+  zangetsu_source_bridge:
+    path: third_party/zangetsu_source_bridge
+  flutter_svg: ^2.3.0
   cs3_engine:
     path: packages/cs3_engine
   path: ^1.9.1
@@ -200,6 +204,15 @@ dev_dependencies:
 # monorepo, so every package points at its subdir path. Pinned to AnymeX's
 # proven commit. To revert: delete this whole block and `flutter pub get`.
 dependency_overrides:
+  # D4rt continuation fixes preserve awaited source expressions and cleanup.
+  d4rt:
+    path: third_party/d4rt
+  # Match the bridge API to the analyzer version verified by compatibility tests.
+  analyzer: 10.0.1
+  # Pinned upstream9.5.5 runtime with the desktop parallel-resume race fixed.
+  # See third_party/background_downloader/PATCHES.txt for provenance.
+  background_downloader:
+    path: third_party/background_downloader
   # Fix Windows environment disposal targeting the factory's channel instead
   # of the created WebView2 environment; required for verification retries.
   flutter_inappwebview_windows:
@@ -283,6 +296,7 @@ flutter:
   generate: true
   uses-material-design: true
   assets:
+    - assets/icons/lucide/
     # Shared with Android's native network security configuration.
     - android/app/src/main/res/raw/trusted_roots.pem
     - LICENSE-MPL-2.0.txt
@@ -307,6 +321,7 @@ flutter:
     - assets/icon/preview_default.png
     - assets/icon/preview_classic.png
     # New Zangetsu mark (black bg keyed out) — for the mode-switch transition.
+    - assets/icon/desktop_z_mark.svg
     - assets/icon/logo_mark.png
     # Metadata provider marks, from each service's own site, for the switcher
     # sheet. The sheet falls back to initials if one ever fails to decode.

@@ -1047,8 +1047,10 @@ class MetadataRepository implements CatalogueRepository {
     String episodeUrl, {
     String? sourceId,
     bool fast = false,
+    String? category,
   }) async {
-    final cut = _cutFor(episodeUrl);
+    // Queued jobs supply their persisted cut; browsing keeps remembered state.
+    final cut = category ?? _cutFor(episodeUrl);
     if (sourceId != null &&
         sourceId.isNotEmpty &&
         sourceId != ZmodeIds.sourceId) {
@@ -1078,12 +1080,13 @@ class MetadataRepository implements CatalogueRepository {
   /// undownloadable (all-DASH), which is a thing only the caller can judge.
   Future<({List<VideoSource> streams, String sourceId})> sourcesWhere(
     String episodeUrl,
-    bool Function(List<VideoSource> streams) accept,
-  ) async {
+    bool Function(List<VideoSource> streams) accept, {
+    String? category,
+  }) async {
     final r = await _playback.resolveForPlayback(
       episodeUrl,
       accept: accept,
-      category: _cutFor(episodeUrl),
+      category: category ?? _cutFor(episodeUrl),
     );
     return (streams: r.streams, sourceId: r.match.sourceId);
   }

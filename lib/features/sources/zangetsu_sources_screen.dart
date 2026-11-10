@@ -3,6 +3,8 @@ import 'package:flutter_bloc/flutter_bloc.dart';
 
 import '../../core/app_mode.dart';
 import '../../core/ui/source_icon_tile.dart';
+import '../../core/ui/desktop_settings_surface.dart';
+import '../../core/ui/settings_widgets.dart';
 import '../../core/di/injector.dart';
 import '../../core/models/provider_info.dart';
 import '../../core/playback/playback_prefs.dart';

@@ -1,4 +1,9 @@
 import '../../core/ui/nav_prefs.dart';
+import 'desktop_settings_category_grid.dart';
+import 'desktop_settings_search.dart';
+import 'desktop_settings_header.dart';
+import 'desktop_settings_profile.dart';
+import 'desktop_settings_workspace.dart';
 import 'dart:async';
 import 'dart:io';
 
@@ -70,6 +75,7 @@ import '../../core/update/update_service.dart';
 import '../update/update_dialog.dart';
 import '../../core/ui/app_dialog.dart';
 import '../../core/ui/settings_widgets.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import '../../core/tv/tv_list_focusable.dart';
 import '../../core/ui/dock_visibility.dart';
 import '../../core/ui/team_section.dart';
@@ -99,8 +105,8 @@ part 'settings_connections.dart';
 part 'settings_privacy.dart';
 part 'settings_tv_pickers.dart';
 
-/// Top-level Settings screen — a grouped list of cards mirroring the
-/// iOS Settings look in our dark/coral language.
+/// Settings navigation shares one entry catalogue across platforms. Windows
+/// presents category cards; phone and TV retain their own navigation surfaces.
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({
     super.key,
@@ -129,6 +135,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// Nested navigator for TV leaf screens (Playback, Downloads, …) so they
   /// stay in the content pane beside the left rail instead of covering it.
   final List<_TvSettingsLeaf> _tvLeaves = [];
+  final _desktopNavigator = GlobalKey<NavigatorState>();
+  int _desktopDepth = 0;
 
   bool get _isTv => sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
 
@@ -174,24 +182,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
   ].where((tracker) => tracker.isConnected).length;
 
   /// Desktop uses a single route header for both the hub and section pages.
-  PreferredSizeWidget _desktopHeader(SettingsState state) => settingsAppBar(
-    widget.returnToPlayer
-        ? 'Back to player'
-        : state.openSection == null
-        ? context.l10n.settingsTitle
-        : settingsSectionTitle(context.l10n, state.openSection!),
-    showBack:
-        widget.showBackButton ||
-        widget.returnToPlayer ||
-        state.openSection != null,
-    onBack: () {
-      if (state.openSection != null && !widget.returnToPlayer) {
-        _settingsCubit.back();
-      } else {
-        Navigator.of(context).maybePop();
-      }
-    },
-  );
+  PreferredSizeWidget _desktopHeader(SettingsState state) =>
+      DesktopSettingsHeader(
+        widget.returnToPlayer
+            ? 'Back to player'
+            : state.openSection == null
+            ? context.l10n.settingsTitle
+            : settingsSectionTitle(context.l10n, state.openSection!),
+        showBack:
+            widget.showBackButton ||
+            widget.returnToPlayer ||
+            state.openSection != null,
+        onBack: () {
+          if (state.openSection != null && !widget.returnToPlayer) {
+            _settingsCubit.back();
+          } else {
+            Navigator.of(context).maybePop();
+          }
+        },
+      );
 
   ProviderRegistry get _registry => sl<ProviderRegistry>();
 
@@ -200,6 +209,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// Pushes onto the TV nested navigator (or the root navigator on phone).
   /// [builder] is re-invoked when Settings rebuilds so section pages stay fresh.
   Future<void> _pushBuilder(Widget Function(BuildContext context) builder) {
+    if (Platform.isWindows && !_isTv) return _pushDesktopBuilder(builder);
     if (_isTv) {
       final done = Completer<void>();
       final key = UniqueKey();
@@ -242,6 +252,38 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  /// Keeps Windows leaf pages inside the reference workspace rather than
+  /// replacing its sidebar. Original route completion/await behavior survives.
+  Future<void> _pushDesktopBuilder(
+    Widget Function(BuildContext context) builder,
+  ) async {
+    final navigator = _desktopNavigator.currentState;
+    if (navigator == null) return;
+    setState(() => _desktopDepth++);
+    shellBackIntercepted.value = true;
+    try {
+      await navigator.push<void>(
+        PageRouteBuilder<void>(
+          pageBuilder: (context, animation, secondaryAnimation) =>
+              builder(context),
+          transitionDuration: MediaQuery.disableAnimationsOf(context)
+              ? Duration.zero
+              : const Duration(milliseconds: 220),
+          reverseTransitionDuration: MediaQuery.disableAnimationsOf(context)
+              ? Duration.zero
+              : const Duration(milliseconds: 180),
+          transitionsBuilder: (context, animation, secondaryAnimation, child) =>
+              FadeTransition(opacity: animation, child: child),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _desktopDepth--);
+        _syncShellBackIntercept();
+      }
+    }
+  }
+
   void _removeTvLeaf(Page<dynamic> page) {
     final i = _tvLeaves.indexWhere((l) => l.key == page.key);
     if (i < 0) return;
@@ -253,7 +295,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// nested leaf route on TV).
   void _syncShellBackIntercept({SettingsState? state}) {
     final s = state ?? _settingsCubit.state;
-    final nestedCanPop = _isTv && _tvLeaves.isNotEmpty;
+    final nestedCanPop =
+        (_isTv && _tvLeaves.isNotEmpty) ||
+        (Platform.isWindows && _desktopDepth > 0);
     shellBackIntercepted.value =
         s.openSection != null || s.query.isNotEmpty || nestedCanPop;
     if (!_isTv) {
@@ -353,6 +397,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
           options: options,
           current: prefs.titleLanguage,
         ),
+      );
+    } else if (Platform.isWindows) {
+      picked = await showGraphiteSettingsChoice<TitleLanguage>(
+        context,
+        title: l10n.titleLanguage,
+        options: options,
+        current: prefs.titleLanguage,
       );
     } else {
       picked = await showModalBottomSheet<TitleLanguage>(
@@ -552,6 +603,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
           current: prefs.layout,
         ),
       );
+    } else if (Platform.isWindows) {
+      picked = await showGraphiteSettingsChoice<SearchLayout>(
+        context,
+        title: context.l10n.searchLayout,
+        options: SearchLayout.values
+            .map((layout) => (layout, layout.localizedLabel(context)))
+            .toList(),
+        current: prefs.layout,
+      );
     } else {
       picked = await showModalBottomSheet<SearchLayout>(
         context: context,
@@ -633,6 +693,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
           current: prefs.batchDownloadStyle,
         ),
       );
+    } else if (Platform.isWindows) {
+      picked = await showGraphiteSettingsChoice<String>(
+        context,
+        title: l10n.batchDownloadStyle,
+        description: l10n.batchDownloadStyleBlurb,
+        options: options,
+        current: prefs.batchDownloadStyle,
+        optionDescriptions: {
+          'classic': l10n.batchDownloadClassicBlurb,
+          'minimal': l10n.batchDownloadMinimalBlurb,
+        },
+      );
     } else {
       picked = await showModalBottomSheet<String>(
         context: context,
@@ -713,58 +785,73 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// library records. The selected descriptive row displays an accent check.
   Future<void> _pickMyListStyle() async {
     final prefs = sl<NavPrefs>();
-    final selected = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: AppColors.surface,
-      constraints: const BoxConstraints(maxWidth: 640),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              margin: const EdgeInsets.only(top: 12, bottom: 12),
-              width: 36,
-              height: 4,
-              decoration: BoxDecoration(
-                color: AppColors.textTertiary,
-                borderRadius: BorderRadius.circular(2),
-              ),
-            ),
-            const ListTile(
-              title: Text('My List style'),
-              subtitle: Text(
+    final selected = Platform.isWindows && !_isTv
+        ? await showGraphiteSettingsChoice<String>(
+            context,
+            title: 'My List style',
+            description:
                 'Choose how your library is organized. Your saved titles and progress stay the same.',
+            options: const [('classic', 'Classic'), ('new', 'New')],
+            current: prefs.myListStyle,
+            optionDescriptions: const {
+              'classic':
+                  'Switch between Streaming, Manga and Novel inside My List.',
+              'new':
+                  'My List follows Anime, Movie/TV, Manga or Novel selected in the dock.',
+            },
+          )
+        : await showModalBottomSheet<String>(
+            context: context,
+            backgroundColor: AppColors.surface,
+            constraints: const BoxConstraints(maxWidth: 640),
+            shape: const RoundedRectangleBorder(
+              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+            ),
+            builder: (ctx) => SafeArea(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    margin: const EdgeInsets.only(top: 12, bottom: 12),
+                    width: 36,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: AppColors.textTertiary,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                  const ListTile(
+                    title: Text('My List style'),
+                    subtitle: Text(
+                      'Choose how your library is organized. Your saved titles and progress stay the same.',
+                    ),
+                  ),
+                  const Divider(height: 1),
+                  for (final option in const [
+                    (
+                      'classic',
+                      'Classic',
+                      'Switch between Streaming, Manga and Novel inside My List.',
+                    ),
+                    (
+                      'new',
+                      'New',
+                      'My List follows Anime, Movie/TV, Manga or Novel selected in the dock.',
+                    ),
+                  ])
+                    ListTile(
+                      title: Text(option.$2),
+                      subtitle: Text(option.$3),
+                      trailing: prefs.myListStyle == option.$1
+                          ? Icon(Icons.check_rounded, color: AppColors.accent)
+                          : null,
+                      onTap: () => Navigator.pop(ctx, option.$1),
+                    ),
+                  const SizedBox(height: 8),
+                ],
               ),
             ),
-            const Divider(height: 1),
-            for (final option in const [
-              (
-                'classic',
-                'Classic',
-                'Switch between Streaming, Manga and Novel inside My List.',
-              ),
-              (
-                'new',
-                'New',
-                'My List follows Anime, Movie/TV, Manga or Novel selected in the dock.',
-              ),
-            ])
-              ListTile(
-                title: Text(option.$2),
-                subtitle: Text(option.$3),
-                trailing: prefs.myListStyle == option.$1
-                    ? Icon(Icons.check_rounded, color: AppColors.accent)
-                    : null,
-                onTap: () => Navigator.pop(ctx, option.$1),
-              ),
-            const SizedBox(height: 8),
-          ],
-        ),
-      ),
-    );
+          );
     if (selected == null) return;
     await prefs.setMyListStyle(selected);
     if (mounted) setState(() {});
@@ -777,26 +864,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// not only a locale guess.
   Future<void> _pickStreamingRegion() async {
     final current = StreamingPrefs.region;
-    final picked = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: AppColors.surface,
-      isScrollControlled: true,
-      builder: (ctx) => SafeArea(
-        child: ListView(
-          shrinkWrap: true,
-          children: [
-            for (final code in kStreamingRegions)
-              ListTile(
-                title: Text(code, style: AppText.body),
-                trailing: code == current
-                    ? Icon(Icons.check_rounded, color: AppColors.accent)
-                    : null,
-                onTap: () => Navigator.pop(ctx, code),
+    final picked = Platform.isWindows && !_isTv
+        ? await showGraphiteSettingsChoice<String>(
+            context,
+            title: context.l10n.streamingRegion,
+            description: context.l10n.streamingRegionSubtitle,
+            options: [for (final code in kStreamingRegions) (code, code)],
+            current: current,
+          )
+        : await showModalBottomSheet<String>(
+            context: context,
+            backgroundColor: AppColors.surface,
+            isScrollControlled: true,
+            builder: (ctx) => SafeArea(
+              child: ListView(
+                shrinkWrap: true,
+                children: [
+                  for (final code in kStreamingRegions)
+                    ListTile(
+                      title: Text(code, style: AppText.body),
+                      trailing: code == current
+                          ? Icon(Icons.check_rounded, color: AppColors.accent)
+                          : null,
+                      onTap: () => Navigator.pop(ctx, code),
+                    ),
+                ],
               ),
-          ],
-        ),
-      ),
-    );
+            ),
+          );
     if (picked == null || picked == current) return;
     await StreamingPrefs.setRegion(picked);
     // The cached provider list is per region; leaving it would show the old
@@ -818,6 +913,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
           final accountStatus = auth.isLoggedIn
               ? (auth.user?.email ?? auth.displayName)
               : context.l10n.notSignedIn;
+          if (Platform.isWindows && !_isTv) {
+            return DesktopSettingsProfile(
+              title: 'Profiles & account',
+              subtitle: 'Watching as ${profile.name} · $accountStatus',
+              onOpen: () => _push(const ViewerProfilesScreen()),
+              avatar: CircleAvatar(
+                radius: 22,
+                backgroundColor: viewerProfileAvatarColor(profile.avatar),
+                child: ProfileAvatarFace(
+                  profile: profile,
+                  photoUrl: profilePhotoForFace(
+                    profile: profile,
+                    accountPhotoUrl: auth.avatarUrl,
+                  ),
+                  iconSize: 22,
+                  photoDiameter: 44,
+                ),
+              ),
+            );
+          }
           return Padding(
             padding: const EdgeInsets.only(bottom: 10),
             child: SettingsCard(
@@ -1495,6 +1610,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       connectedCount: connectedCount,
     );
 
+    if (Platform.isWindows && !_isTv) return _buildDesktopWorkspace(entries);
+
     final hub = _buildHub(entries);
     if (!_isTv) return hub;
 
@@ -1540,6 +1657,283 @@ class _SettingsScreenState extends State<SettingsScreen> {
         },
       ),
     );
+  }
+
+  /// Reference workspace owns category navigation; the nested navigator owns
+  /// leaf Back actions. Switching category always returns to its root first.
+  Widget _buildDesktopWorkspace(List<_SettingsEntry> entries) =>
+      BlocConsumer<SettingsCubit, SettingsState>(
+        bloc: _settingsCubit,
+        listener: (context, state) => _syncShellBackIntercept(state: state),
+        builder: (context, state) {
+          final selected = state.openSection ?? SettingsSection.account;
+          return PopScope(
+            canPop:
+                _desktopDepth == 0 &&
+                state.query.isEmpty,
+            onPopInvokedWithResult: (didPop, _) {
+              if (!didPop) _desktopBack();
+            },
+            child: DesktopSettingsWorkspace(
+              title: context.l10n.settingsTitle,
+              selectedId: selected,
+              onExit: _desktopBack,
+              destinations: [
+                for (final section in _sectionOrder)
+                  if (entries.any((entry) => entry.section == section))
+                    DesktopSettingsDestination(
+                      id: section,
+                      title: settingsSectionTitle(context.l10n, section),
+                      icon: settingsSectionIcon(section),
+                      onOpen: () {
+                        _desktopNavigator.currentState?.popUntil(
+                          (r) => r.isFirst,
+                        );
+                        _searchCtrl.clear();
+                        _settingsCubit.setQuery('');
+                        _settingsCubit.open(section);
+                        _syncShellBackIntercept();
+                        final items = entries
+                            .where((e) => e.section == section)
+                            .toList();
+                        if (items.length == 1) items.single.onTap?.call();
+                      },
+                    ),
+              ],
+              child: Navigator(
+                key: _desktopNavigator,
+                pages: [
+                  MaterialPage<void>(
+                    key: const ValueKey('desktop-settings-root'),
+                    child: _desktopSectionBody(entries, state),
+                  ),
+                ],
+                onDidRemovePage: (_) {},
+              ),
+            ),
+          );
+        },
+      );
+
+  /// Return from real nested content or search, then exit Settings directly.
+  /// Sidebar categories are peers, so they must not add a hidden Account hop.
+  void _desktopBack() {
+    if (widget.returnToPlayer) {
+      Navigator.of(context).maybePop();
+    } else if (_desktopDepth > 0) {
+      _desktopNavigator.currentState?.maybePop();
+    } else if (_settingsCubit.state.query.isNotEmpty) {
+      _searchCtrl.clear();
+      _settingsCubit.setQuery('');
+    } else {
+      Navigator.of(context).maybePop();
+    }
+    _syncShellBackIntercept();
+  }
+
+  /// Real entry and search callbacks are rendered in new graphite panels.
+  /// No account, preference or source data is copied into presentation state.
+  Widget _desktopSectionBody(
+    List<_SettingsEntry> entries,
+    SettingsState state,
+  ) {
+    final section = state.openSection ?? SettingsSection.account;
+    final query = state.query.toLowerCase();
+    final items = entries.where((entry) => entry.section == section).toList();
+    final groups = <String, List<_SettingsEntry>>{};
+    for (final item in items) {
+      groups.putIfAbsent(item.group ?? '', () => []).add(item);
+    }
+    return Material(
+      color: const Color(0xFF101114),
+      child: SingleChildScrollView(
+        key: ValueKey('desktop-section-$section'),
+        padding: const EdgeInsets.fromLTRB(28, 24, 28, 32),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                TextButton(
+                  onPressed: _settingsCubit.back,
+                  child: Text(context.l10n.settingsTitle),
+                ),
+                const Text(
+                  ' / ',
+                  style: TextStyle(color: AppColors.textTertiary),
+                ),
+                Flexible(
+                  child: Text(
+                    settingsSectionTitle(context.l10n, section),
+                    style: AppText.caption,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Text(
+              settingsSectionTitle(context.l10n, section),
+              style: AppText.headline.copyWith(
+                fontSize: 30,
+                color: AppColors.textPrimary,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              settingsSectionSummary(context.l10n, section),
+              style: AppText.body.copyWith(color: AppColors.textSecondary),
+            ),
+            const SizedBox(height: 20),
+            DesktopSettingsSearch(
+              controller: _searchCtrl,
+              hint: context.l10n.settingsSearchHint,
+              onChanged: (value) => _settingsCubit.setQuery(value.trim()),
+              onClear: () {
+                _searchCtrl.clear();
+                _settingsCubit.setQuery('');
+                FocusScope.of(context).unfocus();
+              },
+            ),
+            if (query.isNotEmpty)
+              ..._desktopSearchResults(entries, query)
+            else ...[
+              if (section == SettingsSection.account) ...[
+                _accountCard(context),
+                _desktopProfilesPanel(),
+              ],
+              for (final group in groups.entries) ...[
+                if (group.key.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 12, bottom: 10),
+                    child: Text(
+                      group.key,
+                      style: AppText.body.copyWith(
+                        color: AppColors.textPrimary,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                _desktopPanel([
+                  for (final item in group.value)
+                    DesktopSettingsAction(
+                      title: item.title,
+                      subtitle: item.subtitle,
+                      icon: item.icon,
+                      trailing: item.trailing,
+                      onTap: item.onTap,
+                    ),
+                ]),
+                const SizedBox(height: 16),
+              ],
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Panel boundaries group related actions without individual mobile cards.
+  Widget _desktopPanel(List<Widget> children) =>
+      GraphiteSettingsPanel(margin: EdgeInsets.zero, children: children);
+
+  /// Profile identities are read directly from the existing store. Management
+  /// opens the real editor rather than mutating profiles from a decorative row.
+  Widget _desktopProfilesPanel() => ValueListenableBuilder<int>(
+    valueListenable: sl<ViewerProfileStore>().revision,
+    builder: (context, revision, child) => Padding(
+      padding: const EdgeInsets.only(bottom: 20),
+      child: _desktopPanel([
+        Padding(
+          padding: const EdgeInsets.all(22),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Wrap(
+                spacing: 20,
+                runSpacing: 12,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  Text(
+                    'Profiles',
+                    style: AppText.headline.copyWith(fontSize: 23),
+                  ),
+                  FilledButton(
+                    onPressed: () => _push(const ViewerProfilesScreen()),
+                    child: const Text('Manage profiles'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 22),
+              Wrap(
+                spacing: 24,
+                runSpacing: 20,
+                children: [
+                  for (final profile in sl<ViewerProfileStore>().profiles)
+                    SizedBox(
+                      width: 92,
+                      child: Column(
+                        children: [
+                          CircleAvatar(
+                            radius: 32,
+                            backgroundColor: viewerProfileAvatarColor(
+                              profile.avatar,
+                            ),
+                            child: ProfileAvatarFace(
+                              profile: profile,
+                              iconSize: 32,
+                              photoDiameter: 64,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          Text(
+                            profile.name,
+                            textAlign: TextAlign.center,
+                            style: AppText.caption,
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ]),
+    ),
+  );
+
+  /// Search keeps the real indexed leaf destinations while using new rows.
+  List<Widget> _desktopSearchResults(
+    List<_SettingsEntry> entries,
+    String query,
+  ) {
+    final byId = {
+      for (final entry in entries)
+        if (entry.id != null) entry.id!: entry,
+    };
+    final results = <Widget>[
+      for (final entry in entries)
+        if (entry.matches(query))
+          DesktopSettingsAction(
+            title: entry.title,
+            subtitle: entry.subtitle,
+            icon: entry.icon,
+            trailing: entry.trailing,
+            onTap: entry.onTap,
+          ),
+      for (final leaf in settingsLeaves)
+        if (byId.containsKey(leaf.parentId) &&
+            leaf.matches(query, context.l10n))
+          DesktopSettingsAction(
+            title: leaf.title(context.l10n),
+            subtitle: byId[leaf.parentId]!.title,
+            icon: byId[leaf.parentId]!.icon,
+            onTap: byId[leaf.parentId]!.onTap,
+          ),
+    ];
+    return results.isEmpty
+        ? [Text(context.l10n.settingsNoMatch(query), style: AppText.body)]
+        : [_desktopPanel(results)];
   }
 
   Widget _buildHub(List<_SettingsEntry> entries) {
@@ -1602,12 +1996,32 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                 );
               }
-              if (!_isTv) children.add(_searchField(query));
+              if (!_isTv) {
+                children.add(
+                  Platform.isWindows
+                      ? DesktopSettingsSearch(
+                          controller: _searchCtrl,
+                          hint: context.l10n.settingsSearchHint,
+                          onChanged: (value) =>
+                              _settingsCubit.setQuery(value.trim()),
+                          onClear: () {
+                            _searchCtrl.clear();
+                            _settingsCubit.setQuery('');
+                            FocusScope.of(context).unfocus();
+                          },
+                        )
+                      : _searchField(query),
+                );
+              }
               if (query.isEmpty) {
                 // Browse view: account row + one tappable row per section.
                 children
                   ..add(_accountCard(context))
-                  ..addAll(_categoryRows(entries));
+                  ..addAll(
+                    Platform.isWindows && !_isTv
+                        ? [_desktopCategoryGrid(entries)]
+                        : _categoryRows(entries),
+                  );
               } else {
                 // Search cuts across every section (unchanged behaviour).
                 children.addAll(_buildSettingsList(entries, query));
@@ -1791,6 +2205,32 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
     return [SettingsCard(children: tiles)];
   }
+
+  /// Windows always uses the desktop renderer. It preserves the shared entry
+  /// catalogue and route actions, including single-destination shortcuts.
+  Widget _desktopCategoryGrid(List<_SettingsEntry> entries) =>
+      DesktopSettingsCategoryGrid(
+        categories: [
+          for (final section in _sectionOrder)
+            if (entries.any((entry) => entry.section == section))
+              DesktopSettingsCategory(
+                id: section,
+                title: settingsSectionTitle(context.l10n, section),
+                summary: settingsSectionSummary(context.l10n, section),
+                icon: settingsSectionIcon(section),
+                onOpen: () {
+                  final items = entries
+                      .where((entry) => entry.section == section)
+                      .toList();
+                  if (items.length == 1) {
+                    items.single.onTap?.call();
+                  } else {
+                    _settingsCubit.open(section);
+                  }
+                },
+              ),
+        ],
+      );
 
   /// A section's rows, split into cards under their [_SettingsEntry.group]
   /// headings. A section whose rows carry no group renders as one card, which

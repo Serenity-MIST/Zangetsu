@@ -20,6 +20,8 @@ import 'package:watch_app/features/search/browse_source_screen.dart';
 
 class _FakeRepo implements SourceRepository {
   @override
+  bool hasSource(String id) => true;
+  @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
@@ -53,6 +55,8 @@ class _FakeCloudStreamManager extends ChangeNotifier
 
   @override
   BaseProvider? get(String sourceId) => null;
+  @override
+  BaseProvider? resolveCompatible(String sourceId) => get(sourceId);
 
   @override
   String? repoNameForSourceId(String sourceId) => null;

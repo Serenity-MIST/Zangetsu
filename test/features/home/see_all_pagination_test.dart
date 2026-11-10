@@ -33,6 +33,24 @@ void main() {
     if (sl.isRegistered<AppMode>()) sl.unregister<AppMode>();
   });
 
+  testWidgets('failed next page stays retryable at the same page', (tester) async {
+    final requested=<int>[];
+    await tester.pumpWidget(_wrap(SeeAllScreen(title:'Retry',items:_page(0,30),
+      onTap:(_) {},onLoadMore:(page) async {
+        requested.add(page);
+        if (requested.length==1) throw StateError('Temporary source error');
+        return _page(30,1);
+      })));
+    await tester.pumpAndSettle();
+    await tester.fling(find.byType(GridView),const Offset(0,-6000),6000);
+    await tester.pumpAndSettle();
+    expect(requested, [2]);
+    await tester.tap(find.byKey(const ValueKey('see-all-next-page'))); await tester.pumpAndSettle();
+    expect(requested,[2,2]);
+    final grid=tester.widget<GridView>(find.byType(GridView));
+    expect((grid.childrenDelegate as SliverChildBuilderDelegate).childCount,31);
+  });
+
   testWidgets('onLoadMore == null keeps a fixed list (no pagination)', (
     tester,
   ) async {

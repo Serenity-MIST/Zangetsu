@@ -36,6 +36,7 @@ class _SweepSrc implements SourceRepository {
   /// Sources whose episode call never answers — a real one measured 38s.
   final Set<String> hangs;
   final log = <String>[];
+  final removed = <String>{};
 
   /// Every category this source was asked for.
   final cats = <String>[];
@@ -45,18 +46,18 @@ class _SweepSrc implements SourceRepository {
 
   @override
   List<({String id, String name})> get loadedSources => [
-    (id: 'src-a', name: 'A'),
-    (id: 'src-b', name: 'B'),
+    if (!removed.contains('src-a')) (id: 'src-a', name: 'A'),
+    if (!removed.contains('src-b')) (id: 'src-b', name: 'B'),
   ];
 
   @override
   List<({String id, String name})> get pickableSources => loadedSources;
 
   @override
-  bool hasSource(String sourceId) => true;
+  bool hasSource(String sourceId) => !removed.contains(sourceId);
 
   @override
-  Future<bool> ensureSourceLoaded(String sourceId) async => true;
+  Future<bool> ensureSourceLoaded(String sourceId) async => hasSource(sourceId);
 
   // Shown per row by the "Where to watch" sheet.
   @override
@@ -118,6 +119,22 @@ class _SweepSrc implements SourceRepository {
     if (sourceId == 'src-a') return aStreams;
     if (sourceId == 'src-b') return bStreams;
     return const [];
+  }
+}
+
+/// Independently gated replies reproduce provider replacement during extraction.
+class _HeldInventorySources extends _SweepSrc {
+  _HeldInventorySources() : super(aEps: const [
+    Episode(id:'1',title:'E1',number:1,url:'https://a/1'),
+    Episode(id:'2',title:'E2',number:2,url:'https://a/2')], bEps: const [
+    Episode(id:'1',title:'E1',number:1,url:'https://b/1'),
+    Episode(id:'2',title:'E2',number:2,url:'https://b/2')]);
+  final entered = {for (final id in ['src-a','src-b']) id:Completer<void>()};
+  final replies = {for (final id in ['src-a','src-b']) id:Completer<List<VideoSource>>()};
+  @override Future<List<VideoSource>> sources(String url,{String? sourceId,bool fast=false}) {
+    final id=sourceId!;
+    if (!entered[id]!.isCompleted) entered[id]!.complete();
+    return replies[id]!.future;
   }
 }
 
@@ -224,6 +241,81 @@ void main() {
     );
     r.bindTitleLookup((_) async => (title: 'FMA', alt: null, malId: 100));
     return r;
+  }
+
+  for (final progressive in [false,true]) {
+    for (final oldFirst in [false,true]) {
+      test('provider replacement protects newer lookup progressive=$progressive oldFirst=$oldFirst', () async {
+        final src=_HeldInventorySources()..removed.add('src-b');
+        final matcher=SourceMatcher(sources:src,store:store,prefs:prefs,
+          candidates:(_)=>src.loadedSources);
+        final player=PlaybackResolver(matcher:matcher,sources:src,store:store,
+          prefs:prefs,health:health,candidates:(_)=>src.loadedSources)
+          ..bindTitleLookup((_) async => (title:'FMA',alt:null,malId:100));
+        final old=progressive ? player.resolveProgressive(_ep2).toList()
+            : player.resolveForPlayback(_ep2);
+        final retired=expectLater(old,throwsA(isA<PlaybackAborted>()));
+        await src.entered['src-a']!.future.timeout(const Duration(seconds:5));
+        src.removed..add('src-a')..remove('src-b');
+        final current=player.resolveForPlayback(_ep2);
+        await src.entered['src-b']!.future.timeout(const Duration(seconds:5));
+        if (oldFirst) {
+          src.replies['src-a']!.complete(const [VideoSource(url:'https://a/late')]);
+          await retired;
+          expect(identical(player.resolveForPlayback(_ep2),current),isTrue);
+        }
+        src.replies['src-b']!.complete(const [VideoSource(url:'https://b/current')]);
+        expect((await current).streams.single.url,'https://b/current');
+        if (!oldFirst) {
+          src.replies['src-a']!.complete(const [VideoSource(url:'https://a/late')]);
+          await retired;
+        }
+        expect(player.resolvedSourceId(_ep2),'src-b');
+      });
+    }
+  }
+
+  for (final progressive in [false,true]) {
+    test('installing a provider invalidates cached miss progressive=$progressive', () async {
+      final src=_SweepSrc(aEps:const [],bEps:const [
+        Episode(id:'1',title:'E1',number:1,url:'https://b/1'),
+        Episode(id:'2',title:'E2',number:2,url:'https://b/2')]);
+      src.removed.add('src-b');
+      final matcher=SourceMatcher(sources:src,store:store,prefs:prefs,
+        candidates:(_)=>src.loadedSources);
+      final player=PlaybackResolver(matcher:matcher,sources:src,store:store,
+        prefs:prefs,health:health,candidates:(_)=>src.loadedSources)
+        ..bindTitleLookup((_) async => (title:'FMA',alt:null,malId:100));
+      await expectLater(player.resolveForPlayback(_ep2),throwsA(isA<EpisodeNotAvailable>()));
+      src.removed.remove('src-b');
+      final streams=progressive ? (await player.resolveProgressive(_ep2).last).streams
+          : await player.sources(_ep2);
+      expect(streams.single.url,'https://b/stream');
+    });
+  }
+
+  for (final progressive in [false,true]) {
+    test('removed cached provider yields to installed provider progressive=$progressive', () async {
+      final src=_SweepSrc(aEps:const [
+        Episode(id:'1',title:'E1',number:1,url:'https://a/1'),
+        Episode(id:'2',title:'E2',number:2,url:'https://a/2')],
+        bEps:const [Episode(id:'1',title:'E1',number:1,url:'https://b/1'),
+        Episode(id:'2',title:'E2',number:2,url:'https://b/2')]);
+      final matcher=SourceMatcher(sources:src,store:store,prefs:prefs,
+        candidates:(_)=>src.loadedSources);
+      final player=PlaybackResolver(matcher:matcher,sources:src,store:store,
+        prefs:prefs,health:health,candidates:(_)=>src.loadedSources)
+        ..bindTitleLookup((_) async => (title:'FMA',alt:null,malId:100));
+      await prefs.set(_show.kind,'src-a');
+      expect((await player.resolveForPlayback(_ep2)).match.sourceId,'src-a');
+      src.removed.add('src-a'); src.log.clear();
+      final streams= progressive
+          ? (await player.resolveProgressive(_ep2).last).streams
+          : await player.sources(_ep2);
+      expect(streams.single.url,'https://b/stream');
+      expect(src.log.any((entry)=>entry.contains('src-a')),isFalse);
+      expect(store.get(_show,'src-a'),isNotNull);
+    });
   }
 
   test('switching a title\'s source drops its cached winners', () async {

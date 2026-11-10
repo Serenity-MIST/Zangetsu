@@ -224,11 +224,22 @@ class PlaybackResolver {
   final Map<String, ({String episodeUrl, String sourceId, SourceMatch match})>
   _winners = {};
 
+  /// An uninstall may happen after an episode won. Retire only this transient
+  /// cache entry; saved matches, jobs, media files and progress remain intact.
+  ({String episodeUrl, String sourceId, SourceMatch match})? _availableWinner(String key) {
+    final winner = _winners[key];
+    if (winner != null && !_sources.hasSource(winner.sourceId)) {
+      _winners.remove(key);
+      return null;
+    }
+    return winner;
+  }
+
   static String _winKey(String zmEpisodeUrl, String category) =>
       '$zmEpisodeUrl|$category';
 
   /// In-flight resolves keyed by metadata episode url.
-  final Map<String, Future<ResolvedPlayback>> _inFlight = {};
+  final Map<String, ({String providers, Future<ResolvedPlayback> future})> _inFlight = {};
 
   /// How long one candidate may hold the sweep before we move on. Measured on
   /// a real device: a JS provider with its own 15s internal timeout took 15.8s
@@ -425,8 +436,34 @@ class PlaybackResolver {
   ///
   /// Short-lived and cleared by [invalidateWinner], so installing a source,
   /// solving a Cloudflare challenge or hitting Retry all get a fresh sweep.
-  final Map<String, ({DateTime at, bool hadTitleMatch})> _noSource = {};
+  final Map<String, ({DateTime at, bool hadTitleMatch, String providers})> _noSource = {};
   static const Duration noSourceCooldown = Duration(minutes: 5);
+
+  /// A miss only describes the provider inventory that was actually swept.
+  /// Adding a working plugin must not inherit another inventory's five-minute miss.
+  String _providerSignature(String episodeUrl) {
+    final parsed = ZmodeIds.parseEpisode(episodeUrl);
+    if (parsed == null) return '';
+    final ids = _candidates(parsed.show.kind).map((s) => s.id)
+        .where(_sources.hasSource).toSet().toList()..sort();
+    return ids.join('\u0000');
+  }
+
+  ({DateTime at, bool hadTitleMatch, String providers})? _currentMiss(String url, String category) {
+    final key = _winKey(url, category);
+    final miss = _noSource[key];
+    if (miss != null && miss.providers != _providerSignature(url)) {
+      _noSource.remove(key);
+      return null;
+    }
+    return miss;
+  }
+
+  /// Late provider replies belong to the inventory that started the request.
+  /// Retire the reply without mutating a newer lookup or its winning source.
+  void _checkProviderInventory(String url, String providers) {
+    if (_providerSignature(url) != providers) throw const PlaybackAborted();
+  }
 
   bool _recentlyOverBudget(String id) {
     final at = _overBudget[id];
@@ -451,9 +488,11 @@ class PlaybackResolver {
     final flightKey = _winKey(zmEpisodeUrl, category);
     if (accept == null) {
       final running = _inFlight[flightKey];
-      if (running != null) return running;
+      if (running != null && running.providers == _providerSignature(zmEpisodeUrl)) {
+        return running.future;
+      }
     }
-    final miss = _noSource[flightKey];
+    final miss = _currentMiss(zmEpisodeUrl, category);
     if (miss != null) {
       if (DateTime.now().difference(miss.at) < noSourceCooldown) {
         debugPrint(
@@ -477,11 +516,14 @@ class PlaybackResolver {
         accept: accept,
       );
     }
-    final f = _resolve(zmEpisodeUrl, fast: fast, category: category)
+    final providers = _providerSignature(zmEpisodeUrl);
+    late final Future<ResolvedPlayback> f;
+    f = _resolve(zmEpisodeUrl, fast: fast, category: category)
         .whenComplete(() {
-          _inFlight.remove(flightKey);
+          // A retired request must not erase the replacement's dedupe entry.
+          if (identical(_inFlight[flightKey]?.future, f)) _inFlight.remove(flightKey);
         });
-    _inFlight[flightKey] = f;
+    _inFlight[flightKey] = (providers: providers, future: f);
     return f;
   }
 
@@ -522,8 +564,9 @@ class PlaybackResolver {
     }
     // A sweep that found nothing is remembered by the full path; a replay
     // through here answers from that memory instead of paying the sweep again.
+    final providerSignature = _providerSignature(zmEpisodeUrl);
     final flightKey = _winKey(zmEpisodeUrl, category);
-    final miss = _noSource[flightKey];
+    final miss = _currentMiss(zmEpisodeUrl, category);
     if (miss != null) {
       if (DateTime.now().difference(miss.at) < noSourceCooldown) {
         if (!miss.hadTitleMatch) throw NoSourceMatch(p.show);
@@ -534,7 +577,7 @@ class PlaybackResolver {
     // Winner-cache short-circuit, same as [sources]: a replay opens on the
     // cached winner's streams immediately instead of re-sweeping. `fast: true`
     // is what Play passes on that path today (prefetch/TTL/first-link).
-    final hit = _winners[flightKey];
+    final hit = _availableWinner(flightKey);
     if (hit != null) {
       // A cached winner is resolved on the foreground Play path. Race the
       // provider call with the sweep abort so leaving the player does not
@@ -546,6 +589,7 @@ class PlaybackResolver {
         ),
       ]);
       if (gen != _sweepGen) throw const PlaybackAborted();
+      _checkProviderInventory(zmEpisodeUrl, providerSignature);
       if (streams.isNotEmpty) {
         yield ProgressiveResolve(
           match: hit.match,
@@ -627,6 +671,7 @@ class PlaybackResolver {
     // single-winner bookkeeping [_resolve] does. Late arrivals only extend
     // the accumulated list.
     Future<ProgressiveResolve> recordHit(_Attempt attempt) async {
+      _checkProviderInventory(zmEpisodeUrl, providerSignature);
       if (!winnerWritten) {
         winnerWritten = true;
         firstHit = attempt;
@@ -640,6 +685,7 @@ class PlaybackResolver {
           await _scores?.bump(attempt.match.sourceId);
         }
       }
+      _checkProviderInventory(zmEpisodeUrl, providerSignature);
       for (final s in attempt.streams) {
         if (seenUrls.add(s.url)) acc.add(s);
       }
@@ -752,9 +798,11 @@ class PlaybackResolver {
           'url=$blocked',
         );
       }
+      _checkProviderInventory(zmEpisodeUrl, providerSignature);
       _noSource[_winKey(zmEpisodeUrl, category)] = (
         at: DateTime.now(),
         hadTitleMatch: hadTitleMatch,
+        providers: providerSignature,
       );
       if (hadTitleMatch) {
         throw EpisodeNotAvailable(
@@ -805,6 +853,7 @@ class PlaybackResolver {
       debugPrint('[playback] _resolve → ArgumentError: not a zm episode url');
       throw ArgumentError('not a metadata episode url: $zmEpisodeUrl');
     }
+    final providerSignature = _providerSignature(zmEpisodeUrl);
     debugPrint(
       '[playback] _resolve · url=$zmEpisodeUrl episode=${p.episode} '
       'show=${p.show.kind}/${p.show.id} fast=$fast',
@@ -957,6 +1006,7 @@ class PlaybackResolver {
       // `ask` never throws — every failure inside it is caught and returns
       // null — so one bad source in a wave cannot take the others down.
       final answers = await Future.wait([for (final id in wave) ask(id)]);
+      if (accept == null) _checkProviderInventory(zmEpisodeUrl, providerSignature);
 
       // Again on the way out, not only on the way in. Every candidate in the
       // wave races the abort signal and comes back null the moment it fires,
@@ -1068,9 +1118,11 @@ class PlaybackResolver {
       // cfBlockedUrl covers suppressed searches.
     }
 
+    if (accept == null) _checkProviderInventory(zmEpisodeUrl, providerSignature);
     _noSource[_winKey(zmEpisodeUrl, category)] = (
       at: DateTime.now(),
       hadTitleMatch: hadTitleMatch,
+      providers: providerSignature,
     );
     if (hadTitleMatch) {
       debugPrint(
@@ -1104,7 +1156,7 @@ class PlaybackResolver {
     bool fast = false,
     String category = 'sub',
   }) async {
-    final hit = _winners[_winKey(zmEpisodeUrl, category)];
+    final hit = _availableWinner(_winKey(zmEpisodeUrl, category));
     if (hit != null) {
       return _sources.sources(
         hit.episodeUrl,
@@ -1124,10 +1176,10 @@ class PlaybackResolver {
     String category = 'sub',
   }) async {
     final key = _winKey(zmEpisodeUrl, category);
-    var winner = _winners[key];
+    var winner = _availableWinner(key);
     if (winner == null) {
       await resolveForPlayback(zmEpisodeUrl, category: category);
-      winner = _winners[key];
+      winner = _availableWinner(key);
     }
     if (winner == null) {
       return (sources: const <VideoSource>[], done: true);
@@ -1137,7 +1189,7 @@ class PlaybackResolver {
 
   /// The source that last resolved [zmEpisodeUrl], if any this session.
   String? resolvedSourceId(String zmEpisodeUrl, {String category = 'sub'}) =>
-      _winners[_winKey(zmEpisodeUrl, category)]?.sourceId;
+      _availableWinner(_winKey(zmEpisodeUrl, category))?.sourceId;
 
   /// Drop the cached winner for [zmEpisodeUrl] so the next
   /// [resolveForPlayback] re-sweeps sources instead of reusing the failed one.
@@ -1465,7 +1517,7 @@ class PlaybackResolver {
   }) async {
     final parsed = ZmodeIds.parseEpisode(zmEpisodeUrl);
     if (parsed == null) return const [];
-    final remembered = _store.bestFor(parsed.show);
+    final remembered = _store.bestFor(parsed.show, available: _sources.hasSource);
     if (remembered == null) return const [];
     final title = await _titleLookup(parsed.show);
     await _hasEpisode(parsed, remembered.sourceId, title, category: category);

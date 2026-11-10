@@ -1,3 +1,4 @@
+import 'desktop_media_card.dart';
 import 'dart:math' as math;
 
 import 'package:cached_network_image/cached_network_image.dart';
@@ -189,6 +190,9 @@ double posterRowWidth(BuildContext context) {
 
 double posterRowHeight(BuildContext context) {
   final wide = posterLayout(context) == PosterCardLayout.wide;
+  if(defaultTargetPlatform==TargetPlatform.windows) {
+    return DesktopMediaCard.height(posterRowWidth(context),MediaQuery.textScalerOf(context).scale(1),wide:wide,titleInside:posterTitleInside(context,wide:wide));
+  }
   return posterCellHeight(
     posterRowWidth(context),
     wide: wide,
@@ -231,7 +235,7 @@ bool posterTitleInside(BuildContext context, {required bool wide}) {
   PosterCardScope.watch(context);
   return switch (_posterPrefs?.posterTitlePlacement ??
       PosterTitlePlacement.adaptive) {
-    PosterTitlePlacement.adaptive => wide,
+    PosterTitlePlacement.adaptive => defaultTargetPlatform==TargetPlatform.windows ? false : wide,
     PosterTitlePlacement.inside => true,
     PosterTitlePlacement.below => false,
   };
@@ -290,6 +294,24 @@ class _PosterCardState extends State<PosterCard> {
   /// display scaling, instead of a caller's nominal phone-sized cell width.
   Widget _buildCard(BuildContext context, BoxConstraints constraints) {
     final wide = posterLayout(context) == PosterCardLayout.wide;
+    if (defaultTargetPlatform==TargetPlatform.windows) {
+      final prefs=_posterPrefs;
+      final inside=posterTitleInside(context,wide:wide);
+      return DesktopMediaCard(title:widget.title,titleInside:inside,
+        titleWidget:prefs?.posterTitleStyle==PosterTitleStyle.artwork ?
+          PosterCardTitle(title:widget.title,logoItem:widget.logoItem,width:widget.cellWidth,
+            maxHeight:MediaQuery.textScalerOf(context).scale(34),inside:inside) : null,
+        image:wide && widget.wideImageUrl?.isNotEmpty==true ? widget.wideImageUrl : widget.imageUrl,
+        headers:wide && widget.wideImageUrl?.isNotEmpty==true ? null : widget.headers,
+        onTap:widget.onTap,onMenu:widget.onLongPress,showTitle:widget.showTitle,
+        score:(prefs?.posterScoreBadge ?? true) ? widget.scoreBadge : null,
+        badges:[...widget.tags,
+          if(widget.progressBadge!=null && prefs?.posterProgressBadge==true) widget.progressBadge!,
+          if(widget.isAdult && prefs?.posterAdultBadge==true) '18+',
+          if(wide && widget.genres.isNotEmpty && prefs?.posterGenreBadge==true) widget.genres.first,
+          if(widget.qualityBadge!=null && (prefs?.posterQualityBadge ?? true)) widget.qualityBadge!,
+          if(widget.dubBadge!=null && (prefs?.posterAudioBadge ?? true)) widget.dubBadge!]);
+    }
     final titleInside = posterTitleInside(context, wide: wide);
     final selectedArtUrl = wide && widget.wideImageUrl?.isNotEmpty == true
         ? widget.wideImageUrl
@@ -670,14 +692,14 @@ double posterCellAspect(
 /// [posterCellAspect] for the app's standard poster grid: three columns, 16px
 /// page padding, 12px between cells. Depends on the screen width, so it cannot
 /// be a constant — which is exactly why the hardcoded 0.62 drifted.
-double posterGridAspect(BuildContext context) => posterCellAspect(
-  posterGridCellWidth(context),
-  wide: posterLayout(context) == PosterCardLayout.wide,
-  titleInside: posterTitleInside(
-    context,
-    wide: posterLayout(context) == PosterCardLayout.wide,
-  ),
-);
+double posterGridAspect(BuildContext context) {
+  final width=posterGridCellWidth(context);
+  final wide=posterLayout(context)==PosterCardLayout.wide;
+  if(defaultTargetPlatform==TargetPlatform.windows) {
+    return width/DesktopMediaCard.height(width,MediaQuery.textScalerOf(context).scale(1),wide:wide,titleInside:posterTitleInside(context,wide:wide));
+  }
+  return posterCellAspect(width,wide:wide,titleInside:posterTitleInside(context,wide:wide));
+}
 
 /// Small frosted badge drawn over poster art (e.g. "SUB", "DUB", "MOVIE").
 /// The score chip. A star rather than a bare number: "8.6" alone on a poster
@@ -735,6 +757,7 @@ SliverGridDelegate posterGridDelegate(BuildContext context) =>
           wide: posterLayout(context) == PosterCardLayout.wide,
         ),
         scale: posterCardScale(context),
+        textScale:MediaQuery.textScalerOf(context).scale(1),
       )
     : SliverGridDelegateWithFixedCrossAxisCount(
         crossAxisCount: posterGridColumns(context),
@@ -750,20 +773,22 @@ class DesktopPosterGridDelegate extends SliverGridDelegate {
     this.wide = false,
     this.titleInside = false,
     this.scale = 1,
+    this.textScale = 1,
   });
   final bool wide;
   final bool titleInside;
   final double scale;
+  final double textScale;
   @override
   SliverGridLayout getLayout(SliverConstraints constraints) {
-    const gap = 20.0;
+    const gap = 12.0;
     final count =
-        ((constraints.crossAxisExtent + gap) / ((wide ? 300 : 210) * scale))
+        ((constraints.crossAxisExtent + gap) / ((wide ? 260 : 180) * scale))
             .ceil()
             .clamp(1, 30);
     final width = (constraints.crossAxisExtent - gap * (count - 1)) / count;
     final height =
-        width / posterCellAspect(width, wide: wide, titleInside: titleInside);
+        DesktopMediaCard.height(width,textScale,wide:wide,titleInside:titleInside);
     return SliverGridRegularTileLayout(
       crossAxisCount: count,
       mainAxisStride: height + 28,
@@ -778,7 +803,7 @@ class DesktopPosterGridDelegate extends SliverGridDelegate {
   bool shouldRelayout(covariant DesktopPosterGridDelegate oldDelegate) =>
       wide != oldDelegate.wide ||
       titleInside != oldDelegate.titleInside ||
-      scale != oldDelegate.scale;
+      scale != oldDelegate.scale || textScale != oldDelegate.textScale;
 }
 
 class _PosterTag extends StatelessWidget {

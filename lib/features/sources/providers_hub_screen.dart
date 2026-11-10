@@ -3,6 +3,7 @@ import '../../core/desktop/extension_runtime.dart';
 
 import 'package:flutter/material.dart';
 import '../../core/ui/settings_widgets.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 
 import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
@@ -38,13 +39,9 @@ const Widget _kChevron = Icon(
 const _csBlue = Color(0xFF4D9DFF);
 const _aniGreen = Color(0xFF4DD68C);
 
-/// Providers hub — lists the three provider ecosystems (Zangetsu always,
-/// CloudStream/Aniyomi on Android only), each row pushing its dedicated
-/// ecosystem screen (Tasks 1-3). Stateful only so counts refresh when the
-/// user returns from an ecosystem screen (install/remove there is reflected
-/// here without re-entering the hub).
-///
-/// Reached via `SourcesScreen` (Settings → Providers), on both phone and TV.
+/// Provider ecosystem navigation with live installed/update counts.
+/// Windows settings use graphite controls; phone and TV retain their layouts.
+/// Returning from a manager refreshes counts without fetching or mutating here.
 class ProvidersHubScreen extends StatefulWidget {
   const ProvidersHubScreen({super.key});
 
@@ -173,11 +170,10 @@ class _HubPhoneView extends StatelessWidget {
         children: [
           _HubHeader(
             total: total,
-            // +1 for the always-shown Manga & Novel row — not a separate
-            // ecosystem count (ecoCount itself is untouched, still just
-            // Zangetsu/CS/Aniyomi/Mihon), just the header copy matching
-            // what's on screen.
-            ecoCount: ecoCount + 1,
+            // Desktop counts actual ecosystems, not the reading section label.
+            ecoCount: DesktopSettingsScope.contains(context)
+                ? ecoCount
+                : ecoCount + 1,
             activeName: activeName,
             totalUpdates: totalUpdates,
           ),
@@ -319,6 +315,43 @@ class _HubHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (DesktopSettingsScope.contains(context)) {
+      return GraphiteSettingsPanel(
+        margin: EdgeInsets.zero,
+        children: [
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Padding(
+              padding: const EdgeInsets.all(22),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Source library', style: AppText.headline),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Manage installed extensions and their repositories.',
+                    style: AppText.caption,
+                  ),
+                  const SizedBox(height: 16),
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: [
+                      Chip(label: Text('$total installed sources')),
+                      Chip(label: Text('$ecoCount ecosystems')),
+                      if (totalUpdates > 0)
+                        Chip(label: Text('$totalUpdates updates available')),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Text('Active source: $activeName', style: AppText.caption),
+                ],
+              ),
+            ),
+          ),
+        ],
+      );
+    }
     return Row(
       children: [
         Container(
@@ -404,6 +437,25 @@ class _EcoRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (DesktopSettingsScope.contains(context)) {
+      return GraphiteSettingsPanel(
+        margin: EdgeInsets.zero,
+        children: [
+          GraphiteSettingsControl(
+            icon: icon,
+            title: title,
+            subtitle: [
+              desc,
+              info,
+              if (active) 'Active source',
+              if (updateCount > 0)
+                '$updateCount update${updateCount == 1 ? '' : 's'} available',
+            ].join(' · '),
+            onTap: onTap,
+          ),
+        ],
+      );
+    }
     return Material(
       color: AppColors.surface,
       borderRadius: BorderRadius.circular(14),

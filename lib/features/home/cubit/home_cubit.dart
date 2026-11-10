@@ -370,6 +370,28 @@ class HomeCubit extends Cubit<HomeState> {
     emit(state.copyWith(rows: _mergedRows(sections, kind, library, tracker)));
   }
 
+  /// Desktop's fixed library panel uses the already-fetched tracker cache,
+  /// independently of the old optional horizontal-row arrangement. Never
+  /// substitute another tracker's account or fetch a second library here.
+  NewEpisodesHomeRow? get desktopReleaseRow {
+    final cached = _trackerCache;
+    final kind = _browseKind;
+    final preferred = layoutTrackerName(_layoutKey);
+    if (cached == null ||
+        kind == null ||
+        (preferred != null && cached.$1 != preferred)) {
+      return null;
+    }
+    for (final row in buildTrackerHomeRows(
+      trackerName: cached.$1,
+      library: cached.$2,
+      kind: kind,
+    )) {
+      if (row is NewEpisodesHomeRow) return row;
+    }
+    return null;
+  }
+
   /// The sanitized, merged arrangement of one load. Pure given its inputs;
   /// kept here (not in the composer) because the layout key and platform
   /// come from app state.

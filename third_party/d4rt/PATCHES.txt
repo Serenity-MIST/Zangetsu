@@ -1,0 +1,7 @@
+D4rt 0.2.4 local compatibility patches
+Upstream: https://github.com/kodjodevf/d4rt
+License: MIT; original LICENSE retained.
+
+Changes: preserve await continuations for property/method/null-coalescing expressions; retain ordered evaluated arguments and receivers; hand completed expressions back to scheduler without replay; unwind nested finally returns without looping or skipping outer cleanup.
+
+Only lib/src/async_state.dart, callable.dart and interpreter_visitor.dart differ from the published 0.2.4 lib source. Tests and exact failures/passes are retained in the ignored Mangayomi compatibility checkout. This copy is not enabled by the app pubspec until bridge integration.

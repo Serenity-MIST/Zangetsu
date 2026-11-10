@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:visibility_detector/visibility_detector.dart';
 
@@ -32,6 +33,7 @@ class _RevealItemState extends State<RevealItem>
     with SingleTickerProviderStateMixin {
   AnimationController? _c;
   bool _fired = false;
+  Timer? _revealDelay;
 
   /// Captured once, at build time for this card. A card that has already
   /// revealed keeps the style it revealed with; a change applies as you scroll
@@ -60,6 +62,8 @@ class _RevealItemState extends State<RevealItem>
 
   @override
   void dispose() {
+    // A newly visible card can leave before its stagger begins.
+    _revealDelay?.cancel();
     _c?.dispose();
     super.dispose();
   }
@@ -72,7 +76,7 @@ class _RevealItemState extends State<RevealItem>
     // no wave. Modulo 8 with a longer step reads as one continuous run, and
     // stays capped so a long list never accumulates a visible lag.
     final delay = Duration(milliseconds: 45 * (widget.index % 8));
-    Future.delayed(delay, () {
+    _revealDelay = Timer(delay, () {
       if (mounted) _c?.forward();
     });
   }

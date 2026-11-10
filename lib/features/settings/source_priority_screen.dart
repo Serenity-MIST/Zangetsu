@@ -10,6 +10,8 @@ import '../../core/theme/app_text.dart';
 import '../../core/tv/tv_focusable.dart';
 import '../../core/tv/tv_list_focusable.dart';
 import '../../core/ui/settings_widgets.dart';
+import '../../core/ui/desktop_settings_surface.dart';
+import 'desktop_source_priority_row.dart';
 import '../../core/ui/source_switcher.dart' show categorizedSources;
 import '../../core/zmode/source_order_prefs.dart';
 import '../../core/zmode/source_score_store.dart';
@@ -274,52 +276,124 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
       // No horizontal padding here on purpose: SettingsCard carries its own
       // 16px margin, so anything given an inset by this ListView ends up 12px
       // further in than the cards and the whole screen looks ragged.
-      body: ListView(
-        padding: const EdgeInsets.fromLTRB(0, 10, 0, 36),
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-            child: DropdownButtonFormField<ZKind>(
-              key: const ValueKey('source-priority-kind'),
-              initialValue: _kind,
-              decoration: const InputDecoration(labelText: 'Media'),
-              items: const [
-                DropdownMenuItem(value: ZKind.anime, child: Text('Anime')),
-                DropdownMenuItem(
-                  value: ZKind.movie,
-                  child: Text('Movies / TV'),
+      body: DesktopSettingsScope.contains(context)
+          ? _desktopBody()
+          : ListView(
+              padding: const EdgeInsets.fromLTRB(0, 10, 0, 36),
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+                  child: DropdownButtonFormField<ZKind>(
+                    key: const ValueKey('source-priority-kind'),
+                    initialValue: _kind,
+                    decoration: const InputDecoration(labelText: 'Media'),
+                    items: const [
+                      DropdownMenuItem(
+                        value: ZKind.anime,
+                        child: Text('Anime'),
+                      ),
+                      DropdownMenuItem(
+                        value: ZKind.movie,
+                        child: Text('Movies / TV'),
+                      ),
+                      DropdownMenuItem(
+                        value: ZKind.manga,
+                        child: Text('Manga'),
+                      ),
+                      DropdownMenuItem(
+                        value: ZKind.novel,
+                        child: Text('Novels'),
+                      ),
+                    ],
+                    onChanged: (kind) {
+                      if (kind != null) _refresh(kind);
+                    },
+                  ),
                 ),
-                DropdownMenuItem(value: ZKind.manga, child: Text('Manga')),
-                DropdownMenuItem(value: ZKind.novel, child: Text('Novels')),
+                _capControl(_kind),
+                _section(_kind, _sources),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
+                  child: Text(
+                    'Drag a source to keep it where you put it. Everything else is '
+                    'sorted by what has actually worked for you. A title pinned from '
+                    'its own Detail screen ignores this list.',
+                    style: AppText.caption.copyWith(
+                      color: AppColors.textTertiary,
+                    ),
+                  ),
+                ),
+                if (_hasPins)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 6, 0, 0),
+                    child: Align(
+                      alignment: AlignmentDirectional.centerStart,
+                      child: _resetButton(_kind),
+                    ),
+                  ),
               ],
-              onChanged: (kind) {
-                if (kind != null) _refresh(kind);
-              },
             ),
-          ),
-          _capControl(_kind),
-          _section(_kind, _sources),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
-            child: Text(
-              'Drag a source to keep it where you put it. Everything else is '
-              'sorted by what has actually worked for you. A title pinned from '
-              'its own Detail screen ignores this list.',
-              style: AppText.caption.copyWith(color: AppColors.textTertiary),
-            ),
-          ),
-          if (_hasPins)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 6, 0, 0),
-              child: Align(
-                alignment: AlignmentDirectional.centerStart,
-                child: _resetButton(_kind),
-              ),
-            ),
-        ],
-      ),
     );
   }
+
+  /// Desktop settings retain the same resolver pool and state handlers, with
+  /// a wrapping media toolbar and explicit ordering instructions.
+  Widget _desktopBody() => ListView(
+    padding: const EdgeInsets.fromLTRB(0, 16, 0, 32),
+    children: [
+      GraphiteSettingsPanel(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Media', style: AppText.body),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final (kind, label) in const [
+                      (ZKind.anime, 'Anime'),
+                      (ZKind.movie, 'Movies / TV'),
+                      (ZKind.manga, 'Manga'),
+                      (ZKind.novel, 'Novels'),
+                    ])
+                      ChoiceChip(
+                        label: Text(label),
+                        selected: _kind == kind,
+                        onSelected: (_) => _refresh(kind),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                Text(
+                  'Drag a handle or use Move up / Move down. Pinned sources stay '
+                  'ahead of the automatic ranking.',
+                  style: AppText.caption,
+                ),
+                if (_hasPins) ...[
+                  const SizedBox(height: 8),
+                  _resetButton(_kind),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+      const SizedBox(height: 16),
+      _capControl(_kind),
+      _section(_kind, _sources),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(22, 16, 22, 0),
+        child: Text(
+          'A source chosen on a title’s details page overrides this order.',
+          style: AppText.caption,
+        ),
+      ),
+    ],
+  );
 
   /// How many sources the sweep may try, and the one sentence explaining what
   /// that costs. The number is the whole setting — everything below it is just
@@ -453,7 +527,12 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
   /// Same 16px gutter [SettingsCard] uses, so the tiles line up with the card
   /// above them instead of sitting 12px proud of it.
   Widget _listSurface(List<Widget> children) => Padding(
-    padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+    padding: EdgeInsets.fromLTRB(
+      DesktopSettingsScope.contains(context) ? 22 : 16,
+      14,
+      DesktopSettingsScope.contains(context) ? 22 : 16,
+      0,
+    ),
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: children,
@@ -492,7 +571,27 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
           onReorderItem: (oldIndex, newIndex) =>
               _reorder(kind, oldIndex, newIndex),
           children: [
-            for (var i = 0; i < list.length; i++) _row(kind, list[i], i),
+            for (var i = 0; i < list.length; i++)
+              if (DesktopSettingsScope.contains(context))
+                Column(
+                  key: ValueKey(list[i].id),
+                  children: [
+                    DesktopSourcePriorityRow(
+                      index: i,
+                      count: list.length,
+                      name: _labelFor(list[i]),
+                      repo: _tags[list[i].id]?.repo,
+                      reason: _reasonFor(list[i].id),
+                      health: _health(list[i].id),
+                      tried: i < _cap,
+                      onMoveUp: () => _move(kind, i, -1),
+                      onMoveDown: () => _move(kind, i, 1),
+                    ),
+                    if (i == _cap - 1) _cutLine(),
+                  ],
+                )
+              else
+                _row(kind, list[i], i),
           ],
         ),
     ]);
@@ -582,41 +681,50 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
     );
   }
 
-  Widget _cutLine() => Padding(
-    padding: const EdgeInsets.fromLTRB(2, 10, 2, 10),
-    child: Row(
-      children: [
-        Expanded(
-          child: Divider(
-            color: AppColors.accent.withValues(alpha: 0.35),
-            height: 1,
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8),
+  Widget _cutLine() => DesktopSettingsScope.contains(context)
+      ? Padding(
+          padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
           child: Text(
-            // Two things this line must not do. It must not imply these
-            // sources are broken (they are fine — just past the number set
-            // above), and it must not tell anyone to raise a number that is
-            // already at its maximum. Dragging one up works at every setting,
-            // so that is the action it names.
-            'Auto Resolve stops here · drag one up to use it',
-            style: AppText.caption.copyWith(
-              color: AppColors.accent.withValues(alpha: 0.9),
-              fontSize: 10.5,
-              letterSpacing: 0.3,
-            ),
+            'Auto Resolve stops here. Move a source above this line to include it.',
+            textAlign: TextAlign.center,
+            style: AppText.caption.copyWith(color: AppColors.accent),
           ),
-        ),
-        Expanded(
-          child: Divider(
-            color: AppColors.accent.withValues(alpha: 0.35),
-            height: 1,
+        )
+      : Padding(
+          padding: const EdgeInsets.fromLTRB(2, 10, 2, 10),
+          child: Row(
+            children: [
+              Expanded(
+                child: Divider(
+                  color: AppColors.accent.withValues(alpha: 0.35),
+                  height: 1,
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Text(
+                  // Two things this line must not do. It must not imply these
+                  // sources are broken (they are fine — just past the number set
+                  // above), and it must not tell anyone to raise a number that is
+                  // already at its maximum. Dragging one up works at every setting,
+                  // so that is the action it names.
+                  'Auto Resolve stops here · drag one up to use it',
+                  style: AppText.caption.copyWith(
+                    color: AppColors.accent.withValues(alpha: 0.9),
+                    fontSize: 10.5,
+                    letterSpacing: 0.3,
+                  ),
+                ),
+              ),
+              Expanded(
+                child: Divider(
+                  color: AppColors.accent.withValues(alpha: 0.35),
+                  height: 1,
+                ),
+              ),
+            ],
           ),
-        ),
-      ],
-    ),
-  );
+        );
 
   Widget _healthChip(({String label, Color color}) h) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),

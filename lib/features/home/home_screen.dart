@@ -1,10 +1,14 @@
+import '../../core/zmode/metadata_provider_prefs.dart';
+import '../../core/lnreader/novel_cloudflare.dart';
+import '../../core/error/exceptions.dart';
 import 'dart:async';
 
-import 'desktop_featured.dart';
+import 'desktop_home_page.dart';
 
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:hive_flutter/hive_flutter.dart';
@@ -134,7 +138,9 @@ class _HomeView extends StatefulWidget {
 class _HomeViewState extends State<_HomeView>
     with SingleTickerProviderStateMixin {
   /// Selects the Windows featured/header presentation and desktop interactions.
-  bool get _isDesktop => Platform.isWindows;
+  // Presentation follows Flutter's platform so phone/desktop widget tests can
+  // select their target without changing native engine platform detection.
+  bool get _isDesktop => defaultTargetPlatform == TargetPlatform.windows;
   final _repo = sl<CatalogueRepository>();
   final _myList = sl<MyListStore>();
   final _sourceCatalogueController = SourceCatalogueHomeController();
@@ -379,6 +385,7 @@ class _HomeViewState extends State<_HomeView>
         if (d == null) return null;
         return HeroMeta(
           genres: d.genres,
+          description: d.description,
           episodeCount: d.episodes.length,
           year: d.year,
         );
@@ -918,18 +925,6 @@ class _HomeViewState extends State<_HomeView>
       }
     }
 
-    if (_isDesktop) {
-      return DesktopFeatured(
-        items: heroItems,
-        reading: reading,
-        inList: (m) => _myList.contains(m),
-        onPlay: _playFeatured,
-        onInfo: _openDetail,
-        onToggleList: toggleList,
-        meta: _heroMeta,
-        style: bannerId,
-      );
-    }
     switch (bannerId) {
       case BannerStyle.panelsId:
         return FeaturedBannerPanels(
@@ -1392,7 +1387,7 @@ class _HomeViewState extends State<_HomeView>
         // Z Mode drives the mode from its own controls, so the switcher cards
         // would duplicate them. The hub card stays in BOTH modes: with no
         // Schedule dock tab and no tracker cards, it is the only way in.
-        final others = ZModePrefs.enabled
+        final others = ZModePrefs.enabled || _isDesktop
             ? const <ContentMode>[]
             : ContentMode.values.where((m) => m != current).toList();
         // One row now. Schedule and the tracker libraries used to be a card
@@ -1952,6 +1947,425 @@ class _HomeViewState extends State<_HomeView>
     );
   }
 
+  /// Explicit desktop catalogue selection preserves the chosen metadata
+  /// provider separately from installed playback/reading sources.
+  Future<void> _selectDesktopAnimeCatalogue(AnimeProvider provider) async {
+    final cubit = context.read<HomeCubit>();
+    await sl<MetadataProviderPrefs>().setAnime(provider);
+    await HomeCataloguePrefs.setSourceSelected(false);
+    if (mounted && !cubit.isClosed) {
+      await cubit.load(reset: true);
+    }
+  }
+
+  /// Movies/TV keep their independent metadata choice when leaving sources.
+  Future<void> _selectDesktopVideoCatalogue(VideoProvider provider) async {
+    final cubit = context.read<HomeCubit>();
+    await sl<MetadataProviderPrefs>().setVideo(provider);
+    await HomeCataloguePrefs.setSourceSelected(false);
+    if (mounted && !cubit.isClosed) {
+      await cubit.load(reset: true);
+    }
+  }
+
+  Future<List<HomeSection>>? _newDesktopSourceFuture;
+  String? _newDesktopSourceKey;
+
+  /// Fetch source catalogue data directly. No hidden/offstage legacy view is
+  /// mounted to obtain it; source selection never changes the global provider.
+  Future<List<HomeSection>> _newDesktopSourceRows(ContentMode mode) {
+    final repository = sl<SourceRepository>();
+    final sources = repository.loadedSources
+        .where(
+          (source) => switch (mode) {
+            ContentMode.manga => source.id.startsWith('mihon:'),
+            ContentMode.novel => source.id.startsWith('lnr:'),
+            ContentMode.anime =>
+              !source.id.startsWith('mihon:') && !source.id.startsWith('lnr:'),
+          },
+        )
+        .toList();
+    final sourceId =
+        sources.any((source) => source.id == _sourceCatalogueSourceId)
+        ? _sourceCatalogueSourceId
+        : sources.firstOrNull?.id;
+    final key = '${mode.name}:$sourceId';
+    if (key != _newDesktopSourceKey) {
+      _newDesktopSourceKey = key;
+      _sourceCatalogueSourceId = sourceId;
+      _newDesktopSourceFuture = sourceId == null
+          ? Future.value(const [])
+          : repository.home(sourceId: sourceId).then((sections) {
+              // Novel plugins swallow fetch failures. Convert only this site's
+              // pending challenge into the same typed recovery as Mihon.
+              final challenge = sourceId.startsWith('lnr:') && sections.isEmpty
+                  ? NovelCloudflare.pendingForSite(
+                      repository.baseUrlFor(sourceId),
+                    )
+                  : null;
+              if (challenge != null) {
+                throw CloudflareRequiredException(challenge);
+              }
+              return sections;
+            });
+    }
+    return _newDesktopSourceFuture!;
+  }
+
+  /// A fresh Windows presentation consumes the existing data owners and route
+  /// callbacks. None of the phone/previous desktop presentation is composed.
+  Widget _buildNewDesktopHome() => BlocBuilder<ContentModeCubit, ContentMode>(
+    bloc: sl<ContentModeCubit>(),
+    builder: (context, mode) => BlocBuilder<HomeCubit, HomeState>(
+      builder: (context, state) => AnimatedBuilder(
+        animation: Listenable.merge([
+          if (Hive.isBoxOpen(WatchHistory.boxName))
+            Hive.box<Map>(WatchHistory.boxName).listenable(),
+          if (Hive.isBoxOpen(ReadHistory.boxName))
+            Hive.box<Map>(ReadHistory.boxName).listenable(),
+        ]),
+        builder: (context, _) {
+          Widget render(
+            List<HomeSection> sections, {
+            bool loading = false,
+            String? error,
+            String? sourceVerificationUrl,
+          }) {
+            // Direct-source failures belong to their own request, not the
+            // independently loaded metadata catalogue's challenge state.
+            final verificationUrl = _sourceCatalogueSelected
+                ? sourceVerificationUrl
+                : state.cloudflareUrl;
+            final watched = Hive.isBoxOpen(WatchHistory.boxName)
+                ? sl<WatchHistory>().recent()
+                : <HistoryEntry>[];
+            final read = Hive.isBoxOpen(ReadHistory.boxName)
+                ? sl<ReadHistory>().recent(
+                    type: mode == ContentMode.manga
+                        ? ProviderType.manga
+                        : ProviderType.novel,
+                  )
+                : <ReadEntry>[];
+            final releases =
+                context.read<HomeCubit>().desktopReleaseRow?.items ??
+                const <TrackerListItem>[];
+            final featured = _sourceCatalogueSelected
+                ? (sections.isEmpty
+                      ? const <MediaItem>[]
+                      : sections.first.items)
+                : state.heroItems;
+            void open(MediaItem item) => _sourceCatalogueSelected
+                ? _openSourceCatalogueDetail(item)
+                : _openDetail(item);
+            HistoryEntry? historyFor(MediaItem item) => watched
+                .where(
+                  (e) =>
+                      (e.showId == item.id && e.sourceId == item.sourceId) ||
+                      e.showUrl == item.url,
+                )
+                .firstOrNull;
+            ReadEntry? readingFor(MediaItem item) => read
+                .where(
+                  (e) =>
+                      (e.showId == item.id && e.sourceId == item.sourceId) ||
+                      e.detailUrl == item.url,
+                )
+                .firstOrNull;
+            void play(MediaItem item) {
+              final readingEntry = mode.isReading ? readingFor(item) : null;
+              final videoEntry = mode.isReading ? null : historyFor(item);
+              if (readingEntry != null) {
+                unawaited(_resumeReading(readingEntry));
+                return;
+              }
+              if (videoEntry != null) {
+                unawaited(_resume(videoEntry));
+                return;
+              }
+              if (_sourceCatalogueSelected) {
+                unawaited(_withSourceCatalogueItem(item, _playFeatured));
+              } else {
+                unawaited(_playFeatured(item));
+              }
+            }
+
+            void menu(MediaItem item) => unawaited(
+              showDesktopHomeMenu(
+                context,
+                title: item.title,
+                actions: [
+                  (
+                    label: mode.isReading ? 'Read' : 'Play',
+                    icon: mode.isReading ? 'book-open' : 'play',
+                    run: () => play(item),
+                  ),
+                  (label: 'Details', icon: 'info', run: () => open(item)),
+                  (
+                    label: _myList.contains(item)
+                        ? 'Remove from My List'
+                        : 'Add to My List',
+                    icon: 'bookmark',
+                    run: () => unawaited(_myList.toggle(item)),
+                  ),
+                ],
+              ),
+            );
+            return DesktopHomePage(
+              key: ValueKey(
+                'desktop-home:${mode.name}:${ZModePrefs.streamKind.name}:${_sourceCatalogueSelected ? _sourceCatalogueSourceId : 'catalogue'}',
+              ),
+              // Reauthentication preserves the cached account and library. Capture
+              // the data owner before awaiting a dialog that may outlive Home.
+              onReconnect:
+                  context.watch<AuthCubit>().state.isLoggedIn &&
+                      context.watch<AuthCubit>().state.needsReconnect
+                  ? () async {
+                      final cubit = context.read<HomeCubit>();
+                      final ok = await showReconnectDialog(context) ?? false;
+                      if (ok && mounted && !cubit.isClosed) {
+                        await cubit.load();
+                      }
+                    }
+                  : null,
+              reconnectLabel: context.l10n.reconnectToSync,
+              featured: featured,
+              sections: sections,
+              reading: mode.isReading,
+              loading: loading,
+              onVerify: verificationUrl == null
+                  ? null
+                  : () async {
+                      final cubit = context.read<HomeCubit>();
+                      final sourceKey = _sourceCatalogueSelected
+                          ? _newDesktopSourceKey
+                          : null;
+                      await MihonExtensionService.solveCloudflare(
+                        verificationUrl,
+                      );
+                      if (!mounted) return;
+                      if (sourceKey != null) {
+                        // A user can switch source while verification is open.
+                        // Never invalidate or reload a different selection.
+                        if (_sourceCatalogueSelected &&
+                            _newDesktopSourceKey == sourceKey) {
+                          setState(() => _newDesktopSourceKey = null);
+                        }
+                      } else if (!_sourceCatalogueSelected && !cubit.isClosed) {
+                        await cubit.load(reset: true);
+                      }
+                    },
+              error: error,
+              meta: _heroMeta,
+              playLabel: (item) {
+                final video = historyFor(item);
+                final reading = readingFor(item);
+                if (mode.isReading) {
+                  return reading?.chapterNumber == null
+                      ? 'Read now'
+                      : 'Continue Ch. ${reading!.chapterNumber}';
+                }
+                return video?.episodeNumber == null
+                    ? 'Watch now'
+                    : 'Continue E${video!.episodeNumber!.toInt()}';
+              },
+              onOpen: open,
+              onPlay: play,
+              onMenu: menu,
+              onSection: (section) => _openSeeAll(
+                section,
+                sourceCatalogue: _sourceCatalogueSelected,
+              ),
+              onHistory: _openHistory,
+              onReleases: () => _openNewEpisodes(releases),
+              onRefresh: () async {
+                if (_sourceCatalogueSelected) {
+                  setState(() {
+                    _newDesktopSourceKey = null;
+                  });
+                } else {
+                  await context.read<HomeCubit>().load(reset: true);
+                }
+              },
+              resume: mode.isReading
+                  ? [
+                      for (final e in read)
+                        DesktopHomeResume(
+                          title: e.title,
+                          subtitle: e.chapterNumber == null
+                              ? 'Resume chapter'
+                              : 'Chapter ${e.chapterNumber}',
+                          image: e.cover,
+                          headers: e.coverHeaders,
+                          progress: e.total > 0 ? e.pos / e.total : 0,
+                          open: () => unawaited(_resumeReading(e)),
+                          menu: () => unawaited(
+                            showDesktopHomeMenu(
+                              context,
+                              title: e.title,
+                              actions: [
+                                (
+                                  label: 'Continue reading',
+                                  icon: 'book-open',
+                                  run: () => unawaited(_resumeReading(e)),
+                                ),
+                                (
+                                  label: 'Remove from Continue',
+                                  icon: 'history',
+                                  run: () => unawaited(
+                                    sl<ReadHistory>().remove(
+                                      e.sourceId,
+                                      e.showId,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                    ]
+                  : [
+                      for (final e in watched)
+                        DesktopHomeResume(
+                          title: e.showTitle,
+                          subtitle: e.episodeNumber == null
+                              ? 'Resume playback'
+                              : 'Episode ${e.episodeNumber!.toInt()}',
+                          image: e.thumbnail ?? e.cover,
+                          headers: e.coverHeaders,
+                          progress: e.progress,
+                          remaining: e.duration > e.position
+                              ? '${(e.duration - e.position).inMinutes}m left'
+                              : null,
+                          open: () => unawaited(_resume(e)),
+                          menu: () => unawaited(
+                            showDesktopHomeMenu(
+                              context,
+                              title: e.showTitle,
+                              actions: [
+                                (
+                                  label: 'Continue watching',
+                                  icon: 'play',
+                                  run: () => unawaited(_resume(e)),
+                                ),
+                                (
+                                  label: 'Remove from Continue',
+                                  icon: 'history',
+                                  run: () => unawaited(
+                                    sl<WatchHistory>().remove(
+                                      e.sourceId,
+                                      e.showId,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                    ],
+              releases: [
+                for (final entry in releases)
+                  DesktopHomeRelease(
+                    title: entry.item.title,
+                    subtitle: 'Episode ${releasedCount(entry)} available',
+                    image: entry.item.cover,
+                    headers: entry.item.coverHeaders,
+                    open: () => _openTrackerEntry(entry),
+                  ),
+              ],
+              // Catalogue choice is accessed from the small hero overline.
+              onCatalogue: () => unawaited(
+                showDesktopHomeMenu(
+                  context,
+                  title: 'Choose catalogue',
+                  actions: [
+                    if (sl.isRegistered<MetadataProviderPrefs>() &&
+                        (mode == ContentMode.manga ||
+                            (mode == ContentMode.anime &&
+                                ZModePrefs.streamKind == StreamKind.anime)))
+                      for (final provider in AnimeProvider.values)
+                        (
+                          label: provider == AnimeProvider.anilist
+                              ? 'AniList catalogue'
+                              : 'MyAnimeList catalogue',
+                          icon: 'blocks',
+                          run: () =>
+                              unawaited(_selectDesktopAnimeCatalogue(provider)),
+                        ),
+                    if (sl.isRegistered<MetadataProviderPrefs>() &&
+                        mode == ContentMode.anime &&
+                        ZModePrefs.streamKind == StreamKind.movie)
+                      for (final provider in VideoProvider.values)
+                        (
+                          label: provider == VideoProvider.tmdb
+                              ? 'TMDB catalogue'
+                              : 'Simkl catalogue',
+                          icon: 'blocks',
+                          run: () =>
+                              unawaited(_selectDesktopVideoCatalogue(provider)),
+                        ),
+                    (
+                      label: 'Browse catalogue',
+                      icon: 'blocks',
+                      run: () => unawaited(
+                        HomeCataloguePrefs.setSourceSelected(false),
+                      ),
+                    ),
+                    for (final source
+                        in sl<SourceRepository>().loadedSources.where(
+                          (source) => switch (mode) {
+                            ContentMode.manga => source.id.startsWith('mihon:'),
+                            ContentMode.novel => source.id.startsWith('lnr:'),
+                            ContentMode.anime =>
+                              !source.id.startsWith('mihon:') &&
+                                  !source.id.startsWith('lnr:'),
+                          },
+                        ))
+                      (
+                        label: source.name,
+                        icon: 'puzzle',
+                        run: () {
+                          _selectHomeCatalogueSource(source.id);
+                          unawaited(HomeCataloguePrefs.setSourceSelected(true));
+                        },
+                      ),
+                  ],
+                ),
+              ),
+
+            );
+          }
+
+          if (_sourceCatalogueSelected) {
+            return FutureBuilder<List<HomeSection>>(
+              future: _newDesktopSourceRows(mode),
+              builder: (context, snap) => render(
+                snap.data ?? const [],
+                loading: snap.connectionState != ConnectionState.done,
+                sourceVerificationUrl: snap.error is CloudflareRequiredException
+                    ? (snap.error as CloudflareRequiredException).url
+                    : null,
+                error: snap.error is CloudflareRequiredException
+                    ? 'This source needs website verification.'
+                    : snap.hasError
+                    ? 'This source could not load. Refresh to try again.'
+                    : null,
+              ),
+            );
+          }
+          return render(
+            state.sections ?? const [],
+            loading: state.loading,
+            error: state.offline
+                ? 'You appear to be offline.'
+                : state.cloudflareUrl != null
+                ? 'This source needs website verification.'
+                : null,
+          );
+        },
+      ),
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
     if (sl<AppMode>().isTv) return const HomeScreenTv();
@@ -1972,207 +2386,224 @@ class _HomeViewState extends State<_HomeView>
         // immediately (skeletons), even if the new source's home is slow.
         context.read<HomeCubit>().load(reset: true);
       },
-      child: Scaffold(
-        backgroundColor: AppColors.bg,
-        // Extend content behind the status bar; the floating header handles
-        // its own SafeArea(bottom: false).
-        body: Stack(
-          children: [
-            RefreshIndicator(
-              color: AppColors.accent,
-              onRefresh: () {
-                // Pull-to-refresh is the user saying "try again", so it also
-                // re-tests a session the startup check only assumed was dead
-                // (the "Reconnect to sync" banner). force: it must not sit out
-                // the cool-off when someone deliberately pulled.
-                if (sl.isRegistered<AuthCubit>()) {
-                  unawaited(sl<AuthCubit>().revalidateIfFlagged(force: true));
-                }
-                if (_sourceCatalogueSelected) {
-                  return _sourceCatalogueController.refresh();
-                }
-                return context.read<HomeCubit>().load();
-              },
-              child: BlocBuilder<HomeCubit, HomeState>(
-                builder: (context, state) {
-                  final sections = state.sections ?? const <HomeSection>[];
-                  // Which sections render as rows (the phone drops a
-                  // non-repeating first section so the hero isn't duplicated
-                  // right below itself) is decided by the cubit's merge now —
-                  // providerRowSections in home_rows_composer.dart, moved
-                  // verbatim from here. This build only branches on whether a
-                  // load finished at all.
-                  final showSkeletons = state.loading && sections.isEmpty;
-                  // The load finished but the source returned no rows — almost
-                  // always a dead/blocked site (or a search-only source). Show a
-                  // clear message instead of a blank screen.
-                  final loadedEmpty =
-                      !state.loading &&
-                      state.sections != null &&
-                      state.sections!.isEmpty;
-                  // Manga/novel with nothing installed: the mode-switch fallback
-                  // sets a matching source when one exists, so a reading mode
-                  // still on a non-matching (usually stale anime) active id means
-                  // nothing's installed for it — show the install guide and drop
-                  // the leaking anime rows/hero. Cheap DI-free prefix check, so
-                  // it's safe to run every build (unlike categorizedSources()).
-                  // Anime's own zero-source case (skipped setup) has no source to
-                  // load and flows through `loadedEmpty` → HomeLoadedEmptyView.
-                  // Z Mode manga/novel rows come from AniList, not an installed
-                  // `mihon:`/`lnr:` source, so the active-source prefix check
-                  // would wrongly call a fetch that just succeeded "no sources".
-                  final activeId = context.read<ActiveSourceCubit>().state;
-                  final noSourceForMode =
-                      _sourceCatalogueSelected || ZModePrefs.enabled
-                      ? false
-                      : switch (sl<ContentModeCubit>().state) {
-                          ContentMode.manga => !activeId.startsWith('mihon:'),
-                          ContentMode.novel => !activeId.startsWith('lnr:'),
-                          ContentMode.anime => false,
-                        };
-                  return Padding(
-                    padding: EdgeInsets.symmetric(
-                      horizontal: _isDesktop ? 20 : 0,
-                    ),
-                    child: CustomScrollView(
-                      slivers: [
-                        SliverToBoxAdapter(
-                          child: Builder(
-                            builder: (context) {
-                              final heroItems = _sourceCatalogueSelected
-                                  ? _sourceCatalogueHeroItems
-                                  : state.heroItems;
-                              final hasHero = heroItems.isNotEmpty;
-                              if (hasHero) _prewarmHeroMeta(heroItems);
-
-                              return HomeBannerHeader(
-                                headerAboveBanner: _isDesktop,
-                                bannerStyle: BannerStyle.current,
-                                hasHero: hasHero && !noSourceForMode,
-                                bannerBuilder: (bannerId) =>
-                                    _featuredBanner(bannerId, heroItems),
-                                headerBuilder: (edgeBanner) =>
-                                    _buildHeader(edgeBanner: edgeBanner),
-                              );
-                            },
+      child: _isDesktop
+          ? _buildNewDesktopHome()
+          : Scaffold(
+              backgroundColor: AppColors.bg,
+              // Extend content behind the status bar; the floating header handles
+              // its own SafeArea(bottom: false).
+              body: Stack(
+                children: [
+                  RefreshIndicator(
+                    color: AppColors.accent,
+                    onRefresh: () {
+                      // Pull-to-refresh is the user saying "try again", so it also
+                      // re-tests a session the startup check only assumed was dead
+                      // (the "Reconnect to sync" banner). force: it must not sit out
+                      // the cool-off when someone deliberately pulled.
+                      if (sl.isRegistered<AuthCubit>()) {
+                        unawaited(
+                          sl<AuthCubit>().revalidateIfFlagged(force: true),
+                        );
+                      }
+                      if (_sourceCatalogueSelected) {
+                        return _sourceCatalogueController.refresh();
+                      }
+                      return context.read<HomeCubit>().load();
+                    },
+                    child: BlocBuilder<HomeCubit, HomeState>(
+                      builder: (context, state) {
+                        final sections =
+                            state.sections ?? const <HomeSection>[];
+                        // Which sections render as rows (the phone drops a
+                        // non-repeating first section so the hero isn't duplicated
+                        // right below itself) is decided by the cubit's merge now —
+                        // providerRowSections in home_rows_composer.dart, moved
+                        // verbatim from here. This build only branches on whether a
+                        // load finished at all.
+                        final showSkeletons = state.loading && sections.isEmpty;
+                        // The load finished but the source returned no rows — almost
+                        // always a dead/blocked site (or a search-only source). Show a
+                        // clear message instead of a blank screen.
+                        final loadedEmpty =
+                            !state.loading &&
+                            state.sections != null &&
+                            state.sections!.isEmpty;
+                        // Manga/novel with nothing installed: the mode-switch fallback
+                        // sets a matching source when one exists, so a reading mode
+                        // still on a non-matching (usually stale anime) active id means
+                        // nothing's installed for it — show the install guide and drop
+                        // the leaking anime rows/hero. Cheap DI-free prefix check, so
+                        // it's safe to run every build (unlike categorizedSources()).
+                        // Anime's own zero-source case (skipped setup) has no source to
+                        // load and flows through `loadedEmpty` → HomeLoadedEmptyView.
+                        // Z Mode manga/novel rows come from AniList, not an installed
+                        // `mihon:`/`lnr:` source, so the active-source prefix check
+                        // would wrongly call a fetch that just succeeded "no sources".
+                        final activeId = context
+                            .read<ActiveSourceCubit>()
+                            .state;
+                        final noSourceForMode =
+                            _sourceCatalogueSelected || ZModePrefs.enabled
+                            ? false
+                            : switch (sl<ContentModeCubit>().state) {
+                                ContentMode.manga => !activeId.startsWith(
+                                  'mihon:',
+                                ),
+                                ContentMode.novel => !activeId.startsWith(
+                                  'lnr:',
+                                ),
+                                ContentMode.anime => false,
+                              };
+                        return Padding(
+                          padding: EdgeInsets.symmetric(
+                            horizontal: _isDesktop ? 20 : 0,
                           ),
-                        ),
+                          child: CustomScrollView(
+                            slivers: [
+                              SliverToBoxAdapter(
+                                child: Builder(
+                                  builder: (context) {
+                                    final heroItems = _sourceCatalogueSelected
+                                        ? _sourceCatalogueHeroItems
+                                        : state.heroItems;
+                                    final hasHero = heroItems.isNotEmpty;
+                                    if (hasHero) _prewarmHeroMeta(heroItems);
 
-                        // ── Mode cards, and Schedule ──────────────────────────────
-                        // Unconditional: _modeCards drops the mode switchers
-                        // itself under Z Mode and keeps Schedule, which has no
-                        // other entry point since it left the dock.
-                        SliverToBoxAdapter(child: _modeCards()),
+                                    return HomeBannerHeader(
+                                      headerAboveBanner: _isDesktop,
+                                      bannerStyle: BannerStyle.current,
+                                      hasHero: hasHero && !noSourceForMode,
+                                      bannerBuilder: (bannerId) =>
+                                          _featuredBanner(bannerId, heroItems),
+                                      headerBuilder: (edgeBanner) =>
+                                          _buildHeader(edgeBanner: edgeBanner),
+                                    );
+                                  },
+                                ),
+                              ),
 
-                        // ── Reconnect banner (session lapsed → sync is off) ───────
-                        if (needsReconnect)
-                          SliverToBoxAdapter(child: _reconnectBanner()),
+                              // ── Mode cards, and Schedule ──────────────────────────────
+                              // Unconditional: _modeCards drops the mode switchers
+                              // itself under Z Mode and keeps Schedule, which has no
+                              // other entry point since it left the dock.
+                              SliverToBoxAdapter(child: _modeCards()),
 
-                        // ── The arrangement ─────────────────────────────────────
-                        // state.rows is the merged view of this load: the local
-                        // Continue row, the tracker rows the user enabled, and the
-                        // provider sections, in the saved order (Settings →
-                        // Interface → Appearance → Home rows). ContinueSection renders wherever
-                        // the layout puts it — the same widgets as before, just
-                        // arranged. Before the first merge lands (rows null), the
-                        // ContinueSection keeps its old spot above the skeletons
-                        // so the loading screen is exactly today's.
-                        if (state.rows case final rows?)
-                          if (_sourceCatalogueSelected)
-                            ..._sourceCatalogueHomeSlivers(rows)
-                          else
-                            ...rows.map(_homeRowSliver)
-                        else ...[
-                          ContinueSection(
-                            onResume: _resume,
-                            onLongPress: _showContinueInfo,
-                            onSeeAll: _openHistory,
-                            onResumeReading: _resumeReading,
-                            onLongPressReading: _showContinueReadingInfo,
-                          ),
-                          if (_sourceCatalogueSelected)
-                            _sourceCatalogueHomeSliver(),
-                        ],
+                              // ── Reconnect banner (session lapsed → sync is off) ───────
+                              if (needsReconnect)
+                                SliverToBoxAdapter(child: _reconnectBanner()),
 
-                        // ── Skeletons while the first load runs / empty states ───
-                        // The provider rows themselves are part of state.rows
-                        // above; this branch only owns the loading placeholders
-                        // and the "nothing came back" views.
-                        if (!_sourceCatalogueSelected &&
-                            showSkeletons &&
-                            !noSourceForMode)
-                          ...List.generate(
-                            3,
-                            (_) =>
-                                const SliverToBoxAdapter(child: RowSkeleton()),
-                          )
-                        else if (!_sourceCatalogueSelected &&
-                            (noSourceForMode || loadedEmpty))
-                          SliverFillRemaining(
-                            hasScrollBody: false,
-                            child: HomeLoadedEmptyView(
-                              offline: state.offline,
-                              mode: sl<ContentModeCubit>().state,
-                              // Name whatever ACTUALLY answered: in Z Mode the
-                              // rows come from AniList/MAL/TMDB/Simkl, not the
-                              // active source, so blaming the source was simply
-                              // pointing at the wrong thing. The router hands
-                              // back the right name in either mode.
-                              sourceName: _repo.displayName(_repo.sourceId),
-                              // A metadata catalogue, not an installed source —
-                              // the "switch source at the top" advice does not
-                              // apply to it.
-                              isMetadataProvider:
-                                  _repo.sourceId == ZmodeIds.sourceId,
-                              rateLimitedSeconds: state.rateLimitedSeconds,
-                              onRetry: () =>
-                                  context.read<HomeCubit>().load(reset: true),
-                              // No-source guide points at the Providers hub (all
-                              // ecosystems); the source-returned-nothing case
-                              // (_SourceUnavailable) keeps its retry.
-                              onInstallSources: () =>
-                                  Navigator.of(context).push(
-                                    MaterialPageRoute<void>(
-                                      builder: (_) =>
-                                          const ProvidersHubScreen(),
-                                    ),
+                              // ── The arrangement ─────────────────────────────────────
+                              // state.rows is the merged view of this load: the local
+                              // Continue row, the tracker rows the user enabled, and the
+                              // provider sections, in the saved order (Settings →
+                              // Interface → Appearance → Home rows). ContinueSection renders wherever
+                              // the layout puts it — the same widgets as before, just
+                              // arranged. Before the first merge lands (rows null), the
+                              // ContinueSection keeps its old spot above the skeletons
+                              // so the loading screen is exactly today's.
+                              if (state.rows case final rows?)
+                                if (_sourceCatalogueSelected)
+                                  ..._sourceCatalogueHomeSlivers(rows)
+                                else
+                                  ...rows.map(_homeRowSliver)
+                              else ...[
+                                ContinueSection(
+                                  onResume: _resume,
+                                  onLongPress: _showContinueInfo,
+                                  onSeeAll: _openHistory,
+                                  onResumeReading: _resumeReading,
+                                  onLongPressReading: _showContinueReadingInfo,
+                                ),
+                                if (_sourceCatalogueSelected)
+                                  _sourceCatalogueHomeSliver(),
+                              ],
+
+                              // ── Skeletons while the first load runs / empty states ───
+                              // The provider rows themselves are part of state.rows
+                              // above; this branch only owns the loading placeholders
+                              // and the "nothing came back" views.
+                              if (!_sourceCatalogueSelected &&
+                                  showSkeletons &&
+                                  !noSourceForMode)
+                                ...List.generate(
+                                  3,
+                                  (_) => const SliverToBoxAdapter(
+                                    child: RowSkeleton(),
                                   ),
-                              // Cloudflare-blocked (Mihon) source: offer the visible
-                              // solve, then reload once the user closes the WebView.
-                              cloudflareUrl: state.cloudflareUrl,
-                              onSolveCloudflare: state.cloudflareUrl == null
-                                  ? null
-                                  : () async {
-                                      await MihonExtensionService.solveCloudflare(
-                                        state.cloudflareUrl!,
-                                      );
-                                      if (context.mounted) {
-                                        context.read<HomeCubit>().load(
-                                          reset: true,
-                                        );
-                                      }
-                                    },
-                            ),
-                          ),
+                                )
+                              else if (!_sourceCatalogueSelected &&
+                                  (noSourceForMode || loadedEmpty))
+                                SliverFillRemaining(
+                                  hasScrollBody: false,
+                                  child: HomeLoadedEmptyView(
+                                    offline: state.offline,
+                                    mode: sl<ContentModeCubit>().state,
+                                    // Name whatever ACTUALLY answered: in Z Mode the
+                                    // rows come from AniList/MAL/TMDB/Simkl, not the
+                                    // active source, so blaming the source was simply
+                                    // pointing at the wrong thing. The router hands
+                                    // back the right name in either mode.
+                                    sourceName: _repo.displayName(
+                                      _repo.sourceId,
+                                    ),
+                                    // A metadata catalogue, not an installed source —
+                                    // the "switch source at the top" advice does not
+                                    // apply to it.
+                                    isMetadataProvider:
+                                        _repo.sourceId == ZmodeIds.sourceId,
+                                    rateLimitedSeconds:
+                                        state.rateLimitedSeconds,
+                                    onRetry: () => context
+                                        .read<HomeCubit>()
+                                        .load(reset: true),
+                                    // No-source guide points at the Providers hub (all
+                                    // ecosystems); the source-returned-nothing case
+                                    // (_SourceUnavailable) keeps its retry.
+                                    onInstallSources: () =>
+                                        Navigator.of(context).push(
+                                          MaterialPageRoute<void>(
+                                            builder: (_) =>
+                                                const ProvidersHubScreen(),
+                                          ),
+                                        ),
+                                    // Cloudflare-blocked (Mihon) source: offer the visible
+                                    // solve, then reload once the user closes the WebView.
+                                    cloudflareUrl: state.cloudflareUrl,
+                                    onSolveCloudflare:
+                                        state.cloudflareUrl == null
+                                        ? null
+                                        : () async {
+                                            await MihonExtensionService.solveCloudflare(
+                                              state.cloudflareUrl!,
+                                            );
+                                            if (context.mounted) {
+                                              context.read<HomeCubit>().load(
+                                                reset: true,
+                                              );
+                                            }
+                                          },
+                                  ),
+                                ),
 
-                        // ── Bottom padding ────────────────────────────────────────
-                        // Clear the floating dock, which overlays content (the
-                        // shell's extendBody reserves it no space of its own).
-                        SliverToBoxAdapter(
-                          child: SizedBox(
-                            height: MediaQuery.paddingOf(context).bottom,
+                              // ── Bottom padding ────────────────────────────────────────
+                              // Clear the floating dock, which overlays content (the
+                              // shell's extendBody reserves it no space of its own).
+                              SliverToBoxAdapter(
+                                child: SizedBox(
+                                  height: MediaQuery.paddingOf(context).bottom,
+                                ),
+                              ),
+                            ],
                           ),
-                        ),
-                      ],
+                        );
+                      },
                     ),
-                  );
-                },
+                  ),
+                  if (_slashing) _slashOverlay(),
+                ],
               ),
             ),
-            if (_slashing) _slashOverlay(),
-          ],
-        ),
-      ),
     );
   }
 }

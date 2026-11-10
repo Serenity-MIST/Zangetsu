@@ -1,3 +1,4 @@
+import '../../core/mode/content_mode.dart';
 import 'dart:async';
 
 import 'package:dio/dio.dart';
@@ -10,6 +11,7 @@ import '../../core/di/injector.dart';
 import '../../core/mode/content_mode_cubit.dart';
 import '../../core/models/home_section.dart';
 import '../../core/models/media_item.dart';
+import '../../core/models/provider_info.dart';
 import '../../core/playback/playback_prefs.dart';
 import '../../core/profiles/viewer_profile.dart';
 import '../../core/theme/app_colors.dart';
@@ -43,11 +45,24 @@ typedef GenreArt = ({String url, Map<String, String>? headers});
 ///
 /// Genres nothing on screen happens to carry are simply absent, and their
 /// tile falls back to its own tint.
-Map<String, GenreArt> genreArtFrom(List<HomeSection> sections) {
+Map<String, GenreArt> genreArtFrom(List<HomeSection> sections, {ZKind? kind}) {
   final out = <String, GenreArt>{};
   final used = <String>{};
   for (final s in sections) {
     for (final MediaItem m in s.items) {
+      // Home can retain the previous catalogue while its replacement loads.
+      // Canonical identity is stronger than a provider's generic video type.
+      if (kind != null) {
+        final mediaKind = ZmodeIds.parseShow(m.url)?.kind ?? switch (m.type) {
+          ProviderType.anime => ZKind.anime,
+          ProviderType.movie => ZKind.movie,
+          ProviderType.manga => ZKind.manga,
+          ProviderType.novel => ZKind.novel,
+        };
+        final video = kind == ZKind.movie || kind == ZKind.tv;
+        if (video ? mediaKind != ZKind.movie && mediaKind != ZKind.tv
+            : mediaKind != kind) continue;
+      }
       final url = m.cover;
       if (url == null || url.isEmpty || m.genres.isEmpty) continue;
       for (final g in m.genres) {
@@ -110,14 +125,39 @@ class _GenresScreenState extends State<GenresScreen> {
   /// only runs when the tile is actually shown, and a failure just leaves the
   /// tint behind.
   GenreArt? _adultArt;
+  late ZKind _kind;
+  late StreamSubscription<ContentMode> _modeSubscription;
+  int _artRequest = 0;
+  StreamSubscription<HomeState>? _homeSubscription;
+
+  ZKind get _currentKind => browseKindFor(
+      sl<ContentModeCubit>().state, ZModePrefs.streamKind);
+
+  /// Const retained pages need their own subscriptions; parent rebuilds alone
+  /// do not update an existing catalogue or retire its outstanding artwork.
+  void _catalogueChanged() {
+    final kind = _currentKind;
+    if (!mounted || kind == _kind) return;
+    _artRequest++;
+    setState(() { _kind = kind; _adultArt = null; });
+    if (_adultAllowed) unawaited(_loadAdultArt());
+  }
+
+  @override void dispose() {
+    _artRequest++;
+    unawaited(_modeSubscription.cancel());
+    unawaited(_homeSubscription?.cancel());
+    ZModePrefs.revision.removeListener(_catalogueChanged);
+    super.dispose();
+  }
 
   /// One cover per genre, from rows Home has ALREADY loaded.
   ///
   /// Nothing is registered in some shells and Home may not have loaded yet,
   /// and neither is worth failing over — the tiles fall back to their tint.
-  static Map<String, GenreArt> _artByGenre() {
+  static Map<String, GenreArt> _artByGenre(ZKind kind) {
     if (!sl.isRegistered<HomeCubit>()) return const {};
-    return genreArtFrom(sl<HomeCubit>().state.sections ?? const []);
+    return genreArtFrom(sl<HomeCubit>().state.sections ?? const [], kind: kind);
   }
 
   bool get _adultAllowed =>
@@ -129,6 +169,19 @@ class _GenresScreenState extends State<GenresScreen> {
   @override
   void initState() {
     super.initState();
+    _kind = _currentKind;
+    _modeSubscription = sl<ContentModeCubit>().stream.listen((_) => _catalogueChanged());
+    ZModePrefs.revision.addListener(_catalogueChanged);
+    if (sl.isRegistered<HomeCubit>()) {
+      // Only new rows affect genre artwork; loading/progress emissions do not.
+      final home = sl<HomeCubit>();
+      var sections = home.state.sections;
+      _homeSubscription = home.stream.listen((state) {
+        if (!mounted || identical(sections, state.sections)) return;
+        sections = state.sections;
+        setState(() {});
+      });
+    }
     if (_adultAllowed) unawaited(_loadAdultArt());
     unawaited(_refreshGenres());
   }
@@ -153,10 +206,8 @@ class _GenresScreenState extends State<GenresScreen> {
   }
 
   Future<void> _loadAdultArt() async {
-    final kind = browseKindFor(
-      sl<ContentModeCubit>().state,
-      ZModePrefs.streamKind,
-    );
+    final kind = _kind;
+    final request = ++_artRequest;
     if (kind == ZKind.movie || kind == ZKind.tv) return; // no such genre there
     if (!sl.isRegistered<MetadataRepository>()) return;
     final repo = sl<MetadataRepository>();
@@ -167,7 +218,8 @@ class _GenresScreenState extends State<GenresScreen> {
         filters: genreFilters(kAdultGenre),
       );
       final withCover = res.where((m) => m.cover?.isNotEmpty ?? false);
-      if (withCover.isEmpty || !mounted) return;
+      if (withCover.isEmpty || !mounted || request != _artRequest ||
+          kind != _kind || !_adultAllowed) return;
       final hit = withCover.first;
       setState(() => _adultArt = (url: hit.cover!, headers: hit.coverHeaders));
     } catch (_) {
@@ -177,15 +229,12 @@ class _GenresScreenState extends State<GenresScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final kind = browseKindFor(
-      sl<ContentModeCubit>().state,
-      ZModePrefs.streamKind,
-    );
+    final kind = _kind;
     // Settings → Privacy. Read here only to decide whether the adult tile is
     // OFFERED; the repository re-checks the same switch on every request, so
     // this cannot leak results on its own.
     final genres = GenreCatalog.genresFor(kind, adult: _adultAllowed);
-    final art = {..._artByGenre(), kAdultGenre: ?_adultArt};
+    final art = {..._artByGenre(kind), kAdultGenre: ?_adultArt};
     return Scaffold(
       backgroundColor: AppColors.bg,
       appBar: AppBar(

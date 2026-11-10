@@ -19,6 +19,22 @@ class NovelCloudflare {
   /// The page to open in the solver, or null when nothing is waiting.
   static String? get pendingUrl => _pendingUrl;
 
+  /// Returns a challenge only for the selected site's exact host. Do not
+  /// borrow a global latch from another source or accept suffix lookalikes.
+  static String? pendingForSite(String site) {
+    final requested = Uri.tryParse(site);
+    final pending = Uri.tryParse(_pendingUrl ?? '');
+    if (requested == null ||
+        pending == null ||
+        !const {'http', 'https'}.contains(requested.scheme) ||
+        !const {'http', 'https'}.contains(pending.scheme) ||
+        requested.host.isEmpty ||
+        requested.host != pending.host) {
+      return null;
+    }
+    return _pendingUrl;
+  }
+
   static void needsSolve(String url) => _pendingUrl = url;
 
   static void clear() => _pendingUrl = null;
