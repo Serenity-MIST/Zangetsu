@@ -20,21 +20,15 @@ import 'base_provider.dart';
 import 'cf_solve_needed.dart';
 import 'cs_repo_url.dart';
 
-/// Keeps category names and opaque URLs intact, including spaces in either.
-String encodeCloudStreamCategory(String name, String data) => jsonEncode([name, data]);
+/// Desktop-era name for [csMainPageCategoryId]; both encode the same JSON
+/// pair, so this simply delegates to upstream's codec.
+String encodeCloudStreamCategory(String name, String data) =>
+    csMainPageCategoryId(name, data);
 
-/// Accepts the structured form and older in-memory space-delimited links.
-({String name, String data}) decodeCloudStreamCategory(String value) {
-  try {
-    final decoded = jsonDecode(value);
-    if (decoded is List && decoded.length == 2 && decoded.every((item) => item is String)) {
-      return (name: decoded[0] as String, data: decoded[1] as String);
-    }
-  } on FormatException { /* Older browse links use the fallback below. */ }
-  final separator = value.indexOf(' ');
-  return (name: separator < 0 ? value : value.substring(0, separator),
-      data: separator < 0 ? '' : value.substring(separator + 1));
-}
+/// Desktop-era name for [csMainPageCategory] (same format, incl. older
+/// space-delimited links).
+({String name, String data}) decodeCloudStreamCategory(String value) =>
+    csMainPageCategory(value);
 
 /// Shared transport for JSON-shaped CloudStream operations on Android/Windows.
 final _csChannel = _CloudStreamHost();
@@ -69,6 +63,29 @@ class _CloudStreamHost {
       native.setMethodCallHandler(handler);
     }
   }
+}
+
+/// Keeps the provider's category name and opaque data intact for pagination.
+String csMainPageCategoryId(String name, String data) =>
+    jsonEncode([name, data]);
+
+({String name, String data}) csMainPageCategory(String id) {
+  try {
+    final parts = jsonDecode(id);
+    if (parts is List &&
+        parts.length == 2 &&
+        parts[0] is String &&
+        parts[1] is String) {
+      return (name: parts[0] as String, data: parts[1] as String);
+    }
+  } on FormatException {
+    // Accept category IDs produced by older app builds.
+  }
+  final separator = id.indexOf(' ');
+  return (
+    name: separator < 0 ? id : id.substring(0, separator),
+    data: separator < 0 ? '' : id.substring(separator + 1),
+  );
 }
 
 /// Whether the CloudStream source [apiName] exposes its OWN settings UI
@@ -710,9 +727,7 @@ class CloudStreamProvider implements BaseProvider {
           : BrowseMore(
               sourceId: sourceId,
               kind: 'cs_mainpage',
-              // Both fields can contain spaces. A structured value preserves
-              // the exact category name and opaque data on every platform.
-              categoryId: encodeCloudStreamCategory(catName, catData),
+              categoryId: csMainPageCategoryId(catName, catData),
             );
       sections.add(
         HomeSection(
@@ -726,14 +741,13 @@ class CloudStreamProvider implements BaseProvider {
   }
 
   /// One further page of a CloudStream `mainPage` category, for the "See all"
-  /// browse grid's infinite scroll. [categoryId] is the packed `"<name> <data>"`
+  /// browse grid's infinite scroll. [categoryId] preserves both category fields
   /// produced in [_fetchHome]; [page] is 1-based. Android-only; returns `[]` on
   /// any error (never throws) so a failed page just stops the scroll.
   Future<List<MediaItem>> browseMainPage(String categoryId, int page) async {
+    // Windows also hosts CloudStream; the category codec is upstream's.
     if (!_csSupported) return const [];
-    final category = decodeCloudStreamCategory(categoryId);
-    final name = category.name;
-    final data = category.data;
+    final (:name, :data) = csMainPageCategory(categoryId);
     try {
       final raw = await _csChannel.invokeMethod<List<dynamic>>(
         'getMainPagePaged',

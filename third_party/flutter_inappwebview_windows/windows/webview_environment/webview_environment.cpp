@@ -1,6 +1,7 @@
 #include <WebView2EnvironmentOptions.h>
 #include <wil/wrl.h>
 
+#include "../utils/com_apartment.h"
 #include "../utils/log.h"
 #include "webview_environment.h"
 
@@ -28,6 +29,16 @@ namespace flutter_inappwebview_plugin
     if (!hwnd) {
       if (completionHandler) {
         completionHandler(E_FAIL);
+      }
+      return;
+    }
+
+    // Zangetsu patch: WebView2 needs this thread to be a COM STA. Repair the
+    // apartment first instead of failing with CO_E_NOTINITIALIZED.
+    const auto comHr = ensureComApartment();
+    if (FAILED(comHr)) {
+      if (completionHandler) {
+        completionHandler(comHr);
       }
       return;
     }

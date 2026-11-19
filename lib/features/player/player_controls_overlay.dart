@@ -40,7 +40,11 @@ class _ControlsOverlay extends StatelessWidget {
     required this.enhanceActive,
     required this.onColorProfile,
     this.visible = true,
+    this.onShowPage,
   });
+
+  /// Windows only: one click to the show's detail page. Null hides it.
+  final VoidCallback? onShowPage;
 
   final PlayerCubit controller;
   final PlayerState state;
@@ -89,20 +93,82 @@ class _ControlsOverlay extends StatelessWidget {
   /// Overflow panel that slides in from the RIGHT (like the episodes panel) —
   /// holds the occasional actions so the control bars stay clean.
   void _showMore(BuildContext context) {
+    showPlayerMorePanel(
+      context: context,
+      onInteract: onInteract,
+      decoderLabel: decoderLabel,
+      enhanceActive: enhanceActive,
+      onDecoder: onDecoder,
+      onEnhance: onEnhance,
+      onColorProfile: onColorProfile,
+      onScreenshot: onScreenshot,
+      sleepActive: sleepActive,
+      onSleep: onSleep,
+      onPip: onPip,
+      // Windows: enables Copy stream link / Open in external player.
+      controller: controller,
+    );
+  }
+
+  /// Shared overflow panel (decoder / enhance / colour / snapshot / sleep /
+  /// PiP). The fullscreen overlay and the portrait watch page open the same
+  /// panel so the occasional actions live in exactly one place.
+  static void showPlayerMorePanel({
+    required BuildContext context,
+    required VoidCallback onInteract,
+    required String decoderLabel,
+    required bool enhanceActive,
+    required VoidCallback onDecoder,
+    required VoidCallback onEnhance,
+    required VoidCallback onColorProfile,
+    required VoidCallback onScreenshot,
+    required bool sleepActive,
+    required VoidCallback onSleep,
+    required VoidCallback? onPip,
+    bool animatePortraitEntrance = false,
+    // Windows: the stream link / headers for the copy and external rows.
+    PlayerCubit? controller,
+  }) {
+    // Windows (player-15): the standard docked panel, with sub-options
+    // opening inside it. Phone keeps the slide-in strip below unchanged.
+    if (playerMenusDocked) {
+      onInteract();
+      showDesktopPlayerMorePanel(
+        context: context,
+        decoderLabel: decoderLabel,
+        enhanceActive: enhanceActive,
+        onDecoder: onDecoder,
+        onEnhance: onEnhance,
+        onColorProfile: onColorProfile,
+        onScreenshot: onScreenshot,
+        sleepActive: sleepActive,
+        onSleep: onSleep,
+        onPip: onPip,
+        controller: controller,
+      );
+      return;
+    }
+    final portrait =
+        animatePortraitEntrance &&
+        MediaQuery.orientationOf(context) == Orientation.portrait;
+    final reduced = portrait && MediaQuery.disableAnimationsOf(context);
     onInteract();
     showGeneralDialog<void>(
       context: context,
       barrierDismissible: true,
       barrierLabel: 'More',
-      barrierColor: Colors.black54,
-      transitionDuration: const Duration(milliseconds: 240),
+      // Windows keeps the same light scrim as the other docked panels.
+      barrierColor: playerMenusDocked ? Colors.black26 : Colors.black54,
+      transitionDuration: reduced
+          ? Duration.zero
+          : const Duration(milliseconds: 240),
       pageBuilder: (ctx, _, _) {
         // Same width and surface as the episodes panel — this slides in from
         // the same edge with the same motion, so looking different was just
         // two panels wearing two skins. 40% was wider than it needed to be
         // for a short list of labels, too.
         final w = (MediaQuery.of(ctx).size.width * 0.33).clamp(250.0, 360.0);
-        return Align(
+        final panel = Align(
           alignment: AlignmentDirectional.centerEnd,
           child: Material(
             color: Colors.transparent,
@@ -193,7 +259,7 @@ class _ControlsOverlay extends StatelessWidget {
                           label: ctx.l10n.pictureInPicture,
                           onTap: () {
                             Navigator.pop(ctx);
-                            onPip!();
+                            onPip();
                           },
                         ),
                     ],
@@ -203,14 +269,39 @@ class _ControlsOverlay extends StatelessWidget {
             ),
           ),
         );
+        // Windows: Esc closes this panel first instead of the window-level
+        // Esc leaving fullscreen, like the other docked panels.
+        return playerMenusDocked ? _EscCloses(child: panel) : panel;
       },
-      transitionBuilder: (ctx, anim, _, child) => SlideTransition(
-        position: Tween(
-          begin: const Offset(1, 0),
-          end: Offset.zero,
-        ).animate(CurvedAnimation(parent: anim, curve: Curves.easeOutCubic)),
-        child: child,
-      ),
+      transitionBuilder: (ctx, anim, _, child) => portrait
+          ? (reduced
+                ? child
+                : FadeTransition(
+                    opacity: CurvedAnimation(
+                      parent: anim,
+                      curve: Curves.easeOut,
+                    ),
+                    child: SlideTransition(
+                      position:
+                          Tween(
+                            begin: const Offset(0, .03),
+                            end: Offset.zero,
+                          ).animate(
+                            CurvedAnimation(
+                              parent: anim,
+                              curve: Curves.easeOutCubic,
+                            ),
+                          ),
+                      child: child,
+                    ),
+                  ))
+          : SlideTransition(
+              position: Tween(begin: const Offset(1, 0), end: Offset.zero)
+                  .animate(
+                    CurvedAnimation(parent: anim, curve: Curves.easeOutCubic),
+                  ),
+              child: child,
+            ),
     );
   }
 
@@ -482,63 +573,31 @@ class _ControlsOverlay extends StatelessWidget {
                     tooltip: context.l10n.back,
                     onPressed: onBack,
                   ),
-                  // Text hit-tests as opaque (RenderParagraph.hitTestSelf is
-                  // true), so the title used to eat taps aimed at the video —
-                  // a wide dead strip across the top where tapping did nothing.
-                  // Nothing here is interactive, so let taps fall through to the
-                  // zones below and toggle the controls like anywhere else.
+                  // The show title and episode line. On Windows (onShowPage
+                  // set) they double as the link to the show page, replacing
+                  // the old "Show page" button; on phone they stay inert so
+                  // taps fall through to the video as before.
                   Expanded(
-                    child: IgnorePointer(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Row(
-                            children: [
-                              Flexible(
-                                child: Text(
-                                  primaryTitle,
-                                  style: AppText.headline.copyWith(
-                                    color: Colors.white,
-                                  ),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                              // Filler comes from the Jikan lookup, not the
-                              // source — Episode.filler is always false here.
-                              // Listened to because that lookup lands long
-                              // after this is first built.
-                              ValueListenableBuilder<Set<int>>(
-                                valueListenable: c.fillerEpisodes,
-                                builder: (context, _, _) =>
-                                    c.isFillerAt(state.currentIndex)
-                                    ? const Padding(
-                                        padding: EdgeInsetsDirectional.only(
-                                          start: 8,
-                                        ),
-                                        // No colour passed: TagBadge falls back
-                                        // to the app accent, so the badge
-                                        // follows the user's theme colour.
-                                        child: TagBadge(text: 'FILLER'),
-                                      )
-                                    : const SizedBox.shrink(),
-                              ),
-                            ],
-                          ),
-                          if (secondaryLine != null)
-                            Padding(
-                              padding: const EdgeInsets.only(top: 1),
-                              child: Text(
-                                secondaryLine,
-                                style: AppText.caption.copyWith(
-                                  color: Colors.white70,
-                                ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                        ],
+                    child: _TopBarTitle(
+                      title: primaryTitle,
+                      secondaryLine: secondaryLine,
+                      onShowPage: onShowPage,
+                      // Filler comes from the Jikan lookup, not the source —
+                      // Episode.filler is always false here. Listened to
+                      // because that lookup lands long after this is first
+                      // built.
+                      badge: ValueListenableBuilder<Set<int>>(
+                        valueListenable: c.fillerEpisodes,
+                        builder: (context, _, _) =>
+                            c.isFillerAt(state.currentIndex)
+                            ? const Padding(
+                                padding: EdgeInsetsDirectional.only(start: 8),
+                                // No colour passed: TagBadge falls back to the
+                                // app accent, so the badge follows the user's
+                                // theme colour.
+                                child: TagBadge(text: 'FILLER'),
+                              )
+                            : const SizedBox.shrink(),
                       ),
                     ),
                   ),
@@ -692,140 +751,169 @@ class _ControlsOverlay extends StatelessWidget {
                 // both button groups share it, so every edge lines up. Kept wide
                 // so the controls sit clear of the screen edges.
                 padding: const EdgeInsets.fromLTRB(44, 0, 44, 14),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    // Duration tracker (off-screen listener via StreamBuilder).
-                    StreamBuilder<Duration>(
-                      stream: c.player.stream.duration,
-                      builder: (context, snap) {
-                        final d = snap.data ?? duration;
-                        WidgetsBinding.instance.addPostFrameCallback((_) {
-                          if (d > Duration.zero) onDurationChanged(d);
-                        });
-                        return _SeekRow(
-                          controller: c,
-                          duration: d > Duration.zero ? d : duration,
-                          onInteract: onInteract,
-                          // MegaSkip — manual jump-forward, riding the timestamp's
-                          // line rather than a row of its own above it.
-                          trailing: megaSkipEnabled
-                              ? _MegaSkipPill(
-                                  seconds: megaSkipSeconds,
-                                  onTap: onMegaSkip,
-                                )
-                              : null,
-                        );
-                      },
-                    ),
-                    const SizedBox(height: 2),
-                    // Control bar under the progress bar: the pickers ride in one
-                    // translucent group on the left, episode list + fit mode in
-                    // another on the right. Two groups rather than seven floating
-                    // chips — the split reads at a glance, and every button is the
-                    // same width so nothing shifts as the video changes.
-                    LayoutBuilder(
-                      builder: (context, constraints) {
-                        // Rendered from the user's saved arrangement rather than
-                        // a fixed row. Untouched prefs give the defaults, which
-                        // are the exact layout that shipped before the Settings
-                        // screen existed — so nobody's bar moves unless they
-                        // move it.
-                        final left = _barButtons(context, barConfig.left);
-                        final right = _barButtons(context, barConfig.right);
-                        if (Platform.isWindows) {
-                          left.insert(
-                            0,
-                            SizedBox(
-                              width: 148,
-                              child: StreamBuilder<double>(
-                                stream: c.player.stream.volume,
-                                initialData: c.player.state.volume,
-                                builder: (context, snapshot) => Row(
-                                  children: [
-                                    const Tooltip(
-                                      message: 'Volume · ↑ / ↓   M to mute',
-                                      child: Icon(
-                                        Icons.volume_up_rounded,
-                                        color: Colors.white,
-                                        size: 20,
-                                      ),
-                                    ),
-                                    Expanded(
-                                      child: Slider(
-                                        value: (snapshot.data ?? 100).clamp(
-                                          0.0,
-                                          100.0,
+                // Measured so the Skip pill can sit just above this block.
+                child: _ReportBottomBlockHeight(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Duration tracker (off-screen listener via StreamBuilder).
+                      StreamBuilder<Duration>(
+                        stream: c.player.stream.duration,
+                        initialData: c.player.state.duration,
+                        builder: (context, snap) {
+                          final d = snap.data ?? duration;
+                          WidgetsBinding.instance.addPostFrameCallback((_) {
+                            if (d > Duration.zero) onDurationChanged(d);
+                          });
+                          return PlayerSeekBar(
+                            controller: c,
+                            duration: d > Duration.zero ? d : duration,
+                            onInteract: onInteract,
+                            // MegaSkip — manual jump-forward, riding the timestamp's
+                            // line rather than a row of its own above it.
+                            trailing: megaSkipEnabled
+                                ? _MegaSkipPill(
+                                    seconds: megaSkipSeconds,
+                                    onTap: onMegaSkip,
+                                  )
+                                : null,
+                          );
+                        },
+                      ),
+                      const SizedBox(height: 2),
+                      // Control bar under the progress bar: the pickers ride in one
+                      // translucent group on the left, episode list + fit mode in
+                      // another on the right. Two groups rather than seven floating
+                      // chips — the split reads at a glance, and every button is the
+                      // same width so nothing shifts as the video changes.
+                      LayoutBuilder(
+                        builder: (context, constraints) {
+                          // Rendered from the user's saved arrangement rather than
+                          // a fixed row. Untouched prefs give the defaults, which
+                          // are the exact layout that shipped before the Settings
+                          // screen existed — so nobody's bar moves unless they
+                          // move it.
+                          final left = _barButtons(context, barConfig.left);
+                          final right = _barButtons(context, barConfig.right);
+                          if (Platform.isWindows) {
+                            left.insert(
+                              0,
+                              SizedBox(
+                                width: 148,
+                                child: StreamBuilder<double>(
+                                  stream: c.player.stream.volume,
+                                  initialData: c.player.state.volume,
+                                  builder: (context, snapshot) {
+                                    // player-6: the slider is the 0-100
+                                    // user level; the saved volume boost is
+                                    // applied on top by the controller, so
+                                    // dragging never resets it.
+                                    final level = c.userVolumeFromMpv(
+                                      snapshot.data ?? 100,
+                                    );
+                                    return Row(
+                                      children: [
+                                        Tooltip(
+                                          message: context.l10n.volumeTooltipKeys,
+                                          // Click toggles mute and comes
+                                          // back to the previous level.
+                                          child: InkWell(
+                                            key: const ValueKey(
+                                              'player-volume-mute',
+                                            ),
+                                            customBorder: const CircleBorder(),
+                                            onTap: () {
+                                              c.toggleUserMute();
+                                              onInteract();
+                                            },
+                                            child: Icon(
+                                              level <= 0
+                                                  ? Icons.volume_off_rounded
+                                                  : Icons.volume_up_rounded,
+                                              color: Colors.white,
+                                              size: 20,
+                                            ),
+                                          ),
                                         ),
-                                        max: 100,
-                                        onChanged: (value) {
-                                          c.player.setVolume(value);
-                                          onInteract();
-                                        },
-                                      ),
-                                    ),
-                                  ],
+                                        Expanded(
+                                          child: Slider(
+                                            value: level,
+                                            max: 100,
+                                            onChanged: (value) {
+                                              c.setUserVolume(value);
+                                              onInteract();
+                                            },
+                                          ),
+                                        ),
+                                      ],
+                                    );
+                                  },
                                 ),
                               ),
-                            ),
-                          );
-                          right.add(
-                            Tooltip(
-                              message:
-                                  'Space / K: play or pause\nJ / L or ← / →: seek ${sl<PlaybackPrefs>().tvSeekSeconds}s\nShift + ← / →: seek 60s\n↑ / ↓: volume • M: mute\nF / F11: fullscreen\nDouble-click: fullscreen\nRight-click: settings\nMouse back: return • mouse forward: seek\nMiddle-click: play or pause',
-                              child: const SizedBox(
-                                width: 48,
-                                height: 48,
-                                child: Icon(
+                            );
+                            // player-5: opens the '?' shortcut overlay
+                            // (player keys first, remaps included) instead
+                            // of a hover-only tooltip.
+                            right.add(
+                              IconButton(
+                                key: const ValueKey('player-shortcuts-help'),
+                                tooltip: context.l10n.keyboardShortcutsWithKey,
+                                icon: const Icon(
                                   Icons.keyboard_rounded,
                                   color: Colors.white,
                                 ),
+                                onPressed: () {
+                                  onInteract();
+                                  showPlayerShortcutsHelp(context);
+                                },
                               ),
+                            );
+                          }
+                          // Buttons are a uniform 48 (12 padding + 24 icon + 12)
+                          // and each group adds 8 of its own, so the width the bar
+                          // wants is arithmetic rather than something to measure.
+                          const buttonWidth = 48.0;
+                          const groupPadding = 8.0;
+                          double groupWidth(int n) =>
+                              n == 0 ? 0 : n * buttonWidth + groupPadding;
+                          final wanted =
+                              groupWidth(left.length) +
+                              groupWidth(right.length) +
+                              (Platform.isWindows ? 100 : 0);
+
+                          if (wanted <= constraints.maxWidth) {
+                            return Row(
+                              children: [
+                                if (left.isNotEmpty) _BarGroup(children: left),
+                                const Spacer(),
+                                if (right.isNotEmpty)
+                                  _BarGroup(children: right),
+                              ],
+                            );
+                          }
+                          // Narrower than the bar wants — portrait, or a bar the
+                          // user has loaded up in Settings. The Spacer pins the
+                          // groups to opposite edges and can't give any width back,
+                          // so the right-hand group would run off-screen and take
+                          // its buttons out of reach. Scroll the pair instead:
+                          // everything stays tappable, and nothing about the
+                          // landscape layout above changes.
+                          return SingleChildScrollView(
+                            scrollDirection: Axis.horizontal,
+                            child: Row(
+                              children: [
+                                if (left.isNotEmpty) _BarGroup(children: left),
+                                if (left.isNotEmpty && right.isNotEmpty)
+                                  const SizedBox(width: 8),
+                                if (right.isNotEmpty)
+                                  _BarGroup(children: right),
+                              ],
                             ),
                           );
-                        }
-                        // Buttons are a uniform 48 (12 padding + 24 icon + 12)
-                        // and each group adds 8 of its own, so the width the bar
-                        // wants is arithmetic rather than something to measure.
-                        const buttonWidth = 48.0;
-                        const groupPadding = 8.0;
-                        double groupWidth(int n) =>
-                            n == 0 ? 0 : n * buttonWidth + groupPadding;
-                        final wanted =
-                            groupWidth(left.length) +
-                            groupWidth(right.length) +
-                            (Platform.isWindows ? 100 : 0);
-
-                        if (wanted <= constraints.maxWidth) {
-                          return Row(
-                            children: [
-                              if (left.isNotEmpty) _BarGroup(children: left),
-                              const Spacer(),
-                              if (right.isNotEmpty) _BarGroup(children: right),
-                            ],
-                          );
-                        }
-                        // Narrower than the bar wants — portrait, or a bar the
-                        // user has loaded up in Settings. The Spacer pins the
-                        // groups to opposite edges and can't give any width back,
-                        // so the right-hand group would run off-screen and take
-                        // its buttons out of reach. Scroll the pair instead:
-                        // everything stays tappable, and nothing about the
-                        // landscape layout above changes.
-                        return SingleChildScrollView(
-                          scrollDirection: Axis.horizontal,
-                          child: Row(
-                            children: [
-                              if (left.isNotEmpty) _BarGroup(children: left),
-                              if (left.isNotEmpty && right.isNotEmpty)
-                                const SizedBox(width: 8),
-                              if (right.isNotEmpty) _BarGroup(children: right),
-                            ],
-                          ),
-                        );
-                      },
-                    ),
-                  ],
+                        },
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -835,6 +923,163 @@ class _ControlsOverlay extends StatelessWidget {
     );
   }
 }
+
+/// The player top bar's title block: show title (plus [badge]) and the
+/// episode line under it.
+///
+/// With [onShowPage] (Windows only) both lines act as one link to the show
+/// page: hand cursor, an underline on hover, an "Open show page" tooltip and
+/// a click that runs [onShowPage]. The hit area hugs the text, so clicks on
+/// the empty bar beside it still reach the video and toggle the controls.
+///
+/// Without it (phone, local files) the block is wrapped in [IgnorePointer]:
+/// Text hit-tests as opaque (RenderParagraph.hitTestSelf is true), so the
+/// title would otherwise eat taps aimed at the video — a wide dead strip
+/// across the top where tapping did nothing.
+class _TopBarTitle extends StatefulWidget {
+  const _TopBarTitle({
+    required this.title,
+    required this.secondaryLine,
+    required this.badge,
+    this.onShowPage,
+  });
+
+  final String title;
+
+  /// Episode line ("E1", "S1 · E3 · Name"); null hides it.
+  final String? secondaryLine;
+
+  /// Trailing decoration on the title row (the FILLER tag). Never clickable.
+  final Widget badge;
+
+  /// Opens the show page; null keeps the title inert.
+  final VoidCallback? onShowPage;
+
+  @override
+  State<_TopBarTitle> createState() => _TopBarTitleState();
+}
+
+class _TopBarTitleState extends State<_TopBarTitle> {
+  /// The pointer is over either line. Shared, so both lines underline
+  /// together and read as a single link.
+  bool _hover = false;
+
+  void _setHover(bool value) {
+    if (_hover != value) setState(() => _hover = value);
+  }
+
+  /// Wraps one line of text in the show-page link (cursor, hover, tooltip,
+  /// click). The wrappers are all proxies, so the hit area stays the text's
+  /// own size.
+  Widget _link(Key key, Widget text) {
+    final onShowPage = widget.onShowPage;
+    if (onShowPage == null) return text;
+    return Tooltip(
+      message: 'Open show page',
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        onEnter: (_) => _setHover(true),
+        onExit: (_) => _setHover(false),
+        child: GestureDetector(
+          key: key,
+          // Opaque: a click on a gap between glyphs still counts.
+          behavior: HitTestBehavior.opaque,
+          onTap: onShowPage,
+          child: text,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Underline only while hovered, and only when there is a link at all.
+    final underline = widget.onShowPage != null && _hover
+        ? TextDecoration.underline
+        : TextDecoration.none;
+    final secondary = widget.secondaryLine;
+    final column = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Row(
+          children: [
+            Flexible(
+              child: _link(
+                const ValueKey('player-title-link'),
+                Text(
+                  widget.title,
+                  style: AppText.headline.copyWith(
+                    color: Colors.white,
+                    decoration: underline,
+                    decorationColor: Colors.white,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ),
+            // The badge is not part of the link; let taps on it fall through.
+            IgnorePointer(child: widget.badge),
+          ],
+        ),
+        if (secondary != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 1),
+            child: _link(
+              const ValueKey('player-episode-link'),
+              Text(
+                secondary,
+                style: AppText.caption.copyWith(
+                  color: Colors.white70,
+                  decoration: underline,
+                  decorationColor: Colors.white70,
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
+      ],
+    );
+    // Phone / no show: nothing here is interactive, so let taps through.
+    return widget.onShowPage == null ? IgnorePointer(child: column) : column;
+  }
+}
+
+/// Test hook: the player top bar's title block, which is private.
+@visibleForTesting
+Widget debugPlayerTopBarTitle({
+  required String title,
+  String? secondaryLine,
+  VoidCallback? onShowPage,
+}) => _TopBarTitle(
+  title: title,
+  secondaryLine: secondaryLine,
+  badge: const SizedBox.shrink(),
+  onShowPage: onShowPage,
+);
+
+/// Test hook: opens the shared "More" panel, which lives on a private class.
+@visibleForTesting
+void debugShowPlayerMorePanel(
+  BuildContext context, {
+  VoidCallback? onSleep,
+  VoidCallback? onDecoder,
+  VoidCallback? onPip,
+}) => _ControlsOverlay.showPlayerMorePanel(
+      context: context,
+      onInteract: () {},
+      decoderLabel: 'HW',
+      enhanceActive: false,
+      onDecoder: onDecoder ?? () {},
+      onEnhance: () {},
+      onColorProfile: () {},
+      onScreenshot: () {},
+      sleepActive: false,
+      onSleep: onSleep ?? () {},
+      onPip: onPip,
+    );
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Seek row — current time + slider (stream-bound) + total time.

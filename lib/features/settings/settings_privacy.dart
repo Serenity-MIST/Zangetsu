@@ -120,7 +120,7 @@ class _PrivacySettingsScreenState extends State<PrivacySettingsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar(context.l10n.privacy),
       body: ListView(
         padding: const EdgeInsets.only(top: 8, bottom: 24),
@@ -178,17 +178,21 @@ class _PrivacySettingsScreenState extends State<PrivacySettingsScreen> {
                   onChanged: (v) => _onAdultMetaChanged(v ?? false),
                 ),
               ),
-              SettingsTile(
-                icon: Icons.extension_outlined,
-                title: context.l10n.showNSFWSources,
-                subtitle: context.l10n.adultAniyomiExtensions,
-                onTap: () => _onNsfwAniChanged(!_nsfwAni),
-                trailing: Switch.adaptive(
-                  value: _nsfwAni,
-                  activeThumbColor: AppColors.accent,
-                  onChanged: _onNsfwAniChanged,
+              // Windows only has Aniyomi sources when the extension engine is
+              // bundled; without it this switch has nothing to show or hide.
+              // Same predicate as the search index, so the two agree.
+              if (aniyomiNsfwRowVisible())
+                SettingsTile(
+                  icon: Icons.extension_outlined,
+                  title: context.l10n.showNSFWSources,
+                  subtitle: context.l10n.adultAniyomiExtensions,
+                  onTap: () => _onNsfwAniChanged(!_nsfwAni),
+                  trailing: Switch.adaptive(
+                    value: _nsfwAni,
+                    activeThumbColor: AppColors.accent,
+                    onChanged: _onNsfwAniChanged,
+                  ),
                 ),
-              ),
             ],
           ),
           Padding(
@@ -230,6 +234,13 @@ class _ApiKeyDialogState extends State<_ApiKeyDialog> {
 
   @override
   Widget build(BuildContext context) {
+    // Windows: the graphite settings alert look; the phone keeps the plain
+    // dialog below unchanged. (Same gate as desktopPanelsEnabled, inline so
+    // settings_screen.dart needs no new import.)
+    final windowsUi =
+        defaultTargetPlatform == TargetPlatform.windows &&
+        !(sl.isRegistered<AppMode>() && sl<AppMode>().isTv);
+    if (windowsUi) return _buildDesktop(context);
     return AlertDialog(
       backgroundColor: AppColors.surface,
       title: Text(context.l10n.opensubtitlesAPIKey, style: AppText.headline),
@@ -274,4 +285,83 @@ class _ApiKeyDialogState extends State<_ApiKeyDialog> {
       ],
     );
   }
+
+  /// Graphite field border; the accent marks the focused state.
+  OutlineInputBorder _border(Color color) => OutlineInputBorder(
+    borderRadius: BorderRadius.circular(12),
+    borderSide: BorderSide(color: color),
+  );
+
+  /// Windows look: the same frame, title and buttons as AppDialog's desktop
+  /// settings alert, with a graphite field. Enter saves, Esc cancels.
+  Widget _buildDesktop(BuildContext context) => AlertDialog(
+    backgroundColor: GraphiteSettingsColors.dialog,
+    surfaceTintColor: Colors.transparent,
+    constraints: const BoxConstraints(maxWidth: 560),
+    insetPadding: const EdgeInsets.all(24),
+    shape: RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(20),
+      side: BorderSide(color: GraphiteSettingsColors.dialogEdge),
+    ),
+    scrollable: true,
+    title: Text(
+      context.l10n.opensubtitlesAPIKey,
+      style: AppText.headline.copyWith(fontSize: 23),
+    ),
+    content: Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        TextField(
+          controller: _controller,
+          autofocus: true,
+          cursorColor: AppColors.accent,
+          style: AppText.body.copyWith(color: AppColors.textPrimary),
+          decoration: InputDecoration(
+            isDense: true,
+            labelText: context.l10n.apiKeyLabel,
+            hintText: context.l10n.pasteYourKey,
+            filled: true,
+            fillColor: GraphiteSettingsColors.inputFill,
+            hoverColor: GraphiteSettingsColors.inputHover,
+            border: _border(GraphiteSettingsColors.dialogEdge),
+            enabledBorder: _border(GraphiteSettingsColors.dialogEdge),
+            focusedBorder: _border(AppColors.accent),
+          ),
+          onSubmitted: (v) => Navigator.pop(context, v.trim()),
+        ),
+        const SizedBox(height: 12),
+        Text(
+          context.l10n.createAFreeKeyAtOpensubtitlesComConsumers,
+          style: AppText.caption.copyWith(
+            color: AppColors.textSecondary,
+            height: 1.45,
+          ),
+        ),
+      ],
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        style: TextButton.styleFrom(
+          foregroundColor: AppColors.textPrimary,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(10),
+          ),
+        ),
+        child: Text(context.l10n.cancel),
+      ),
+      FilledButton(
+        onPressed: () => Navigator.pop(context, _controller.text.trim()),
+        style: FilledButton.styleFrom(
+          backgroundColor: AppColors.accent,
+          foregroundColor: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(10),
+          ),
+        ),
+        child: Text(context.l10n.save),
+      ),
+    ],
+  );
 }

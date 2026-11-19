@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart' show debugPrint;
 import '../di/injector.dart';
 import '../mode/content_mode.dart';
 import '../mode/content_mode_cubit.dart';
+import '../mangayomi/mangayomi_manager.dart';
 import '../provider/provider_registry.dart';
 import '../repository/source_repository.dart';
 import '../zmode/source_matcher.dart';
@@ -88,10 +89,14 @@ bool hasInstalledPlaybackSources(ContentMode mode) {
     }
   }
 
+  final mangayomiIds = sl.isRegistered<MangayomiManager>()
+      ? sl<MangayomiManager>().installed.map((item) => item.source.key)
+      : const <String>[];
+
   // Merge: runtime + registry (deduplicated). This covers both the normal
   // phone path (runtime has everything) and the TV path (registry has what
   // the runtime doesn't because loadAll was skipped).
-  final allIds = <String>{...runtimeIds, ...registryIds};
+  final allIds = <String>{...runtimeIds, ...registryIds, ...mangayomiIds};
 
   debugPrint(
     '[tv-playback] hasInstalledPlaybackSources · mode=$mode · '
@@ -102,10 +107,14 @@ bool hasInstalledPlaybackSources(ContentMode mode) {
   );
 
   final result = switch (mode) {
-    ContentMode.manga => allIds.any((id) => id.startsWith('mihon:')),
-    ContentMode.novel => allIds.any((id) => id.startsWith('lnr:')),
+    ContentMode.manga => allIds.any(
+      (id) => sourceIdMatchesContentMode(id, ContentMode.manga),
+    ),
+    ContentMode.novel => allIds.any(
+      (id) => sourceIdMatchesContentMode(id, ContentMode.novel),
+    ),
     ContentMode.anime => allIds.any(
-      (id) => !id.startsWith('mihon:') && !id.startsWith('lnr:'),
+      (id) => sourceIdMatchesContentMode(id, ContentMode.anime),
     ),
   };
   debugPrint(

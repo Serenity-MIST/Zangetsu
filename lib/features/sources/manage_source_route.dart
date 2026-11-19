@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 
 import 'aniyomi_sources_screen.dart';
 import 'cloudstream_sources_screen.dart';
+import 'desktop_sources_manager.dart';
 import 'lnreader_sources_screen.dart';
+import 'mangayomi_sources_screen.dart';
 import 'mihon_sources_screen.dart';
 import 'zangetsu_sources_screen.dart';
 
@@ -27,6 +29,7 @@ Widget? manageSourceScreenFor(String sourceId) {
   if (sourceId.startsWith('ani:')) return const AniyomiSourcesScreen();
   if (sourceId.startsWith('mihon:')) return const MihonSourcesScreen();
   if (sourceId.startsWith('lnr:')) return const LnReaderSourcesScreen();
+  if (sourceId.startsWith('mg:')) return const MangayomiSourcesScreen();
   // Everything else is a JS provider from the Zangetsu repo — those ids carry
   // no prefix, so this is the fallback rather than a match.
   return const ZangetsuSourcesScreen();
@@ -40,6 +43,17 @@ bool canManageSource(String sourceId) =>
 /// Pushes the owning Sources screen for [sourceId].
 Future<void> openManageSource(BuildContext context, String sourceId) async {
   if (!canManageSource(sourceId)) return;
+  // Windows (not TV): open the Sources manager with this source selected;
+  // its Remove uses the same per-ecosystem uninstall code as the screens.
+  if (useDesktopSourcesManager) {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) =>
+            DesktopSourcesManager(showBack: true, initialSourceId: sourceId),
+      ),
+    );
+    return;
+  }
   final screen = manageSourceScreenFor(sourceId);
   if (screen == null) return;
   await Navigator.of(

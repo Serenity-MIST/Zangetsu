@@ -3,6 +3,7 @@ import 'package:flutter_svg/flutter_svg.dart';
 
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 
 /// Windows search surface with a persistent label and animated focus outline.
 /// Search state stays with the settings controller so navigating back preserves
@@ -14,12 +15,24 @@ class DesktopSettingsSearch extends StatefulWidget {
     required this.hint,
     required this.onChanged,
     required this.onClear,
+    this.focusNode,
+    this.onSubmitted,
+    this.padding = const EdgeInsets.fromLTRB(16, 4, 16, 12),
   });
 
   final TextEditingController controller;
   final String hint;
   final ValueChanged<String> onChanged;
   final VoidCallback onClear;
+
+  /// set-3: lets Ctrl+F / Ctrl+K focus the box from any settings page.
+  final FocusNode? focusNode;
+
+  /// Enter in the box (opens the first result).
+  final ValueChanged<String>? onSubmitted;
+
+  /// Outer spacing; the sidebar uses a tighter one than a page body.
+  final EdgeInsetsGeometry padding;
 
   @override
   State<DesktopSettingsSearch> createState() => _DesktopSettingsSearchState();
@@ -31,7 +44,7 @@ class _DesktopSettingsSearchState extends State<DesktopSettingsSearch> {
 
   @override
   Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+    padding: widget.padding,
     child: Focus(
       canRequestFocus: false,
       skipTraversal: true,
@@ -42,10 +55,13 @@ class _DesktopSettingsSearchState extends State<DesktopSettingsSearch> {
             : const Duration(milliseconds: 180),
         curve: Curves.easeOutCubic,
         decoration: BoxDecoration(
-          color: const Color(0xFF14141C),
+          // set-9: fill and border follow Pure black / Background colour.
+          color: GraphiteSettingsColors.searchFill,
           borderRadius: BorderRadius.circular(16),
           border: Border.all(
-            color: _focused ? AppColors.accent : const Color(0xFF30303A),
+            color: _focused
+                ? AppColors.accent
+                : GraphiteSettingsColors.searchEdge,
           ),
           boxShadow: [
             if (_focused)
@@ -58,7 +74,7 @@ class _DesktopSettingsSearchState extends State<DesktopSettingsSearch> {
         child: Row(
           children: [
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
+              padding: const EdgeInsets.symmetric(horizontal: 14),
               child: SvgPicture.asset(
                 'assets/icons/lucide/search.svg',
                 width: 18,
@@ -73,7 +89,9 @@ class _DesktopSettingsSearchState extends State<DesktopSettingsSearch> {
             Expanded(
               child: TextField(
                 controller: widget.controller,
+                focusNode: widget.focusNode,
                 onChanged: widget.onChanged,
+                onSubmitted: widget.onSubmitted,
                 style: AppText.body.copyWith(color: AppColors.textPrimary),
                 cursorColor: AppColors.accent,
                 textInputAction: TextInputAction.search,
@@ -83,14 +101,19 @@ class _DesktopSettingsSearchState extends State<DesktopSettingsSearch> {
                     color: AppColors.textSecondary,
                   ),
                   isDense: true,
+                  // The settings workspace theme fills text fields; the box
+                  // above already draws this one's surface.
+                  filled: false,
                   border: InputBorder.none,
+                  enabledBorder: InputBorder.none,
+                  focusedBorder: InputBorder.none,
                   contentPadding: const EdgeInsets.symmetric(vertical: 15),
                 ),
               ),
             ),
             if (widget.controller.text.isNotEmpty)
               Padding(
-                padding: const EdgeInsets.only(right: 6),
+                padding: const EdgeInsets.only(right: 4),
                 child: IconButton(
                   tooltip: MaterialLocalizations.of(
                     context,

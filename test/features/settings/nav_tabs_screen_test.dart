@@ -1,7 +1,9 @@
 // Dock customization regressions cover the desktop editor and unchanged phone
 // presentation. Hidden choices must be scrolled into view before asserting
 // availability; unbuilt lazy rows are not evidence that an option was removed.
-
+// Task 17 follow-up: Search is back as an opt-in dock tab. It lives in the
+// Home header only while it is NOT on the bar — so the picker offers it as
+// an addable row by default, and it must never be in the default dock.
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -192,24 +194,25 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('Search remains an available hidden tab with Z Mode off', (
+  testWidgets('Search is offered as an addable tab with Z Mode off', (
     tester,
   ) async {
     expect(ZModePrefs.enabled, isFalse);
     await tester.pumpWidget(const MaterialApp(home: NavTabsScreen()));
     await tester.pumpAndSettle();
-
+    // The not-shown card sits below the fold in a lazy sliver — rows only
+    // exist once scrolled to, same as the keep-dock switch below.
     await tester.scrollUntilVisible(
       notShownSearchRow(),
-      250,
+      300,
       scrollable: find.byType(Scrollable).first,
     );
-    await tester.pumpAndSettle();
+
     expect(notShownSearchRow(), findsOneWidget);
     expect(onBarSearchRow(), findsNothing);
   });
 
-  testWidgets('Search remains an available hidden tab with Z Mode on', (
+  testWidgets('Search is offered as an addable tab with Z Mode on', (
     tester,
   ) async {
     // See the module doc comment on watch_app's known Hive-in-testWidgets
@@ -220,13 +223,13 @@ void main() {
 
     await tester.pumpWidget(const MaterialApp(home: NavTabsScreen()));
     await tester.pumpAndSettle();
-
     await tester.scrollUntilVisible(
       notShownSearchRow(),
-      250,
+      300,
       scrollable: find.byType(Scrollable).first,
     );
-    await tester.pumpAndSettle();
+
+
     expect(notShownSearchRow(), findsOneWidget);
     expect(onBarSearchRow(), findsNothing);
   });
@@ -238,12 +241,51 @@ void main() {
     await tester.pumpAndSettle();
 
     final toggle = find.byKey(const ValueKey('keep-dock-expanded-switch'));
+    await tester.scrollUntilVisible(
+      toggle,
+      300,
+      scrollable: find.byType(Scrollable).first,
+    );
     expect(toggle, findsOneWidget);
     expect(tester.widget<Switch>(toggle).value, isFalse);
 
-    await tester.tap(find.text('Keep dock expanded'));
+    await tester.tap(find.text('Keep navigation expanded'));
     await tester.pump();
 
     expect(tester.widget<Switch>(toggle).value, isTrue);
+  });
+  testWidgets('navbar visibility is optional and saves only when released', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const MaterialApp(home: NavTabsScreen()));
+    await tester.pumpAndSettle();
+    final sliderFinder = find.byKey(const ValueKey('glass-visibility-slider'));
+    await tester.scrollUntilVisible(
+      sliderFinder,
+      250,
+      scrollable: find.byType(Scrollable).first,
+    );
+    var slider = tester.widget<Slider>(sliderFinder);
+    expect(slider.value, 0);
+    expect(find.text('Off (default)'), findsOneWidget);
+    slider.onChanged!(0.65);
+    await tester.pump();
+    expect(NavPrefs().glassVisibility, 0);
+    expect(find.text('65%'), findsOneWidget);
+    slider = tester.widget<Slider>(sliderFinder);
+    await tester.runAsync(() async {
+      slider.onChangeEnd!(0.65);
+      await Future<void>.delayed(Duration.zero);
+      await Hive.box(NavPrefs.boxName).flush();
+    });
+    await tester.pumpAndSettle();
+    expect(NavPrefs().glassVisibility, 0.65);
+  });
+
+  testWidgets('classic dock does not offer navbar visibility', (tester) async {
+    await tester.runAsync(() => NavPrefs().setStyle(NavBarStyle.dock));
+    await tester.pumpWidget(const MaterialApp(home: NavTabsScreen()));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('glass-visibility-slider')), findsNothing);
   });
 }

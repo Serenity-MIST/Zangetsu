@@ -48,4 +48,19 @@ class SearchHistory {
   }
 
   Future<void> clear() async => _box.delete(_key);
+
+  /// Puts back a list taken from [recent] before a [clear] (the Undo of
+  /// "Clear all" on Windows, search-9). Keeps any term searched since the
+  /// clear in front, drops case-insensitive duplicates, and keeps the cap.
+  Future<void> restore(List<String> queries) async {
+    final list = recent().toList();
+    for (final q in queries) {
+      final t = q.trim();
+      if (t.isEmpty) continue;
+      if (list.any((e) => e.toLowerCase() == t.toLowerCase())) continue;
+      list.add(t);
+    }
+    if (list.length > _max) list.removeRange(_max, list.length);
+    await _box.put(_key, list);
+  }
 }

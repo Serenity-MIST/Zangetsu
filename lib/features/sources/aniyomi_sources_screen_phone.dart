@@ -30,8 +30,80 @@ class _AniScreenPhoneViewState extends State<_AniScreenPhoneView> {
     super.dispose();
   }
 
+  /// Opens the language picker (app bar globe on phone, toolbar on Windows).
+  void _pickLanguages(BuildContext context) => showSourceLanguageSheet(
+    context,
+    sl<AnimeLangPrefs>(),
+    present: presentLangCodes(
+      sl<AniyomiManager>().all,
+      (p) => p is AniyomiProvider ? p.info.lang : '',
+    ),
+  );
+
+  /// Windows layout (src-3): settings app bar, the shared toolbar (tabs,
+  /// languages, Add repo, search) and no floating button; Ctrl+F / Esc / F5
+  /// via [DesktopSourcesKeys] (src-13 A).
+  Widget _desktop(BuildContext context) => DesktopSourcesKeys(
+    child: DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        backgroundColor: AppColors.bg,
+        appBar: desktopSourcesAppBar(context.l10n.aniyomi),
+        body: Column(
+          children: [
+            DesktopSourcesToolbar(
+              tabs: [context.l10n.installed, context.l10n.repositories],
+              actions: [
+                IconButton(
+                  tooltip: context.l10n.languages,
+                  icon: const Icon(Icons.language_rounded),
+                  onPressed: () => _pickLanguages(context),
+                ),
+                // Builder: the keys scope sits below `context` here.
+                Builder(
+                  builder: (inner) => IconButton(
+                    tooltip: inner.l10n.refreshRepositoriesF5,
+                    icon: const Icon(Icons.refresh_rounded),
+                    onPressed: () =>
+                        DesktopSourcesKeys.maybeOf(inner)?.refresh(),
+                  ),
+                ),
+              ],
+              addLabel: context.l10n.addAniyomiRepo,
+              addKey: const ValueKey('desktop-add-aniyomi-repo'),
+              onAdd: widget.onAddRepo,
+              search: SourcesSearchField(
+                controller: _searchCtrl,
+                onChanged: (q) => setState(() => _query = q),
+              ),
+            ),
+            Expanded(
+              child: TabBarView(
+                children: [
+                  ListView(
+                    padding: kDesktopSourcesListPadding,
+                    children: [_AniyomiInstalledGroup(query: _query)],
+                  ),
+                  AniyomiRepoTab(
+                    repoUrls: widget.repoUrls,
+                    onRemoveRepo: widget.onRemoveRepo,
+                    query: _query,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
+    // Windows: desktop settings look whatever opened it (src-3 A).
+    if (desktopPanelsEnabled) {
+      return DesktopProviderScope(child: Builder(builder: _desktop));
+    }
     return DefaultTabController(
       length: 2,
       child: Scaffold(
@@ -438,65 +510,124 @@ class _AniSourceRowState extends State<_AniSourceRow> {
       );
     }
 
-    return InkWell(
-      onTap: () {
-        context.read<ActiveSourceCubit>().setSource(source.sourceId);
-        ScaffoldMessenger.of(context)
-          ..clearSnackBars()
-          ..showSnackBar(
-            SnackBar(
-              content: Text(context.l10n.activeSourceColon(source.displayName)),
-            ),
-          );
-      },
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 6, 8),
-        child: Row(
-          children: [
-            Padding(
-              padding: const EdgeInsetsDirectional.only(end: 12),
-              child: SourceIconTile(
-                name: source.displayName,
-                icon: aniProvider == null
-                    ? null
-                    : SourceIconStore.urlFor(aniProvider.info.pkg),
+    void activate() {
+      context.read<ActiveSourceCubit>().setSource(source.sourceId);
+      ScaffoldMessenger.of(context)
+        ..clearSnackBars()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(context.l10n.activeSourceColon(source.displayName)),
+          ),
+        );
+    }
+
+    // Windows: hover highlight + right-click with the row's actions
+    // (src-13 B). Built lazily so it reflects the current update state.
+    List<DesktopMenuItem<Object?>> menuItems() {
+      final pkg = aniProvider?.info.pkg;
+      final update = pkg == null ? null : lookup(pkg);
+      return desktopSourceMenuItems(
+        context,
+        onActivate: active ? null : activate,
+        onUpdate: update == null || _busy ? null : () => _applyUpdate(update),
+        updateLabel: update == null
+            ? null
+            : context.l10n.updateArrowVersion('${update.availableVersion}'),
+        onSettings: _hasSettings ? _openSettings : null,
+        onOpenSite: source_actions.webViewUrlFor(source.sourceId) == null
+            ? null
+            : () => source_actions.openSourceWebView(source.sourceId),
+        onUninstall: () => _confirmUninstall(context),
+      );
+    }
+
+    return DesktopSourceRow(
+      items: menuItems,
+      tooltip: lang.isNotEmpty
+          ? '${source.displayName} · aniyomi • $lang'
+          : source.displayName,
+      child: InkWell(
+        onTap: activate,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 6, 8),
+          child: Row(
+            children: [
+              Padding(
+                padding: const EdgeInsetsDirectional.only(end: 12),
+                child: SourceIconTile(
+                  name: source.displayName,
+                  icon: aniProvider == null
+                      ? null
+                      : SourceIconStore.urlFor(aniProvider.info.pkg),
+                ),
               ),
-            ),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    source.displayName,
-                    style: AppText.headline.copyWith(
-                      fontSize: 15,
-                      color: nameColor,
-                      fontWeight: active ? FontWeight.w600 : null,
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      source.displayName,
+                      style: AppText.headline.copyWith(
+                        fontSize: 15,
+                        color: nameColor,
+                        fontWeight: active ? FontWeight.w600 : null,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                     ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    lang.isNotEmpty ? 'aniyomi • $lang' : 'aniyomi',
-                    style: AppText.caption,
-                  ),
-                ],
+                    const SizedBox(height: 2),
+                    Text(
+                      lang.isNotEmpty ? 'aniyomi • $lang' : 'aniyomi',
+                      style: AppText.caption,
+                    ),
+                  ],
+                ),
               ),
-            ),
-            if (widget.updateLookupFn != null)
-              updateButton()
-            else
-              AnimatedBuilder(
-                animation: sl<AniyomiManager>(),
-                builder: (_, _) => updateButton(),
-              ),
-            if (_hasSettings)
+              if (widget.updateLookupFn != null)
+                updateButton()
+              else
+                AnimatedBuilder(
+                  animation: sl<AniyomiManager>(),
+                  builder: (_, _) => updateButton(),
+                ),
+              if (_hasSettings)
+                IconButton(
+                  tooltip: context.l10n.sourceSettings,
+                  icon: const Icon(Icons.tune_rounded, size: 20),
+                  color: AppColors.textSecondary,
+                  onPressed: _openSettings,
+                  // Default IconButtons are 48x48 for a 20px glyph. Three of
+                  // them ate the width the source NAME needed once the row
+                  // grew an icon tile; 36 still clears the 36dp touch floor.
+                  visualDensity: VisualDensity.compact,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints.tightFor(
+                    width: 36,
+                    height: 36,
+                  ),
+                ),
+              if (source_actions.webViewUrlFor(source.sourceId) != null)
+                IconButton(
+                  tooltip: context.l10n.signInToSource,
+                  icon: const Icon(Icons.login_rounded, size: 20),
+                  color: AppColors.textSecondary,
+                  onPressed: () =>
+                      source_actions.openSourceWebView(source.sourceId),
+                  // Default IconButtons are 48x48 for a 20px glyph. Three of
+                  // them ate the width the source NAME needed once the row
+                  // grew an icon tile; 36 still clears the 36dp touch floor.
+                  visualDensity: VisualDensity.compact,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints.tightFor(
+                    width: 36,
+                    height: 36,
+                  ),
+                ),
               IconButton(
-                tooltip: context.l10n.sourceSettings,
-                icon: const Icon(Icons.tune_rounded, size: 20),
+                tooltip: context.l10n.uninstall,
+                icon: const Icon(Icons.delete_outline_rounded, size: 20),
                 color: AppColors.textSecondary,
-                onPressed: _openSettings,
+                onPressed: () => _confirmUninstall(context),
                 // Default IconButtons are 48x48 for a 20px glyph. Three of
                 // them ate the width the source NAME needed once the row
                 // grew an icon tile; 36 still clears the 36dp touch floor.
@@ -507,36 +638,8 @@ class _AniSourceRowState extends State<_AniSourceRow> {
                   height: 36,
                 ),
               ),
-            if (source_actions.webViewUrlFor(source.sourceId) != null)
-              IconButton(
-                tooltip: context.l10n.signInToSource,
-                icon: const Icon(Icons.login_rounded, size: 20),
-                color: AppColors.textSecondary,
-                onPressed: () =>
-                    source_actions.openSourceWebView(source.sourceId),
-                // Default IconButtons are 48x48 for a 20px glyph. Three of
-                // them ate the width the source NAME needed once the row
-                // grew an icon tile; 36 still clears the 36dp touch floor.
-                visualDensity: VisualDensity.compact,
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints.tightFor(
-                  width: 36,
-                  height: 36,
-                ),
-              ),
-            IconButton(
-              tooltip: context.l10n.uninstall,
-              icon: const Icon(Icons.delete_outline_rounded, size: 20),
-              color: AppColors.textSecondary,
-              onPressed: () => _confirmUninstall(context),
-              // Default IconButtons are 48x48 for a 20px glyph. Three of
-              // them ate the width the source NAME needed once the row
-              // grew an icon tile; 36 still clears the 36dp touch floor.
-              visualDensity: VisualDensity.compact,
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints.tightFor(width: 36, height: 36),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );

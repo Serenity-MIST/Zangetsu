@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/di/injector.dart';
 import '../../core/mihon/mihon_extension_service.dart';
+import '../../core/mangayomi/mangayomi_cloudflare.dart';
 import '../../core/provider/cf_solve_needed.dart';
 import '../../core/provider/provider_manager.dart';
 import '../../core/repository/source_actions.dart' as source_actions;
@@ -34,7 +35,8 @@ class SourcePickerRowActions extends StatelessWidget {
         !sourceId.startsWith('ani:') &&
         !sourceId.startsWith('mihon:') &&
         !sourceId.startsWith('cs:') &&
-        !sourceId.startsWith('lnr:');
+        !sourceId.startsWith('lnr:') &&
+        !sourceId.startsWith('mg:');
 
     return FutureBuilder<bool>(
       future: source_actions.hasSourceSettings(sourceId),
@@ -56,8 +58,12 @@ class SourcePickerRowActions extends StatelessWidget {
                   child: Icon(Icons.shield_rounded, size: 18),
                 ),
                 color: _cfOrange,
-                onPressed: () =>
-                    _solveCloudflare(sourceId, solveTarget, isJs: isJs),
+                onPressed: () => _solveCloudflare(
+                  context,
+                  sourceId,
+                  solveTarget,
+                  isJs: isJs,
+                ),
               ),
             if (hasMenu)
               _overflow(
@@ -92,7 +98,7 @@ class SourcePickerRowActions extends StatelessWidget {
     itemBuilder: (_) => [
       if (showSolve)
         PopupMenuItem<VoidCallback>(
-          value: () => _solveCloudflare(id, solveTarget, isJs: isJs),
+          value: () => _solveCloudflare(context, id, solveTarget, isJs: isJs),
           child: Text(context.l10n.solveCloudflare),
         ),
       if (showSignIn)
@@ -113,6 +119,7 @@ class SourcePickerRowActions extends StatelessWidget {
   );
 
   Future<void> _solveCloudflare(
+    BuildContext context,
     String id,
     String fallbackTarget, {
     required bool isJs,
@@ -120,7 +127,9 @@ class SourcePickerRowActions extends StatelessWidget {
     final target =
         await sl<SourceRepository>().cfSolveTargetFor(id) ?? fallbackTarget;
     if (target.isEmpty) return;
-    if (isJs) {
+    if (id.startsWith('mg:')) {
+      await MangayomiCloudflare.solve(target);
+    } else if (isJs) {
       await sl<ProviderManager>().solveCloudflareForHost(
         Uri.parse(target).host,
         target,

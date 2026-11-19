@@ -34,6 +34,7 @@ class _RecordingTrackerHub extends TrackerHub {
     MediaKind kind = MediaKind.anime,
     bool novel = false,
     bool auto = true,
+    bool simklLive = false,
   }) async {
     calls++;
     this.malId = malId;
@@ -60,6 +61,39 @@ VideoSource _src({
 );
 
 void main() {
+  test('native movie display data retains the real playable row', () {
+    final data = phoneWatchPageData(
+      episodes: const [
+        Episode(id: 'film', title: 'Episode 1', number: 1, url: '/film'),
+      ],
+      showTitle: 'Film title',
+      isMovie: true,
+    );
+    final row = (data['episodes'] as List).single as Map;
+    expect(row['index'], 0);
+    expect(row['heading'], 'Film title');
+    expect(row['title'], 'Film title');
+    expect(row['subtitle'], isEmpty);
+    expect(row['number'], isNull);
+  });
+
+  test('watch actions reject stale sessions and invalid episode indices', () {
+    int? index(Map<String, dynamic>? args, {bool open = true}) =>
+        phoneWatchActionIndex(
+          args,
+          sessionId: 7,
+          episodeCount: 3,
+          playerOpen: open,
+        );
+    expect(index({'sessionId': 7, 'index': 2}), 2);
+    expect(index({'sessionId': 6, 'index': 2}), isNull);
+    expect(index({'sessionId': 7, 'index': 2}, open: false), isNull);
+    for (final value in [-1, 3, 1.5, '1', null]) {
+      expect(index({'sessionId': 7, 'index': value}), isNull);
+    }
+    expect(index(null), isNull);
+  });
+
   group('phoneMimeFor', () {
     test('an HLS container is hinted even when the url has no extension', () {
       // Tokenised urls carry no .m3u8, so without the hint ExoPlayer builds a
@@ -90,34 +124,103 @@ void main() {
   });
 
   group('phonePlayerArgs', () {
-    Map<String, dynamic> args({VideoSource? source, int positionMs = 0}) =>
-        phonePlayerArgs(
-          source: source ?? _src(),
-          positionMs: positionMs,
-          title: 'A Show',
-          episodeLabel: 'Episode 1',
-          episodeLabels: const ['Episode 1', 'Episode 2'],
-          startIndex: 0,
-          accentColor: 0xFFFF4D5E,
-          softwareDecoding: false,
-          defaultSpeed: 1.0,
-          bufferParams: const {
-            'minBufferMs': 15000,
-            'maxBufferMs': 50000,
-            'targetBufferBytes': 0,
-            'backBufferMs': 30000,
-          },
-          subtitleScale: 1.0,
-          subtitleFgColor: 0xFFFFFFFF,
-          subtitleBgColor: 0x00000000,
-          subtitleEdgeType: 1,
-          subtitleEdgeColor: 0xFF000000,
-          subtitlePreference: '',
-          autoResume: true,
-          keepScreenOn: false,
-          autoplayNext: true,
-          seekSeconds: 15,
+    Map<String, dynamic> args({
+      VideoSource? source,
+      int positionMs = 0,
+      bool megaSkip = true,
+      int megaSkipSeconds = 85,
+      bool softwareDecoding = false,
+      String? decoderMode,
+      bool nativeCacheEnabled = false,
+      int nativeCacheMb = 128,
+      bool diskCacheEnabled = false,
+      int diskCacheGb = 2,
+    }) => phonePlayerArgs(
+      source: source ?? _src(),
+      positionMs: positionMs,
+      title: 'A Show',
+      episodeLabel: 'Episode 1',
+      episodeLabels: const ['Episode 1', 'Episode 2'],
+      startIndex: 0,
+      accentColor: 0xFFFF4D5E,
+      softwareDecoding: softwareDecoding,
+      decoderMode: decoderMode,
+      nativeCacheEnabled: nativeCacheEnabled,
+      nativeCacheMb: nativeCacheMb,
+      diskCacheEnabled: diskCacheEnabled,
+      diskCacheGb: diskCacheGb,
+      defaultSpeed: 1.0,
+      bufferParams: const {
+        'minBufferMs': 15000,
+        'maxBufferMs': 50000,
+        'targetBufferBytes': 0,
+        'backBufferMs': 30000,
+      },
+      subtitleScale: 1.0,
+      subtitleFgColor: 0xFFFFFFFF,
+      subtitleBgColor: 0x00000000,
+      subtitleEdgeType: 1,
+      subtitleEdgeColor: 0xFF000000,
+      subtitlePreference: '',
+      autoResume: true,
+      keepScreenOn: false,
+      autoplayNext: true,
+      seekSeconds: 15,
+      megaSkip: megaSkip,
+      megaSkipSeconds: megaSkipSeconds,
+    );
+
+    test(
+      'MegaSkip preserves its toggle and amount separately from double-tap seeking',
+      () {
+        expect(args()['megaSkip'], isTrue);
+        expect(args()['megaSkipSeconds'], 85);
+        final custom = args(megaSkip: false, megaSkipSeconds: 30);
+        expect(custom['megaSkip'], isFalse);
+        expect(custom['megaSkipSeconds'], 30);
+        expect(custom['seekSeconds'], 15);
+        expect(args(megaSkipSeconds: 1)['megaSkipSeconds'], 5);
+        expect(args(megaSkipSeconds: 999)['megaSkipSeconds'], 180);
+      },
+    );
+
+    test(
+      'native launch carries automatic decoder compatibility by default',
+      () {
+        expect(args()['decoderMode'], 'auto');
+      },
+    );
+
+    test(
+      'native launch preserves decoder choices and legacy software flag',
+      () {
+        for (final mode in ['auto', 'copy', 'direct', 'sw']) {
+          expect(args(decoderMode: mode)['decoderMode'], mode);
+        }
+        expect(args(softwareDecoding: true)['decoderMode'], 'sw');
+        final explicit = args(softwareDecoding: true, decoderMode: 'direct');
+        expect(explicit['decoderMode'], 'direct');
+        expect(explicit['softwareDecoding'], isTrue);
+      },
+    );
+
+    test(
+      'extra native caches are opt-in and transmitted with bounded amounts',
+      () {
+        expect(args()['nativeCacheEnabled'], isFalse);
+        expect(args()['diskCacheEnabled'], isFalse);
+        final configured = args(
+          nativeCacheEnabled: true,
+          nativeCacheMb: 99999,
+          diskCacheEnabled: true,
+          diskCacheGb: -5,
         );
+        expect(configured['nativeCacheEnabled'], isTrue);
+        expect(configured['nativeCacheMb'], 512);
+        expect(configured['diskCacheEnabled'], isTrue);
+        expect(configured['diskCacheGb'], 1);
+      },
+    );
 
     test('carries the stream, the resume position and the episode list', () {
       final a = args(positionMs: 90000);
@@ -159,6 +262,36 @@ void main() {
       expect(a['backBufferMs'], 30000);
     });
 
+    test('carries the orientation and watch-page metadata', () {
+      final a = phonePlayerArgs(
+        title: 'A Show',
+        episodeLabel: 'Episode 1',
+        episodeLabels: const ['Episode 1', 'Episode 2'],
+        startIndex: 0,
+        accentColor: 0xFFFF4D5E,
+        softwareDecoding: false,
+        defaultSpeed: 1.0,
+        bufferParams: const {},
+        subtitleScale: 1.0,
+        subtitleFgColor: 0xFFFFFFFF,
+        subtitleBgColor: 0x00000000,
+        subtitleEdgeType: 1,
+        subtitleEdgeColor: 0xFF000000,
+        subtitlePreference: '',
+        autoResume: true,
+        keepScreenOn: true,
+        autoplayNext: true,
+        seekSeconds: 10,
+        playerOrientation: 'system',
+        showDescription: 'The show saga.',
+        availableCategories: const ['sub', 'dub'],
+        source: _src(),
+      );
+      expect(a['playerOrientation'], 'system');
+      expect(a['showDescription'], 'The show saga.');
+      expect(a['availableCategories'], ['sub', 'dub']);
+    });
+
     test('carries phone playback settings and subtitle metadata', () {
       final a = args(
         source: _src(
@@ -186,6 +319,28 @@ void main() {
   });
 
   group('phoneSourceMap', () {
+    test(
+      'native subtitle labels include the addon without changing language',
+      () {
+        final map = phoneSourceMap(
+          _src(
+            subtitles: const [
+              Subtitle(
+                url: 'https://subs/en.srt',
+                lang: 'eng',
+                label: 'English',
+                providerName: 'Subtitle Addon',
+              ),
+            ],
+          ),
+          0,
+        );
+        expect(map['subLabels'], ['English · Subtitle Addon']);
+        expect(map['subLangs'], ['eng']);
+        expect(map['subUrls'], ['https://subs/en.srt']);
+      },
+    );
+
     test('carries source and subtitle metadata for the native picker', () {
       final map = phoneSourceMap(
         _src(
@@ -334,6 +489,38 @@ void main() {
     });
   });
 
+  group('phoneShouldScrobbleOnFirstFrame', () {
+    test('only scrobbles the active non-peek start episode once', () {
+      expect(
+        phoneShouldScrobbleOnFirstFrame(
+          playerOpen: true,
+          alreadyScrobbled: false,
+          peek: false,
+          episodeIndex: 2,
+          startIndex: 2,
+        ),
+        isTrue,
+      );
+      for (final values in <({bool open, bool done, bool peek, int index})>[
+        (open: false, done: false, peek: false, index: 2),
+        (open: true, done: true, peek: false, index: 2),
+        (open: true, done: false, peek: true, index: 2),
+        (open: true, done: false, peek: false, index: 3),
+      ]) {
+        expect(
+          phoneShouldScrobbleOnFirstFrame(
+            playerOpen: values.open,
+            alreadyScrobbled: values.done,
+            peek: values.peek,
+            episodeIndex: values.index,
+            startIndex: 2,
+          ),
+          isFalse,
+        );
+      }
+    });
+  });
+
   test('returns normally without a registered TrackerHub', () async {
     const episode = Episode(
       id: 'e1',
@@ -384,31 +571,34 @@ void main() {
   // ordering/dedupe assertion lands here. The method delegates with no extra
   // logic besides the guard and a no-change emit skip.
   group('mergeArrivedStreams', () {
-    test('late stream arrivals merge by position without interrupting playback', () {
-      // Open on streams [A]; deliver cumulative arrival [B, A, C] for the same
-      // episode; expect quality list [B, A, C] and playing stream still A.
-      final a = VideoSource(
-        url: 'https://cdn.test/a.mp4',
-        container: SourceContainer.mp4,
-        quality: '720p',
-      );
-      final b = VideoSource(
-        url: 'https://cdn.test/b.mp4',
-        container: SourceContainer.mp4,
-        quality: '1080p',
-      );
-      final c = VideoSource(
-        url: 'https://cdn.test/c.mp4',
-        container: SourceContainer.mp4,
-        quality: '480p',
-      );
-      final merged = mergeArrivedSourceLists([a], [b, a, c]);
-      expect(merged.map((s) => s.url), [b.url, a.url, c.url]);
-      // The open entry keeps its identity, so the Sources sheet's playing tick
-      // (value equality against `state.active`, which the method never touches)
-      // survives the merge.
-      expect(identical(merged[1], a), isTrue);
-    });
+    test(
+      'late stream arrivals merge by position without interrupting playback',
+      () {
+        // Open on streams [A]; deliver cumulative arrival [B, A, C] for the same
+        // episode; expect quality list [B, A, C] and playing stream still A.
+        final a = VideoSource(
+          url: 'https://cdn.test/a.mp4',
+          container: SourceContainer.mp4,
+          quality: '720p',
+        );
+        final b = VideoSource(
+          url: 'https://cdn.test/b.mp4',
+          container: SourceContainer.mp4,
+          quality: '1080p',
+        );
+        final c = VideoSource(
+          url: 'https://cdn.test/c.mp4',
+          container: SourceContainer.mp4,
+          quality: '480p',
+        );
+        final merged = mergeArrivedSourceLists([a], [b, a, c]);
+        expect(merged.map((s) => s.url), [b.url, a.url, c.url]);
+        // The open entry keeps its identity, so the Sources sheet's playing tick
+        // (value equality against `state.active`, which the method never touches)
+        // survives the merge.
+        expect(identical(merged[1], a), isTrue);
+      },
+    );
 
     test('duplicate arrival URLs collapse to their first occurrence', () {
       final a = VideoSource(
@@ -440,66 +630,85 @@ void main() {
       expect(merged.map((s) => s.url), [b.url, a.url]);
     });
 
-    test('nothing new arrives yields the same URL order (method skips emit)', () {
-      final a = VideoSource(
-        url: 'https://cdn.test/a.mp4',
-        container: SourceContainer.mp4,
-        quality: '720p',
-      );
-      final merged = mergeArrivedSourceLists([a], [a]);
-      expect(merged.map((s) => s.url), [a.url]);
-      expect(identical(merged[0], a), isTrue);
-    });
-  });
-
-  group('mergeArrivedSourceLists keeps every option the full resolve showed', () {
-    VideoSource mk(
-      String url, {
-      String? quality,
-      List<Subtitle> subs = const [],
-    }) =>
-        VideoSource(
-          url: url,
-          quality: quality,
+    test(
+      'nothing new arrives yields the same URL order (method skips emit)',
+      () {
+        final a = VideoSource(
+          url: 'https://cdn.test/a.mp4',
           container: SourceContainer.mp4,
-          headers: null,
-          kind: AudioKind.sub,
-          audioLang: 'sub',
-          subtitles: subs,
+          quality: '720p',
         );
-
-    test('same URL, DIFFERENT quality - both survive', () {
-      // The gap: url-keyed dedup dropped the 720p entry, so a quality the full
-      // resolve would have shown simply disappeared.
-      final out = mergeArrivedSourceLists(const [], [
-        mk('https://x/a', quality: '1080p'),
-        mk('https://x/a', quality: '720p'),
-      ]);
-      expect(out.map((e) => e.quality).toList(), ['1080p', '720p']);
-    });
-
-    test('same URL, different subtitles - both survive', () {
-      final out = mergeArrivedSourceLists(const [], [
-        mk('https://x/a',
-            subs: [const Subtitle(lang: 'en', label: '', url: 'u1')]),
-        mk('https://x/a',
-            subs: [const Subtitle(lang: 'hi', label: '', url: 'u2')]),
-      ]);
-      expect(out.length, 2, reason: 'a different subtitle track is a different option');
-    });
-
-    test('a TRUE duplicate still collapses', () {
-      final out = mergeArrivedSourceLists(const [], [
-        mk('https://x/a', quality: '1080p'),
-        mk('https://x/a', quality: '1080p'),
-      ]);
-      expect(out.length, 1, reason: 'the same option twice is one option');
-    });
-
-    test('the already-playing entry is the SAME object, so the tick survives', () {
-      final open = mk('https://x/a', quality: '1080p');
-      final out = mergeArrivedSourceLists([open], [mk('https://x/a', quality: '1080p')]);
-      expect(identical(out.first, open), isTrue);
-    });
+        final merged = mergeArrivedSourceLists([a], [a]);
+        expect(merged.map((s) => s.url), [a.url]);
+        expect(identical(merged[0], a), isTrue);
+      },
+    );
   });
+
+  group(
+    'mergeArrivedSourceLists keeps every option the full resolve showed',
+    () {
+      VideoSource mk(
+        String url, {
+        String? quality,
+        List<Subtitle> subs = const [],
+      }) => VideoSource(
+        url: url,
+        quality: quality,
+        container: SourceContainer.mp4,
+        headers: null,
+        kind: AudioKind.sub,
+        audioLang: 'sub',
+        subtitles: subs,
+      );
+
+      test('same URL, DIFFERENT quality - both survive', () {
+        // The gap: url-keyed dedup dropped the 720p entry, so a quality the full
+        // resolve would have shown simply disappeared.
+        final out = mergeArrivedSourceLists(const [], [
+          mk('https://x/a', quality: '1080p'),
+          mk('https://x/a', quality: '720p'),
+        ]);
+        expect(out.map((e) => e.quality).toList(), ['1080p', '720p']);
+      });
+
+      test('same URL, different subtitles - both survive', () {
+        final out = mergeArrivedSourceLists(const [], [
+          mk(
+            'https://x/a',
+            subs: [const Subtitle(lang: 'en', label: '', url: 'u1')],
+          ),
+          mk(
+            'https://x/a',
+            subs: [const Subtitle(lang: 'hi', label: '', url: 'u2')],
+          ),
+        ]);
+        expect(
+          out.length,
+          2,
+          reason: 'a different subtitle track is a different option',
+        );
+      });
+
+      test('a TRUE duplicate still collapses', () {
+        final out = mergeArrivedSourceLists(const [], [
+          mk('https://x/a', quality: '1080p'),
+          mk('https://x/a', quality: '1080p'),
+        ]);
+        expect(out.length, 1, reason: 'the same option twice is one option');
+      });
+
+      test(
+        'the already-playing entry is the SAME object, so the tick survives',
+        () {
+          final open = mk('https://x/a', quality: '1080p');
+          final out = mergeArrivedSourceLists(
+            [open],
+            [mk('https://x/a', quality: '1080p')],
+          );
+          expect(identical(out.first, open), isTrue);
+        },
+      );
+    },
+  );
 }

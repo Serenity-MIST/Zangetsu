@@ -22,15 +22,41 @@ mixin ReaderComfortMixin<T extends StatefulWidget> on State<T> {
   bool? _previousWindowFullscreen;
   Future<void> _windowChanges = Future.value();
 
+  /// Set (synchronously) as soon as the reader queues any change to the
+  /// window's full screen state, so dispose knows to restore it even when
+  /// the queued native call has not answered yet.
+  bool _touchedWindow = false;
+
+  /// The "Reader fullscreen" value last applied on Windows (null before the
+  /// first apply), so re-applying comfort only touches the window when that
+  /// setting actually changed.
+  bool? _appliedFullscreenPref;
+
   /// Serializes changes and disposal so a late native reply cannot fullscreen
   /// the library after the reader has already closed.
   void _applyWindowFullscreen(bool? enabled) {
+    if (enabled != null) _touchedWindow = true;
     _windowChanges = _windowChanges
         .then((_) async {
           _previousWindowFullscreen ??= await DesktopWindow.isFullscreen();
           await DesktopWindow.setFullscreen(
             enabled ?? _previousWindowFullscreen!,
           );
+        })
+        .catchError((Object _) {});
+  }
+
+  /// Windows (reader-4): F / F11 in the reader flips full screen for this
+  /// session. Queued behind any pending change, and the window's state from
+  /// before the reader opened is remembered so closing the reader puts it
+  /// back however often it was toggled.
+  void toggleReaderFullscreen() {
+    _touchedWindow = true;
+    _windowChanges = _windowChanges
+        .then((_) async {
+          final now = await DesktopWindow.isFullscreen();
+          _previousWindowFullscreen ??= now;
+          await DesktopWindow.setFullscreen(!now);
         })
         .catchError((Object _) {});
   }
@@ -53,7 +79,19 @@ mixin ReaderComfortMixin<T extends StatefulWidget> on State<T> {
     // Desktop brightness belongs to Windows/the monitor; stored phone comfort
     // preferences must not dim a PC or call unsupported mobile plugin methods.
     if (Platform.isWindows) {
-      _applyWindowFullscreen(prefs.fullscreen);
+      // Only act when the setting itself changed (or on first apply): this
+      // also runs when an unrelated comfort pref changes, and must not undo
+      // a full screen the user just toggled with F / F11.
+      if (_appliedFullscreenPref == prefs.fullscreen) return;
+      _appliedFullscreenPref = prefs.fullscreen;
+      // On: go full screen. Off: leave the window as the user had it, unless
+      // the reader itself changed it this session (the setting was switched
+      // off mid-read), in which case put the earlier state back.
+      if (prefs.fullscreen) {
+        _applyWindowFullscreen(true);
+      } else if (_touchedWindow) {
+        _applyWindowFullscreen(null);
+      }
       return;
     }
     final brightness = prefs.brightness;
@@ -82,7 +120,8 @@ mixin ReaderComfortMixin<T extends StatefulWidget> on State<T> {
   void restoreReaderComfort() {
     WakelockPlus.disable().ignore();
     if (Platform.isWindows) {
-      _applyWindowFullscreen(null);
+      // Nothing to undo when the reader never touched the window.
+      if (_touchedWindow) _applyWindowFullscreen(null);
       return;
     }
     ScreenBrightness.instance.resetApplicationScreenBrightness().catchError(

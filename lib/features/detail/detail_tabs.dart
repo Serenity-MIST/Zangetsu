@@ -135,7 +135,7 @@ class _CastTab extends StatelessWidget {
       physics: nested ? const NeverScrollableScrollPhysics() : null,
       padding: padding,
       // Cap faces by the actual detail-pane width, not three phone columns.
-      gridDelegate: Platform.isWindows
+      gridDelegate: _windowsDesktopUi
           ? const SliverGridDelegateWithMaxCrossAxisExtent(
               maxCrossAxisExtent: 160,
               mainAxisSpacing: 16,
@@ -432,6 +432,7 @@ class _DetailsTab extends StatelessWidget {
     this.detail,
     required this.description,
     this.reading = false,
+    this.isMovie = false,
   });
 
   final String sourceName;
@@ -448,6 +449,7 @@ class _DetailsTab extends StatelessWidget {
 
   /// Manga/novel: the count row reads "Chapters". Display wording only.
   final bool reading;
+  final bool isMovie;
 
   @override
   Widget build(BuildContext context) {
@@ -461,10 +463,11 @@ class _DetailsTab extends StatelessWidget {
           _DetailRow(label: context.l10n.status, value: statusStr),
         if ((year ?? '').isNotEmpty)
           _DetailRow(label: context.l10n.year, value: year!),
-        _DetailRow(
-          label: reading ? context.l10n.chapters : context.l10n.episodes,
-          value: '$episodeCount',
-        ),
+        if (!isMovie)
+          _DetailRow(
+            label: reading ? context.l10n.chapters : context.l10n.episodes,
+            value: '$episodeCount',
+          ),
         if (studios.isNotEmpty)
           _DetailRow(label: context.l10n.studio, value: studios.join(', ')),
         ..._providerRows(context),
@@ -510,7 +513,12 @@ class _DetailsTab extends StatelessWidget {
             style: AppText.caption.copyWith(color: AppColors.textTertiary),
           ),
           const SizedBox(height: 8),
-          Text(desc, style: AppText.body),
+          // Windows (show-11): the full synopsis can be selected and copied
+          // with the mouse / Ctrl+C. Phones keep the plain text.
+          if (_windowsDesktopUi)
+            SelectionArea(child: Text(desc, style: AppText.body))
+          else
+            Text(desc, style: AppText.body),
         ],
       ],
     );

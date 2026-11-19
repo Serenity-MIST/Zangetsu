@@ -1,12 +1,24 @@
 import 'dart:async';
 
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:intl/intl.dart';
 
 import '../../core/app_mode.dart';
+import '../../core/desktop/desktop_chrome_colors.dart';
+import '../../core/desktop/desktop_context_menu.dart';
+import '../../core/desktop/desktop_shortcuts.dart';
 import '../../core/di/injector.dart';
+import '../../core/playback/list_status_store.dart';
 import '../../core/playback/my_list.dart';
+import '../../core/theme/theme_controller.dart';
+import '../../core/ui/list_status_sheet.dart';
+import '../home/lists_hub_screen.dart' show hubUpdatedLabel;
+import 'schedule_offline_cache.dart';
 import '../../core/schedule/airing_service.dart';
 import '../../core/schedule/coming_soon_service.dart';
 import '../../core/schedule/schedule_models.dart';
@@ -23,6 +35,10 @@ import 'schedule_cubit.dart';
 import 'schedule_screen_tv.dart';
 import '../../l10n/l10n.dart';
 
+// The Windows desktop week view lives in its own file but shares this
+// file's private helpers (countdown, time formatting, day headers).
+part 'schedule_desktop_view.dart';
+
 /// The Schedule tab: a monthly/weekly anime airing calendar + upcoming
 /// movies/TV. Self-contained (creates its own ScheduleCubit) so it can sit
 /// directly in the shell page list.
@@ -31,15 +47,28 @@ class ScheduleScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tv = sl<AppMode>().isTv;
+    // Windows (not TV) gets the desktop week view plus its data extras: a
+    // saved offline copy (track-5 B), tracker lists re-read on refresh
+    // (track-11 A) and after in-app status edits (track-11 B). Phone and TV
+    // build the cubit exactly as before.
+    final windows = !tv && defaultTargetPlatform == TargetPlatform.windows;
     return BlocProvider(
       create: (_) => ScheduleCubit(
         sl<AiringService>(),
         sl<ComingSoonService>(),
         sl<MyListStore>(),
         trackerHub: sl.isRegistered<TrackerHub>() ? sl<TrackerHub>() : null,
+        offlineCache: windows ? HiveScheduleOfflineCache() : null,
+        trackerListChanges: windows && sl.isRegistered<ListStatusStore>()
+            ? sl<ListStatusStore>().revision
+            : null,
+        reloadTrackersOnRefresh: windows,
       )..load(),
-      child: sl<AppMode>().isTv
+      child: tv
           ? const ScheduleScreenTv()
+          : windows
+          ? const ScheduleDesktopView()
           : const ScheduleBody(),
     );
   }
@@ -75,26 +104,43 @@ void openCanonical(
     openTitle(context, title);
     return;
   }
-  final c = ZCanonical(kind, id);
   Navigator.of(context).push(
     DetailScreen.route(
-      MediaItem(
-        id: c.id,
+      scheduleCanonicalItem(
+        kind: kind,
+        id: id,
         title: title,
-        url: ZmodeIds.showUrl(c),
-        // Matches what TmdbCatalogue/AniListCatalogue stamp on their own
-        // items, so a row opened from here is the same shape as one opened
-        // from Home rather than a lookalike.
-        type: switch (kind) {
-          ZKind.manga => ProviderType.manga,
-          ZKind.novel => ProviderType.novel,
-          ZKind.movie || ZKind.tv => ProviderType.movie,
-          ZKind.anime => ProviderType.anime,
-        },
-        sourceId: ZmodeIds.sourceId,
-        cover: coverUrl,
+        coverUrl: coverUrl,
       ),
     ),
+  );
+}
+
+/// The [MediaItem] a schedule row stands for (a `zm://` canonical title).
+/// Shared by [openCanonical] and the Windows row menu's My List action, so
+/// both act on the very same item.
+MediaItem scheduleCanonicalItem({
+  required ZKind kind,
+  required String id,
+  required String title,
+  String? coverUrl,
+}) {
+  final c = ZCanonical(kind, id);
+  return MediaItem(
+    id: c.id,
+    title: title,
+    url: ZmodeIds.showUrl(c),
+    // Matches what TmdbCatalogue/AniListCatalogue stamp on their own
+    // items, so a row opened from here is the same shape as one opened
+    // from Home rather than a lookalike.
+    type: switch (kind) {
+      ZKind.manga => ProviderType.manga,
+      ZKind.novel => ProviderType.novel,
+      ZKind.movie || ZKind.tv => ProviderType.movie,
+      ZKind.anime => ProviderType.anime,
+    },
+    sourceId: ZmodeIds.sourceId,
+    cover: coverUrl,
   );
 }
 
@@ -261,17 +307,26 @@ class _ScheduleBodyState extends State<ScheduleBody>
     );
   }
 
-  // ── header: title + My List toggle ──
-  // Refresh lives in the pull-to-refresh gesture; no header button needed.
+  // Pushed from the lists hub and from Search on phone (no back affordance
+  // before — the header was title-only); a no-op arrow on the TV rail tab
+  // would be dead, so it only shows when there is something to pop.
   Widget _header(
     BuildContext context,
     ScheduleState state,
     ScheduleCubit cubit,
   ) {
+    final canPop = Navigator.of(context).canPop();
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 10, 12, 6),
+      padding: EdgeInsets.fromLTRB(canPop ? 4 : 16, 10, 12, 6),
       child: Row(
         children: [
+          if (canPop)
+            IconButton(
+              tooltip: MaterialLocalizations.of(context).backButtonTooltip,
+              onPressed: () => Navigator.of(context).maybePop(),
+              icon: const Icon(Icons.arrow_back_rounded),
+              color: AppColors.textPrimary,
+            ),
           Expanded(
             child: Text(context.l10n.schedule, style: AppText.largeTitle),
           ),

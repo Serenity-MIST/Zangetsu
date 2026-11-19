@@ -1,7 +1,6 @@
 // Loading skeleton and its shimmer gradient.
 part of 'detail_screen.dart';
 
-
 /// Shimmering placeholder shown while the detail loads — mirrors the real
 /// layout (backdrop, title/meta, Play/Download, synopsis, credits) so the
 /// screen eases in instead of popping from a blank spinner to a full page.
@@ -10,7 +9,11 @@ part of 'detail_screen.dart';
 /// skeleton here so they all read as the same material.
 Widget _bone(double w, double h, [double r = 8]) => ClipRRect(
   borderRadius: BorderRadius.circular(r),
-  child: SizedBox(width: w, height: h, child: ColoredBox(color: AppColors.surface2)),
+  child: SizedBox(
+    width: w,
+    height: h,
+    child: ColoredBox(color: AppColors.surface2),
+  ),
 );
 
 /// Sweeps the shimmer sheen across whatever flat shapes it wraps. Owns the
@@ -28,6 +31,7 @@ class _Shimmer extends StatefulWidget {
 class _ShimmerState extends State<_Shimmer>
     with SingleTickerProviderStateMixin {
   late final AnimationController _ctrl;
+  Animation<double>? _routeAnim;
 
   @override
   void initState() {
@@ -37,11 +41,35 @@ class _ShimmerState extends State<_Shimmer>
     _ctrl = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1250),
-    )..repeat();
+    );
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final routeAnim = ModalRoute.of(context)?.animation;
+    if (identical(routeAnim, _routeAnim)) return;
+    _routeAnim?.removeStatusListener(_syncToRoute);
+    _routeAnim = routeAnim;
+    _routeAnim?.addStatusListener(_syncToRoute);
+    _syncToRoute(_routeAnim?.status ?? AnimationStatus.completed);
+  }
+
+  /// Only sweep the sheen while the page is settled. The [ShaderMask] repaints
+  /// the whole skeleton, so letting it run underneath the detail route's
+  /// slide transition stacked two full-screen operations and dropped frames
+  /// on low-end phones — the same collision the slide-only route fixed.
+  void _syncToRoute(AnimationStatus status) {
+    if (status == AnimationStatus.completed) {
+      if (!_ctrl.isAnimating) _ctrl.repeat();
+    } else {
+      _ctrl.stop();
+    }
   }
 
   @override
   void dispose() {
+    _routeAnim?.removeStatusListener(_syncToRoute);
     _ctrl.dispose();
     super.dispose();
   }
@@ -129,6 +157,103 @@ class _DetailSkeleton extends StatelessWidget {
     );
 
     return _Shimmer(child: shapes);
+  }
+}
+
+/// Lightweight first frame: artwork and title are known from the tapped row,
+/// so the screen feels immediate while the complete detail tree waits for the
+/// spring transition to settle.
+class _DetailOpeningPreview extends StatelessWidget {
+  const _DetailOpeningPreview({required this.item, required this.heroHeight});
+
+  final MediaItem item;
+  final double heroHeight;
+
+  @override
+  Widget build(BuildContext context) {
+    final coverUrl =
+        mobileHeroArt(
+          item.cover,
+          item.banner ?? item.landscapePoster,
+          sourceId: item.sourceId,
+        ) ??
+        '';
+    final topInset = MediaQuery.paddingOf(context).top;
+    final titleStyle = AppText.largeTitle.copyWith(fontSize: 28);
+
+    return Scaffold(
+      backgroundColor: AppColors.bg,
+      body: Stack(
+        children: [
+          CustomScrollView(
+            physics: const NeverScrollableScrollPhysics(),
+            slivers: [
+              SliverToBoxAdapter(
+                child: SizedBox(
+                  // Exactly the real hero height: SliverAppBar's expandedHeight
+                  // already includes the status-bar area, so adding topInset
+                  // here made the preview taller and the swap visibly jumped.
+                  height: heroHeight,
+                  child: RepaintBoundary(
+                    child: _Hero(
+                      coverUrl: coverUrl,
+                      coverHeaders: item.coverHeaders,
+                      hasCover: coverUrl.isNotEmpty,
+                    ),
+                  ),
+                ),
+              ),
+              SliverToBoxAdapter(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 24),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        item.title,
+                        style: titleStyle,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      if ((item.quality?.trim().isNotEmpty ?? false) ||
+                          item.isAdult) ...[
+                        const SizedBox(height: 8),
+                        Wrap(
+                          spacing: 8,
+                          children: [
+                            if (item.quality?.trim().isNotEmpty ?? false)
+                              _MetaBadge(item.quality!.trim().toUpperCase()),
+                            if (item.isAdult) const _MetaBadge('18+'),
+                          ],
+                        ),
+                      ],
+                      const SizedBox(height: 18),
+                      _bone(double.infinity, 48, 14),
+                      const SizedBox(height: 12),
+                      _bone(double.infinity, 48, 14),
+                      const SizedBox(height: 22),
+                      _bone(double.infinity, 12),
+                      const SizedBox(height: 9),
+                      _bone(double.infinity, 12),
+                      const SizedBox(height: 9),
+                      _bone(180, 12),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+          Positioned(
+            // Same widget and spot as the SliverAppBar's automatic leading
+            // (56-wide leading box, icon centred): a different style or a few
+            // pixels off reads as a pop on the preview → body swap.
+            top: topInset + 4,
+            left: 14,
+            child: const _DetailBackButton(),
+          ),
+        ],
+      ),
+    );
   }
 }
 

@@ -1,4 +1,5 @@
 import 'package:dio/dio.dart';
+import 'package:hive_flutter/hive_flutter.dart';
 
 /// One opening/ending interval to skip.
 class SkipInterval {
@@ -10,6 +11,28 @@ class SkipInterval {
   final Duration start;
   final Duration end;
   final String type; // 'op' (opening) | 'ed' (ending) | 'recap'
+
+  /// Stored form, used by the offline cache and download metadata files.
+  Map<String, Object?> toJson() => {
+    'start_ms': start.inMilliseconds,
+    'end_ms': end.inMilliseconds,
+    'type': type,
+  };
+
+  /// Parses [toJson]'s output; null for anything malformed (files from other
+  /// PCs or older versions are data to validate, never trusted).
+  static SkipInterval? fromJson(Object? raw) {
+    if (raw is! Map) return null;
+    final start = raw['start_ms'], end = raw['end_ms'], type = raw['type'];
+    if (start is! num || end is! num || type is! String || end <= start) {
+      return null;
+    }
+    return SkipInterval(
+      start: Duration(milliseconds: start.toInt()),
+      end: Duration(milliseconds: end.toInt()),
+      type: type,
+    );
+  }
 }
 
 /// Whether [type] names an ending. AniSkip also returns `mixed-ed`, and
@@ -102,20 +125,83 @@ class SkipService {
         final media = (data['data'] as Map?)?['Media'];
         if (media is Map) mal = (media['idMal'] as num?)?.toInt();
       }
-    } catch (_) {}
+    } catch (_) {
+      // Offline or an outage: don't remember "no id", or the title would stay
+      // unmatched for the rest of the session once the connection returns.
+      return null;
+    }
     _malCache[title] = mal;
     return mal;
   }
 
-  /// OP/ED/recap intervals for [episode] of the anime named [title]. [duration] is the
-  /// episode length (improves accuracy; 0 is tolerated). Empty when not anime
-  /// or not in the AniSkip DB.
+  /// Hive box remembering every skip-time answer, so intros and outros can
+  /// still be skipped offline (downloads, or a dropped connection).
+  static const String boxName = 'skip_times';
+
+  /// Opens [boxName]. Call once during bootstrap; without it the service
+  /// simply works online-only.
+  static Future<void> init() async {
+    if (!Hive.isBoxOpen(boxName)) await Hive.openBox<List>(boxName);
+  }
+
+  static String _cacheKey(String title, int episode) =>
+      '${title.trim().toLowerCase()}|$episode';
+
+  /// Skip times saved on this PC for [title] episode [episode], if any.
+  List<SkipInterval> savedSkipTimes(String title, int episode) {
+    if (!Hive.isBoxOpen(boxName)) return const [];
+    final raw = Hive.box<List>(boxName).get(_cacheKey(title, episode));
+    return [for (final r in raw ?? const []) ?SkipInterval.fromJson(r)];
+  }
+
+  /// Saves [intervals] for offline use (e.g. read from a download's metadata
+  /// file on another PC). Empty lists never overwrite saved times.
+  Future<void> rememberSkipTimes(
+    String title,
+    int episode,
+    List<SkipInterval> intervals,
+  ) async {
+    if (intervals.isEmpty || !Hive.isBoxOpen(boxName)) return;
+    await Hive.box<List>(boxName).put(
+      _cacheKey(title, episode),
+      [for (final iv in intervals) iv.toJson()],
+    );
+  }
+
+  /// Online lookup first; when that yields nothing (offline, outage, no
+  /// match) the times saved on this PC are used instead. A successful lookup
+  /// is saved for next time.
   Future<List<SkipInterval>> skipTimes({
     required String title,
     required int episode,
     required Duration duration,
   }) async {
-    final mal = await _malId(title);
+    final online = await _onlineSkipTimes(
+      title: title,
+      episode: episode,
+      duration: duration,
+    );
+    if (online.isNotEmpty) {
+      await rememberSkipTimes(title, episode, online);
+      return online;
+    }
+    return savedSkipTimes(title, episode);
+  }
+
+  /// OP/ED/recap intervals for [episode] of the anime named [title]. [duration] is the
+  /// episode length (improves accuracy; 0 is tolerated). Empty when not anime
+  /// or not in the AniSkip DB.
+  Future<List<SkipInterval>> _onlineSkipTimes({
+    required String title,
+    required int episode,
+    required Duration duration,
+  }) async {
+    final int? mal;
+    try {
+      mal = await _malId(title);
+    } catch (_) {
+      return const [];
+    }
     if (mal == null) return const [];
     try {
       final res = await _dio.getUri<dynamic>(

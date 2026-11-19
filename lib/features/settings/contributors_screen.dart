@@ -23,7 +23,7 @@ class _ContributorsScreenState extends State<ContributorsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar(context.l10n.contributors),
       body: ListView(
         padding: const EdgeInsets.only(top: 4, bottom: 28),

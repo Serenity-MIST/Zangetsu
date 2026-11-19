@@ -71,49 +71,50 @@ class _ZPhoneViewState extends State<_ZPhoneView> {
   }
 
   /// Desktop toolbar keeps navigation and repository creation in normal flow.
-  /// A narrow workspace stacks actions instead of hiding them under a FAB.
-  Widget _desktopToolbar(BuildContext context) => Padding(
-    padding: const EdgeInsets.fromLTRB(22, 12, 22, 0),
-    child: LayoutBuilder(
-      builder: (context, constraints) {
-        final tabs = SizedBox(
-          width: 300,
-          child: TabBar(
-            isScrollable: true,
-            tabAlignment: TabAlignment.start,
-            tabs: [
-              Tab(text: context.l10n.installed),
-              Tab(text: context.l10n.repositories),
-            ],
-          ),
-        );
-        final add = FilledButton.icon(
-          key: const ValueKey('desktop-add-zangetsu-repo'),
-          onPressed: () => _showAddRepoDialog(context),
-          icon: const Icon(Icons.add, size: 18),
-          label: Text(context.l10n.addZangetsuRepo),
-        );
-        return Align(
-          alignment: Alignment.centerLeft,
-          child: Wrap(
-            spacing: 20,
-            runSpacing: 12,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              SizedBox(
-                width: constraints.maxWidth < 300 ? constraints.maxWidth : 300,
-                child: tabs,
-              ),
-              add,
-            ],
-          ),
-        );
-      },
-    ),
+  /// The shared provider toolbar (graphite segmented switch, square icon
+  /// buttons, secondary Add button), so Zangetsu looks like every other
+  /// ecosystem; the screen lays its own search field out below it.
+  Widget _desktopToolbar(BuildContext context) => DesktopSourcesToolbar(
+    tabs: [context.l10n.installed, context.l10n.repositories],
+    actions: [
+      // Builder: reaches the F5 keys scope the same way the other screens do.
+      Builder(
+        builder: (inner) => IconButton(
+          tooltip: inner.l10n.refreshRepositoriesF5,
+          icon: const Icon(Icons.refresh_rounded),
+          onPressed: () => DesktopSourcesKeys.maybeOf(inner)?.refresh(),
+        ),
+      ),
+    ],
+    addLabel: context.l10n.addZangetsuRepo,
+    addKey: const ValueKey('desktop-add-zangetsu-repo'),
+    onAdd: () => _showAddRepoDialog(context),
   );
+
+  /// F5 on Windows (src-13 A): re-fetch every repository.
+  void _refreshAllRepos(BuildContext context) {
+    final bloc = context.read<SourcesBloc>();
+    for (final repo in bloc.state.repos) {
+      bloc.add(RepoRefreshed(repo.url));
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
+    // Windows: the desktop settings look whatever opened the screen
+    // (src-3 A), plus Ctrl+F / Esc / F5 (src-13 A).
+    if (desktopPanelsEnabled) {
+      return DesktopProviderScope(
+        child: DesktopSourcesKeys(
+          onRefresh: () => _refreshAllRepos(context),
+          child: Builder(builder: _build),
+        ),
+      );
+    }
+    return _build(context);
+  }
+
+  Widget _build(BuildContext context) {
     final readingOnly = widget.scopeToReading && !_showAll;
     final desktop = DesktopSettingsScope.contains(context);
     return BlocListener<SourcesBloc, SourcesState>(
@@ -543,6 +544,18 @@ class _ZInstalledRow extends StatelessWidget {
     bloc.add(SourceUninstalled(_key, displayName: name));
   }
 
+  /// Opens this source's settings page (desktop button and menu).
+  void _openSettings(BuildContext context, String name) =>
+      Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => SourceSettingsScreen(
+            sourceId: entry.name,
+            repoUrl: entry.originRepoUrl,
+            displayName: name,
+          ),
+        ),
+      );
+
   /// Desktop actions wrap below long source labels instead of squeezing
   /// the title between a touch switch and several unlabeled icon buttons.
   Widget _desktopRow(
@@ -641,7 +654,32 @@ class _ZInstalledRow extends StatelessWidget {
     final saved = entry.logoUrl;
     final logo = state.manifestLogos[_key] ?? (saved.isEmpty ? null : saved);
     if (DesktopSettingsScope.contains(context)) {
-      return _desktopRow(context, name, meta, logo, hasUpdate, newVersion);
+      // Hover highlight + right-click with the row's actions (src-13 B).
+      return DesktopSourceRow(
+        tooltip: '$name · $meta',
+        items: () => desktopSourceMenuItems(
+          context,
+          onUpdate: hasUpdate
+              ? () => context.read<SourcesBloc>().add(SourceUpdated(_key))
+              : null,
+          updateLabel: hasUpdate ? 'Update to v$newVersion' : null,
+          onSettings: () => _openSettings(context, name),
+          onUninstall: bundled ? null : () => _confirmRemove(context),
+          uninstallLabel: context.l10n.navTabsRemove,
+          extra: [
+            DesktopMenuItem<Object?>(
+              label: entry.enabled ? context.l10n.disable : context.l10n.enable,
+              icon: entry.enabled
+                  ? Icons.toggle_off_outlined
+                  : Icons.toggle_on_outlined,
+              onTap: () => context.read<SourcesBloc>().add(
+                SourceEnabledToggled(_key, enabled: !entry.enabled),
+              ),
+            ),
+          ],
+        ),
+        child: _desktopRow(context, name, meta, logo, hasUpdate, newVersion),
+      );
     }
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 8, 6, 8),
@@ -1084,59 +1122,78 @@ class _ZRepoSourceRow extends StatelessWidget {
     bloc.add(SourceUninstalled(_key, displayName: source.name));
   }
 
+  /// Windows actions for this catalogue row: one list for the '...' menu
+  /// and right-click (src-6 B / src-13 B).
+  List<DesktopMenuItem<Object?>> _menuItems(BuildContext context) =>
+      desktopSourceMenuItems(
+        context,
+        onInstall: installed ? null : () => _install(context),
+        onUpdate: installed && hasUpdate ? () => _update(context) : null,
+        onSettings: installed
+            ? () => Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => SourceSettingsScreen(
+                    sourceId: source.id,
+                    repoUrl: repo.url,
+                    displayName: source.name,
+                  ),
+                ),
+              )
+            : null,
+        onUninstall: installed ? () => _uninstall(context) : null,
+      );
+
   /// Readable desktop source metadata and explicit install/update/uninstall
   /// actions share their original bloc handlers and confirmation flow.
-  Widget _desktopSource(BuildContext context) => _ZDesktopSourceRow(
-    heading: Row(
-      children: [
-        SourceIconTile(
-          name: source.name,
-          icon: ProviderReposRegistry.resolveLogoUrl(repo, source),
-        ),
-        const SizedBox(width: 14),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                source.name,
-                style: AppText.body.copyWith(color: AppColors.textPrimary),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                '${source.lang} · v${source.version}',
-                style: AppText.caption,
-              ),
-              if (source.nsfw) const _ZNsfwBadge(),
-            ],
+  /// Installed rows show a status check and a '...' menu instead of a
+  /// clickable Uninstall (src-6 B).
+  Widget _desktopSource(BuildContext context) => DesktopSourceRow(
+    tooltip: '${source.name} · ${source.lang} · v${source.version}',
+    items: () => _menuItems(context),
+    child: _ZDesktopSourceRow(
+      heading: Row(
+        children: [
+          SourceIconTile(
+            name: source.name,
+            icon: ProviderReposRegistry.resolveLogoUrl(repo, source),
           ),
-        ),
-      ],
-    ),
-    actions: Wrap(
-      spacing: 12,
-      runSpacing: 8,
-      children: [
-        if (!installed)
-          FilledButton.icon(
-            onPressed: () => _install(context),
-            icon: const Icon(Icons.add, size: 18),
-            label: Text(context.l10n.install),
-          )
-        else ...[
-          if (hasUpdate)
-            FilledButton.icon(
-              onPressed: () => _update(context),
-              icon: const Icon(Icons.download_outlined, size: 18),
-              label: Text(context.l10n.update),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  source.name,
+                  style: AppText.body.copyWith(color: AppColors.textPrimary),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '${source.lang} · v${source.version}',
+                  style: AppText.caption,
+                ),
+                if (source.nsfw) const _ZNsfwBadge(),
+              ],
             ),
-          OutlinedButton.icon(
-            onPressed: () => _uninstall(context),
-            icon: const Icon(Icons.delete_outline, size: 18),
-            label: Text(context.l10n.uninstall),
           ),
         ],
-      ],
+      ),
+      actions: Wrap(
+        spacing: 12,
+        runSpacing: 8,
+        children: [
+          if (!installed)
+            FilledButton.icon(
+              onPressed: () => _install(context),
+              icon: const Icon(Icons.add, size: 18),
+              label: Text(context.l10n.install),
+            )
+          else
+            DesktopInstalledActions(
+              items: () => _menuItems(context),
+              updateAvailable: hasUpdate,
+            ),
+        ],
+      ),
     ),
   );
 
@@ -1327,16 +1384,27 @@ class _ZAddRepoDialogState extends State<_ZAddRepoDialog> {
                 ),
               ),
               const SizedBox(height: 12),
-              TextField(
+              // Windows: clipboard pre-fill + drop a link / file (src-12 B).
+              DesktopAddRepoAssist(
                 controller: _urlCtrl,
-                enabled: !_loading,
-                autofocus: true,
-                keyboardType: TextInputType.url,
-                cursorColor: AppColors.accent,
-                style: AppText.body.copyWith(color: AppColors.textPrimary),
-                decoration: InputDecoration(
-                  labelText: context.l10n.manifestUrl,
-                  hintText: context.l10n.manifestUrlHint,
+                onFilled: () {
+                  if (_error != null) setState(() => _error = null);
+                },
+                child: TextField(
+                  controller: _urlCtrl,
+                  enabled: !_loading,
+                  autofocus: true,
+                  keyboardType: TextInputType.url,
+                  cursorColor: AppColors.accent,
+                  style: AppText.body.copyWith(color: AppColors.textPrimary),
+                  // Windows: Enter adds the (pre-filled) link (src-12 B).
+                  onSubmitted: desktopPanelsEnabled
+                      ? (_) => _loading ? null : _submit()
+                      : null,
+                  decoration: InputDecoration(
+                    labelText: context.l10n.manifestUrl,
+                    hintText: context.l10n.manifestUrlHint,
+                  ),
                 ),
               ),
               const SizedBox(height: 10),

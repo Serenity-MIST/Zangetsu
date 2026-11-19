@@ -8,6 +8,7 @@ import '../../core/di/injector.dart';
 import '../../core/download/download_manager.dart';
 import '../../core/download/download_prefs.dart';
 import '../../core/download/download_record.dart';
+import '../../core/playback/resume_store.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/tv/tv_focusable.dart';
@@ -16,6 +17,7 @@ import '../../core/ui/states.dart';
 import '../../l10n/l10n.dart';
 import '../settings/download_location_screen.dart' show folderLabelFromUri;
 import 'downloads_screen.dart';
+import 'downloaded_episode_playback.dart';
 
 /// TV Downloads: a full-screen focusable list of downloaded episodes backed by
 /// [DownloadManager]. Mirrors the phone's [DownloadsScreen] layout and data;
@@ -24,15 +26,19 @@ import 'downloads_screen.dart';
 /// via the shared [launchDownloadedEpisode] path.
 ///
 /// The phone [DownloadsScreen] is byte-identical except for the single
-/// `if (sl<AppMode>().isTv) return const DownloadsScreenTv();` branch at the
+/// `if (sl<AppMode>().isTv)` branch at the
 /// top of [DownloadsScreen.build].
 class DownloadsScreenTv extends StatelessWidget {
-  const DownloadsScreenTv({super.key, this.manager});
+  const DownloadsScreenTv({super.key, this.manager, this.resume});
 
   /// Optional [DownloadManager] override — injected in tests to avoid sl/Hive
   /// setup. In production this is always null and [sl<DownloadManager>()] is
   /// used, matching the phone screen's own DI pattern.
   final DownloadManager? manager;
+
+  /// Per-episode watched positions shown on finished tiles. Optional for the
+  /// same reason as [manager]: tests build this screen without GetIt.
+  final ResumeStore? resume;
 
   @override
   Widget build(BuildContext context) {
@@ -82,6 +88,7 @@ class DownloadsScreenTv extends StatelessWidget {
                       return _TvShowGroup(
                         records: recs,
                         manager: mgr,
+                        resume: resume,
                         // Only the first group's first tile receives autofocus
                         // so the D-pad starts on a real item, not the rail.
                         autofocusFirst: i == 0,
@@ -108,10 +115,12 @@ class _TvShowGroup extends StatelessWidget {
     required this.records,
     required this.manager,
     required this.autofocusFirst,
+    this.resume,
   });
 
   final List<DownloadRecord> records;
   final DownloadManager manager;
+  final ResumeStore? resume;
 
   /// When true the first episode tile in this group gets [TvFocusable.autofocus].
   final bool autofocusFirst;
@@ -193,13 +202,20 @@ class _TvShowGroup extends StatelessWidget {
             // (Play/Pause/Resume/Cancel/Delete as applicable).
             onTap: () => showDialog<void>(
               context: context,
-              builder: (_) =>
-                  _TvDownloadActions(record: records[j], manager: manager),
+              builder: (_) => _TvDownloadActions(
+                record: records[j],
+                manager: manager,
+                screenContext: context,
+              ),
             ),
             // Reuse the phone's tile widget unchanged — only the interaction
             // model changes (D-pad vs touch). The tile's own ListTile.onTap
             // still works for pointer/touch input on hybrid remotes.
-            child: DownloadTile(record: records[j], manager: manager),
+            child: DownloadTile(
+              record: records[j],
+              manager: manager,
+              resume: resume,
+            ),
           ),
         const SizedBox(height: 6),
       ],
@@ -302,10 +318,19 @@ class _TvShowGroup extends StatelessWidget {
 /// for the record's current status, each D-pad focusable. Mirrors the
 /// `_TvOptionPicker` pattern in settings_tv_pickers.dart.
 class _TvDownloadActions extends StatelessWidget {
-  const _TvDownloadActions({required this.record, required this.manager});
+  const _TvDownloadActions({
+    required this.record,
+    required this.manager,
+    this.screenContext,
+  });
 
   final DownloadRecord record;
   final DownloadManager manager;
+
+  /// The Downloads screen's context. The dialog's own context dies with the
+  /// pop animation — awaiting file checks on it returns silently, so playback
+  /// launches from out here instead. Null in tests, which never pop.
+  final BuildContext? screenContext;
 
   List<(String, IconData, VoidCallback)> _actions(BuildContext context) {
     final l10n = context.l10n;
@@ -315,7 +340,21 @@ class _TvDownloadActions extends StatelessWidget {
       out.add((
         l10n.play,
         Icons.play_arrow_rounded,
-        () => launchDownloadedEpisode(context, r),
+        () async {
+          final queue = await downloadedSiblingQueue(
+            showRecords: manager.byShow[r.showId] ?? const [],
+            record: r,
+            filePresent: manager.filePresent,
+          );
+          final launchCtx = screenContext ?? context;
+          if (!launchCtx.mounted) return;
+          await launchDownloadedEpisode(
+            launchCtx,
+            r,
+            episodes: queue.episodes,
+            startIndex: queue.startIndex,
+          );
+        },
       ));
     }
     if (r.status == DownloadStatus.downloading) {

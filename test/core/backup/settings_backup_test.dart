@@ -33,6 +33,24 @@ void main() {
     });
   });
 
+  test(
+    'restores the last tracker view without backing up sign-in data',
+    () async {
+      final selection = await Hive.openBox('tracker_switch_prefs');
+      await selection.put('lastTracker', 'AniList');
+      final auth = await Hive.openBox('anilist');
+      await auth.put('token', 'test-only-token');
+
+      final backup = SettingsBackup().build();
+      expect(backup['tracker_switch_prefs'], {'lastTracker': 'AniList'});
+      expect(backup.containsKey('anilist'), isFalse);
+      await selection.clear();
+      await SettingsBackup().merge(backup);
+      expect(selection.get('lastTracker'), 'AniList');
+      expect(auth.get('token'), 'test-only-token');
+    },
+  );
+
   test('backs up viewer profile metadata', () async {
     final profile = {
       'id': 'default',
@@ -60,6 +78,50 @@ void main() {
     await SettingsBackup().merge(data);
     expect(Hive.box<Map>('title_prefs').get('src::1'), {'quality': '720p'});
   });
+
+  // zmode_source_order is a Box<List>; the old type tries missed it entirely.
+  test('backs up a Box<List> box (source priority order)', () async {
+    final order = await Hive.openBox<List>('zmode_source_order');
+    await order.put('video', ['a', 'b']);
+    final data = SettingsBackup().build();
+    expect(data['zmode_source_order'], {
+      'video': ['a', 'b'],
+    });
+    await order.clear();
+    await SettingsBackup().merge(data);
+    expect(order.get('video'), ['a', 'b']);
+  });
+
+  // ar-8: hand-made matches survive a restore; automatic guesses are not saved.
+  test('backs up only pinned matches and their title names', () async {
+    final matches = await Hive.openBox<Map>(SettingsBackup.matchesBox);
+    Map<String, dynamic> m(String src, {required bool pinned}) => {
+      'sourceId': src,
+      'showUrl': 'https://$src/show',
+      'showId': '1',
+      'showTitle': 'Show',
+      'pinned': pinned,
+    };
+    await matches.put('anime:1@srcA', m('srcA', pinned: true));
+    await matches.put('anime:1@srcB', m('srcB', pinned: false));
+    await matches.put('anime:2@srcB', m('srcB', pinned: false));
+    await matches.put('label:anime:1', {'title': 'Frieren'});
+    await matches.put('last:anime:1', {'sourceId': 'srcB'});
+
+    final data = SettingsBackup().build();
+    final saved = data[SettingsBackup.matchesBox] as Map;
+    expect(saved.keys.toSet(), {'anime:1@srcA', 'label:anime:1'});
+
+    // New device: the title has a different pin of its own. The restored pin
+    // wins and the old one is demoted, so only one pin remains per title.
+    await matches.clear();
+    await matches.put('anime:1@srcC', m('srcC', pinned: true));
+    await SettingsBackup().merge(data);
+    expect(matches.get('anime:1@srcA')?['pinned'], isTrue);
+    expect(matches.get('anime:1@srcC')?['pinned'], isFalse);
+    expect(matches.get('label:anime:1'), {'title': 'Frieren'});
+    expect(matches.containsKey('anime:2@srcB'), isFalse);
+  });
 }
 
 // The real bug wasn't any one missing box — it was drift. The list was written
@@ -79,13 +141,16 @@ void _driftGuard() {
       'mangabaka': 'oauth token',
       'discord': 'rpc token',
       'auth_cache': 'session cache',
+      'stremio_installations': 'requires device-local secure addon URLs',
       // Device-specific: holds a SAF content:// URI that is meaningless (and
       // unwritable) on another device.
       'download_prefs': 'device-specific download location',
       // Reference source ids the restoring device may not have installed.
       'pinned_sources': 'source ids',
       'subscriptions': 'source ids',
-      'zmode_matches': 'source ids',
+      // Only the hand-made (pinned) matches are saved, through
+      // SettingsBackup.matchesBox, never the automatic guesses.
+      'zmode_matches': 'pinned matches only, via SettingsBackup.matchesBox',
       // Installed sources — carried by the separate Sources bundle.
       'provider_settings': 'sources bundle',
       'provider_registry': 'sources bundle',
@@ -105,10 +170,13 @@ void _driftGuard() {
       'reader_overrides': 'per-title, library-shaped',
       'chapter_downloads': 'downloads, not settings',
       'downloads': 'downloads, not settings',
+      // Offline details cache for downloaded shows; rebuilt on demand.
+      'downloaded_show_details': 'download cache, not settings',
       // Caches and transient state — regenerated, never restored.
       'logo_cache': 'cache',
       'provider_js_cache': 'cache',
       'episode_meta': 'cache',
+      'skip_times': 'cache of intro/outro times, refetched online',
       'cf_clearance': 'cache',
       'genre_catalog': 'cache',
       // Icon URLs picked back up the next time a repo index is read.
@@ -120,6 +188,17 @@ void _driftGuard() {
       'search_history': 'transient',
       'content_mode': 'restored per device',
       'home_cache': 'cache',
+      // Windows "Schedule and lists" tiles and airing rows, refetched online.
+      'lists_hub_cache': 'cache',
+      // Windows window/close/folder choices: device-specific (an automatic
+      // backup folder path means nothing on another PC).
+      'desktop_prefs': 'device-specific Windows settings',
+      // New-episode alerts already shown on this device.
+      'new_episode_inbox': 'transient',
+      // Pending tracker pushes, retried online; not a setting.
+      'tracker_sync_queue': 'transient',
+      // Offline copy of the airing schedule, refetched online.
+      'schedule_offline_cache': 'cache',
     };
 
     test('every settings box is either backed up or explicitly excluded', () {

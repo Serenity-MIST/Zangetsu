@@ -242,16 +242,38 @@ class _BarButton extends StatelessWidget {
 /// A single leading-icon row in the ⋮ More overflow sheet.
 class _MoreRow extends StatelessWidget {
   const _MoreRow({
+    super.key,
     required this.icon,
     required this.label,
     required this.onTap,
+    this.subtitle,
+    this.hint,
+    this.trailing,
+    this.chevron = false,
+    this.enabled = true,
   });
   final IconData icon;
   final String label;
   final VoidCallback onTap;
 
+  /// Optional second line (e.g. a warning about an external player).
+  final String? subtitle;
+
+  /// Optional shortcut hint shown on the right (e.g. 'Ctrl+M').
+  final String? hint;
+
+  /// Optional widget on the right (e.g. a switch).
+  final Widget? trailing;
+
+  /// Windows More panel: a chevron for rows that open a sub-page in place.
+  final bool chevron;
+
+  /// Greyed out and not clickable when false.
+  final bool enabled;
+
   @override
   Widget build(BuildContext context) {
+    final color = enabled ? AppColors.textPrimary : AppColors.textTertiary;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
       child: Material(
@@ -259,26 +281,65 @@ class _MoreRow extends StatelessWidget {
         borderRadius: BorderRadius.circular(10),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
-          onTap: onTap,
+          onTap: enabled ? onTap : null,
           child: Padding(
             // Tighter than the old 14 — the panel is narrower now, and these
             // rows were spaced like a settings screen rather than a menu.
-            padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
+            padding: EdgeInsets.symmetric(
+              horizontal: 13,
+              vertical: trailing != null ? 4 : 11,
+            ),
             child: Row(
               children: [
-                Icon(icon, color: AppColors.textPrimary, size: 20),
+                Icon(icon, color: color, size: 20),
                 const SizedBox(width: 12),
                 Expanded(
-                  child: Text(
-                    label,
-                    style: AppText.body.copyWith(
-                      color: AppColors.textPrimary,
-                      fontSize: 14,
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        label,
+                        style: AppText.body.copyWith(
+                          color: color,
+                          fontSize: 14,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      if (subtitle != null)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 2),
+                          child: Text(
+                            subtitle!,
+                            style: AppText.caption.copyWith(
+                              color: AppColors.textSecondary,
+                            ),
+                          ),
+                        ),
+                    ],
                   ),
                 ),
+                if (hint != null)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 8),
+                    child: Text(
+                      hint!,
+                      style: AppText.caption.copyWith(
+                        color: AppColors.textTertiary,
+                      ),
+                    ),
+                  ),
+                ?trailing,
+                if (chevron)
+                  const Padding(
+                    padding: EdgeInsets.only(left: 6),
+                    child: Icon(
+                      Icons.chevron_right_rounded,
+                      color: AppColors.textTertiary,
+                      size: 20,
+                    ),
+                  ),
               ],
             ),
           ),
@@ -432,3 +493,32 @@ class _TransportButton extends StatelessWidget {
 /// — instead of an edge-to-edge frosted panel. Drop-in for the old
 /// `FrostedSurface(...)` sheet wrappers: it accepts (and ignores) blur/opacity/
 /// borderRadius so those call sites only needed a rename.
+
+/// Height of the bottom controls block (timestamp, seek bar, button groups)
+/// while it is laid out, so overlays that must stay clickable above it — the
+/// Skip Intro/Outro pill — can sit exactly over it instead of guessing a
+/// screen fraction. One player is on screen at a time, so one value suffices.
+final ValueNotifier<double> _controlsBottomBlockHeight = ValueNotifier(0);
+
+/// Reports its child's laid-out height into [_controlsBottomBlockHeight].
+class _ReportBottomBlockHeight extends SingleChildRenderObjectWidget {
+  const _ReportBottomBlockHeight({required super.child});
+
+  @override
+  RenderObject createRenderObject(BuildContext context) =>
+      _RenderReportHeight();
+}
+
+class _RenderReportHeight extends RenderProxyBox {
+  @override
+  void performLayout() {
+    super.performLayout();
+    final h = size.height;
+    if ((h - _controlsBottomBlockHeight.value).abs() > 0.5) {
+      // Notify after layout; listeners rebuild on the next frame.
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => _controlsBottomBlockHeight.value = h,
+      );
+    }
+  }
+}

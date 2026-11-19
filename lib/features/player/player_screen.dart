@@ -1,13 +1,22 @@
 import 'dart:async';
 import 'dart:io';
+import '../../core/desktop/desktop_focus_repair.dart';
+import '../../core/desktop/desktop_context_menu.dart';
 import '../../core/desktop/desktop_player_input.dart';
+import '../../core/desktop/desktop_shortcuts.dart';
 import '../../core/desktop/desktop_window.dart';
+import '../../core/desktop/desktop_reveal.dart';
+import '../detail/desktop_single_download_dialog.dart';
+import '../detail/download_source_lookup.dart';
+import 'package:path/path.dart' as pathlib;
+import 'package:path_provider_windows/path_provider_windows.dart';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:media_kit/media_kit.dart' show Track;
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show RenderProxyBox;
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:media_kit_video/media_kit_video.dart';
@@ -17,22 +26,42 @@ import 'package:screen_brightness/screen_brightness.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../../core/cache/app_image_cache.dart';
+import '../../core/ui/copy_playback_link.dart';
 import '../../core/di/injector.dart';
+import '../../core/playback/filler_service.dart';
+import '../../core/repository/catalogue_repository.dart';
 import '../../core/repository/source_repository.dart';
 import '../../core/zmode/playback_resolver.dart';
+import '../../core/zmode/zmode_ids.dart';
 import '../../core/tracker/tracker_hub.dart';
 import '../../core/playback/external_player.dart';
 import '../../core/logging/app_logger.dart';
 import 'phone_playback_launch.dart';
+import 'episode_player_route.dart';
+import 'player_engine_fallback.dart';
+import 'player_error_view.dart';
+import '../../core/download/download_manager.dart';
+import '../../core/download/download_record.dart';
+import '../downloads/episode_download_icon.dart';
+import '../downloads/episode_download_source_sheet.dart';
 import '../../core/playback/playback_prefs.dart';
 import 'subtitle_style.dart';
 import 'subtitle_font_service.dart';
 import 'player_lifecycle.dart';
 import '../../core/torrent/torrent_util.dart';
+import '../downloads/downloaded_episode_playback.dart';
 import '../../core/models/episode.dart';
+import '../../core/models/film.dart';
 import '../../core/models/episode_title.dart';
 import '../../core/models/video_source.dart';
 import '../../core/playback/resume_store.dart';
+import '../../core/playback/tv_track_helpers.dart' show tvEpisodeUrl;
+import '../../core/ui/episode_player_sheet.dart' show showMirrorSheet;
+import '../../core/stremio/stremio_manager.dart';
+import '../../core/stremio/stremio_ref.dart';
+import '../../core/stremio/stremio_stream_mapping.dart';
+import '../detail/stremio_episode_links_sheet.dart';
+import '../../core/ui/app_toast.dart';
 import '../../core/playback/skip_service.dart';
 import '../../core/playback/source_selection.dart';
 import '../../core/playback/subtitle_language.dart';
@@ -41,12 +70,17 @@ import '../../core/playback/watch_history.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/ui/app_dialog.dart';
+import '../../core/ui/desktop_docked_panel.dart' show DesktopPanelColors;
 import '../../core/ui/episode_unavailable_dialog.dart';
 import '../../core/ui/badge.dart';
 import '../../core/ui/brand_loader.dart';
 import '../../core/ui/frosted_surface.dart';
 import '../../core/ui/subtitle_language_picker.dart';
 import '../detail/cubit/detail_cubit.dart' show seasonOf, seasonsOf;
+import '../detail/detail_screen.dart' show DetailScreen;
+import '../../core/models/media_item.dart';
+import '../../core/models/provider_info.dart' show ProviderType;
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import '../../core/cast/cast_controller.dart';
 import '../../core/cast/cast_proxy.dart';
 import '../watch_together/watch_together_controller.dart';
@@ -55,6 +89,12 @@ import '../../core/app_mode.dart';
 import '../../core/tv/tv_focusable.dart';
 import '../settings/settings_screen.dart';
 import 'player_controller.dart';
+import 'desktop_ambient_frame.dart';
+import 'desktop_player_hud.dart';
+import 'desktop_video_click.dart';
+import 'player_watch_page.dart';
+import 'watch_page_motion.dart';
+import 'watch_page_info.dart';
 import 'player_controls_config.dart';
 import 'player_tv_controls.dart';
 import 'seek_preview.dart';
@@ -71,7 +111,7 @@ part 'player_controls_widgets.dart';
 part 'player_episodes_panel.dart';
 part 'player_sheets.dart';
 
-/// Netflix-style fullscreen player: a live [Video] with a tap-to-toggle
+/// Fullscreen player: a live [Video] with a tap-to-toggle
 /// overlay (auto-hiding), configurable double-tap seek, long-press 2x speed, a
 /// stream-bound seek slider, and Speed / Audio / Quality / Source / Next
 /// controls. Forces landscape + immersive UI while open and restores portrait
@@ -99,6 +139,41 @@ bool headerGatedButPlayerCant(Map<String, String>? headers, String pkg) {
   });
   if (!gated) return false;
   return !kHeaderForwardingPlayers.any(pkg.startsWith);
+}
+
+/// Physical turns switch between the portrait page and landscape fullscreen.
+/// Returns null when nothing should change.
+@visibleForTesting
+PlayerPresentation? rotationPresentation({
+  required Orientation? last,
+  required Orientation current,
+  required PlayerPresentation presentation,
+}) {
+  if (last == null || last == current) {
+    return null;
+  }
+  if (current == Orientation.landscape &&
+      presentation == PlayerPresentation.watchPage) {
+    return PlayerPresentation.fullscreen;
+  }
+  if (current == Orientation.portrait &&
+      presentation == PlayerPresentation.fullscreen) {
+    return PlayerPresentation.watchPage;
+  }
+  return null;
+}
+
+@visibleForTesting
+PlayerPresentation initialPresentation({
+  required bool isTv,
+  required String orientation,
+  required bool isLandscape,
+}) {
+  if (isTv ||
+      (orientation != 'portrait' && (orientation != 'system' || isLandscape))) {
+    return PlayerPresentation.fullscreen;
+  }
+  return PlayerPresentation.watchPage;
 }
 
 /// True when [url] is already served by a local proxy (localhost / 127.0.0.1) —
@@ -154,9 +229,11 @@ class PlayerScreen extends StatefulWidget {
     this.resumePosition = Duration.zero,
     this.history,
     this.showTitle,
+    this.showDescription,
     this.cover,
     this.coverHeaders,
     this.showUrl,
+    this.downloadShowId,
     this.category,
     this.malId,
     this.scrobbleTitle,
@@ -168,12 +245,32 @@ class PlayerScreen extends StatefulWidget {
     this.joinRoomCode,
     this.playerOverride,
     this.initialSource,
-  });
+    this.engineFallback,
+    this.onEngineChange,
+    this.engineRecovery = false,
+    bool? isMovie,
+  }) : _isMovie = isMovie;
 
   /// A mirror picked from the episode list's long-press menu, opened instead
   /// of the adaptive default. One-shot: the cubit clears it after the first
   /// episode so nothing later is affected.
   final VideoSource? initialSource;
+  final PlayerEngineFallback? engineFallback;
+  final void Function(PlaybackEngine, PhonePlaybackFailure, Future<void>)?
+  onEngineChange;
+  final bool engineRecovery;
+
+  /// Uses movie wording without changing the playable entries.
+  final bool? _isMovie;
+  bool get isMovie =>
+      _isMovie ??
+      isFilmContent(
+        episodes: episodes,
+        showTitle: showTitle,
+        tmdbId: tmdbId,
+        tmdbIsTv: tmdbIsTv,
+        zmUrl: showUrl,
+      );
 
   /// Set by the episode list's long-press sheet: play this one episode here,
   /// ignoring the Settings default. Empty string means the built-in player
@@ -181,6 +278,7 @@ class PlayerScreen extends StatefulWidget {
   /// reading [PlaybackPrefs.externalPlayerPackage].
   final String? playerOverride;
 
+  final String? downloadShowId;
   final String sourceId;
   final ResumeStore resume;
   final Future<List<VideoSource>> Function(String episodeUrl) resolveSources;
@@ -226,6 +324,7 @@ class PlayerScreen extends StatefulWidget {
   // Optional show-context threaded into history (Continue Watching feed).
   final WatchHistory? history;
   final String? showTitle;
+  final String? showDescription;
   final String? cover;
   final Map<String, String>? coverHeaders;
   final String? showUrl;
@@ -259,7 +358,100 @@ class PlayerScreen extends StatefulWidget {
   final String? joinRoomCode;
 
   @override
-  State<PlayerScreen> createState() => _PlayerScreenState();
+  // Recovery keeps a stable host while replacing only the player session.
+  // ignore: no_logic_in_create_state
+  State<PlayerScreen> createState() {
+    final preferred = stremioPlayerPackage(
+      sourceId,
+      initialSource,
+      playerOverride ?? sl<PlaybackPrefs>().externalPlayerPackage,
+    );
+    if (engineFallback == null &&
+        Platform.isAndroid &&
+        !sl<AppMode>().isTv &&
+        sl<PlaybackPrefs>().autoPlayerFallback &&
+        (preferred.isEmpty || preferred == PlaybackPrefs.androidPlayerId)) {
+      return _PlayerEngineHostState();
+    }
+    return _PlayerScreenState();
+  }
+}
+
+// Keep the route alive so returning to Detail still refreshes watched progress.
+class _PlayerEngineHostState extends State<PlayerScreen> {
+  final _fallback = PlayerEngineFallback();
+  PhonePlaybackFailure? _failure;
+  PlaybackEngine? _engine;
+  int _generation = 0;
+  bool _changing = false;
+
+  @override
+  Widget build(BuildContext context) {
+    if (_changing) return const SizedBox.shrink();
+    final failure = _failure;
+    return PlayerScreen(
+      key: ValueKey(_generation),
+      sourceId: widget.sourceId,
+      resume: widget.resume,
+      resolveSources: widget.resolveSources,
+      resolveDownloadedSources: widget.resolveDownloadedSources,
+      localOnly: widget.localOnly,
+      pollSources: widget.pollSources,
+      episodes: failure?.episodes ?? widget.episodes,
+      startIndex: failure?.index ?? widget.startIndex,
+      episodesResolver: failure == null ? widget.episodesResolver : null,
+      resumeEpisodeId: failure == null ? widget.resumeEpisodeId : null,
+      resumeEpisodeNumber: failure == null ? widget.resumeEpisodeNumber : null,
+      resumePosition: failure?.position ?? widget.resumePosition,
+      history: widget.history,
+      showTitle: widget.showTitle,
+      showDescription: widget.showDescription,
+      cover: widget.cover,
+      coverHeaders: widget.coverHeaders,
+      showUrl: widget.showUrl,
+      downloadShowId: widget.downloadShowId,
+      category: failure?.category ?? widget.category,
+      malId: widget.malId,
+      scrobbleTitle: widget.scrobbleTitle,
+      tmdbId: widget.tmdbId,
+      tmdbIsTv: widget.tmdbIsTv,
+      imdbId: widget.imdbId,
+      peek: widget.peek,
+      availableCategories: widget.availableCategories,
+      joinRoomCode: widget.joinRoomCode,
+      playerOverride: _engine == null
+          ? widget.playerOverride
+          : _engine == PlaybackEngine.mpv
+          ? ''
+          : PlaybackPrefs.androidPlayerId,
+      initialSource: failure == null
+          ? widget.initialSource
+          : _fallback
+                .blockedUrls(
+                  failure.episodes[failure.index].url,
+                  failure.category,
+                )
+                .contains(failure.source.url)
+          ? null
+          : failure.source,
+      engineFallback: _fallback,
+      engineRecovery: failure != null,
+      onEngineChange: (engine, request, teardown) async {
+        if (!mounted || _changing) return;
+        setState(() => _changing = true);
+        // Wait only for this session, not another paused player underneath it.
+        await teardown;
+        if (!mounted) return;
+        setState(() {
+          _engine = engine;
+          _failure = request;
+          _generation++;
+          _changing = false;
+        });
+      },
+      isMovie: widget.isMovie,
+    );
+  }
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
@@ -270,8 +462,24 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// the initState hand-off, the header-gated proxy path, and the launch call.
   /// Reading prefs directly in each is how an override gets honoured by two of
   /// them and silently dropped by the third.
-  String get _chosenPlayer =>
-      widget.playerOverride ?? sl<PlaybackPrefs>().externalPlayerPackage;
+  String get _chosenPlayer => stremioPlayerPackage(
+    widget.sourceId,
+    widget.initialSource,
+    widget.playerOverride ?? sl<PlaybackPrefs>().externalPlayerPackage,
+  );
+
+  late final PlayerEngineFallback _engineFallback =
+      widget.engineFallback ?? PlayerEngineFallback();
+  bool _switchingEngine = false;
+  Completer<void>? _engineTeardown;
+  PhonePlaybackFailure? _nativeEngineFailure;
+
+  bool get _canTryOtherPlayer =>
+      widget.onEngineChange != null &&
+      Platform.isAndroid &&
+      !sl<AppMode>().isTv &&
+      sl<PlaybackPrefs>().autoPlayerFallback &&
+      (_chosenPlayer.isEmpty || _chosenPlayer == PlaybackPrefs.androidPlayerId);
 
   late final PlayerCubit _c;
   final WatchTogetherController _room = sl<WatchTogetherController>();
@@ -390,6 +598,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
   bool _hudIsBrightness = false;
   Timer? _hudTimer;
 
+  /// Windows: volume / seek feedback on the theater watch page (the full
+  /// player reuses [_AdjustHud] and [_SeekIndicator] above for the same).
+  final DesktopHudController _watchHud = DesktopHudController();
+
+  /// Windows: the 0-100 user volume (boost applied on top by the cubit),
+  /// for the theater page's volume button. Built once per session.
+  late final Stream<double> _userVolumeStream = _c.player.stream.volume.map(
+    _c.userVolumeFromMpv,
+  );
+
   // ── Lock / zoom / drag-seek / up-next ─────────────────────────────────────
   bool _locked = false; // controls + gestures disabled
   // Aspect cycle: Fit (contain) → Fill (cover) → Stretch (fill).
@@ -472,9 +690,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await Navigator.of(context).maybePop();
   }
 
+  /// Windows: whether the window was already fullscreen when the player
+  /// opened. Leaving the player puts the window back that way, so going
+  /// fullscreen for an episode never leaves the app stuck in fullscreen.
+  /// Null until the native answer arrives.
+  bool? _windowFullscreenOnOpen;
+
   @override
   void initState() {
     super.initState();
+    if (Platform.isWindows) {
+      unawaited(
+        DesktopWindow.isFullscreen()
+            .then((v) => _windowFullscreenOnOpen = v)
+            .catchError((Object _) => _windowFullscreenOnOpen = false),
+      );
+    }
+    // Windows: follow the mini player / always-on-top state (the runner can
+    // also change it, e.g. Esc in the mini window).
+    if (_windowsDesktopUi) {
+      DesktopWindow.miniPlayer.addListener(_onDesktopWindowModeChanged);
+      DesktopWindow.alwaysOnTop.addListener(_onDesktopWindowModeChanged);
+    }
     // Refresh the "enhancement shaders downloaded?" flag so the in-player picker
     // gates correctly (they're fetched on demand from Settings). Fire-and-forget.
     unawaited(ShaderPresets.refreshDownloaded());
@@ -487,44 +724,377 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return;
     }
     _initInApp();
+    if (Platform.isAndroid && !sl<AppMode>().isTv && _followSensor) {
+      _orientationTurns = const EventChannel('zangetsu/player_orientation')
+          .receiveBroadcastStream()
+          .listen(
+            (_) {
+              if (!mounted || ModalRoute.of(context)?.isCurrent != true) return;
+              _followSensor = true;
+              SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+            },
+            onError: (Object error) {
+              AppLogger.instance.log(
+                '[player] Orientation sensor unavailable: $error',
+              );
+            },
+          );
+    }
   }
 
-  /// Watching upright (the ⟳ button). Starts false — every episode opens
-  /// landscape, as it always has.
-  bool _portraitMode = false;
+  /// Watching upright (the ⟳ button). Starts from the saved Default
+  /// orientation — landscape unless the user picked otherwise.
+  bool _portraitMode = sl<PlaybackPrefs>().playerOrientation == 'portrait';
+
+  /// The saved orientation selects the opening layout; Auto follows rotation.
+  PlayerPresentation _presentation = PlayerPresentation.fullscreen;
+
+  /// Season filter for the watch-page episode list. Null = all seasons; a
+  /// new episode resets it so the list always opens on what is playing.
+  int? _watchSeason;
+
+  bool get _watchPageEnabled =>
+      !sl<AppMode>().isTv && (!Platform.isAndroid || _chosenPlayer.isEmpty);
+
+  /// Live frames for the watch-page ambient glow. Sampled slowly from the
+  /// playing texture (a blurred backdrop needs no frame rate), only while
+  /// the page is visible, never in background.
+  Timer? _ambientTimer;
+  final StreamController<Uint8List?> _ambientFrames =
+      StreamController<Uint8List?>.broadcast();
+
+  /// Set once a glow color is up. A paused frame never changes, so there is
+  /// nothing new to sample — sampling only runs while the picture moves.
+  bool _ambientGlowReady = false;
+
+  /// Permanent give-up kept killing the glow when the player was just slow
+  /// to produce its first frame. Now misses only back the sampler off for
+  /// a minute instead — slow sources still get their glow eventually.
+  int _ambientSkip = 0;
+  int _ambientMisses = 0;
+  int _ambientEp = -1;
+
+  void _startAmbientSampler() {
+    if (!_ready || (_ambientTimer?.isActive ?? false)) return;
+    _ambientTimer = Timer.periodic(const Duration(seconds: 6), (_) {
+      _sampleAmbientFrame();
+    });
+    _sampleAmbientFrame();
+  }
+
+  void _stopAmbientSampler() {
+    _ambientTimer?.cancel();
+    _ambientTimer = null;
+  }
+
+  Future<void> _sampleAmbientFrame() async {
+    if (!mounted ||
+        !_ready ||
+        _presentation != PlayerPresentation.watchPage ||
+        WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return;
+    }
+    if (_ambientEp != _c.state.currentIndex) {
+      _ambientEp = _c.state.currentIndex;
+      _ambientMisses = 0;
+      _ambientSkip = 0;
+    }
+    // Paused with a glow up: the frame is frozen, sampling it again only
+    // burns battery for identical bytes.
+    if (!_c.player.state.playing && _ambientGlowReady) return;
+    if (_ambientSkip > 0) {
+      _ambientSkip--;
+      return;
+    }
+    if (_ambientMisses >= 3) {
+      // No readable frame three times in a row — back off a minute and
+      // try again instead of giving up for the whole episode.
+      _ambientMisses = 0;
+      _ambientSkip = 10;
+      return;
+    }
+    final sw = Stopwatch()..start();
+    try {
+      // Windows: a tiny raw frame instead of a full-resolution JPEG (see
+      // [_grabSmallAmbientFrame]); phone keeps its JPEG grab.
+      final bytes = _windowsDesktopUi
+          ? await _grabSmallAmbientFrame()
+          : await _c.player.screenshot();
+      sw.stop();
+      if (!mounted) return;
+      if (bytes == null || bytes.isEmpty) {
+        _ambientMisses++;
+        AppLogger.instance.log(
+          '[watch-ambient] frame missed (${_ambientMisses}x) — '
+          'hw buffers often unreadable, stills carry the glow',
+        );
+        return;
+      }
+      if (sw.elapsedMilliseconds > 800) _ambientSkip = 2;
+      // Windows: once a glow colour is up it only needs to drift with the
+      // scene, so sample every ~18s (two skipped 6s ticks) instead of 6s.
+      if (_windowsDesktopUi && _ambientGlowReady && _ambientSkip < 2) {
+        _ambientSkip = 2;
+      }
+      _ambientMisses = 0;
+      _ambientGlowReady = true;
+      if (!_ambientFrames.isClosed) _ambientFrames.add(bytes);
+    } catch (e) {
+      if (!mounted) return;
+      _ambientMisses++;
+      AppLogger.instance.log('[watch-ambient] frame error: $e');
+    }
+  }
+
+  /// Windows: a ~32px frame for the ambient glow. mpv hands over the raw
+  /// BGRA frame (no JPEG encode of a 1440p/4K picture, which was the
+  /// periodic stutter), it is point-sampled down here and wrapped as a tiny
+  /// BMP the watch page decodes for free. Falls back to the old JPEG grab
+  /// when the raw buffer does not match the reported video size.
+  Future<Uint8List?> _grabSmallAmbientFrame() async {
+    final raw = await _c.player.safeScreenshot(format: null);
+    if (raw == null || raw.isEmpty) return null;
+    final small = downscaleBgraToBmp(
+      raw,
+      _c.player.state.width ?? 0,
+      _c.player.state.height ?? 0,
+    );
+    return small ?? await _c.player.screenshot();
+  }
+
+  void _applyPlayerSystemUi() {
+    final watchPage =
+        _watchPageEnabled && _presentation == PlayerPresentation.watchPage;
+    SystemChrome.setEnabledSystemUIMode(
+      watchPage ? SystemUiMode.edgeToEdge : SystemUiMode.immersiveSticky,
+    );
+    if (watchPage) {
+      SystemChrome.setSystemUIOverlayStyle(
+        const SystemUiOverlayStyle(
+          statusBarColor: Colors.transparent,
+          statusBarIconBrightness: Brightness.light,
+          statusBarBrightness: Brightness.dark,
+        ),
+      );
+    }
+  }
+
+  void _enterFullscreen({bool fromRotation = false}) {
+    _stopAmbientSampler();
+    _desktopWatchViaBack = false;
+    if (!fromRotation) _followSensor = false;
+    _lastOrientation = MediaQuery.orientationOf(context);
+    setState(() {
+      _duration = _c.player.state.duration;
+      _portraitMode = false;
+      _presentation = PlayerPresentation.fullscreen;
+    });
+    _applyPlayerSystemUi();
+    // Fullscreen holds the saved orientation, or follows the sensor.
+    SystemChrome.setPreferredOrientations(_orientationLock);
+  }
+
+  void _enterWatchPage({bool fromRotation = false}) {
+    if (!fromRotation) _followSensor = false;
+    _startAmbientSampler();
+    _lastOrientation = MediaQuery.orientationOf(context);
+    setState(() => _presentation = PlayerPresentation.watchPage);
+    _portraitMode = true;
+    _applyPlayerSystemUi();
+    SystemChrome.setPreferredOrientations(_orientationLock);
+  }
+
+  /// Physical orientation the last presentation decision was made for. Manual
+  /// switches record it so the sensor hook below doesn't flip straight back.
+  Orientation? _lastOrientation;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_watchPageEnabled) return;
+    final current = MediaQuery.orientationOf(context);
+    if (_lastOrientation == null) {
+      _lastOrientation = current;
+      final initial = initialPresentation(
+        isTv: false,
+        orientation: sl<PlaybackPrefs>().playerOrientation,
+        isLandscape: current == Orientation.landscape,
+      );
+      _presentation = initial;
+      _applyPlayerSystemUi();
+      if (initial == PlayerPresentation.watchPage) {
+        _startAmbientSampler();
+        _portraitMode = true;
+        SystemChrome.setPreferredOrientations(_orientationLock);
+      } else {
+        _applyOrientationWhenCovered();
+      }
+      return;
+    }
+    // Windows: a window snapped narrow is not a phone turned upright. Only
+    // "Match window shape" ('system', until a manual switch) follows it;
+    // "Watch page" / "Full window" keep the layout the user is in.
+    if (_windowsDesktopUi && !_followSensor) {
+      _lastOrientation = current;
+      return;
+    }
+    final next = rotationPresentation(
+      last: _lastOrientation,
+      current: current,
+      presentation: _presentation,
+    );
+    _lastOrientation = current;
+    if (next == PlayerPresentation.watchPage) {
+      _enterWatchPage(fromRotation: true);
+    } else if (next == PlayerPresentation.fullscreen) {
+      _enterFullscreen(fromRotation: true);
+    }
+  }
+
+  /// Windows desktop UI (theater watch page, clickable show title). Uses the
+  /// target platform, not the host, so tests on a Windows host stay phone.
+  bool get _windowsDesktopUi => defaultTargetPlatform == TargetPlatform.windows;
+
+  /// Windows: the one-click show page action (clicking the title in the
+  /// player top bar), or null when there is no show to go to (local files,
+  /// links without a show URL); null leaves the title inert.
+  VoidCallback? get _showPageAction {
+    if (!_windowsDesktopUi) return null;
+    if (ModalRoute.of(context) is EpisodePlayerRoute) return _openShowPage;
+    if (widget.localOnly || (widget.showUrl?.trim().isEmpty ?? true)) {
+      return null;
+    }
+    return _openShowPage;
+  }
+
+  /// Windows: straight to the show's detail page in one go. Opened from
+  /// Detail (the only caller of [EpisodePlayerRoute]) it simply pops back
+  /// there; opened from Home / History / Search it swaps the player for the
+  /// show's detail page, so no stray player route is left underneath.
+  /// Bypasses the close confirmation on purpose: it is an explicit click.
+  /// Fullscreen is restored by [dispose] as on every other exit.
+  void _openShowPage() {
+    if (!mounted) return;
+    final nav = Navigator.of(context);
+    if (ModalRoute.of(context) is EpisodePlayerRoute) {
+      _leavePlayer();
+      return;
+    }
+    final url = widget.showUrl!.trim();
+    nav.pushReplacement(
+      DetailScreen.route(
+        MediaItem(
+          id: widget.downloadShowId ?? url,
+          title: widget.showTitle ?? '',
+          cover: widget.cover,
+          coverHeaders: widget.coverHeaders,
+          url: url,
+          // Same stub shape Home uses for Continue Watching; Detail reloads
+          // the real type from the source.
+          type: widget.isMovie ? ProviderType.movie : ProviderType.anime,
+          sourceId: widget.sourceId,
+          malId: widget.malId,
+          tmdbId: widget.tmdbId,
+          imdbId: widget.imdbId,
+        ),
+      ),
+    );
+  }
+
+  /// Windows Back from the theater watch page. The Back that brought the
+  /// viewer here already counts as the first press of "double back", so it
+  /// leaves at once; "confirm" still asks. Phone keeps [_handleCloseRequest].
+  ///
+  /// Opened straight on the watch page ("Player opens in: Watch page") no
+  /// Back has been pressed yet, so "double back" still needs two presses
+  /// there; only the full-window → watch-page Back counts as the first one.
+  void _handleDesktopWatchBack() {
+    final mode = sl<PlaybackPrefs>().closeConfirmation;
+    if (mode == 'confirm' || (mode == 'double_back' && !_desktopWatchViaBack)) {
+      _handleCloseRequest();
+      return;
+    }
+    _leavePlayer();
+  }
+
+  /// Windows: the theater watch page was reached by Back from the full
+  /// window (the first press of "double back"). Cleared on going full again.
+  bool _desktopWatchViaBack = false;
+
+  /// Back from the full window to the watch page; on Windows it remembers
+  /// that this was the first Back (see [_handleDesktopWatchBack]).
+  void _backToWatchPage() {
+    _desktopWatchViaBack = _windowsDesktopUi;
+    _enterWatchPage();
+  }
+
+  /// Fullscreen Back lands on the watch page instead of leaving the player;
+  /// the page's own Back uses the normal close guard.
+  ///
+  /// Windows Back / Esc / mouse-back, in order: Esc first leaves window
+  /// fullscreen ([DesktopPlayerInput]); then the full player drops to the
+  /// theater watch page (or opens with it when the default orientation is
+  /// portrait); Back there leaves the player ([_handleDesktopWatchBack]).
+  /// Clicking the show title in the top bar skips all of that in one click.
+  void _handlePlayerBack() {
+    if (_watchPageEnabled && _presentation == PlayerPresentation.fullscreen) {
+      _backToWatchPage();
+      return;
+    }
+    Navigator.of(context).maybePop();
+  }
+
+  /// Follow the device sensor instead of locking, when the saved default is
+  /// 'system'. The ⟳ button still locks to one side for the session.
+  StreamSubscription<dynamic>? _orientationTurns;
+  bool _followSensor = sl<PlaybackPrefs>().playerOrientation == 'system';
 
   /// The orientation this player holds right now. Single source of truth: the
   /// screen pins orientation in more than one place (open, and either side of
   /// the Settings trip), and hardcoding landscape at each of them is what would
   /// throw you back to landscape after a detour.
-  List<DeviceOrientation> get _orientationLock => _portraitMode
-      ? const [DeviceOrientation.portraitUp]
-      : const [
+  List<DeviceOrientation> get _orientationLock => sl<AppMode>().isTv
+      ? const [
           DeviceOrientation.landscapeLeft,
           DeviceOrientation.landscapeRight,
-        ];
+        ]
+      : _followSensor
+      ? DeviceOrientation.values
+      : PlaybackPrefs.orientationLockFor(
+          _portraitMode ? 'portrait' : 'landscape',
+        );
 
-  /// Locked either way rather than following the sensor: a phone resting flat
-  /// shouldn't flip the video mid-episode, and this still works for people who
-  /// keep system auto-rotate switched off.
+  /// Manual layout changes hold that orientation for this session.
+  /// The saved orientation preference is unchanged.
   void _toggleOrientation() {
-    setState(() => _portraitMode = !_portraitMode);
+    if (_watchPageEnabled) {
+      if (_presentation == PlayerPresentation.fullscreen) {
+        _enterWatchPage();
+      } else {
+        _enterFullscreen();
+      }
+      _bumpControls();
+      return;
+    }
+    setState(() {
+      _followSensor = false;
+      _portraitMode = !_portraitMode;
+    });
     SystemChrome.setPreferredOrientations(_orientationLock);
     _bumpControls();
   }
 
-  /// Whether the opening rotation has been asked for. Two paths race to it
-  /// below, so the first one wins and the second is a no-op.
-  bool _turned = false;
+  /// Prevents the initial orientation request from being applied twice.
+  bool _orientationApplied = false;
 
-  void _turnLandscape() {
-    if (_turned || !mounted) return;
-    _turned = true;
+  void _applyOrientation() {
+    if (_orientationApplied || !mounted) return;
+    _orientationApplied = true;
     SystemChrome.setPreferredOrientations(_orientationLock);
   }
 
-  /// Ask for landscape once the screen we opened over has faded out, rather
-  /// than the instant this screen is built.
+  /// Apply orientation after the opening transition so its snapshot cannot
+  /// bleed into the player while Android animates the turn.
   ///
   /// Android takes a snapshot of the window when a rotation is requested and
   /// composites it into the rotation animation. Asking from initState means
@@ -542,32 +1112,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// fully drawn with this player faint on top of it, which is the bug itself.
   /// The outgoing page does not fade here — that only happens through a
   /// delegated transition, which this route does not get.
-  void _turnLandscapeWhenCovered() {
+  void _applyOrientationWhenCovered() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       final opening = ModalRoute.of(context)?.animation;
       if (opening == null || opening.status == AnimationStatus.completed) {
-        _turnLandscape();
+        _applyOrientation();
         return;
       }
       void turnOnceCovered() {
         if (opening.value < 0.8) return;
         opening.removeListener(turnOnceCovered);
-        _turnLandscape();
+        _applyOrientation();
       }
 
       opening.addListener(turnOnceCovered);
       // If that value never arrives — the transition is interrupted, the route
       // is swapped underneath us — the player would sit in portrait for good,
       // which is worse than the thing this avoids.
-      Future.delayed(const Duration(milliseconds: 600), _turnLandscape);
+      Future.delayed(const Duration(milliseconds: 600), _applyOrientation);
     });
   }
 
   void _initInApp() {
     _routeTeardownLease ??= playerRouteTeardownBarrier.acquire();
-    _turnLandscapeWhenCovered();
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    if (!_watchPageEnabled) _applyOrientationWhenCovered();
+    _applyPlayerSystemUi();
     // Wake-lock is bound to playback in _startSession, once the player exists.
     // The volume swipe sets the real system volume; hide the OS volume bar so
     // only our own HUD shows (CloudStream draws its own too). Restored on exit.
@@ -822,11 +1392,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } catch (_) {}
   }
 
-  /// Resolve the start episode + its best source and open it in the user's
-  /// chosen external player, then pop. The branded loader shows briefly while
-  /// resolving. Any failure falls back to the in-app player.
-  /// Play through the native ExoPlayer activity instead of mpv, then leave
-  /// this screen — the same shape as [_launchExternalThenPop].
+  /// Open the native ExoPlayer activity, then leave this screen. Source errors
+  /// stay in that player so the user can retry or go back.
   ///
   /// Uses the very player the TV build ships ([launchTvPlayback] →
   /// TvPlayerActivity): a separate Activity with its own SurfaceView, so there
@@ -839,8 +1406,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// whose constructor makes a media_kit `Player`, which is exactly what throws
   /// on a device where libmpv never loaded.
   ///
-  /// Falls back to the in-app player on any failure, so turning this on can
-  /// never leave someone worse off than before.
+  /// A launch failure is reported here; playback failures are handled by the
+  /// native player's retry screen.
   Future<void> _launchExoThenPop() async {
     try {
       var eps = widget.episodes;
@@ -868,7 +1435,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
         resumePosition: widget.resumePosition.inMilliseconds,
         peek: widget.peek,
         showUrl: widget.showUrl,
+        downloadShowId: widget.downloadShowId,
+        allowDownloads: !widget.localOnly,
         showTitle: widget.showTitle,
+        showDescription: widget.showDescription,
         cover: widget.cover,
         coverHeaders: widget.coverHeaders,
         category: widget.category ?? 'sub',
@@ -880,20 +1450,114 @@ class _PlayerScreenState extends State<PlayerScreen> {
         tmdbId: widget.tmdbId,
         tmdbIsTv: widget.tmdbIsTv,
         imdbId: widget.imdbId,
+        isMovie: widget.isMovie,
+        engineFallback: _canTryOtherPlayer ? _engineFallback : null,
+        forceInitialResume: widget.engineRecovery,
+        onEngineFallback: (failure) => _nativeEngineFailure = failure,
       );
+      final failure = _nativeEngineFailure;
+      if (mounted && failure != null) {
+        await _replacePlayerEngine(
+          engine: PlaybackEngine.mpv,
+          episodes: failure.episodes,
+          index: failure.index,
+          source: failure.source,
+          position: failure.position,
+          category: failure.category,
+        );
+        return;
+      }
       if (!opened) {
+        if (await _recoverUnavailableNative()) return;
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text(context.l10n.androidPlayerUnavailable)),
         );
+        _leavePlayer();
         return;
       }
       _leavePlayer();
     } catch (e, st) {
       AppLogger.instance.logError(e, st);
+      if (await _recoverUnavailableNative()) return;
       if (!mounted) return;
       Navigator.of(context).maybePop();
     }
+  }
+
+  Future<bool> _recoverUnavailableNative() async {
+    final source = widget.initialSource;
+    final index = widget.startIndex;
+    if (!mounted ||
+        !widget.engineRecovery ||
+        !_canTryOtherPlayer ||
+        source == null ||
+        source.isDrm ||
+        isTorrentUrl(source.url) ||
+        index < 0 ||
+        index >= widget.episodes.length) {
+      return false;
+    }
+    _engineFallback.next(
+      enabled: true,
+      failedEngine: PlaybackEngine.nativePlayer,
+      episodeUrl: widget.episodes[index].url,
+      category: widget.category ?? 'sub',
+      source: source,
+    );
+    await _replacePlayerEngine(
+      engine: PlaybackEngine.mpv,
+      episodes: widget.episodes,
+      index: index,
+      source: source,
+      position: widget.resumePosition,
+      category: widget.category ?? 'sub',
+    );
+    return true;
+  }
+
+  Future<bool> _onMpvSourceFailure(
+    VideoSource source,
+    Duration position,
+  ) async {
+    if (!mounted || _switchingEngine || !_canTryOtherPlayer) return false;
+    final target = _engineFallback.next(
+      enabled: true,
+      failedEngine: PlaybackEngine.mpv,
+      episodeUrl: _c.currentEpisode.url,
+      category: _c.activeCategory,
+      source: source,
+    );
+    if (target == null) return false;
+    await _replacePlayerEngine(
+      engine: target,
+      episodes: _c.episodes,
+      index: _c.state.currentIndex,
+      source: source,
+      position: position,
+      category: _c.activeCategory,
+    );
+    return true;
+  }
+
+  Future<void> _replacePlayerEngine({
+    required PlaybackEngine engine,
+    required List<Episode> episodes,
+    required int index,
+    required VideoSource source,
+    required Duration position,
+    required String category,
+  }) async {
+    if (!mounted || _switchingEngine) return;
+    _switchingEngine = true;
+    _engineTeardown = Completer<void>();
+    widget.onEngineChange?.call(engine, (
+      episodes: episodes,
+      index: index,
+      source: source,
+      position: position,
+      category: category,
+    ), _engineTeardown!.future);
   }
 
   Future<void> _launchExternalThenPop() async {
@@ -912,7 +1576,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
         if (i >= 0) idx = i;
       }
       final ep = eps[idx.clamp(0, eps.length - 1)];
-      final sources = await widget.resolveSources(ep.url);
+      final sources =
+          stremioSeedSources(widget.sourceId, widget.initialSource) ??
+          await widget.resolveSources(ep.url);
       final prefer = widget.category == 'dub' ? AudioKind.dub : AudioKind.sub;
       final src = pickDefault(sources, prefer: prefer);
       if (src == null) throw StateError('no source');
@@ -1078,6 +1744,54 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return e.title.isNotEmpty ? e.title : null;
   }
 
+  /// Finds the finished download of [episode] so playback can fall back to it
+  /// when every online option fails. Matching is exact (episode url, then
+  /// catalogue ids plus episode number); a different show or audio cut is never
+  /// returned. Null when nothing suitable is saved.
+  Future<List<VideoSource>?> _findLocalDownload(Episode episode) async {
+    if (!sl.isRegistered<DownloadManager>()) return null;
+    final record = await sl<DownloadManager>().finishedForEpisode(
+      sourceId: widget.sourceId,
+      // The player does not know the show's own id, so the lookup relies on the
+      // episode url, catalogue ids and episode number instead.
+      showId: '',
+      episodeId: episode.id,
+      episodeUrl: episode.url,
+      malId: widget.malId,
+      tmdbId: widget.tmdbId,
+      tmdbIsTv: widget.tmdbIsTv,
+      episodeNumber: episode.number,
+      category: widget.category,
+      season: episode.season,
+    );
+    return record == null ? null : [downloadedVideoSource(record)];
+  }
+
+  /// Asks whether to switch to the downloaded copy (setting "ask").
+  Future<bool> _confirmLocalFallback() async {
+    if (!mounted) return false;
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (dialog) => AlertDialog(
+        title: const Text('Playback keeps failing'),
+        content: const Text(
+          'You have this episode downloaded. Play the downloaded copy instead?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialog, false),
+            child: const Text('Keep trying'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialog, true),
+            child: const Text('Play download'),
+          ),
+        ],
+      ),
+    );
+    return accepted ?? false;
+  }
+
   void _startSession(List<Episode> eps, int startIndex) {
     _c = PlayerCubit(
       sourceId: widget.sourceId,
@@ -1104,7 +1818,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
       initialResume: widget.resumePosition,
       initialSource: widget.initialSource,
       onDrmSource: _handoffToNativeDrm,
+      localDownloadFinder: _findLocalDownload,
+      confirmLocalFallback: _confirmLocalFallback,
+      onSourceFailure: _canTryOtherPlayer ? _onMpvSourceFailure : null,
+      engineFallback: _canTryOtherPlayer ? _engineFallback : null,
+      forceInitialResume: widget.engineRecovery,
     )..init(startIndex);
+    // Windows (player-10): the media Stop key from the Windows media overlay
+    // closes the player, same as the focused Stop key below.
+    if (_windowsDesktopUi) _c.onDesktopMediaStop = _desktopMediaStop;
 
     // Bind the wake-lock to playback now that the player exists: on while
     // playing/buffering, released on pause. Set up here (not _initInApp) because
@@ -1112,6 +1834,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _playingSub = _c.player.stream.playing.listen((_) => _syncWakelock());
     _bufferingSub = _c.player.stream.buffering.listen((_) => _syncWakelock());
     _syncWakelock();
+    // Anime4K switched itself off (mpv couldn't run the shaders): refresh the
+    // enhance control and tell the user on either layout.
+    _c.shaderFallbackRev.addListener(_onShaderFallback);
 
     _room.attachPlayer(
       localPosition: () => _c.player.state.position,
@@ -1153,7 +1878,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
       if (done) _onEpisodeComplete();
     });
     if (mounted) setState(() => _ready = true);
+    if (_presentation == PlayerPresentation.watchPage) {
+      _startAmbientSampler();
+    }
     _scheduleHide();
+  }
+
+  /// The full player already shows the controller's toast; the watch page
+  /// has no toast layer, so it gets a snackbar instead.
+  void _onShaderFallback() {
+    if (!mounted) return;
+    setState(() {});
+    if (_presentation == PlayerPresentation.watchPage) {
+      ScaffoldMessenger.maybeOf(context)
+        ?..clearSnackBars()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(_c.shaderFallbackMessage),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+    }
   }
 
   void _wireRoom(WatchTogetherController room) {
@@ -1282,7 +2027,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
           ..clearSnackBars()
           ..showSnackBar(
             SnackBar(
-              content: Text(context.l10n.pressBackAgainToExit),
+              // A PC has no BACK key: name what it actually presses.
+              content: Text(
+                _windowsDesktopUi
+                    ? kWindowsPressAgainToClose
+                    : context.l10n.pressBackAgainToExit,
+              ),
               duration: Duration(seconds: 2),
               behavior: SnackBarBehavior.floating,
             ),
@@ -1292,6 +2042,21 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
+    // Windows: restore the window's fullscreen state from before the player
+    // (back button, end of playback, mouse back: every exit lands here).
+    // The native setter is idempotent, so this is safe when already windowed.
+    if (Platform.isWindows && _windowFullscreenOnOpen != true) {
+      unawaited(DesktopWindow.setFullscreen(false).catchError((Object _) {}));
+    }
+    // Windows: leaving the player from the mini window restores the normal
+    // window (size, place and the user's own always-on-top choice).
+    DesktopWindow.miniPlayer.removeListener(_onDesktopWindowModeChanged);
+    DesktopWindow.alwaysOnTop.removeListener(_onDesktopWindowModeChanged);
+    if (_windowsDesktopUi && DesktopWindow.miniPlayer.value) {
+      unawaited(DesktopWindow.exitMiniPlayer());
+    }
+    _watchHud.dispose();
+    _orientationTurns?.cancel();
     AppLogger.instance.log(
       '[player-route] dispose ready=$_ready '
       'loading=${_ready ? _c.state.loadingSources : 'uninitialized'} '
@@ -1316,7 +2081,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _sleepTimer?.cancel();
     _completedSub?.cancel();
     _playingSub?.cancel();
+    _stopAmbientSampler();
+    _ambientFrames.close();
     _bufferingSub?.cancel();
+    if (_ready) {
+      // The cubit may already have disposed its notifier.
+      try {
+        _c.shaderFallbackRev.removeListener(_onShaderFallback);
+      } catch (_) {}
+    }
     _pipSub?.cancel();
     for (final s in _pipStateSubs) {
       s.cancel();
@@ -1341,9 +2114,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final routeLease = _routeTeardownLease;
     if (_ready) {
       _c.close();
-      unawaited(_c.nativeTeardown.whenComplete(() => routeLease?.release()));
+      unawaited(
+        _c.nativeTeardown.whenComplete(() {
+          routeLease?.release();
+          _engineTeardown?.complete();
+        }),
+      );
     } else {
       routeLease?.release();
+      _engineTeardown?.complete();
     }
     // Detach from the app-level party controller (nulls out player hooks and,
     // if this client is host, marks the room lobby). Does NOT leave the party —
@@ -1388,6 +2167,389 @@ class _PlayerScreenState extends State<PlayerScreen> {
   void _bumpControls() {
     if (!_controlsVisible) setState(() => _controlsVisible = true);
     _scheduleHide();
+  }
+
+  // ── Windows keyboard / wheel feedback ──────────────────────────────────
+
+  /// Windows: one volume step from Up/Down or the wheel over the video,
+  /// with the volume indicator so the change is visible even when the
+  /// controls are hidden.
+  void _desktopVolumeStep(double delta) {
+    if (!_ready || _c.isClosed) return;
+    // The cubit keeps the 0-100 user level and re-applies the boost.
+    _showDesktopVolume(_c.stepUserVolume(delta));
+  }
+
+  /// Windows (player-10): the media Stop key / overlay button. Closes the
+  /// player only while its route is on top; with a menu or dialog open over
+  /// it (or another page pushed above) a blind pop would close that instead,
+  /// so it just pauses then.
+  void _desktopMediaStop() {
+    if (!mounted || _c.isClosed) return;
+    if (ModalRoute.of(context)?.isCurrent ?? true) {
+      Navigator.of(context).maybePop();
+    } else if (_c.player.state.playing) {
+      _c.togglePlay();
+    }
+  }
+
+  /// Windows: M mutes, and unmutes back to the level from before.
+  void _desktopToggleMute() {
+    if (!_ready || _c.isClosed) return;
+    _showDesktopVolume(_c.toggleUserMute());
+  }
+
+  /// Shows [volume] (0..100): the watch page's pill there, the side-rail
+  /// volume HUD (the one the phone swipe uses) in the full player.
+  void _showDesktopVolume(double volume) {
+    if (!_windowsDesktopUi) return; // phone keeps its swipe-only HUD
+    if (_presentation == PlayerPresentation.watchPage) {
+      _watchHud.showVolume(volume);
+      return;
+    }
+    _hudTimer?.cancel();
+    setState(() {
+      _hudVisible = true;
+      // The HUD runs 0..200% (phone boost range); 100% volume = half.
+      _hudValue = (volume / 200).clamp(0.0, 1.0);
+      _hudIsBrightness = false;
+    });
+    _hudTimer = Timer(const Duration(milliseconds: 700), () {
+      if (mounted) setState(() => _hudVisible = false);
+    });
+  }
+
+  /// Windows: a keyboard / mouse-button seek, plus feedback: the watch
+  /// page's pill, or the full player's double-tap seek indicator with the
+  /// running total (−10s, −20s…) while presses keep coming.
+  void _desktopSeek(int seconds) {
+    if (!_ready || _c.isClosed || seconds == 0) return;
+    _c.seekBy(Duration(seconds: seconds));
+    if (!_windowsDesktopUi) return;
+    if (_presentation == PlayerPresentation.watchPage) {
+      _watchHud.showSeek(seconds);
+      return;
+    }
+    final dir = seconds.sign;
+    _seekLabelTimer?.cancel();
+    setState(() {
+      if (_seekSide != dir) _seekAccum = 0;
+      _seekSide = dir;
+      _seekAccum += seconds.abs();
+      _seekTick++; // re-key so the indicator replays per press
+    });
+    _seekLabelTimer = Timer(const Duration(milliseconds: 800), () {
+      if (mounted) {
+        setState(() {
+          _seekSide = 0;
+          _seekAccum = 0;
+        });
+      }
+    });
+  }
+
+  /// Windows S key: skips the AniSkip interval under the playhead (same
+  /// target as the Skip button); does nothing outside one.
+  void _desktopSkip() {
+    if (!_ready || _c.isClosed) return;
+    if (_c.skipCurrentInterval()) _bumpControls();
+  }
+
+  /// Windows [ / ] keys: one speed step slower / faster (remembered like a
+  /// pick from the speed menu), with a short toast naming the new rate.
+  void _desktopSpeedStep(int dir) {
+    if (!_ready || _c.isClosed) return;
+    final next = _c.stepSpeed(dir);
+    showAppToast(context, '${next}x');
+  }
+
+  /// Windows C key: subtitles on / off for this session, with a toast.
+  Future<void> _desktopToggleSubtitles() async {
+    if (!_ready || _c.isClosed) return;
+    final on = await _c.toggleSubtitles();
+    if (mounted) {
+      showAppToast(context, on ? context.l10n.subtitlesOn : context.l10n.subtitlesOff);
+    }
+  }
+
+  /// Windows G / H keys: subtitle delay one step earlier / later.
+  void _desktopSubtitleDelay(int dir) {
+    if (!_ready || _c.isClosed) return;
+    final ms = _c.nudgeSubtitleDelay(dir).inMilliseconds;
+    final sign = ms > 0 ? '+' : '';
+    showAppToast(context, context.l10n.subtitleDelayMs('$sign$ms'));
+  }
+
+  /// Title handed to an external player: show and episode, when known.
+  String? get _externalPlayerTitle {
+    final parts = [
+      widget.showTitle,
+      _c.currentEpisode.title,
+    ].whereType<String>().where((s) => s.trim().isNotEmpty).toList();
+    return parts.isEmpty ? null : parts.join(' • ');
+  }
+
+  /// Windows: opens the current stream (with its headers) in an installed
+  /// desktop player, and pauses the built-in one once that player started.
+  Future<void> _openInDesktopPlayer(DesktopExternalPlayerApp app) async {
+    final url = _c.previewUri;
+    if (url == null || url.trim().isEmpty) return;
+    final ok = await DesktopExternalPlayers.launch(
+      app,
+      url: url,
+      headers: _c.previewHeaders,
+      title: _externalPlayerTitle,
+    );
+    if (ok && !_c.isClosed && _c.player.state.playing) _c.togglePlay();
+    if (mounted) {
+      showAppToast(
+        context,
+        ok
+            ? context.l10n.openedInApp(app.label)
+            : context.l10n.couldNotStartApp(app.label),
+      );
+    }
+  }
+
+  // ── Windows mini player / always on top / context menu ─────────────────
+
+  /// Windows: mini player on/off. Coming from the theater watch page it
+  /// first switches to the full player, which is what fits a 480x270
+  /// frame; the window itself is shrunk and pinned by the runner.
+  Future<void> _toggleDesktopMiniPlayer() async {
+    if (!_windowsDesktopUi) return;
+    if (DesktopWindow.miniPlayer.value) {
+      await DesktopWindow.exitMiniPlayer();
+      return;
+    }
+    if (_presentation == PlayerPresentation.watchPage) _enterFullscreen();
+    await DesktopWindow.enterMiniPlayer();
+  }
+
+  /// Windows: pins / unpins the window above other windows.
+  Future<void> _toggleAlwaysOnTop() =>
+      DesktopWindow.setAlwaysOnTop(!DesktopWindow.alwaysOnTop.value);
+
+  /// Rebuilds the full player when the runner enters / leaves the mini
+  /// player (also when Esc or the restore button left it).
+  void _onDesktopWindowModeChanged() {
+    if (mounted) setState(() {});
+  }
+
+  /// The keys bound to a player shortcut, for the menu's hint column
+  /// (honours remaps); null when nothing is bound.
+  String? _shortcutHint(String id) {
+    final keys = DesktopShortcuts.activatorsFor(id);
+    return keys.isEmpty ? null : DesktopShortcuts.describe(keys.first);
+  }
+
+  /// Windows: right-click menu over the video, at the pointer, in both the
+  /// full player and the theater page. Replaces the old right-click that
+  /// paused and pushed the whole Settings screen.
+  Future<void> _showDesktopVideoMenu(Offset at) async {
+    if (!_windowsDesktopUi || !mounted || !_ready || _c.isClosed) return;
+    final l10n = context.l10n;
+    const rates = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0];
+    final rate = _c.player.state.rate;
+    final playing = _c.player.state.playing;
+    // The playable stream (what the More panel copies / hands on too).
+    final url = _c.previewUri;
+    final canCopy = url != null && url.trim().isNotEmpty;
+    // Installed mpv / VLC / MPC-HC; cached after the first look.
+    final players = canCopy
+        ? await DesktopExternalPlayers.detect()
+        : const <DesktopExternalPlayerApp>[];
+    if (!mounted || _c.isClosed) return;
+    await showDesktopContextMenu<void>(
+      context,
+      position: at,
+      items: [
+        DesktopMenuItem(
+          label: playing ? l10n.pause : l10n.play,
+          icon: playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
+          shortcut: _shortcutHint('player.playPause'),
+          onTap: _c.togglePlay,
+        ),
+        const DesktopMenuItem.divider(),
+        DesktopMenuItem(
+          label: l10n.playbackSpeed,
+          icon: Icons.speed_rounded,
+          submenu: [
+            for (final r in rates)
+              DesktopMenuItem(
+                label: r == 1.0 ? l10n.normalSpeed : '${r}x',
+                checked: (rate - r).abs() < 0.01,
+                onTap: () => _c.setRateRemembered(r),
+              ),
+          ],
+        ),
+        DesktopMenuItem(
+          label: l10n.audio,
+          icon: Icons.headphones_rounded,
+          onTap: () => _openAudioSubsSheet(focus: AudioSubsFocus.audio),
+        ),
+        DesktopMenuItem(
+          label: l10n.subtitles,
+          icon: Icons.closed_caption_rounded,
+          shortcut: _shortcutHint('player.subtitles'),
+          onTap: () => _openAudioSubsSheet(focus: AudioSubsFocus.subtitles),
+        ),
+        DesktopMenuItem(
+          label: context.l10n.aspectRatio,
+          icon: Icons.aspect_ratio_rounded,
+          submenu: [
+            for (var i = 0; i < _fits.length; i++)
+              DesktopMenuItem(
+                label: _fits[i].$2,
+                checked: i == _fitIndex,
+                onTap: () {
+                  if (mounted) setState(() => _fitIndex = i);
+                },
+              ),
+          ],
+        ),
+        const DesktopMenuItem.divider(),
+        DesktopMenuItem(
+          label: context.l10n.screenshot,
+          icon: Icons.photo_camera_outlined,
+          onTap: _captureScreenshot,
+        ),
+        DesktopMenuItem(
+          label: context.l10n.copyStreamLink,
+          icon: Icons.link_rounded,
+          enabled: canCopy,
+          onTap: canCopy
+              ? () => copyStreamLinkWithHeaders(context, url, _c.previewHeaders)
+              : null,
+        ),
+        DesktopMenuItem(
+          label: context.l10n.openInExternalPlayer,
+          icon: Icons.open_in_new_rounded,
+          enabled: canCopy,
+          submenu: [
+            for (final app in players)
+              DesktopMenuItem(
+                label: app.label,
+                onTap: () => _openInDesktopPlayer(app),
+              ),
+            if (players.isEmpty)
+              DesktopMenuItem(
+                label: context.l10n.noExternalPlayerFound,
+                enabled: false,
+              ),
+          ],
+        ),
+        DesktopMenuItem(
+          label: l10n.nextEpisode,
+          icon: Icons.skip_next_rounded,
+          shortcut: _shortcutHint('player.nextEpisode'),
+          enabled: _c.hasPlayableNext,
+          onTap: () => _c.playNext(),
+        ),
+        const DesktopMenuItem.divider(),
+        DesktopMenuItem(
+          label: context.l10n.shortcutPlayerMiniPlayer,
+          icon: Icons.picture_in_picture_alt_rounded,
+          checked: DesktopWindow.miniPlayer.value,
+          shortcut: _shortcutHint('player.miniPlayer'),
+          onTap: _toggleDesktopMiniPlayer,
+        ),
+        DesktopMenuItem(
+          label: context.l10n.alwaysOnTop,
+          icon: Icons.push_pin_outlined,
+          checked: DesktopWindow.alwaysOnTop.value,
+          shortcut: _shortcutHint('player.alwaysOnTop'),
+          onTap: _toggleAlwaysOnTop,
+        ),
+        const DesktopMenuItem.divider(),
+        DesktopMenuItem(
+          label: context.l10n.playerSettings,
+          icon: Icons.settings_outlined,
+          onTap: _openSettings,
+        ),
+      ],
+    );
+  }
+
+  /// Windows mini player: hover-only controls sized for a 480x270 window
+  /// (restore, play / pause, seek bar). The full overlay does not fit there.
+  Widget _desktopMiniControls() {
+    Widget btn(
+      IconData icon,
+      String tip,
+      VoidCallback onTap, {
+      double size = 34,
+      Key? key,
+    }) => Tooltip(
+      message: tip,
+      child: Material(
+        color: Colors.black.withValues(alpha: 0.5),
+        shape: const CircleBorder(),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          key: key,
+          onTap: () {
+            onTap();
+            _bumpControls();
+          },
+          child: SizedBox.square(
+            dimension: size,
+            child: Icon(icon, color: Colors.white, size: size * 0.55),
+          ),
+        ),
+      ),
+    );
+    return AnimatedOpacity(
+      opacity: _controlsVisible ? 1 : 0,
+      duration: Duration(milliseconds: _controlsVisible ? 160 : 240),
+      child: IgnorePointer(
+        ignoring: !_controlsVisible,
+        child: Stack(
+          children: [
+            Positioned(
+              top: 6,
+              right: 6,
+              child: btn(
+                Icons.open_in_full_rounded,
+                context.l10n.restoreWithKey('Esc'),
+                DesktopWindow.exitMiniPlayer,
+                key: const ValueKey('mini-player-restore'),
+              ),
+            ),
+            Center(
+              child: StreamBuilder<bool>(
+                stream: _c.player.stream.playing,
+                initialData: _c.player.state.playing,
+                builder: (context, snap) {
+                  final on = snap.data ?? false;
+                  return btn(
+                    on ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                    on ? context.l10n.pause : context.l10n.play,
+                    _c.togglePlay,
+                    size: 46,
+                  );
+                },
+              ),
+            ),
+            Positioned(
+              left: 6,
+              right: 6,
+              bottom: 2,
+              child: StreamBuilder<Duration>(
+                stream: _c.player.stream.duration,
+                initialData: _c.player.state.duration,
+                builder: (context, d) => PlayerSeekBar(
+                  controller: _c,
+                  duration: d.data ?? Duration.zero,
+                  onInteract: _bumpControls,
+                  showTime: false,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   /// A tap landing on one of the three zones — sorts "toggle the controls" from
@@ -1681,7 +2843,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       top: p.playerBarTop ?? PlayerControlsConfig.defaultTop,
       left: p.playerBarLeft ?? PlayerControlsConfig.defaultLeft,
       right: p.playerBarRight ?? PlayerControlsConfig.defaultRight,
-    ).sanitised();
+      // Windows drops Cast / PiP, which never render there.
+    ).sanitised(unavailable: unavailablePlayerControls());
   }
 
   /// Settings, from the top bar. Pushed over the player rather than replacing
@@ -1722,7 +2885,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     // Back to whichever orientation you were watching in — not landscape by
     // default, or a portrait session would end up sideways after a settings trip.
     await SystemChrome.setPreferredOrientations(_orientationLock);
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    _applyPlayerSystemUi();
     await _c.applySavedPlaybackSettings();
     if (!mounted) return;
     // A language changed in app settings must reach the still-open episode;
@@ -1802,8 +2965,33 @@ class _PlayerScreenState extends State<PlayerScreen> {
     Future.delayed(const Duration(milliseconds: 130), () {
       if (mounted) setState(() => _flashing = false);
     });
-    await _c.captureScreenshot(); // saves to gallery + toasts the result
+    if (Platform.isWindows) {
+      await _captureScreenshotWindows();
+    } else {
+      await _c.captureScreenshot(); // saves to gallery + toasts the result
+    }
     _bumpControls();
+  }
+
+  /// Windows: gal writes into the Pictures library with no file path to show
+  /// and "gallery" wording, so the PNG goes to Pictures\Zangetsu here and the
+  /// notice offers Show in folder.
+  Future<void> _captureScreenshotWindows() async {
+    try {
+      final bytes = await _c.player.screenshot(format: 'image/png');
+      if (bytes == null || bytes.isEmpty) {
+        if (mounted) showAppToast(context, "Couldn't capture the frame");
+        return;
+      }
+      final file = await saveWindowsSnapshot(
+        bytes,
+        picturesDir: await windowsPicturesDirectory(),
+      );
+      if (mounted) showSnapshotSavedNotice(context, file.path);
+    } catch (e) {
+      AppLogger.instance.log('[snapshot] save failed: $e');
+      if (mounted) showAppToast(context, 'Screenshot failed');
+    }
   }
 
   void _onEpisodeComplete() {
@@ -1924,23 +3112,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
       context: context,
       barrierDismissible: true,
       barrierLabel: 'Episodes',
-      barrierColor: Colors.black54,
+      // Windows keeps the same light scrim as the other docked panels.
+      barrierColor: playerMenusDocked ? Colors.black26 : Colors.black54,
       transitionDuration: const Duration(milliseconds: 240),
-      pageBuilder: (ctx, _, _) => Align(
-        alignment: AlignmentDirectional.centerEnd,
-        child: _EpisodesPanel(
-          episodes: _c.episodes,
-          currentIndex: _c.state.currentIndex,
-          cover: widget.cover,
-          coverHeaders: widget.coverHeaders,
-          fillerEps: _c.fillerEpisodes.value,
-          onSelect: (i) {
-            Navigator.pop(ctx);
-            if (i != _c.state.currentIndex) _c.openEpisode(i);
-            _bumpControls();
-          },
-        ),
-      ),
+      pageBuilder: (ctx, _, _) {
+        final panel = Align(
+          alignment: AlignmentDirectional.centerEnd,
+          child: _EpisodesPanel(
+            episodes: _c.episodes,
+            currentIndex: _c.state.currentIndex,
+            cover: widget.cover,
+            coverHeaders: widget.coverHeaders,
+            fillerEps: _c.fillerEpisodes.value,
+            onSelect: (i) {
+              Navigator.pop(ctx);
+              if (i != _c.state.currentIndex) _c.openEpisode(i);
+              _bumpControls();
+            },
+          ),
+        );
+        // Windows: Esc closes the panel itself, ahead of the window-level Esc
+        // (leave fullscreen / go back), like the other docked panels.
+        return playerMenusDocked ? _EscCloses(child: panel) : panel;
+      },
       transitionBuilder: (ctx, anim, _, child) => SlideTransition(
         position: Tween(
           begin: const Offset(1, 0),
@@ -2025,6 +3219,109 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
     final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
     return d.inHours > 0 ? '${d.inHours}:$m:$s' : '$m:$s';
+  }
+
+  /// The one stable video surface: the live texture plus the poster that
+  /// covers it until the first frame decodes. Shared by fullscreen and the
+  /// portrait watch page — the [Video] widget re-attaches to the same
+  /// controller, so switching layouts never re-opens the stream.
+  Widget _buildVideoSurface() {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        // The video. NoVideoControls disables media_kit's built-in
+        // controls (which include their own buffering spinner + gestures)
+        // so only our custom controls show — fixes the duplicate
+        // spinner / double controls.
+        Center(
+          child: ValueListenableBuilder<int>(
+            valueListenable: _c.subtitleStyleRev,
+            builder: (context, _, _) => Transform.translate(
+              // Pinch-zoom: scale about centre, then pan. Overflow is
+              // clipped by the Stack so a zoomed frame crops to screen.
+              offset: _zoomPan,
+              child: Transform.scale(
+                scale: _zoom,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    Video(
+                      controller: _c.videoController,
+                      controls: NoVideoControls,
+                      fit: _fits[_fitIndex].$1,
+                      subtitleViewConfiguration:
+                          const SubtitleViewConfiguration(visible: false),
+                    ),
+                    if (!_c.styledSubtitlesOn)
+                      StreamBuilder<List<String>>(
+                        stream: _c.player.stream.subtitle,
+                        initialData: _c.player.state.subtitle,
+                        builder: (context, snapshot) {
+                          final prefs = sl<PlaybackPrefs>();
+                          return PositionedSubtitle(
+                            text: (snapshot.data ?? const <String>[])
+                                .where((line) => line.trim().isNotEmpty)
+                                .join('\n'),
+                            position: prefs.subtitlePosition,
+                            style: buildSubtitleTextStyle(
+                              prefs,
+                              fontSize: 32 * prefs.subtitleScale,
+                            ),
+                          );
+                        },
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+
+        // Poster-on-start: cover the black surface with the episode's
+        // poster until the first frame decodes, then fade it out. width
+        // emits non-null/>0 once dimensions are known (≈ first frame), and
+        // resets per new media so the poster re-shows each episode.
+        Positioned.fill(
+          child: StreamBuilder<int?>(
+            stream: _c.player.stream.width,
+            initialData: _c.player.state.width,
+            builder: (context, snap) {
+              final hasFrame = (snap.data ?? 0) > 0;
+              final img =
+                  (_c.currentEpisode.thumbnail?.trim().isNotEmpty ?? false)
+                  ? _c.currentEpisode.thumbnail!.trim()
+                  : (widget.cover ?? '');
+              return IgnorePointer(
+                child: AnimatedOpacity(
+                  opacity: hasFrame || img.isEmpty ? 0 : 1,
+                  duration: const Duration(milliseconds: 350),
+                  child: img.isEmpty
+                      ? const ColoredBox(color: Colors.black)
+                      : Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            CachedNetworkImage(
+                              imageUrl: img,
+                              httpHeaders: widget.coverHeaders,
+                              fit: BoxFit.cover,
+                              errorWidget: (c, u, e) =>
+                                  const ColoredBox(color: Colors.black),
+                            ),
+                            // subtle scrim so it reads as a player background
+                            const DecoratedBox(
+                              decoration: BoxDecoration(
+                                color: Color(0x33000000),
+                              ),
+                            ),
+                          ],
+                        ),
+                ),
+              );
+            },
+          ),
+        ),
+      ],
+    );
   }
 
   Widget _buildUpNextCard() {
@@ -2188,14 +3485,619 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
+  // ── Portrait watch page ────────────────────────────────────────────────
+
+  /// Key of the show the lazy description fetch was requested for. Entries
+  /// without a detail snapshot enrich once per show, lazily, and never delay
+  /// playback: a new show (or a changed key) re-arms, anything else reuses.
+  String? _descKey;
+  String? _enrichedDescription;
+
+  /// Show synopsis for entries that arrived without one (anything but Details
+  /// and offline downloads). Fire-and-forget with arrival guards: a changed
+  /// show, a disposed screen, or a failed fetch just leaves the section
+  /// hidden — the title and episodes were already on screen.
+  void _maybeEnrichDescription() {
+    if (widget.localOnly) return;
+    final url = widget.showUrl?.trim() ?? '';
+    if (url.isEmpty) return;
+    if ((widget.showDescription?.trim().isNotEmpty ?? false)) return;
+    final key = '${widget.sourceId}::$url';
+    if (_descKey == key) return;
+    _descKey = key;
+    final requestedKey = key;
+    unawaited(
+      sl<CatalogueRepository>()
+          .detail(url, sourceId: widget.sourceId)
+          .then((d) {
+            if (!mounted || _descKey != requestedKey) return;
+            final desc = d.description?.trim() ?? '';
+            if (desc.isEmpty || _enrichedDescription == desc) return;
+            setState(() => _enrichedDescription = desc);
+          })
+          .catchError((_) {}),
+    );
+  }
+
+  /// The autoplay target under the same rule the Next button and autoplay use
+  /// (auto-skip filler when that pref is on). Null = no next episode.
+  int? _upNextIndex() => nextAutoplayIndex(
+    currentIndex: _c.state.currentIndex,
+    episodes: _c.episodes,
+    fillerEps: _c.fillerEpisodes.value,
+    autoSkipFiller: sl<PlaybackPrefs>().autoSkipFiller,
+  );
+
+  void _openComingSoonSheet() {
+    // Windows panel: the shared title row with a close button, no inner card.
+    if (playerMenusDocked) {
+      _sheet<void>(
+        Builder(
+          builder: (ctx) => Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _PanelTitleBar(title: ctx.l10n.watchComments),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+                child: Text(
+                  ctx.l10n.watchComingSoon,
+                  style: AppText.body.copyWith(color: AppColors.textSecondary),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+      return;
+    }
+    _sheet<void>(
+      _SheetSurface(
+        child: SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 16, 24, 32),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(
+                  Icons.chat_bubble_outline_rounded,
+                  color: AppColors.accent,
+                  size: 28,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  context.l10n.watchComments,
+                  style: AppText.title.copyWith(color: Colors.white),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  context.l10n.watchComingSoon,
+                  style: AppText.body.copyWith(color: AppColors.textSecondary),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _setAutoplayNext(bool value) async {
+    await sl<PlaybackPrefs>().setAutoplayNext(value);
+    if (mounted) setState(() {});
+  }
+
+  void _openWatchMorePanel() {
+    _ControlsOverlay.showPlayerMorePanel(
+      context: context,
+      animatePortraitEntrance: true,
+      onInteract: _bumpControls,
+      decoderLabel: _shortDecoder(_c.decoderMode),
+      enhanceActive: sl<PlaybackPrefs>().videoShaderStyle != 'off',
+      onDecoder: _openDecoderSheet,
+      onEnhance: _openEnhanceSheet,
+      onColorProfile: _openColorProfileSheet,
+      onScreenshot: _captureScreenshot,
+      sleepActive: _sleepActive,
+      onSleep: _openSleepSheet,
+      onPip: _pipSupported
+          ? _enterPip
+          // Windows: the PiP control / More row opens the mini player.
+          : (_windowsDesktopUi ? _toggleDesktopMiniPlayer : null),
+      // Windows: the stream link for the Copy / external player rows.
+      controller: _c,
+    );
+  }
+
+  /// Portrait watch page: the stable surface on top, episode info below.
+  /// Rebuilt from cubit state, so episode changes refresh the header and
+  /// Up-next — but position ticks never reach here (they stay inside the
+  /// seek row's own StreamBuilders).
+  bool _watchEpisodeWatched(int index) =>
+      index >= 0 &&
+      index < _c.episodes.length &&
+      (widget.resume
+              .get(
+                widget.sourceId,
+                widget.showUrl ?? widget.sourceId,
+                _c.episodes[index].id,
+              )
+              ?.finished ??
+          false);
+
+  Future<void> _setWatchEpisodeWatched(int index, bool watched) async {
+    if (index < 0 || index >= _c.episodes.length) return;
+    final ep = _c.episodes[index];
+    try {
+      await widget.resume.setWatched(
+        widget.sourceId,
+        widget.showUrl ?? widget.sourceId,
+        ep.id,
+        watched: watched,
+      );
+      if (!mounted) return;
+      setState(() {});
+      showAppToast(
+        context,
+        watched ? context.l10n.markedAsWatched : context.l10n.markedUnwatched,
+      );
+      if (watched) {
+        unawaited(
+          phoneScrobbleOnLaunch(
+            episode: ep,
+            episodes: _c.episodes,
+            malId: widget.malId,
+            scrobbleTitle: widget.scrobbleTitle ?? widget.showTitle,
+            tmdbId: widget.tmdbId,
+            tmdbIsTv: widget.tmdbIsTv,
+            imdbId: widget.imdbId,
+            auto: false,
+          ),
+        );
+      }
+    } catch (_) {
+      if (mounted) showAppToast(context, 'Could not update watched status');
+    }
+  }
+
+  Future<void> _playWatchEpisodeMirror(int index) async {
+    if (index < 0 || index >= _c.episodes.length || _c.isClosed) return;
+    final ep = _c.episodes[index];
+    final playingIndex = _c.state.currentIndex;
+    final url = _c.categories.length > 1
+        ? tvEpisodeUrl(ep.url, _c.activeCategory)
+        : ep.url;
+    final navigator = Navigator.of(context, rootNavigator: true);
+    final loading = DialogRoute<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(child: CircularProgressIndicator()),
+    );
+    var done = false;
+    var canceled = false;
+    unawaited(
+      navigator.push(loading).then((_) {
+        if (!done) canceled = true;
+      }),
+    );
+    List<VideoSource> sources;
+    try {
+      sources = sl.isRegistered<CatalogueRepository>()
+          ? await sl<CatalogueRepository>().sources(
+              url,
+              sourceId: widget.sourceId,
+              fast: false,
+            )
+          : await widget.resolveSources(url);
+    } catch (_) {
+      sources = const [];
+    } finally {
+      if (!loading.isActive) canceled = true;
+      done = true;
+      if (loading.isActive) navigator.removeRoute(loading);
+    }
+    if (!mounted ||
+        canceled ||
+        _c.isClosed ||
+        _c.state.currentIndex != playingIndex) {
+      return;
+    }
+    if (sources.isEmpty) {
+      showAppToast(context, context.l10n.noSourcesFoundForThisEpisode);
+      return;
+    }
+    final picked = await showMirrorSheet(
+      context,
+      episodeLabel: ep.title,
+      sources: sources,
+    );
+    if (picked == null ||
+        !mounted ||
+        _c.isClosed ||
+        _c.state.currentIndex != playingIndex) {
+      return;
+    }
+    if (index == _c.state.currentIndex) {
+      await _c.switchSource(picked);
+    } else {
+      setState(() => _watchSeason = seasonOf(ep));
+      await _c.openEpisode(index, sourceOverride: picked);
+    }
+  }
+
+  String? _resolvedWatchDownloadId;
+  bool _watchDownloadPending = false;
+
+  Future<void> _downloadWatchEpisode(int index) async {
+    if (_watchDownloadPending ||
+        index < 0 ||
+        index >= _c.episodes.length ||
+        widget.localOnly ||
+        (widget.showUrl?.isEmpty ?? true)) {
+      return;
+    }
+    _watchDownloadPending = true;
+    try {
+      final manager = sl<DownloadManager>();
+      final episode = _c.episodes[index];
+      final category = _c.activeCategory;
+      final episodeId = episode.id;
+      final downloadShowId = await resolveEpisodeDownloadShowId(
+        sourceId: widget.sourceId,
+        showUrl: widget.showUrl!,
+        knownId: widget.downloadShowId ?? _resolvedWatchDownloadId,
+        downloads: manager.all,
+        loadShowId: () async => (await sl<CatalogueRepository>().detail(
+          widget.showUrl!,
+          sourceId: widget.sourceId,
+        )).id,
+      );
+      if (!mounted) return;
+      setState(() => _resolvedWatchDownloadId = downloadShowId);
+      final record = manager.recordFor(
+        widget.sourceId,
+        downloadShowId,
+        episodeId,
+      );
+      if (record != null &&
+          {
+            DownloadStatus.downloading,
+            DownloadStatus.paused,
+            DownloadStatus.queued,
+            DownloadStatus.resolving,
+          }.contains(record.status)) {
+        EpisodeDownloadIcon.showDownloadMenu(context, manager, record);
+        return;
+      }
+      Future<Map<int, List<Episode>>> resolveEpisodes(String cut) async {
+        final episodes = await sl<CatalogueRepository>().episodes(
+          widget.showUrl ?? widget.sourceId,
+          sourceId: widget.sourceId,
+          category: cut,
+        );
+        return {
+          for (final season in episodes.map((ep) => seasonOf(ep) ?? 1).toSet())
+            season: episodes
+                .where((ep) => (seasonOf(ep) ?? 1) == season)
+                .toList(),
+        };
+      }
+
+      Future<List<VideoSource>> resolve(Episode ep) =>
+          sl.isRegistered<CatalogueRepository>()
+          ? sl<CatalogueRepository>().sources(
+              ep.url,
+              sourceId: widget.sourceId,
+              fast: false,
+            )
+          : widget.resolveSources(ep.url);
+
+      final SingleEpisodeDownloadChoice? choice;
+      // Real source the Windows dialog's links came from (catalogue titles).
+      String? watchResolveSourceId;
+      if (playerMenusDocked) {
+        // Windows: the same cut/server dialog as the show page, not a phone
+        // bottom sheet. The cut only changes which episode list is used.
+        final picked = await showDialog<DesktopSingleDownloadChoice>(
+          context: context,
+          builder: (_) => DesktopSingleDownloadDialog(
+            episode: episode,
+            season: seasonOf(episode) ?? 1,
+            initialCategory: category,
+            availableCategories: _c.categories,
+            resolveEpisodes: resolveEpisodes,
+            resolveSources: (ep, _) => resolve(ep),
+            // Same bounded fallback search as the show page; the source that
+            // is playing this episode right now is asked first.
+            searchSources: sl.isRegistered<CatalogueRepository>()
+                ? (ep, cut) => episodeDownloadSourceSearch(
+                    episode: ep,
+                    category: cut,
+                    sourceId: widget.sourceId,
+                    preferredSourceId: sl.isRegistered<PlaybackResolver>()
+                        ? sl<PlaybackResolver>().resolvedSourceId(
+                            ep.url,
+                            category: cut,
+                          )
+                        : null,
+                  )
+                : null,
+          ),
+        );
+        // Catalogue titles keep their record key; retries ask this source.
+        final picked0 = picked?.sourceId;
+        watchResolveSourceId =
+            picked0 != null &&
+                picked0.isNotEmpty &&
+                picked0 != widget.sourceId &&
+                ZmodeIds.isZ(picked!.episode.url)
+            ? picked0
+            : null;
+        choice = picked == null
+            ? null
+            : (
+                chosen: picked.chosen,
+                all: picked.all,
+                episode: picked.episode,
+                category: picked.category,
+              );
+      } else {
+        choice = await showModalBottomSheet<SingleEpisodeDownloadChoice>(
+          context: context,
+          backgroundColor: AppColors.surface,
+          isScrollControlled: true,
+          shape: const RoundedRectangleBorder(
+            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+          ),
+          builder: (_) => EpisodeDownloadSourceSheet(
+            title: episode.title,
+            episode: episode,
+            category: category,
+            availableCategories: _c.categories,
+            resolveEpisodes: resolveEpisodes,
+            resolve: resolve,
+          ),
+        );
+      }
+      if (choice == null || !mounted) return;
+      final hinted = watchResolveSourceId;
+      if (hinted != null) {
+        manager.hintResolveSource(
+          sourceId: widget.sourceId,
+          showId: downloadShowId,
+          episodeIds: [choice.episode.id],
+          category: choice.category,
+          resolveSourceId: hinted,
+        );
+      }
+      if (playerMenusDocked) {
+        // Windows: the link was picked by hand in the server dialog, same as
+        // the show page, so retries stay on that server and SUB/DUB kind.
+        manager.hintPinnedServer(
+          sourceId: widget.sourceId,
+          showId: downloadShowId,
+          episodeId: choice.episode.id,
+          category: choice.category,
+        );
+      }
+      await manager.enqueueSource(
+        sourceId: widget.sourceId,
+        showId: downloadShowId,
+        showTitle: widget.showTitle ?? '',
+        cover: widget.cover,
+        coverHeaders: widget.coverHeaders,
+        showUrl: widget.showUrl ?? widget.sourceId,
+        category: choice.category,
+        episode: choice.episode,
+        source: choice.chosen,
+        qualityLabel: choice.chosen.quality ?? 'auto',
+        fallbacks: choice.all,
+        nowMs: DateTime.now().millisecondsSinceEpoch,
+        malId: widget.malId,
+      );
+      if (mounted) showAppToast(context, context.l10n.addedToDownloads);
+    } catch (_) {
+      if (mounted) {
+        showAppToast(context, context.l10n.couldntLoadDownloadOptions);
+      }
+    } finally {
+      _watchDownloadPending = false;
+    }
+  }
+
+  Widget _buildWatchPage(PlayerState state) {
+    final prefs = sl<PlaybackPrefs>();
+    _maybeEnrichDescription();
+    final header = resolveWatchPageHeader(
+      episode: _c.currentEpisode,
+      showTitle: widget.showTitle,
+      showDescription: widget.showDescription ?? _enrichedDescription,
+      isMovie: widget.isMovie,
+    );
+    final seasonSet = seasonsOf(_c.episodes);
+    final seasons = seasonSet.length > 1 ? (seasonSet.toList()..sort()) : null;
+    final nextIdx = _upNextIndex();
+    Episode? next;
+    if (nextIdx != null &&
+        nextIdx >= 0 &&
+        nextIdx < _c.episodes.length &&
+        nextIdx != state.currentIndex) {
+      next = _c.episodes[nextIdx];
+    }
+    final nextNum = next == null ? null : episodeNumberInt(next);
+    return PlayerWatchPage(
+      video: _buildVideoSurface(),
+      header: header,
+      isMovie: widget.isMovie,
+      coverHeaders: widget.coverHeaders,
+      coverUrl: (_c.currentEpisode.thumbnail?.trim().isNotEmpty ?? false)
+          ? _c.currentEpisode.thumbnail!.trim()
+          : widget.cover,
+      loading: state.loadingSources || state.torrentPhase != null,
+      loadingStatus: state.torrentPhase,
+      bufferingStream: _c.player.stream.buffering,
+      initialBuffering: _c.player.state.buffering,
+      firstFrameStream: _c.player.stream.width,
+      initialFirstFrame: _c.player.state.width ?? 0,
+      ambientFrameStream: _ambientFrames.stream,
+      positionStream: _c.player.stream.position,
+      durationStream: _c.player.stream.duration,
+      playingStream: _c.player.stream.playing,
+      initialPlaying: _c.player.state.playing,
+      initialPosition: _c.player.state.position,
+      initialDuration: _c.player.state.duration,
+      hasPrevious: state.currentIndex > 0,
+      nextThumb: (next?.thumbnail?.trim().isNotEmpty ?? false)
+          ? next!.thumbnail!.trim()
+          : null,
+      nextLabel: next == null || nextNum == null
+          ? null
+          : (next.season != null ? 'S${next.season} E$nextNum' : 'E$nextNum'),
+      nextTitle: next == null
+          ? null
+          : (episodeDisplayTitle(next, number: nextNum) ??
+                (nextNum != null ? 'Episode $nextNum' : next.title)),
+      autoplay: prefs.autoplayNext,
+      episodes: watchPageEpisodes(
+        episodes: _c.episodes,
+        currentIndex: state.currentIndex,
+        isMovie: widget.isMovie,
+        showTitle: widget.showTitle,
+        coverFallback: widget.cover,
+        season: _watchSeason ?? seasonOf(_c.currentEpisode),
+        isWatched: (ep) =>
+            widget.resume
+                .get(widget.sourceId, widget.showUrl ?? widget.sourceId, ep.id)
+                ?.finished ??
+            false,
+      ),
+      seasons: seasons,
+      selectedSeason:
+          _watchSeason ?? seasonOf(_c.currentEpisode) ?? seasons?.first,
+      onSelectSeason: (s) => setState(() => _watchSeason = s),
+      serverName: _c.state.active?.label,
+      onTogglePlay: _c.togglePlay,
+      // Same seek as the full player: clears the pending resume target,
+      // marks a user seek (progress saving) and reaches watch-party guests.
+      onSeek: (d) => _c.seekTo(d),
+      onSeekBy: _locked ? null : _c.seekBy,
+      doubleTapSeconds: _seekSeconds,
+      onHoldSpeedChanged: !_holdSpeedEnabled || _locked
+          ? null
+          : (holding) {
+              if (_c.isClosed) return;
+              if (holding) {
+                _rateBeforeHold = rateToRestoreAfterHold(_c.player.state.rate);
+                _c.setRate(2.0);
+              } else {
+                _c.setRate(_rateBeforeHold);
+              }
+            },
+      onPrevious: () => _c.playPrevious(),
+      onNext: () => _c.playNext(),
+      onFullscreen: _enterFullscreen,
+      onBack: _windowsDesktopUi ? _handleDesktopWatchBack : _handleCloseRequest,
+      // Windows theater page only; the phone page ignores these.
+      onShowPage: _showPageAction,
+      showTitle: widget.showTitle,
+      episodeProgress: _windowsDesktopUi ? _watchEpisodeProgress : null,
+      skipButtonFor: _windowsDesktopUi && !_locked ? _skipButtonFor : null,
+      onServer: _openSourceSheet,
+      onAudio: () => _openAudioSubsSheet(focus: AudioSubsFocus.audio),
+      onSubtitles: () => _openAudioSubsSheet(focus: AudioSubsFocus.subtitles),
+      onMore: _openWatchMorePanel,
+      onSetWatched: _setWatchEpisodeWatched,
+      onPlayMirror: widget.localOnly ? null : _playWatchEpisodeMirror,
+      downloadButton:
+          widget.localOnly ||
+              (widget.showUrl?.isEmpty ?? true) ||
+              !sl.isRegistered<DownloadManager>()
+          ? null
+          : (ep) => EpisodeDownloadIcon(
+              sourceId: widget.sourceId,
+              showId:
+                  widget.downloadShowId ??
+                  _resolvedWatchDownloadId ??
+                  widget.showUrl ??
+                  widget.sourceId,
+              episodeId: _c.episodes[ep.index].id,
+              onTap: () => _downloadWatchEpisode(ep.index),
+            ),
+      isEpisodeWatched: _watchEpisodeWatched,
+      onOpenEpisode: (i) {
+        setState(() => _watchSeason = seasonOf(_c.episodes[i]));
+        _c.openEpisode(i);
+      },
+      onComments: _openComingSoonSheet,
+      onAutoplayChanged: _setAutoplayNext,
+      // Windows theater page: the full player's seek bar, right-click menu,
+      // wheel volume over the video, input feedback, volume and speed.
+      seekBar: _windowsDesktopUi
+          ? StreamBuilder<Duration>(
+              stream: _c.player.stream.duration,
+              initialData: _c.player.state.duration,
+              builder: (context, d) => PlayerSeekBar(
+                controller: _c,
+                duration: d.data ?? Duration.zero,
+                onInteract: () {},
+                showTime: false,
+              ),
+            )
+          : null,
+      onContextMenu: _windowsDesktopUi ? _showDesktopVideoMenu : null,
+      onWheelVolume: _windowsDesktopUi
+          ? (step) => _desktopVolumeStep(step * 5.0)
+          : null,
+      hud: _windowsDesktopUi ? _watchHud : null,
+      volumeStream: _windowsDesktopUi ? _userVolumeStream : null,
+      initialVolume: _windowsDesktopUi ? _c.userVolume : 100,
+      onVolumeChanged: _windowsDesktopUi ? _c.setUserVolume : null,
+      onToggleMute: _windowsDesktopUi ? _desktopToggleMute : null,
+      rateStream: _c.player.stream.rate,
+      initialRate: _c.player.state.rate,
+      onSpeed: _windowsDesktopUi ? _openSpeedSheet : null,
+    );
+  }
+
+  /// Saved progress (0..1) for an episode row on the Windows theater page.
+  /// Null when nothing was watched yet or the length is unknown.
+  double? _watchEpisodeProgress(int index) {
+    if (index < 0 || index >= _c.episodes.length) return null;
+    final mark = widget.resume.get(
+      widget.sourceId,
+      widget.showUrl ?? widget.sourceId,
+      _c.episodes[index].id,
+    );
+    if (mark == null || mark.duration.inMilliseconds <= 0) return null;
+    return mark.position.inMilliseconds / mark.duration.inMilliseconds;
+  }
+
   // ── Sheets ──────────────────────────────────────────────────────────────
 
   Future<T?> _sheet<T>(Widget child) {
+    // Windows: every in-player menu docks right like Subtitle style.
+    if (playerMenusDocked) {
+      return showDesktopPlayerPanel<T>(context, builder: (_) => child);
+    }
+    final portraitMotion =
+        _presentation == PlayerPresentation.watchPage &&
+        MediaQuery.orientationOf(context) == Orientation.portrait;
     return showModalBottomSheet<T>(
       context: context,
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
-      builder: (_) => _SheetSurface(child: SafeArea(top: false, child: child)),
+      sheetAnimationStyle:
+          portraitMotion && MediaQuery.disableAnimationsOf(context)
+          ? AnimationStyle.noAnimation
+          : null,
+      builder: (_) {
+        final surface = _SheetSurface(
+          child: SafeArea(top: false, child: child),
+        );
+        return portraitMotion ? WatchPageMenuEntrance(child: surface) : surface;
+      },
     );
   }
 
@@ -2235,12 +4137,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// decoder in place, so a stuttering/green/black stream can be fixed without
   /// leaving the video.
   void _openDecoderSheet() {
-    const modes = [
-      ('copy', 'Hardware+ (recommended)'),
-      ('direct', 'Hardware (faster)'),
-      ('sw', 'Software (most compatible)'),
-      ('auto', 'Auto'),
-    ];
+    // Windows names the D3D11 path, the same wording as Settings there.
+    final modes = _windowsDesktopUi
+        ? kWindowsDecoderOptions
+        : const [
+            ('copy', 'Hardware+ (recommended)'),
+            ('direct', 'Hardware (faster)'),
+            ('sw', 'Software (most compatible)'),
+            ('auto', 'Auto'),
+          ];
     final current = _c.decoderMode;
     _sheet<void>(
       _SheetColumn(
@@ -2262,63 +4167,71 @@ class _PlayerScreenState extends State<PlayerScreen> {
     );
   }
 
-  /// Build the Flutter subtitle overlay style from the user's prefs. media_kit
-  /// renders text subtitles via this [SubtitleViewConfiguration] (a Flutter
-  /// overlay), NOT libass — so font/colour/size/outline/position all live here.
-  /// The [TextStyle] comes from the shared [buildSubtitleTextStyle] so the live
-  /// preview in the style sheet matches exactly what renders on the video.
-  SubtitleViewConfiguration _subtitleConfig() {
-    final p = sl<PlaybackPrefs>();
-    // position 0 (top) … 100 (bottom). Higher value → nearer the bottom (less
-    // bottom padding); lower value lifts the text up the frame.
-    final pos = p.subtitlePosition.clamp(0, 100);
-    final bottom = 16.0 + (100 - pos) * 3.0;
-    return SubtitleViewConfiguration(
-      textAlign: TextAlign.center,
-      padding: EdgeInsets.fromLTRB(16, 0, 16, bottom),
-      style: buildSubtitleTextStyle(p, fontSize: 32.0 * p.subtitleScale),
-    );
-  }
-
   /// Netflix-style combined Audio | Subtitles panel (two columns, live
-  /// selection without closing).
-  void _openAudioSubsSheet({bool castMode = false}) {
+  /// selection without closing). Portrait chips pass [focus] to open on one
+  /// column; fullscreen passes nothing and keeps the pair.
+  void _openAudioSubsSheet({bool castMode = false, AudioSubsFocus? focus}) {
+    if (playerMenusDocked) {
+      // Two columns need a wider panel than the single-list menus.
+      showDesktopPlayerPanel<void>(
+        context,
+        width: focus == null ? 640 : 440,
+        builder: (_) => _audioSubsSheetBody(castMode: castMode, focus: focus),
+      );
+      return;
+    }
+    final portraitMotion =
+        _presentation == PlayerPresentation.watchPage &&
+        MediaQuery.orientationOf(context) == Orientation.portrait;
     showModalBottomSheet<void>(
       context: context,
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
-      builder: (_) => _SheetSurface(
-        blur: true,
-        opacity: 0.82,
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
-        child: SafeArea(
-          top: false,
-          child: _AudioSubsSheet(
-            controller: _c,
-            onInteract: _bumpControls,
-            castMode: castMode,
-            onSoftSubPicked: (s) => _castSubtitle = s,
-            onSubtitlesOff: () => _castSubtitle = null,
-            onAfterChange: () {
-              unawaited(_maybeRecast());
-            },
-            onLoadFile: () {
-              Navigator.pop(context);
-              _loadSubtitleFromFile();
-            },
-            onSearchOnline: () {
-              Navigator.pop(context);
-              _openOnlineSubtitleSheet();
-            },
-            onTranslate: () {
-              Navigator.pop(context);
-              _openTranslateSheet();
-            },
+      sheetAnimationStyle:
+          portraitMotion && MediaQuery.disableAnimationsOf(context)
+          ? AnimationStyle.noAnimation
+          : null,
+      builder: (_) {
+        final surface = _SheetSurface(
+          blur: true,
+          opacity: 0.82,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+          child: SafeArea(
+            top: false,
+            child: _audioSubsSheetBody(castMode: castMode, focus: focus),
           ),
-        ),
-      ),
+        );
+        return portraitMotion ? WatchPageMenuEntrance(child: surface) : surface;
+      },
     );
   }
+
+  /// The Audio | Subtitles menu body, shared by the phone sheet and the
+  /// Windows docked panel.
+  Widget _audioSubsSheetBody({required bool castMode, AudioSubsFocus? focus}) =>
+      _AudioSubsSheet(
+        controller: _c,
+        focus: focus,
+        onInteract: _bumpControls,
+        castMode: castMode,
+        onSoftSubPicked: (s) => _castSubtitle = s,
+        onSubtitlesOff: () => _castSubtitle = null,
+        onAfterChange: () {
+          unawaited(_maybeRecast());
+        },
+        onLoadFile: () {
+          Navigator.pop(context);
+          _loadSubtitleFromFile();
+        },
+        onSearchOnline: () {
+          Navigator.pop(context);
+          _openOnlineSubtitleSheet();
+        },
+        onTranslate: () {
+          Navigator.pop(context);
+          _openTranslateSheet();
+        },
+      );
 
   // ── Translate the active subtitle into a chosen language ──────────────────
   void _openTranslateSheet() {
@@ -2371,6 +4284,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final initialQuery = (widget.showTitle?.trim().isNotEmpty ?? false)
         ? widget.showTitle!.trim()
         : (widget.scrobbleTitle?.trim() ?? '');
+    final body = _OnlineSubtitleSheet(
+      initialQuery: initialQuery,
+      // Default the manual search to the preferred language, falling back
+      // to English (the prior default) when no preference is set.
+      initialLanguage: sl<PlaybackPrefs>().preferredSubtitleLanguage.isEmpty
+          ? 'en'
+          : sl<PlaybackPrefs>().preferredSubtitleLanguage,
+      imdbId: widget.imdbId,
+      tmdbId: widget.tmdbId,
+      isTv: widget.tmdbIsTv,
+      season: _c.currentEpisode.season,
+      episode: _c.currentEpisode.number?.toInt(),
+      onApply: (path) async {
+        await _c.setSubtitleFromFile(path);
+        _bumpControls();
+      },
+    );
+    if (playerMenusDocked) {
+      showDesktopPlayerPanel<void>(context, width: 520, builder: (_) => body);
+      return;
+    }
     showModalBottomSheet<void>(
       context: context,
       backgroundColor: Colors.transparent,
@@ -2379,24 +4313,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         blur: true,
         opacity: 0.82,
         borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
-        child: SafeArea(
-          top: false,
-          child: _OnlineSubtitleSheet(
-            initialQuery: initialQuery,
-            // Default the manual search to the preferred language, falling back
-            // to English (the prior default) when no preference is set.
-            initialLanguage:
-                sl<PlaybackPrefs>().preferredSubtitleLanguage.isEmpty
-                ? 'en'
-                : sl<PlaybackPrefs>().preferredSubtitleLanguage,
-            imdbId: widget.imdbId,
-            tmdbId: widget.tmdbId,
-            onApply: (path) async {
-              await _c.setSubtitleFromFile(path);
-              _bumpControls();
-            },
-          ),
-        ),
+        child: SafeArea(top: false, child: body),
       ),
     );
   }
@@ -2455,7 +4372,31 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _sheet<void>(_SheetColumn(header: context.l10n.quality, children: rows));
   }
 
+  Future<void> _openStremioSourceSheet() async {
+    final index = _c.state.currentIndex;
+    final episode = _c.currentEpisode;
+    final picked = await showStremioEpisodeLinksSheet(
+      context,
+      manager: sl<StremioManager>(),
+      ref: StremioRef.parse(episode.url),
+      title: episode.title,
+    );
+    if (picked == null ||
+        !mounted ||
+        _c.isClosed ||
+        _c.state.currentIndex != index) {
+      return;
+    }
+    await _c.selectSource(picked);
+    await _maybeRecast();
+    _bumpControls();
+  }
+
   void _openSourceSheet() {
+    if (widget.sourceId == stremioSourceId && !widget.localOnly) {
+      unawaited(_openStremioSourceSheet());
+      return;
+    }
     final kinds = availableKinds(_c.state.sources);
     _sheet<void>(
       _SheetColumn(
@@ -2476,6 +4417,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     : '${k != AudioKind.unknown ? '${k.name.toUpperCase()} • ' : ''}'
                           '${s.quality?.isNotEmpty == true ? s.quality : s.container.name}',
                 active: s == _c.state.active,
+                onLongPress: () => copyPlaybackLink(context, s.url),
                 onTap: () async {
                   Navigator.pop(context);
                   await _c.selectSource(
@@ -2496,11 +4438,21 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // branded spinner, so tapping Play opens straight into a "player that's
   // loading" instead of a black screen while the source resolves + buffers —
   // the CloudStream-style instant-player feel. Purely visual; no logic change.
-  Widget _loadingBackdropBody(String label, {String? thumb}) {
+  //
+  // [onBack] (Windows only) adds the overlay-style back arrow top-left plus
+  // Esc / mouse back, so a slow or stuck resolve can always be left.
+  // [handleMouseBack] is false inside DesktopPlayerInput, which already maps
+  // the mouse back button (two handlers would pop twice).
+  Widget _loadingBackdropBody(
+    String label, {
+    String? thumb,
+    VoidCallback? onBack,
+    bool handleMouseBack = false,
+  }) {
     final img = (thumb?.trim().isNotEmpty ?? false)
         ? thumb!.trim()
         : (widget.cover ?? '').trim();
-    return Stack(
+    final body = Stack(
       fit: StackFit.expand,
       children: [
         if (img.isNotEmpty)
@@ -2525,18 +4477,191 @@ class _PlayerScreenState extends State<PlayerScreen> {
           ),
         ),
         Center(child: BrandLoader(label: label)),
+        if (onBack != null)
+          Positioned(
+            top: 0,
+            left: 0,
+            child: PlayerBackButton(onPressed: onBack),
+          ),
       ],
+    );
+    if (onBack == null) return body;
+    return PlayerBackScope(
+      onBack: onBack,
+      handleMouseBack: handleMouseBack,
+      onEscape: _stateEscape,
+      child: body,
+    );
+  }
+
+  /// Windows: back from a player state without the controls overlay
+  /// (loading, error). Same as the player's Esc / mouse back: the mini
+  /// player restores the window first, otherwise the player closes.
+  void _stateBack() {
+    if (!mounted) return;
+    if (DesktopWindow.miniPlayer.value) {
+      unawaited(DesktopWindow.exitMiniPlayer());
+      return;
+    }
+    Navigator.of(context).maybePop();
+  }
+
+  /// Windows: Esc on those states. Leaves fullscreen first, then
+  /// [_stateBack], exactly like the player's own Esc ('player.exit').
+  void _stateEscape() {
+    unawaited(() async {
+      if (await DesktopWindow.exitFullscreen()) return;
+      _stateBack();
+    }());
+  }
+
+  /// [_stateBack] on Windows, null (no back affordance) on phone.
+  VoidCallback? get _desktopStateBack => _windowsDesktopUi ? _stateBack : null;
+
+  /// Portrait twin of [_loadingBackdropBody]: the same boxed surface card
+  /// (cover art dimmed, loader on top) with skeleton rows below — so opening
+  /// from detail lands straight on the portrait page instead of a fullscreen
+  /// cover interlude that then snaps into portrait. Static: no cubit, no
+  /// streams; it only paints until [_startSession]/[_resolveThenStart] flips
+  /// [_ready], at which point the real watch page takes over with everything
+  /// already in place.
+  Widget _watchPageLoadingShell() {
+    final cover = (widget.cover ?? '').trim();
+    final title = (widget.showTitle ?? '').trim();
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        bottom: false,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(18),
+                child: SizedBox(
+                  height: ((MediaQuery.sizeOf(context).width - 24) * 9 / 16)
+                      .clamp(0.0, MediaQuery.sizeOf(context).height * 0.38),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      if (cover.isNotEmpty)
+                        CachedNetworkImage(
+                          imageUrl: cover,
+                          httpHeaders: widget.coverHeaders,
+                          fit: BoxFit.cover,
+                          memCacheWidth: 1080,
+                          errorWidget: (c, u, e) =>
+                              const ColoredBox(color: Colors.black),
+                          placeholder: (c, u) =>
+                              const ColoredBox(color: Colors.black),
+                        )
+                      else
+                        const ColoredBox(color: Colors.black),
+                      const DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: [Color(0x99000000), Color(0xCC000000)],
+                          ),
+                        ),
+                      ),
+                      Positioned.fill(
+                        bottom: 60,
+                        child: Align(
+                          alignment: const Alignment(0, 0.5),
+                          child: WatchPlayerButton(
+                            icon: Icons.play_arrow_rounded,
+                            label: context.l10n.loading,
+                            size: 56,
+                            iconSize: 32,
+                            busy: true,
+                            onTap: null,
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        top: 6,
+                        left: 6,
+                        child: WatchPlayerButton(
+                          icon: Icons.arrow_back_ios_new_rounded,
+                          label: context.l10n.back,
+                          size: 32,
+                          iconSize: 18,
+                          onTap: () => Navigator.of(context).maybePop(),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+              child: title.isEmpty
+                  ? const _ShellBar(width: 220, height: 18)
+                  : Text(
+                      title,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: AppText.headline.copyWith(
+                        color: Colors.white,
+                        fontSize: 20,
+                      ),
+                    ),
+            ),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 6, 16, 0),
+              child: _ShellBar(width: 140, height: 12),
+            ),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 14, 16, 8),
+              child: _ShellBar(width: 110, height: 16),
+            ),
+            Expanded(
+              child: ListView.builder(
+                physics: const NeverScrollableScrollPhysics(),
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                itemCount: 5,
+                itemBuilder: (_, _) => const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 10),
+                  child: Row(
+                    children: [
+                      _ShellBar(width: 116, height: 65, radius: 10),
+                      SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            _ShellBar(width: double.infinity, height: 14),
+                            SizedBox(height: 6),
+                            _ShellBar(width: 120, height: 12),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
+    final route = ModalRoute.of(context);
+    if (_chosenPlayer == PlaybackPrefs.androidPlayerId &&
+        (route is NativePlayerHandoffRoute || widget.onEngineChange != null)) {
+      return const SizedBox.shrink();
+    }
     // A Watch Together join that couldn't resolve the room's source — explain
     // it clearly instead of a blank/bouncing screen.
     if (_loadError != null) {
-      return Scaffold(
-        backgroundColor: Colors.black,
-        body: SafeArea(
+      final errorBody = SafeArea(
           child: Center(
             child: Padding(
               padding: const EdgeInsets.all(28),
@@ -2559,15 +4684,39 @@ class _PlayerScreenState extends State<PlayerScreen> {
               ),
             ),
           ),
-        ),
-      );
-    }
-    // Still resolving the episode list (instant-nav path) — show the branded
-    // loader instead of touching the not-yet-created cubit.
-    if (!_ready) {
+        );
       return Scaffold(
         backgroundColor: Colors.black,
-        body: _loadingBackdropBody('Loading…'),
+        // Windows: Esc / mouse back leave too (built outside
+        // DesktopPlayerInput, so the player's own handling is absent; the
+        // scope also keeps the app-wide handlers from acting a second time).
+        body: _windowsDesktopUi
+            ? PlayerBackScope(
+                onBack: _stateBack,
+                onEscape: _stateEscape,
+                child: errorBody,
+              )
+            : errorBody,
+      );
+    }
+    // Still resolving the episode list (instant-nav path) — the portrait
+    // shell in watch mode (same boxed surface + skeleton rows, no fullscreen
+    // cover interlude), the branded loader otherwise. Either way we never
+    // touch the not-yet-created cubit.
+    if (!_ready) {
+      // Windows skips the phone portrait shell for the branded loader.
+      if (_watchPageEnabled && !_windowsDesktopUi) {
+        return _watchPageLoadingShell();
+      }
+      return Scaffold(
+        backgroundColor: Colors.black,
+        // Built before DesktopPlayerInput exists, so this state handles the
+        // mouse back button itself (Windows).
+        body: _loadingBackdropBody(
+          'Loading…',
+          onBack: _desktopStateBack,
+          handleMouseBack: true,
+        ),
       );
     }
     // One tooltip style for everything in the player, set here rather than on
@@ -2575,18 +4724,52 @@ class _PlayerScreenState extends State<PlayerScreen> {
     // `tooltip:` property, so per-widget styling would leave those on Material's
     // default grey while ours were dark. Theming the whole subtree catches both.
     final scaffold = DesktopPlayerInput(
-      hideCursor: !_controlsVisible,
+      // The theater watch page manages its own cursor over the video; never
+      // hide it over the side panel because the full player's bar timed out.
+      hideCursor:
+          !_controlsVisible && _presentation != PlayerPresentation.watchPage,
       seekSeconds: sl<PlaybackPrefs>().tvSeekSeconds,
       onPlayPause: () {
         _bumpControls();
         _c.togglePlay();
       },
-      onSeek: (seconds) => _c.seekBy(Duration(seconds: seconds)),
-      onVolume: (delta) => _c.player.setVolume(
-        (_c.player.state.volume + delta).clamp(0.0, 100.0),
-      ),
-      onMute: () => _c.player.setVolume(_c.player.state.volume == 0 ? 100 : 0),
-      onBack: () => Navigator.of(context).maybePop(),
+      // Windows: every keyboard / mouse-button seek and volume change shows
+      // the matching indicator (see _desktopSeek / _showDesktopVolume).
+      onSeek: _desktopSeek,
+      onVolume: _desktopVolumeStep,
+      onMute: _desktopToggleMute,
+      // Esc / mouse Back in the mini player restores the window first.
+      onBack: () {
+        if (_windowsDesktopUi && DesktopWindow.miniPlayer.value) {
+          unawaited(DesktopWindow.exitMiniPlayer());
+          return;
+        }
+        Navigator.of(context).maybePop();
+      },
+      // Windows: Ctrl+M mini player, Ctrl+T always on top (remappable).
+      onMiniPlayer: _windowsDesktopUi ? _toggleDesktopMiniPlayer : null,
+      onAlwaysOnTop: _windowsDesktopUi ? _toggleAlwaysOnTop : null,
+      // N / P and the media keys: next / previous episode. Always wired on
+      // Windows: this widget is built outside the cubit's BlocBuilder, so a
+      // build-time "has next / previous" check would go stale after an
+      // episode change. playNext / playPrevious do nothing at either end.
+      onNextEpisode: _windowsDesktopUi ? () => _c.playNext() : null,
+      onPreviousEpisode: _windowsDesktopUi ? () => _c.playPrevious() : null,
+      // S: skip the intro / ending / recap under the playhead.
+      onSkip: _windowsDesktopUi ? _desktopSkip : null,
+      // 0-9: jump to that tenth of the episode.
+      onJumpToFraction: _windowsDesktopUi ? _c.jumpToFraction : null,
+      // [ and ]: one speed step slower / faster.
+      onSpeedStep: _windowsDesktopUi ? _desktopSpeedStep : null,
+      // C: subtitles on / off; G / H: subtitle delay; , / .: frame step.
+      onToggleSubtitles: _windowsDesktopUi ? _desktopToggleSubtitles : null,
+      onSubtitleDelayStep: _windowsDesktopUi ? _desktopSubtitleDelay : null,
+      onFrameStep: _windowsDesktopUi ? (dir) => _c.frameStep(dir) : null,
+      // Media Stop key (while focused): close the player (player-10).
+      onStop: _windowsDesktopUi ? _desktopMediaStop : null,
+      // Windows: the wheel changes volume over the video only, handled by
+      // DesktopVideoWheel / the watch page (player-13); phones keep it here.
+      wheelVolume: !_windowsDesktopUi,
       child: TooltipTheme(
         data: TooltipThemeData(
           decoration: BoxDecoration(
@@ -2630,10 +4813,25 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   ),
                 );
               }
+              // Portrait watch page (phone only): the stable surface on top,
+              // episode info below. It stays up through source resolves — the
+              // loading spinner sits on the mini player instead of a black
+              // loader screen, and the header is already the new episode
+              // (the cubit emits the index before resolving). Torrent progress
+              // stays in the miniplayer; errors keep their screen below.
+              // Windows mini player always shows the plain video: a
+              // theater page cannot fit a 480x270 window.
+              final mini = _windowsDesktopUi && DesktopWindow.miniPlayer.value;
+              if (_presentation == PlayerPresentation.watchPage &&
+                  state.error == null &&
+                  !mini) {
+                return _buildWatchPage(state);
+              }
               if (state.loadingSources) {
                 return _loadingBackdropBody(
                   'Finding the best source…',
                   thumb: _c.currentEpisode.thumbnail,
+                  onBack: _desktopStateBack,
                 );
               }
               // Torrent source buffering: "Finding peers…" / "Buffering N%".
@@ -2641,53 +4839,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 return _loadingBackdropBody(
                   state.torrentPhase!,
                   thumb: _c.currentEpisode.thumbnail,
+                  onBack: _desktopStateBack,
                 );
               }
               if (state.error != null) {
-                return Center(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 32),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(
-                          Icons.error_outline,
-                          size: 40,
-                          color: AppColors.textTertiary,
-                        ),
-                        const SizedBox(height: 12),
-                        // First line is the headline, the rest is what actually
-                        // happened. Kept as one string in the state and split here
-                        // so the controller stays free of presentation — and so a
-                        // message with no second line still renders fine.
-                        Text(
-                          state.error!.split('\n').first,
-                          style: AppText.title.copyWith(fontSize: 17),
-                          textAlign: TextAlign.center,
-                        ),
-                        if (state.error!.contains('\n')) ...[
-                          const SizedBox(height: 6),
-                          Text(
-                            state.error!.split('\n').skip(1).join('\n'),
-                            style: AppText.body.copyWith(
-                              color: AppColors.textSecondary,
-                            ),
-                            textAlign: TextAlign.center,
-                          ),
-                        ],
-                        const SizedBox(height: 16),
-                        TextButton(
-                          onPressed: () => _c.openEpisode(state.currentIndex),
-                          child: Text(
-                            'Try again',
-                            style: AppText.body.copyWith(
-                              color: AppColors.accent,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
+                // Windows adds a back arrow + Esc; phone keeps the old view.
+                // DesktopPlayerInput above already maps the mouse back button.
+                return PlayerErrorView(
+                  message: state.error!,
+                  onRetry: () => _c.openEpisode(state.currentIndex),
+                  onBack: _desktopStateBack,
+                  onEscape: _windowsDesktopUi ? _stateEscape : null,
+                  handleMouseBack: false,
                 );
               }
               // Reset any pinch-zoom when the episode changes.
@@ -2698,7 +4861,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
               }
               // Passive Listener tracks raw pointers for pinch-to-zoom so it never
               // competes with the 1-finger gesture detector inside the Stack.
-              return Listener(
+              final surface = Listener(
                 onPointerDown: _onPointerDown,
                 onPointerHover: Platform.isWindows
                     ? (_) => _bumpControls()
@@ -2709,76 +4872,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 child: Stack(
                   fit: StackFit.expand,
                   children: [
-                    // 1. The video. NoVideoControls disables media_kit's built-in
-                    // controls (which include their own buffering spinner + gestures)
-                    // so ONLY our custom Netflix overlay shows — fixes the duplicate
-                    // spinner / double controls.
-                    Center(
-                      child: ValueListenableBuilder<int>(
-                        valueListenable: _c.subtitleStyleRev,
-                        builder: (context, _, _) => Transform.translate(
-                          // Pinch-zoom: scale about centre, then pan. Overflow is
-                          // clipped by the Stack so a zoomed frame crops to screen.
-                          offset: _zoomPan,
-                          child: Transform.scale(
-                            scale: _zoom,
-                            child: Video(
-                              controller: _c.videoController,
-                              controls: NoVideoControls,
-                              fit: _fits[_fitIndex].$1,
-                              subtitleViewConfiguration: _subtitleConfig(),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-
-                    // 1b. Poster-on-start: cover the black surface with the episode's
-                    // poster until the first frame decodes, then fade it out. width
-                    // emits non-null/>0 once dimensions are known (≈ first frame), and
-                    // resets per new media so the poster re-shows each episode.
-                    Positioned.fill(
-                      child: StreamBuilder<int?>(
-                        stream: _c.player.stream.width,
-                        initialData: _c.player.state.width,
-                        builder: (context, snap) {
-                          final hasFrame = (snap.data ?? 0) > 0;
-                          final img =
-                              (_c.currentEpisode.thumbnail?.trim().isNotEmpty ??
-                                  false)
-                              ? _c.currentEpisode.thumbnail!.trim()
-                              : (widget.cover ?? '');
-                          return IgnorePointer(
-                            child: AnimatedOpacity(
-                              opacity: hasFrame || img.isEmpty ? 0 : 1,
-                              duration: const Duration(milliseconds: 350),
-                              child: img.isEmpty
-                                  ? const ColoredBox(color: Colors.black)
-                                  : Stack(
-                                      fit: StackFit.expand,
-                                      children: [
-                                        CachedNetworkImage(
-                                          imageUrl: img,
-                                          httpHeaders: widget.coverHeaders,
-                                          fit: BoxFit.cover,
-                                          errorWidget: (c, u, e) =>
-                                              const ColoredBox(
-                                                color: Colors.black,
-                                              ),
-                                        ),
-                                        // subtle scrim so it reads as a player background
-                                        const DecoratedBox(
-                                          decoration: BoxDecoration(
-                                            color: Color(0x33000000),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                            ),
-                          );
-                        },
-                      ),
-                    ),
+                    _buildVideoSurface(),
 
                     // 2. Input layer — D-pad on TV; touch gestures on phone.
                     // On TV: PlayerTvControls owns the Focus/key-handler + bottom bar.
@@ -2800,6 +4894,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
                               ? () => _c.playNext()
                               : null,
                           onBack: () => Navigator.of(context).maybePop(),
+                          onInfo: _infoFields.isEmpty
+                              ? null
+                              : () => setState(
+                                  () => _infoPanelOpen = !_infoPanelOpen,
+                                ),
+                          showInfo: _infoFields.isNotEmpty,
+                          infoOpen: _infoPanelOpen,
                           playingStream: _c.player.stream.playing,
                           initialPlaying: _c.player.state.playing,
                           barVisible: _tvBarVisible,
@@ -2918,13 +5019,25 @@ class _PlayerScreenState extends State<PlayerScreen> {
                             // All three carry a bare onTap (no double-tap recognizer,
                             // which would hold the arena and stall every single tap by
                             // 300ms); _tapZone sorts toggle from seek itself.
-                            if (Platform.isWindows)
+                            //
+                            // Windows: play / pause on the first click with
+                            // no double-click wait; a quick second click
+                            // undoes it and toggles fullscreen (restores the
+                            // window in the mini player). Right-click opens
+                            // the player menu at the pointer, and dragging
+                            // the mini player moves its window.
+                            if (_windowsDesktopUi)
                               Positioned.fill(
-                                child: GestureDetector(
-                                  behavior: HitTestBehavior.translucent,
-                                  onTap: _c.togglePlay,
-                                  onDoubleTap: DesktopWindow.toggleFullscreen,
-                                  onSecondaryTap: _openSettings,
+                                child: DesktopVideoPointer(
+                                  key: const ValueKey('player-video-click'),
+                                  onToggle: _c.togglePlay,
+                                  onDoubleClick: mini
+                                      ? DesktopWindow.exitMiniPlayer
+                                      : DesktopWindow.toggleFullscreen,
+                                  onContextMenu: _showDesktopVideoMenu,
+                                  onDragStart: mini
+                                      ? (_) => DesktopWindow.startDrag()
+                                      : null,
                                 ),
                               )
                             else
@@ -3138,7 +5251,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       ),
 
                     // 6. Controls overlay (phone only — TV uses PlayerTvControls above).
-                    if (!sl<AppMode>().isTv && !_locked)
+                    // Windows mini player: compact hover-only controls.
+                    if (mini)
+                      Positioned.fill(child: _desktopMiniControls())
+                    else if (!sl<AppMode>().isTv && !_locked)
                       AnimatedOpacity(
                         opacity: _controlsVisible ? 1 : 0,
                         // Snappy pop-in, gentle fade-out; eased so it reads as fast.
@@ -3163,7 +5279,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                             onInteract: _bumpControls,
                             onRotate: _toggleOrientation,
                             portraitMode: _portraitMode,
-                            onBack: () => Navigator.of(context).maybePop(),
+                            onBack: _handlePlayerBack,
+                            onShowPage: _showPageAction,
                             onSpeed: _openSpeedSheet,
                             onAudioSubs: _openAudioSubsSheet,
                             onQuality: _openQualitySheet,
@@ -3172,7 +5289,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
                             onSettings: _openSettings,
                             barConfig: _barConfig,
                             onZoom: _cycleFit,
-                            onPip: _pipSupported ? _enterPip : null,
+                            onPip: _pipSupported
+                                ? _enterPip
+                                // Windows: the PiP control / More row opens the mini player.
+                                : (_windowsDesktopUi
+                                      ? _toggleDesktopMiniPlayer
+                                      : null),
                             onSleep: _openSleepSheet,
                             sleepActive: _sleepActive,
                             decoderLabel: _shortDecoder(_c.decoderMode),
@@ -3245,11 +5367,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
                     // 6b. Player info overlay ("stats for nerds") — the fields the
                     // user ticked in Settings, toggled by the ⓘ button (top-left,
-                    // below the top bar). Persists until toggled off.
-                    if (!sl<AppMode>().isTv &&
-                        !_locked &&
-                        _infoPanelOpen &&
-                        _infoFields.isNotEmpty)
+                    // below the top bar on phone; Info button in the bar on TV).
+                    // Persists until toggled off.
+                    if (!_locked && _infoPanelOpen && _infoFields.isNotEmpty)
                       Positioned(
                         left: 16,
                         top: MediaQuery.of(context).padding.top + 58,
@@ -3284,15 +5404,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
                             snap.data ?? Duration.zero,
                           );
                           if (btn == null) return const SizedBox.shrink();
-                          // Sit low (Netflix-style) while watching; slide up above the
-                          // seek bar when the controls are showing so they never clash.
-                          return AnimatedAlign(
-                            duration: const Duration(milliseconds: 220),
-                            curve: Curves.easeOut,
-                            alignment: Alignment(
-                              0.94,
-                              _controlsVisible ? 0.4 : 0.74,
-                            ),
+                          // Sit low (Netflix-style) while watching; when the
+                          // controls show, rise to just above the measured
+                          // bottom block (seek bar + button rows) so the pill is
+                          // never covered and stays clickable. A screen-fraction
+                          // alignment used to land inside the taller desktop
+                          // block on smaller windows.
+                          return ValueListenableBuilder<double>(
+                            valueListenable: _controlsBottomBlockHeight,
+                            builder: (context, block, child) {
+                              final inset = MediaQuery.paddingOf(
+                                context,
+                              ).bottom;
+                              return AnimatedPositioned(
+                                duration: const Duration(milliseconds: 220),
+                                curve: Curves.easeOut,
+                                right: 44,
+                                bottom: _controlsVisible && block > 0
+                                    ? inset + block + 14 + 12
+                                    : inset + 72,
+                                child: child!,
+                              );
+                            },
                             child: btn,
                           );
                         },
@@ -3358,7 +5491,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           right: false,
                           child: RoomChatPanel(
                             controller: _room,
-                            onClose: () => setState(() => _chatOpen = false),
+                            onClose: () {
+                              setState(() => _chatOpen = false);
+                              // R1: closing chat removes its focused field;
+                              // give the keys back to the player after.
+                              DesktopFocusRepair.schedule();
+                            },
                           ),
                         ),
                       ),
@@ -3391,6 +5529,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   ],
                 ),
               );
+              // Windows: the wheel changes volume over the video only (this
+              // whole surface in the full player), with the volume HUD.
+              return DesktopVideoWheel(
+                enabled: _windowsDesktopUi,
+                onStep: (step) => _desktopVolumeStep(step * 5.0),
+                child: surface,
+              );
             },
           ),
         ),
@@ -3411,8 +5556,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
     // 'direct' pops straight through (canPop true); the other two are vetoed
     // and routed to _handleCloseRequest. This catches the back button, the
     // system/gesture back, and the cast-panel back — all of which maybePop().
+    // Fullscreen with the watch page enabled intercepts first: Back drops to
+    // the watch page instead of leaving the player.
     return PopScope(
-      canPop: sl<PlaybackPrefs>().closeConfirmation == 'direct',
+      canPop:
+          _presentation == PlayerPresentation.fullscreen && _watchPageEnabled
+          ? false
+          : sl<PlaybackPrefs>().closeConfirmation == 'direct',
       onPopInvokedWithResult: (didPop, _) {
         AppLogger.instance.log(
           '[player-route] pop didPop=$didPop loading=${_c.state.loadingSources} '
@@ -3420,6 +5570,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
           'deadEnd=$_handlingDeadEnd',
         );
         if (didPop) return;
+        if (_presentation == PlayerPresentation.fullscreen &&
+            _watchPageEnabled) {
+          _backToWatchPage();
+          return;
+        }
+        // Windows theater page: see [_handlePlayerBack] for the order.
+        if (_windowsDesktopUi &&
+            _presentation == PlayerPresentation.watchPage) {
+          _handleDesktopWatchBack();
+          return;
+        }
         _handleCloseRequest();
       },
       child: scaffold,
@@ -3433,3 +5594,97 @@ class _PlayerScreenState extends State<PlayerScreen> {
 // Hides the Video widget behind it and provides a seek bar + play/pause / ±10s
 // / Stop casting controls bound to CastController's live position/duration.
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// One static skeleton bar for the portrait loading shell.
+class _ShellBar extends StatelessWidget {
+  const _ShellBar({required this.width, required this.height, this.radius = 6});
+
+  final double width;
+  final double height;
+  final double radius;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: width,
+      height: height,
+      decoration: BoxDecoration(
+        color: AppColors.surface2,
+        borderRadius: BorderRadius.circular(radius),
+      ),
+    );
+  }
+}
+
+// ── Windows snapshot saving ────────────────────────────────────────────────
+
+/// The user's Pictures folder (follows OneDrive / folder redirection), or
+/// %USERPROFILE%\Pictures when the shell lookup fails.
+Future<String> windowsPicturesDirectory() async {
+  try {
+    // FOLDERID_Pictures; the WindowsKnownFolder constants are not visible
+    // through the package's conditional export when analysing (the analyser
+    // sees the stub, whose getPath is non-null; the real one can be null).
+    final Future<String?> Function(String) lookup =
+        PathProviderWindows().getPath;
+    final known = await lookup('{33E28130-4E1E-4676-835A-98395C3BC3BB}');
+    if (known != null && known.isNotEmpty) return known;
+  } catch (_) {}
+  final home = Platform.environment['USERPROFILE'] ?? '';
+  return pathlib.windows.join(home, 'Pictures');
+}
+
+/// File name for a snapshot taken at [now], for example
+/// `Zangetsu 2026-11-17 14.03.22.png` (Windows file names forbid colons).
+@visibleForTesting
+String windowsSnapshotName(DateTime now) {
+  String two(int v) => v.toString().padLeft(2, '0');
+  return 'Zangetsu ${now.year}-${two(now.month)}-${two(now.day)} '
+      '${two(now.hour)}.${two(now.minute)}.${two(now.second)}.png';
+}
+
+/// Writes [bytes] to `<picturesDir>\Zangetsu`, creating the folder, and never
+/// overwrites: a second snapshot in the same second gets " (2)", " (3)"...
+@visibleForTesting
+Future<File> saveWindowsSnapshot(
+  List<int> bytes, {
+  required String picturesDir,
+  DateTime? now,
+}) async {
+  final dir = Directory(pathlib.join(picturesDir, 'Zangetsu'));
+  await dir.create(recursive: true);
+  final name = windowsSnapshotName(now ?? DateTime.now());
+  final stem = name.substring(0, name.length - '.png'.length);
+  var file = File(pathlib.join(dir.path, name));
+  for (var n = 2; await file.exists(); n++) {
+    file = File(pathlib.join(dir.path, '$stem ($n).png'));
+  }
+  return file.writeAsBytes(bytes, flush: true);
+}
+
+/// "Screenshot saved" notice with a Show in folder action that selects the
+/// file in Explorer. Falls back to the plain toast without a Scaffold.
+@visibleForTesting
+void showSnapshotSavedNotice(BuildContext context, String path) {
+  const message = r'Screenshot saved to Pictures\Zangetsu';
+  final messenger = ScaffoldMessenger.maybeOf(context);
+  if (messenger == null) {
+    showAppToast(context, message);
+    return;
+  }
+  messenger
+    ..hideCurrentSnackBar()
+    ..showSnackBar(
+      SnackBar(
+        key: const ValueKey('snapshot-saved'),
+        behavior: SnackBarBehavior.floating,
+        width: 460,
+        duration: const Duration(seconds: 6),
+        content: const Text(message),
+        action: SnackBarAction(
+          label: 'Show in folder',
+          onPressed: () => unawaited(revealInExplorer(path)),
+        ),
+      ),
+    );
+}

@@ -6,6 +6,7 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
+import '../../l10n/l10n.dart';
 
 /// Windows app-owned data lives in the OS application-support directory.
 /// Downloads have an independent location and never move with app preferences.
@@ -295,17 +296,18 @@ class _StorageRecoveryScreen extends StatelessWidget {
                 color: Color(0xffff465b),
               ),
               const SizedBox(height: 20),
-              const Text(
-                'Your app data could not be opened',
-                style: TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
+              // Shown before the app is fully up; context.l10n falls back to English.
+              Text(
+                context.l10n.appDataCouldNotOpen,
+                style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
               ),
               const SizedBox(height: 16),
-              const Text(
-                'Your previous files have been kept. Make sure the previous data folder or drive is available and there is enough free space, then try again.',
+              Text(
+                context.l10n.appDataCouldNotOpenBody,
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 24),
-              FilledButton(onPressed: onRetry, child: const Text('Try again')),
+              FilledButton(onPressed: onRetry, child: Text(context.l10n.tryAgain)),
             ],
           ),
         ),

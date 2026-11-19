@@ -119,13 +119,14 @@ class _DesktopSettingsAlert extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => AlertDialog(
-    backgroundColor: const Color(0xFF1A1B20),
+    // set-9: themed graphite colours (stock greys by default).
+    backgroundColor: GraphiteSettingsColors.dialog,
     surfaceTintColor: Colors.transparent,
     constraints: const BoxConstraints(maxWidth: 560),
     insetPadding: const EdgeInsets.all(24),
     shape: RoundedRectangleBorder(
       borderRadius: BorderRadius.circular(20),
-      side: const BorderSide(color: Color(0xFF36373E)),
+      side: BorderSide(color: GraphiteSettingsColors.dialogEdge),
     ),
     scrollable: true,
     title: Text(title, style: AppText.headline.copyWith(fontSize: 23)),

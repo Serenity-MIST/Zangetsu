@@ -11,6 +11,9 @@ import 'package:watch_app/core/anilist/anilist_network_policy.dart';
 /// and an unconsumed error future fails the test on its own.
 ErrorInterceptorHandler _errHandler() {
   final h = ErrorInterceptorHandler();
+  // The handler only exposes its future to subclasses; reading it here is
+  // the simplest way to mark the expected rejection as handled.
+  // ignore: invalid_use_of_protected_member
   h.future.ignore();
   return h;
 }

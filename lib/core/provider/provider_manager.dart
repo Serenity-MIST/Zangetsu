@@ -807,6 +807,9 @@ class _JsHost {
   }
 
   /// True if a CF solve for [host] failed within the last [_cfFailTtlMs].
+  // Kept for the parked Cloudflare-solve call in the request path (commented
+  // out for now), so the analyzer's unused warning is silenced on purpose.
+  // ignore: unused_element
   bool _cfRecentlyFailed(String host) {
     final at = _cfFailedAt[host];
     if (at == null) return false;
@@ -840,6 +843,9 @@ class _JsHost {
   }
 
   /// True when a response is a Cloudflare interstitial rather than real content.
+  // Kept for the parked Android native retry (commented out in the request
+  // path), so the analyzer's unused warning is silenced on purpose.
+  // ignore: unused_element
   bool _looksLikeBlocked(Response<dynamic> resp) => looksLikeCloudflareBlock(
     resp.statusCode ?? 0,
     resp.data?.toString() ?? '',
@@ -852,6 +858,8 @@ class _JsHost {
   /// client for the same class of problem, so this borrows it rather than
   /// standing up a second stack. Android-only; null on any failure, and the
   /// caller then keeps the original response.
+  // Parked with the commented-out Android retry above; silenced on purpose.
+  // ignore: unused_element
   Future<Response<dynamic>?> _retryOverNative(
     String url,
     String method,

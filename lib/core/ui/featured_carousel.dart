@@ -1,12 +1,17 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart' show listEquals;
+import 'package:flutter/foundation.dart'
+    show ValueListenable, listEquals, visibleForTesting;
 import 'package:flutter/material.dart';
 
 import '../models/media_item.dart';
+import 'banner_image_preloader.dart';
 import '../theme/app_colors.dart';
 import 'route_observer.dart';
 import 'featured_hero.dart';
+import 'mobile_hero_art.dart';
+import 'native_cover_provider.dart';
+import 'poster_palette.dart';
 
 /// Hero height as a share of the screen, so the banner keeps the same
 /// proportions everywhere instead of the same pixel count.
@@ -29,9 +34,11 @@ const double kHeroHeightMax = 560;
 ///
 /// Reads the screen rather than the incoming constraints on purpose: the
 /// carousel is built inside a sliver, where the height constraint is unbounded.
-double heroHeightFor(BuildContext context) => (MediaQuery.sizeOf(context).height *
-        kHeroHeightFactor)
-    .clamp(kHeroHeightMin, kHeroHeightMax);
+double heroHeightFor(BuildContext context) =>
+    (MediaQuery.sizeOf(context).height * kHeroHeightFactor).clamp(
+      kHeroHeightMin,
+      kHeroHeightMax,
+    );
 
 /// Banner transition styles (A/B).
 enum HeroTransition {
@@ -63,6 +70,9 @@ class FeaturedCarousel extends StatefulWidget {
     this.style = HeroTransition.parallax,
     this.reading = false,
     this.isActive = true,
+    this.onArtColor,
+    this.backgroundTint,
+    this.paletteLoader,
   });
 
   final List<MediaItem> items;
@@ -87,6 +97,13 @@ class FeaturedCarousel extends StatefulWidget {
   /// separately so a pushed detail page also pauses auto-advance.
   final bool isActive;
 
+  /// Receives the visible slide's artwork colour for Home's background.
+  final ValueChanged<Color?>? onArtColor;
+  final ValueListenable<Color?>? backgroundTint;
+
+  @visibleForTesting
+  final Future<Color?> Function(String, Map<String, String>?)? paletteLoader;
+
   @override
   State<FeaturedCarousel> createState() => _FeaturedCarouselState();
 }
@@ -100,6 +117,7 @@ class _FeaturedCarouselState extends State<FeaturedCarousel> with RouteAware {
   late List<MediaItem> _pages;
   int _index = 0; // virtual page index
   Timer? _timer;
+  final _imagePreloader = BannerImagePreloader();
   PageRoute<dynamic>? _route;
   bool _routeIsCurrent = true;
 
@@ -121,6 +139,9 @@ class _FeaturedCarouselState extends State<FeaturedCarousel> with RouteAware {
     _index = _count > 1 ? _startIndex : 0;
     _pc = PageController(initialPage: _index);
     _startTimer();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _syncActiveTint();
+    });
   }
 
   @override
@@ -182,6 +203,7 @@ class _FeaturedCarouselState extends State<FeaturedCarousel> with RouteAware {
     if (!mounted || !_shouldAutoAdvance) return;
     if (widget.style == HeroTransition.cinematic) {
       setState(() => _index++);
+      _syncActiveTint();
     } else if (_pc.hasClients) {
       _pc.nextPage(
         duration: const Duration(milliseconds: 750),
@@ -208,6 +230,11 @@ class _FeaturedCarouselState extends State<FeaturedCarousel> with RouteAware {
       if (_pc.hasClients) _pc.jumpToPage(_index);
       _startTimer();
     }
+    if (changed || (old.onArtColor == null && widget.onArtColor != null)) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _syncActiveTint();
+      });
+    }
     // Style toggled (A/B) — restart the timer for the new mode and resync the
     // PageController when switching into parallax.
     if (old.style != widget.style) {
@@ -223,24 +250,58 @@ class _FeaturedCarouselState extends State<FeaturedCarousel> with RouteAware {
 
   @override
   void dispose() {
+    _imagePreloader.dispose();
     appRouteObserver.unsubscribe(this);
     _timer?.cancel();
     _pc.dispose();
     super.dispose();
   }
 
-  FeaturedHero _hero(MediaItem it, {double parallax = 0, bool kenBurns = false}) =>
-      FeaturedHero(
-        item: it,
-        inList: widget.inList(it),
-        onPlay: () => widget.onPlay(it),
-        onInfo: () => widget.onInfo(it),
-        onToggleList: () => widget.onToggleList(it),
-        metaFuture: widget.meta?.call(it),
-        parallax: parallax,
-        kenBurns: kenBurns,
-        reading: widget.reading,
-      );
+  Future<void> _syncActiveTint() async {
+    if (widget.onArtColor == null) return;
+    if (_pages.isEmpty) {
+      widget.onArtColor?.call(null);
+      return;
+    }
+    final item = _pages[_realIndex];
+    final art = mobileHeroArt(item.cover, item.banner);
+    if (art == null || art.isEmpty) {
+      widget.onArtColor?.call(null);
+      return;
+    }
+    final poster = item.cover?.trim();
+    final backdrop = item.banner?.trim();
+    final sampleArt = adaptiveArtUrl(poster, backdrop) ?? art;
+    final usingBackdrop =
+        (poster == null || poster.isEmpty) &&
+        backdrop != null &&
+        backdrop.isNotEmpty;
+    final color = await (widget.paletteLoader ?? extractAdaptiveColor)(
+      adaptiveSampleUrl(sampleArt, backdrop: usingBackdrop),
+      item.coverHeaders,
+    );
+    if (!mounted || _pages.isEmpty || !identical(_pages[_realIndex], item)) {
+      return;
+    }
+    widget.onArtColor?.call(color);
+  }
+
+  FeaturedHero _hero(
+    MediaItem it, {
+    double parallax = 0,
+    bool kenBurns = false,
+  }) => FeaturedHero(
+    item: it,
+    inList: widget.inList(it),
+    onPlay: () => widget.onPlay(it),
+    onInfo: () => widget.onInfo(it),
+    onToggleList: () => widget.onToggleList(it),
+    metaFuture: widget.meta?.call(it),
+    parallax: parallax,
+    kenBurns: kenBurns,
+    reading: widget.reading,
+    backgroundTint: widget.backgroundTint,
+  );
 
   /// The pager — cinematic cross-fade (A) or parallax slide (B).
   Widget _buildPager() {
@@ -251,9 +312,11 @@ class _FeaturedCarouselState extends State<FeaturedCarousel> with RouteAware {
           final v = d.primaryVelocity ?? 0;
           if (v < -80) {
             setState(() => _index++);
+            _syncActiveTint();
             _startTimer();
           } else if (v > 80) {
             setState(() => _index--);
+            _syncActiveTint();
             _startTimer();
           }
         },
@@ -273,7 +336,10 @@ class _FeaturedCarouselState extends State<FeaturedCarousel> with RouteAware {
     // Parallax slide.
     return PageView.builder(
       controller: _pc,
-      onPageChanged: (i) => setState(() => _index = i),
+      onPageChanged: (i) {
+        setState(() => _index = i);
+        _syncActiveTint();
+      },
       itemBuilder: (context, i) => AnimatedBuilder(
         animation: _pc,
         builder: (context, _) {
@@ -297,6 +363,27 @@ class _FeaturedCarouselState extends State<FeaturedCarousel> with RouteAware {
 
     // Empty state — reserve the height so layout doesn't jump.
     if (_count == 0) return SizedBox(height: heroHeight);
+
+    if (_shouldAutoAdvance) {
+      final mq = MediaQuery.of(context);
+      _imagePreloader.warm(
+        context,
+        _pages,
+        _realIndex,
+        artwork: (item) {
+          final url = mobileHeroArt(item.cover, item.banner);
+          return url == null || url.isEmpty
+              ? null
+              : ResizeImage(
+                  nativeCoverProvider(url, item.coverHeaders),
+                  width: mobileHeroDecodeWidth(
+                    item.sourceId,
+                    (mq.size.width * mq.devicePixelRatio).round(),
+                  ),
+                );
+        },
+      );
+    }
 
     // Single item — no dots, no timer. Still pinned to the hero height.
     if (_count == 1) {

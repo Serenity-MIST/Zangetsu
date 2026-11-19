@@ -23,7 +23,7 @@ void main() {
     await tester.tap(find.text('Other files and previous attempts (1)'));
     await tester.pumpAndSettle();
     expect(find.text('record:failed'),findsOneWidget);
-    expect(find.text('source - dub'),findsOneWidget);
+    expect(find.text('source - Dubbed'),findsOneWidget);
     await tester.tap(find.text('Select episodes'));
     await tester.pumpAndSettle();
     expect(find.byType(Checkbox),findsNWidgets(2));
@@ -60,7 +60,7 @@ void main() {
     await tester.tap(find.text('Select all')); await tester.pumpAndSettle();
     await tester.tap(find.byType(Checkbox).at(1)); await tester.pumpAndSettle();
     await tester.tap(find.text('Delete (2)')); await tester.pumpAndSettle();
-    await tester.tap(find.widgetWithText(FilledButton, 'Delete')); await tester.pumpAndSettle();
+    await tester.tap(find.descendant(of: find.byType(Dialog), matching: find.text('Delete'))); await tester.pumpAndSettle();
     expect(calls.single.map((r) => r.id), ['1', '3']);
     expect(find.byType(Checkbox), findsNothing);
   });
@@ -71,7 +71,7 @@ void main() {
     await tester.tap(find.text('Select episodes')); await tester.pumpAndSettle();
     await tester.tap(find.text('Select all')); await tester.pumpAndSettle();
     await tester.tap(find.text('Delete (1)')); await tester.pumpAndSettle();
-    await tester.tap(find.widgetWithText(FilledButton, 'Delete')); await tester.pumpAndSettle();
+    await tester.tap(find.descendant(of: find.byType(Dialog), matching: find.text('Delete'))); await tester.pumpAndSettle();
     expect(find.textContaining('could not be removed'), findsOneWidget);
     expect(tester.widget<Checkbox>(find.byType(Checkbox)).value, isTrue);
   });
@@ -89,7 +89,7 @@ void main() {
     await tester.tap(find.text('Delete (2)')); await tester.pumpAndSettle();
     update(() => records = [rec('1', generation: 'new'), rec('2')]);
     await tester.pumpAndSettle();
-    await tester.tap(find.widgetWithText(FilledButton, 'Delete')); await tester.pumpAndSettle();
+    await tester.tap(find.descendant(of: find.byType(Dialog), matching: find.text('Delete'))); await tester.pumpAndSettle();
     expect(calls.single.map((r) => r.id), ['2']);
   });
 }

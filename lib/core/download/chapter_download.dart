@@ -41,9 +41,13 @@ class ChapterDownload {
   final String showId;
   final String showTitle;
   final String? cover;
+
   /// Source image headers, scoped to cover origin when reused for a thumbnail.
   final Map<String, String>? coverHeaders;
-  /// Optional chapter artwork; old records and most novel sources have none.
+
+  /// The chapter's own image when the source has one (Mangayomi/Aniyomi
+  /// previews); most manga sources and every novel leave it null, as do old
+  /// records.
   final String? thumbnail;
   final String chapterId;
   final String chapterUrl;
@@ -170,7 +174,9 @@ class ChapterDownload {
       showId: '${m['showId'] ?? ''}',
       showTitle: '${m['showTitle'] ?? ''}',
       cover: m['cover'] as String?,
-      coverHeaders: m['coverHeaders'] is Map ? (m['coverHeaders'] as Map).map((k,v) => MapEntry('$k', '$v')) : null,
+      coverHeaders: m['coverHeaders'] is Map
+          ? (m['coverHeaders'] as Map).map((k, v) => MapEntry('$k', '$v'))
+          : null,
       thumbnail: m['thumbnail'] is String ? m['thumbnail'] as String : null,
       chapterId: '${m['chapterId'] ?? ''}',
       chapterUrl: '${m['chapterUrl'] ?? ''}',

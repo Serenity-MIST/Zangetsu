@@ -12,6 +12,7 @@ import '../../core/state/active_source_cubit.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../sources/providers_hub_screen.dart';
+import '../sources/sources_desktop_kit.dart' show DesktopProviderScope;
 import 'onboarding_screen_tv.dart';
 import '../../l10n/l10n.dart';
 
@@ -202,9 +203,13 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     await _markOnboarded();
     if (!mounted) return;
     widget.onDone();
-    Navigator.of(
-      context,
-    ).push(MaterialPageRoute<void>(builder: (_) => const ProvidersHubScreen()));
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        // Windows: the Providers hub in the desktop settings look, the same
+        // as from Settings (src-3 A). Pass-through elsewhere.
+        builder: (_) => const DesktopProviderScope(child: ProvidersHubScreen()),
+      ),
+    );
   }
 
   Future<void> _later() async {

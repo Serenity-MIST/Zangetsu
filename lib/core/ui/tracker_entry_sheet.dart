@@ -2,6 +2,7 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
 import '../app_mode.dart';
+import '../desktop/desktop_sheet.dart';
 import '../di/injector.dart';
 import '../models/media_item.dart';
 import '../anilist/anilist_service.dart';
@@ -32,9 +33,12 @@ Future<void> showTrackerEntrySheet(
   VoidCallback? onFind,
   VoidCallback? onChanged,
   List<String> customLists = const [],
+  bool isPrivate = false,
 }) async {
-  await showModalBottomSheet<void>(
-    context: context,
+  // Windows (home-3): a centred graphite dialog; phone/TV keep the sheet.
+  await showAdaptiveSheet<void>(
+    context,
+    desktopWidth: 560,
     backgroundColor: AppColors.surface,
     isScrollControlled: true,
     shape: const RoundedRectangleBorder(
@@ -43,6 +47,7 @@ Future<void> showTrackerEntrySheet(
     builder: (_) => _TrackerEntrySheet(
       tracker: tracker,
       customLists: customLists,
+      isPrivate: isPrivate,
       item: item,
       status: status,
       progress: progress,
@@ -58,6 +63,7 @@ class _TrackerEntrySheet extends StatefulWidget {
   const _TrackerEntrySheet({
     required this.tracker,
     required this.customLists,
+    required this.isPrivate,
     required this.item,
     required this.status,
     required this.progress,
@@ -72,6 +78,7 @@ class _TrackerEntrySheet extends StatefulWidget {
   /// Which of the tracker's own custom lists this entry is in. AniList only —
   /// the row below doesn't appear for the others, which have no such concept.
   final List<String> customLists;
+  final bool isPrivate;
   final MediaItem item;
   final WatchStatus? status;
   final int? progress;
@@ -101,6 +108,7 @@ class _TrackerEntrySheetState extends State<_TrackerEntrySheet> {
   late WatchStatus? _status = widget.status;
   late int _progress = widget.progress ?? 0;
   late int _score = (widget.score ?? 0).round().clamp(0, 10);
+  late bool _private = widget.isPrivate;
   bool _busy = false;
 
   Future<void> _apply() async {
@@ -111,22 +119,42 @@ class _TrackerEntrySheetState extends State<_TrackerEntrySheet> {
     final statusChanged = _status != widget.status;
     final progressChanged = _progress != (widget.progress ?? 0);
     final scoreChanged = _score != (widget.score ?? 0).round().clamp(0, 10);
-    if (!statusChanged && !progressChanged && !scoreChanged) {
+    final privacyChanged =
+        widget.tracker is AniListService && _private != widget.isPrivate;
+    if (!statusChanged &&
+        !progressChanged &&
+        !scoreChanged &&
+        !privacyChanged) {
       Navigator.pop(context);
       return;
     }
     setState(() => _busy = true);
-    await widget.tracker.updateEntry(
-      malId: widget.item.malId,
-      tmdbId: widget.item.tmdbId,
-      imdbId: widget.item.imdbId,
-      title: widget.item.title,
-      tmdbIsTv: widget.tmdbIsTv,
-      status: statusChanged ? _status : null,
-      score: scoreChanged ? _score.toDouble() : null,
-      progress: progressChanged ? _progress : null,
-      kind: _kind,
-    );
+    try {
+      await widget.tracker.updateEntry(
+        malId: widget.item.malId,
+        tmdbId: widget.item.tmdbId,
+        imdbId: widget.item.imdbId,
+        title: widget.item.title,
+        pinnedId: widget.tracker is AniListService
+            ? widget.item.anilistId?.toString()
+            : null,
+        tmdbIsTv: widget.tmdbIsTv,
+        status: statusChanged ? _status : null,
+        score: scoreChanged ? _score.toDouble() : null,
+        progress: progressChanged ? _progress : null,
+        kind: _kind,
+        isPrivate: privacyChanged ? _private : null,
+      );
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _busy = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not save changes. Please try again.'),
+        ),
+      );
+      return;
+    }
     widget.onChanged?.call();
     if (mounted) Navigator.pop(context);
   }
@@ -140,6 +168,9 @@ class _TrackerEntrySheetState extends State<_TrackerEntrySheet> {
       tmdbId: ids.tmdbId,
       imdbId: widget.item.imdbId,
       title: widget.item.title,
+      pinnedId: widget.tracker is AniListService
+          ? widget.item.anilistId?.toString()
+          : null,
       tmdbIsTv: ids.tmdbIsTv || widget.tmdbIsTv,
       kind: _kind,
     );
@@ -168,16 +199,18 @@ class _TrackerEntrySheetState extends State<_TrackerEntrySheet> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 const SizedBox(height: 10),
-                Center(
-                  child: Container(
-                    width: 36,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: AppColors.hairline,
-                      borderRadius: BorderRadius.circular(2),
+                // Phone drag handle; the Windows dialog has nothing to drag.
+                if (!DesktopSheetScope.of(context))
+                  Center(
+                    child: Container(
+                      width: 36,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: AppColors.hairline,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
                     ),
                   ),
-                ),
                 _header(),
                 const Divider(
                   height: 1,
@@ -187,6 +220,17 @@ class _TrackerEntrySheetState extends State<_TrackerEntrySheet> {
                 const SizedBox(height: 18),
                 _statusChips(),
                 _customListsRow(context),
+                if (widget.tracker is AniListService)
+                  SwitchListTile.adaptive(
+                    title: const Text('Private'),
+                    subtitle: const Text(
+                      'Only you can see this entry on AniList',
+                    ),
+                    value: _private,
+                    onChanged: _busy
+                        ? null
+                        : (value) => setState(() => _private = value),
+                  ),
                 const SizedBox(height: 20),
                 _stepperRow(
                   _reading ? 'Chapters' : 'Episodes',

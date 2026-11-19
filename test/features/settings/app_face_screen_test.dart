@@ -32,7 +32,12 @@ void main() {
         const MaterialApp(home: DesktopSettingsScope(child: AppFaceScreen())),
       );
       await tester.pumpAndSettle();
-      expect(find.text('Windows app icon'), findsOneWidget);
+      // Windows shows only the splash picker: no icon note, no Home banner
+      // picker (the desktop Home never reads it), and the page says so.
+      expect(find.text('Windows app icon'), findsNothing);
+      expect(find.text('Home banner'), findsNothing);
+      expect(find.byKey(const ValueKey('desktop-banner-edge')), findsNothing);
+      expect(find.text('Splash screen'), findsOneWidget);
       expect(tester.binding.hasScheduledFrame, isFalse);
       await tester.ensureVisible(
         find.byKey(const ValueKey('desktop-splash-bankai')),
@@ -45,20 +50,11 @@ void main() {
       await tester.pumpAndSettle();
       expect(SplashStyle.selectedId, 'bankai');
       expect(tester.binding.hasScheduledFrame, isFalse);
-      final edge = find.byKey(const ValueKey('desktop-banner-edge'));
-      await tester.ensureVisible(edge);
-      await tester.runAsync(() async {
-        await tester.tap(edge);
-        await Hive.box(SplashStyle.boxName).flush();
-      });
-      await tester.pumpAndSettle();
-      expect(BannerStyle.current.value, 'edge');
       await tester.runAsync(() async {
         await Hive.box(SplashStyle.boxName).close();
         await Hive.openBox(SplashStyle.boxName);
       });
       expect(SplashStyle.selectedId, 'bankai');
-      expect(BannerStyle.selectedId, 'edge');
       final preview = find.byKey(const ValueKey('desktop-splash-preview'));
       await tester.ensureVisible(preview);
       await tester.tap(preview);
@@ -92,10 +88,10 @@ void main() {
       await tester.tap(preview);
       await tester.pumpAndSettle();
       expect(tester.binding.hasScheduledFrame, isFalse);
-      final banner = find.byKey(const ValueKey('desktop-banner-panels'));
-      await tester.ensureVisible(banner);
+      final option = find.byKey(const ValueKey('desktop-splash-wordmark'));
+      await tester.ensureVisible(option);
       await tester.pumpAndSettle();
-      expect(banner.hitTestable(), findsOneWidget);
+      expect(option.hitTestable(), findsOneWidget);
       expect(tester.takeException(), isNull);
     },
   );

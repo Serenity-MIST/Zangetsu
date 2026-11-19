@@ -1,6 +1,7 @@
 import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/material.dart';
+import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
 import '../../core/di/injector.dart';
 import '../../core/mode/content_mode.dart';
@@ -8,6 +9,7 @@ import '../../core/mode/content_mode_cubit.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/ui/nav_prefs.dart';
+import '../../core/ui/liquid_nav_glass.dart';
 import '../../core/ui/settings_widgets.dart';
 import '../../core/ui/desktop_settings_surface.dart';
 import '../../l10n/l10n.dart';
@@ -43,6 +45,11 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
 
   late DockTab _start = _prefs.startTab;
   late bool _keepDockExpanded = _prefs.keepDockExpanded;
+  late NavBarStyle _style = _prefs.style;
+  late double _glassTint = _prefs.glassTint;
+  late GlassQuality _glassQuality = _prefs.glassQuality;
+  late bool _glassBlurEnabled = _prefs.glassBlurEnabled;
+  late double _glassVisibility = _prefs.glassVisibility;
 
   /// The centre button is drawn from a real [DockTab]'s slot count, so it has
   /// to be mirrored here too: it is always on the bar and never editable.
@@ -62,6 +69,28 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
       // The app-bar Reset action reads the persisted preference too.
       setState(() => _keepDockExpanded = _prefs.keepDockExpanded);
     }
+  }
+
+  Future<void> _setStyle(NavBarStyle value) async {
+    setState(() => _style = value);
+    await _prefs.setStyle(value);
+  }
+
+  Future<void> _saveGlassTint(double value) => _prefs.setGlassTint(value);
+
+  Future<void> _setGlassQuality(GlassQuality value) async {
+    setState(() => _glassQuality = value);
+    await _prefs.setGlassQuality(value);
+  }
+
+  Future<void> _setGlassBlurEnabled(bool value) async {
+    setState(() => _glassBlurEnabled = value);
+    await _prefs.setGlassBlurEnabled(value);
+  }
+
+  Future<void> _resetGlassTint() async {
+    setState(() => _glassTint = NavPrefs.defaultGlassTint);
+    await _prefs.setGlassTint(NavPrefs.defaultGlassTint);
   }
 
   void _remove(DockTab t) {
@@ -99,6 +128,11 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
       _shown = List.of(_prefs.tabs);
       _start = _prefs.startTab;
       _keepDockExpanded = _prefs.keepDockExpanded;
+      _style = _prefs.style;
+      _glassTint = _prefs.glassTint;
+      _glassQuality = _prefs.glassQuality;
+      _glassBlurEnabled = _prefs.glassBlurEnabled;
+      _glassVisibility = _prefs.glassVisibility;
     });
   }
 
@@ -107,7 +141,7 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
     final l10n = context.l10n;
     final hidden = _hidden;
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar(
         l10n.navigationBar,
         actions: [
@@ -131,11 +165,86 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
               children: [
                 _preview(),
                 const SizedBox(height: 4),
+                SettingsSectionLabel('Navigation style', first: true),
+                SettingsCard(
+                  children: [
+                    for (final style in NavBarStyle.values)
+                      SettingsTile(
+                        icon: style == NavBarStyle.dock
+                            ? Icons.dock_rounded
+                            : Icons.blur_on_rounded,
+                        title: style == NavBarStyle.dock
+                            ? 'Dock'
+                            : 'Liquid glass',
+                        trailing: Icon(
+                          _style == style
+                              ? Icons.radio_button_checked_rounded
+                              : Icons.radio_button_unchecked_rounded,
+                          color: _style == style
+                              ? AppColors.accent
+                              : AppColors.textTertiary,
+                        ),
+                        onTap: () => _setStyle(style),
+                      ),
+                    if (_style == NavBarStyle.liquid) _glassTintControl(),
+                  ],
+                ),
+                if (_style == NavBarStyle.liquid) ...[
+                  const SettingsSectionLabel('Glass quality'),
+                  SettingsCard(
+                    children: [
+                      for (final quality in [
+                        GlassQuality.premium,
+                        GlassQuality.standard,
+                      ])
+                        SettingsTile(
+                          icon: _glassQualityIcon(quality),
+                          title: _glassQualityTitle(quality),
+                          subtitle: _glassQualitySubtitle(quality),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (quality == NavPrefs.defaultGlassQuality) ...[
+                                Text(
+                                  'Default',
+                                  style: AppText.caption.copyWith(
+                                    color: AppColors.textSecondary,
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                              ],
+                              Icon(
+                                _glassQuality == quality
+                                    ? Icons.radio_button_checked_rounded
+                                    : Icons.radio_button_unchecked_rounded,
+                                color: _glassQuality == quality
+                                    ? AppColors.accent
+                                    : AppColors.textTertiary,
+                              ),
+                            ],
+                          ),
+                          onTap: () => _setGlassQuality(quality),
+                        ),
+                      SettingsTile(
+                        icon: Icons.blur_on_rounded,
+                        title: 'Blur background',
+                        subtitle: 'Softens artwork behind the liquid navbar',
+                        onTap: () => _setGlassBlurEnabled(!_glassBlurEnabled),
+                        trailing: Switch.adaptive(
+                          key: const ValueKey('glass-blur-switch'),
+                          value: _glassBlurEnabled,
+                          activeThumbColor: AppColors.accent,
+                          onChanged: _setGlassBlurEnabled,
+                        ),
+                      ),
+                      _glassVisibilityControl(),
+                    ],
+                  ),
+                ],
                 SettingsSectionLabel(
                   // The cap is visible before you hit it, rather than discovered as
                   // a greyed-out button.
                   l10n.navTabsOnBar(_shown.length, NavPrefs.maxTabs),
-                  first: true,
                 ),
                 SettingsCard(
                   children: [
@@ -154,13 +263,21 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
                     if (_hasSwitcher) _switcherRow(),
                   ],
                 ),
-                SettingsSectionLabel(l10n.navDockBehavior),
+                SettingsSectionLabel(
+                  _style == NavBarStyle.liquid
+                      ? 'Navigation behaviour'
+                      : l10n.navDockBehavior,
+                ),
                 SettingsCard(
                   children: [
                     SettingsTile(
                       icon: Icons.unfold_more_rounded,
-                      title: l10n.keepDockExpanded,
-                      subtitle: l10n.keepDockExpandedSubtitle,
+                      title: _style == NavBarStyle.liquid
+                          ? 'Keep navigation expanded'
+                          : l10n.keepDockExpanded,
+                      subtitle: _style == NavBarStyle.liquid
+                          ? 'Keep tabs and labels visible while scrolling'
+                          : l10n.keepDockExpandedSubtitle,
                       onTap: () => _setKeepDockExpanded(!_keepDockExpanded),
                       trailing: Switch.adaptive(
                         key: const ValueKey('keep-dock-expanded-switch'),
@@ -511,52 +628,308 @@ class _NavTabsScreenState extends State<NavTabsScreen> {
       child: SizedBox(
         height: 104,
         child: DecoratedBox(
-          decoration: const BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: [Color(0xFF2B3350), Color(0xFF4A3450), Color(0xFF233042)],
-            ),
-          ),
+          decoration: BoxDecoration(color: AppColors.surface2),
           child: Padding(
             padding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(20),
-                  child: BackdropFilter(
-                    filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 4,
-                        vertical: 7,
-                      ),
-                      decoration: BoxDecoration(
-                        color: AppColors.surface.withValues(alpha: 0.55),
-                        borderRadius: BorderRadius.circular(20),
-                        border: Border.all(
-                          color: Colors.white.withValues(alpha: 0.07),
-                        ),
-                      ),
-                      child: Row(
-                        children: [
-                          // Split where _FloatingDock splits, so the centre
-                          // button sits exactly where it will on the phone.
-                          for (final t in _shown.take(_shown.length ~/ 2))
-                            Expanded(child: _previewItem(t, t == _start)),
-                          if (_hasSwitcher) _previewFab(),
-                          for (final t in _shown.skip(_shown.length ~/ 2))
-                            Expanded(child: _previewItem(t, t == _start)),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ],
+            child: Align(
+              alignment: Alignment.bottomCenter,
+              child: _style == NavBarStyle.liquid
+                  ? _liquidPreview()
+                  : _dockPreview(),
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _glassVisibilityControl() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Navbar visibility',
+                  style: AppText.body.copyWith(color: AppColors.textPrimary),
+                ),
+              ),
+              Text(
+                _glassVisibility == 0
+                    ? 'Off (default)'
+                    : '${(_glassVisibility * 100).round()}%',
+                style: AppText.caption,
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Darkens the whole glass background for clearer icons.',
+            style: AppText.caption,
+          ),
+          Slider(
+            key: const ValueKey('glass-visibility-slider'),
+            value: _glassVisibility,
+            divisions: 20,
+            label: _glassVisibility == 0
+                ? 'Off'
+                : '${(_glassVisibility * 100).round()}%',
+            activeColor: AppColors.accent,
+            onChanged: (value) => setState(() => _glassVisibility = value),
+            onChangeEnd: (value) async {
+              await _prefs.setGlassVisibility(value);
+              if (mounted) setState(() {});
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _dockPreview() => ClipRRect(
+    borderRadius: BorderRadius.circular(20),
+    child: BackdropFilter(
+      filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 7),
+        decoration: BoxDecoration(
+          color: AppColors.surface.withValues(alpha: 0.55),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.07)),
+        ),
+        child: Row(
+          children: [
+            for (final t in _shown.take(_shown.length ~/ 2))
+              Expanded(child: _previewItem(t, t == _start)),
+            if (_hasSwitcher) _previewFab(),
+            for (final t in _shown.skip(_shown.length ~/ 2))
+              Expanded(child: _previewItem(t, t == _start)),
+          ],
+        ),
+      ),
+    ),
+  );
+
+  Widget _liquidPreview() {
+    final glass = liquidNavGlassSettings(
+      _glassTint,
+      extraBlur: _glassBlurEnabled,
+      glassVisibility: _glassVisibility,
+    );
+    return Row(
+      children: [
+        Expanded(
+          child: GlassTabBar.bottom(
+            tabs: [
+              for (final tab in _shown)
+                GlassTab(
+                  icon: _liquidPreviewIcon(tab, selected: false),
+                  activeIcon: _liquidPreviewIcon(tab, selected: true),
+                  label: tab.localizedLabel(context),
+                ),
+            ],
+            selectedIndex: _shown.indexOf(_start).clamp(0, _shown.length - 1),
+            onTabSelected: (_) {},
+            horizontalPadding: 4,
+            verticalPadding: 4,
+            barHeight: 48,
+            barBorderRadius: 24,
+            tabPadding: EdgeInsets.zero,
+            iconSize: 16,
+            labelFontSize: 8,
+            quality: _glassQuality,
+            backgroundQuality: _glassQuality,
+            settings: glass,
+            indicatorColor: AppColors.accent.withValues(alpha: 0.14),
+            selectedIconColor: AppColors.accent,
+            unselectedIconColor: AppColors.textPrimary,
+            selectedLabelColor: AppColors.textPrimary,
+            unselectedLabelColor: AppColors.textSecondary,
+            indicatorExpansion: const EdgeInsets.symmetric(
+              horizontal: 4,
+              vertical: 4,
+            ),
+            magnification: 1.02,
+          ),
+        ),
+        if (_hasSwitcher) ...[
+          const SizedBox(width: 6),
+          GlassButton(
+            icon: const Icon(Icons.menu_rounded),
+            label: 'Change content mode',
+            onTap: () {},
+            width: 42,
+            height: 42,
+            quality: _glassQuality,
+            settings: glass,
+            isStationary: true,
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _liquidPreviewIcon(DockTab tab, {required bool selected}) {
+    final color = selected ? AppColors.accent : AppColors.textPrimary;
+    final glyph = dockGlyphFor(tab);
+    return glyph == null
+        ? Icon(_iconFor(tab, selected), size: 16, color: color)
+        : DockIcon(glyph, color: color, filled: selected, size: 16);
+  }
+
+  IconData _glassQualityIcon(GlassQuality quality) =>
+      quality == GlassQuality.premium
+      ? Icons.auto_awesome_rounded
+      : Icons.speed_rounded;
+
+  String _glassQualityTitle(GlassQuality quality) =>
+      quality == GlassQuality.premium ? 'Premium' : 'Standard';
+
+  String _glassQualitySubtitle(GlassQuality quality) =>
+      quality == GlassQuality.premium
+      ? 'Most detailed glass effect'
+      : 'Lighter effect for smoother scrolling';
+
+  Widget _glassTintControl() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 2, 16, 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Glass tint',
+                  style: AppText.body.copyWith(
+                    color: AppColors.textPrimary,
+                    fontSize: 14.5,
+                  ),
+                ),
+              ),
+              if (_glassTint == NavPrefs.defaultGlassTint)
+                Text(
+                  'Default',
+                  style: AppText.caption.copyWith(
+                    color: AppColors.textSecondary,
+                  ),
+                )
+              else
+                TextButton(
+                  onPressed: _resetGlassTint,
+                  child: const Text('Reset'),
+                ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Adjust the tab bar and mode button together.',
+            style: AppText.caption.copyWith(color: AppColors.textTertiary),
+          ),
+          const SizedBox(height: 8),
+          Directionality(
+            textDirection: TextDirection.ltr,
+            child: SizedBox(
+              height: 50,
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  const inset = 15.0;
+                  final trackWidth = constraints.maxWidth - inset * 2;
+                  final defaultX =
+                      inset + trackWidth * NavPrefs.defaultGlassTint;
+                  return Stack(
+                    children: [
+                      Positioned(
+                        left: (defaultX - 20).clamp(
+                          0,
+                          constraints.maxWidth - 40,
+                        ),
+                        top: 0,
+                        child: Text(
+                          'Default',
+                          style: AppText.caption.copyWith(
+                            color: AppColors.textTertiary,
+                            fontSize: 9,
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        left: inset,
+                        right: inset,
+                        top: 24,
+                        child: Container(
+                          height: 4,
+                          decoration: BoxDecoration(
+                            gradient: const LinearGradient(
+                              colors: [Colors.white, Colors.black],
+                            ),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        left: defaultX - 1,
+                        top: 18,
+                        child: Container(
+                          width: 2,
+                          height: 16,
+                          decoration: BoxDecoration(
+                            color: AppColors.textSecondary,
+                            borderRadius: BorderRadius.circular(2),
+                          ),
+                        ),
+                      ),
+                      Positioned.fill(
+                        child: SliderTheme(
+                          data: SliderTheme.of(context).copyWith(
+                            trackHeight: 4,
+                            activeTrackColor: Colors.transparent,
+                            inactiveTrackColor: Colors.transparent,
+                            thumbColor: AppColors.accent,
+                            overlayColor: AppColors.accent.withValues(
+                              alpha: 0.12,
+                            ),
+                          ),
+                          child: Slider(
+                            value: _glassTint,
+                            semanticFormatterCallback: (value) =>
+                                '${(value * 100).round()}% black tint',
+                            onChanged: (value) =>
+                                setState(() => _glassTint = value),
+                            onChangeEnd: _saveGlassTint,
+                          ),
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ),
+          ),
+          const SizedBox(height: 2),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'White',
+                style: AppText.caption.copyWith(
+                  color: AppColors.textSecondary,
+                  fontSize: 11,
+                ),
+              ),
+              Text(
+                'Black',
+                style: AppText.caption.copyWith(
+                  color: AppColors.textSecondary,
+                  fontSize: 11,
+                ),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }

@@ -97,6 +97,7 @@ Future<void> pumpEmptyView(
   VoidCallback? onRetry,
   String? cloudflareUrl,
   Future<void> Function()? onSolveCloudflare,
+  bool cloudflareUnsupported = false,
   bool offline = false,
 }) async {
   await tester.pumpWidget(
@@ -109,6 +110,7 @@ Future<void> pumpEmptyView(
           onInstallSources: onInstall ?? () {},
           cloudflareUrl: cloudflareUrl,
           onSolveCloudflare: onSolveCloudflare,
+          cloudflareUnsupported: cloudflareUnsupported,
           offline: offline,
         ),
       ),
@@ -131,6 +133,24 @@ void main() {
         expect(find.textContaining('sources yet'), findsNothing);
       },
     );
+
+    testWidgets('protected Mangayomi sources explain the iOS limitation', (
+      tester,
+    ) async {
+      await pumpEmptyView(
+        tester,
+        mode: ContentMode.anime,
+        cloudflareUrl: 'https://source.example/challenge',
+        cloudflareUnsupported: true,
+      );
+
+      expect(
+        find.textContaining('verification for Mangayomi sources is not'),
+        findsOneWidget,
+      );
+      expect(find.text('Solve Cloudflare'), findsNothing);
+      expect(find.text('Retry'), findsNothing);
+    });
   });
 
   group('HomeLoadedEmptyView — with source DI up (all modes)', () {

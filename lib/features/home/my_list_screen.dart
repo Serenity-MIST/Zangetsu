@@ -8,6 +8,12 @@ import '../../core/zmode/zmode_prefs.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
 import '../../core/tracker/tracker_item_url.dart';
+import 'package:flutter/services.dart';
+import '../../core/desktop/desktop_context_menu.dart';
+import '../../core/desktop/desktop_dialogs.dart';
+import '../../core/desktop/desktop_sheet.dart';
+import '../../core/desktop/desktop_shortcuts.dart';
+import '../../core/ui/category_picker_sheet.dart';
 import '../../core/zmode/metadata_provider_prefs.dart';
 import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
@@ -23,18 +29,23 @@ import '../../core/ui/anilist_custom_lists_sheet.dart';
 import '../../core/prefs/list_sort.dart';
 import '../../core/models/watch_status.dart';
 import '../../core/playback/my_list.dart';
+import '../../core/stremio/stremio_library_badge.dart';
+import '../../core/stremio/stremio_ref.dart';
 import '../../core/playback/list_status_store.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../l10n/l10n.dart';
 import '../../core/tracker/tracker.dart';
 import '../../core/tracker/tracker_hub.dart';
+import '../../core/tracker/tracker_switch_prefs.dart';
+import 'tracker_switch_popup.dart';
 import '../../core/ui/buttons.dart';
 import '../../core/ui/list_status_sheet.dart';
 import '../../core/ui/poster_card.dart';
 import '../../core/models/provider_info.dart';
 import '../../core/ui/states.dart';
 import '../../core/ui/tracker_entry_sheet.dart';
+import '../../core/ui/tracker_badge.dart';
 import '../auth/auth_cubit.dart';
 import '../auth/auth_screens.dart';
 import '../detail/detail_screen.dart';
@@ -139,6 +150,12 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
   CategoryStore? get _cats =>
       sl.isRegistered<CategoryStore>() ? sl<CategoryStore>() : null;
 
+  LibraryCategoryCounts? _categoryCounts;
+
+  void _onCategoriesChanged() {
+    if (mounted) setState(() {});
+  }
+
   /// Null until the user picks one — the default then depends on which list is
   /// showing (your own keeps insertion order, a tracker leads with score), and
   /// that can change under us when the source switcher moves.
@@ -216,8 +233,14 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
       );
       ZModePrefs.revision.addListener(_dockChanged);
     }
-    // Own My List is Hive; tracker chips cache a fetch. While this screen is
-    // mounted, keep both aligned with other devices — TV never backgrounds.
+    final cats = _cats;
+    if (cats != null && !sl<AppMode>().isTv) {
+      _categoryCounts = LibraryCategoryCounts(cats);
+      cats.revision.addListener(_onCategoriesChanged);
+    }
+    // Cross-device My List freshness is handled by the app-wide foreground
+    // poll in main.dart (stale-gated). A 15s force-pull here doubled PostgREST
+    // traffic whenever this screen stayed mounted (including the TV branch).
   }
 
   @override
@@ -227,7 +250,10 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
     _modeChanges?.cancel();
     ZModePrefs.revision.removeListener(_dockChanged);
     WidgetsBinding.instance.removeObserver(this);
+    _categoryCounts?.store.revision.removeListener(_onCategoriesChanged);
     _searchController.dispose();
+    _searchFocus.dispose();
+    _pageFocus.dispose();
     super.dispose();
   }
 
@@ -249,7 +275,33 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
     if (sl<AppMode>().isTv) {
       return MyListScreenTv(initialStatus: widget.initialStatus);
     }
-    return Scaffold(
+    // Re-open on the last-picked tracker (preference, unless the viewer
+    // picks explicitly this session or the screen was opened for one
+    // tracker already). Post-frame: selecting emits, which is not allowed
+    // mid-build.
+    if (widget.pinnedTracker == null &&
+        !_userPickedTracker &&
+        !_restoreScheduled) {
+      _restoreScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        final saved = TrackerSwitchPrefs.lastTracker();
+        if (saved == null) return;
+        final cubit = context.read<TrackerListCubit>();
+        if (!cubit.state.isMyList) return;
+        Tracker? match;
+        for (final t in sl<TrackerHub>().connected) {
+          if (t.displayName == saved) {
+            match = t;
+            break;
+          }
+        }
+        if (match != null) {
+          cubit.selectTracker(match, kind: libraryKindForTracker(match, _kind));
+        }
+      });
+    }
+    final scaffold = Scaffold(
       backgroundColor: AppColors.bg,
       // bottom: false — the shell's floating dock overlays the content
       // (extendBody); a full SafeArea would clip the grid at the dock's top
@@ -276,7 +328,79 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
         ),
       ),
     );
+    if (!_desktop) return scaffold;
+    // Windows (home-4): F5 / Ctrl+R refresh the list on screen and Ctrl+F
+    // opens the title filter. The page focus node catches the keys even
+    // before anything inside has been clicked.
+    return CallbackShortcuts(
+      bindings: _desktopShortcutBindings(
+        DesktopShortcuts.bindings({
+          'app.refresh': _refreshShownList,
+          'lists.search': _openSearch,
+        }),
+      ),
+      child: Focus(
+        focusNode: _pageFocus,
+        autofocus: true,
+        child: scaffold,
+      ),
+    );
   }
+
+  /// Windows: focus target for the page shortcuts (not a tab stop).
+  final _pageFocus = FocusNode(debugLabel: 'my-list', skipTraversal: true);
+
+  /// The registered shortcut map, or the stock keys when the shortcut
+  /// catalogue is not registered (widget tests that skip DesktopPrefs.init).
+  Map<ShortcutActivator, VoidCallback> _desktopShortcutBindings(
+    Map<ShortcutActivator, VoidCallback> registered,
+  ) {
+    if (registered.isNotEmpty) return registered;
+    return {
+      const SingleActivator(LogicalKeyboardKey.f5): _refreshShownList,
+      const SingleActivator(LogicalKeyboardKey.keyR, control: true):
+          _refreshShownList,
+      const SingleActivator(LogicalKeyboardKey.keyF, control: true):
+          _openSearch,
+    };
+  }
+
+  /// Windows (home-4): refreshes whichever list is on screen — your own list
+  /// from the cloud, or the selected tracker's library. Shows the header
+  /// spinner while it runs.
+  Future<void> _refreshShownList() async {
+    if (!mounted || _refreshing) return;
+    setState(() => _refreshing = true);
+    try {
+      final tracker = context.read<TrackerListCubit>();
+      if (tracker.state.isMyList) {
+        if (sl.isRegistered<MyListStore>()) {
+          await sl<MyListStore>().pullFromCloud();
+        }
+      } else {
+        await tracker.refresh();
+      }
+    } catch (_) {
+      // The list keeps what it had; the error state offers another try.
+    } finally {
+      if (mounted) setState(() => _refreshing = false);
+    }
+  }
+
+  /// True while a Windows Refresh started here is running.
+  bool _refreshing = false;
+
+  /// Windows Ctrl+F: show the title filter (and focus it).
+  void _openSearch() {
+    if (_searching) {
+      _searchFocus.requestFocus();
+      return;
+    }
+    _toggleSearch();
+  }
+
+  /// Focus of the title filter, so Ctrl+F can jump back into it.
+  final _searchFocus = FocusNode(debugLabel: 'my-list-search');
 
   double _cellW(BuildContext context) => posterGridCellWidth(context);
 
@@ -284,6 +408,10 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
   /// list, in every kind. View state: it belongs to the screen, and a query
   /// should not survive leaving it.
   bool _searching = false;
+  // Restore-once guards for the saved tracker switch: the preference wins
+  // until the viewer picks explicitly this session.
+  bool _restoreScheduled = false;
+  bool _userPickedTracker = false;
   String _query = '';
   final _searchController = TextEditingController();
 
@@ -314,6 +442,7 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
           Expanded(
             child: TextField(
               controller: _searchController,
+              focusNode: _searchFocus,
               autofocus: true,
               style: AppText.body.copyWith(color: AppColors.textPrimary),
               cursorColor: AppColors.accent,
@@ -352,22 +481,26 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
       animation: Listenable.merge(hub.trackers),
       builder: (context, _) {
         final l10n = context.l10n;
+        // Pinned screens name their tracker; the open screen follows the
+        // switcher instead (cubit tracker or the own list).
         final pinned = widget.pinnedTracker;
+        final active =
+            pinned ?? context.read<TrackerListCubit>().state.tracker;
         // Opened for one tracker: name it. Saying "Library / My List + 3
         // trackers" on a screen showing only AniList was just wrong.
         // Whose list this is: the account name earns its place here, where the
         // avatar did not — it says the same thing in less space and reads.
-        final who = pinned?.viewerName;
-        final title = pinned == null
-            ? l10n.libraryLabel
+        final who = active?.viewerName;
+        final title = active == null
+            ? 'Zangetsu List'
             : (who == null || who.isEmpty
-                  ? pinned.displayName
-                  : '${pinned.displayName} · $who');
+                  ? active.displayName
+                  : '${active.displayName} · $who');
         // Names the kind on screen rather than "titles": a tracker screen is
         // opened FOR one, so being vague about it helps nobody.
-        final subtitle = pinned == null
+        final subtitle = active == null
             ? l10n.yourSavedTitles
-            : switch (widget.pinnedKind ?? sl<ContentModeCubit>().state) {
+            : switch (_selectedKind(context)) {
                 ContentMode.manga => l10n.yourSavedMangaList,
                 ContentMode.novel => l10n.yourSavedNovelList,
                 ContentMode.anime => l10n.yourSavedAnimeList,
@@ -406,9 +539,19 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
               padding: const EdgeInsets.fromLTRB(10, 6, 8, 6),
               child: Row(
                 children: [
+                  // Windows: opened from another page (e.g. Schedule and
+                  // lists) there is no system back, so offer one here.
+                  if (_desktop && Navigator.of(context).canPop()) ...[
+                    _pillIcon(
+                      Icons.arrow_back_rounded,
+                      MaterialLocalizations.of(context).backButtonTooltip,
+                      () => Navigator.of(context).maybePop(),
+                    ),
+                    const SizedBox(width: 8),
+                  ],
                   // The account this list belongs to, round and leading —
                   // a tracker's own avatar, or yours on My List.
-                  _headerAvatar(context, pinned),
+                  _headerAvatar(context, active),
                   const SizedBox(width: 10),
                   Expanded(
                     child: Column(
@@ -443,9 +586,36 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
                     _toggleSearch,
                     active: _query.isNotEmpty,
                   ),
-
                   const SizedBox(width: 8),
                   _libraryOptionsButton(context),
+                  // Windows (home-4): a mouse cannot pull to refresh.
+                  if (_desktop) ...[
+                    const SizedBox(width: 8),
+                    _refreshing
+                        ? const SizedBox(
+                            width: 36,
+                            height: 36,
+                            child: Padding(
+                              padding: EdgeInsets.all(10),
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          )
+                        : _pillIcon(
+                            Icons.refresh_rounded,
+                            context.l10n.refreshF5,
+                            () => unawaited(_refreshShownList()),
+                          ),
+                  ],
+                  if (widget.pinnedTracker == null &&
+                      hub.connected.isNotEmpty) ...[
+                    const SizedBox(width: 8),
+                    _pillIcon(
+                      Icons.swap_horiz_rounded,
+                      'Switch tracker',
+                      () => _openTrackerSwitch(context),
+                      active: active != null,
+                    ),
+                  ],
                   const SizedBox(width: 8),
                 ],
               ),
@@ -456,8 +626,38 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
     );
   }
 
-  /// Search stays separate; this menu gathers random selection and sorting in
-  /// one compact control at the end of the header.
+  /// Switch lists without changing their contents.
+  /// The pick applies immediately and is remembered for the next visit.
+  Future<void> _openTrackerSwitch(BuildContext context) async {
+    final connected = sl<TrackerHub>().connected.toList();
+    if (connected.isEmpty || !context.mounted) return;
+    final cubit = context.read<TrackerListCubit>();
+    await showTrackerSwitchPopup(
+      context,
+      current: cubit.state.tracker,
+      ownAvatarUrl: sl.isRegistered<AuthCubit>()
+          ? sl<AuthCubit>().state.avatarUrl
+          : null,
+      ownName: sl.isRegistered<AuthCubit>()
+          ? sl<AuthCubit>().state.displayName
+          : null,
+      trackers: connected,
+      onPick: (tracker) {
+        if (!context.mounted) return;
+        _userPickedTracker = true;
+        if (tracker == null) {
+          cubit.selectMyList();
+        } else {
+          cubit.selectTracker(
+            tracker,
+            kind: libraryKindForTracker(tracker, _kind),
+          );
+        }
+        unawaited(TrackerSwitchPrefs.saveLastTracker(tracker?.displayName));
+      },
+    );
+  }
+
   Widget _libraryOptionsButton(BuildContext context) {
     final isMyList = context.read<TrackerListCubit>().state.isMyList;
     final active = _sortFor(isMyList: isMyList);
@@ -591,7 +791,7 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
     BuildContext context,
     AniListService service,
   ) async {
-    final mode = sl<ContentModeCubit>().state;
+    final mode = _selectedKind(context);
     final made = await promptCreateAniListList(
       context,
       service,
@@ -609,31 +809,13 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
   /// reading the same would be indistinguishable), so say so rather than
   /// failing silently.
   Future<void> _createCategory(BuildContext context) async {
-    final controller = TextEditingController();
-    final name = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppColors.surface,
-        title: Text(context.l10n.newCategory, style: AppText.title),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          style: AppText.body.copyWith(color: AppColors.textPrimary),
-          decoration: InputDecoration(hintText: context.l10n.personaGym),
-          onSubmitted: (v) => Navigator.pop(ctx, v),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: Text(context.l10n.cancel),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text),
-            style: FilledButton.styleFrom(backgroundColor: AppColors.accent),
-            child: Text(context.l10n.create),
-          ),
-        ],
-      ),
+    // Windows: graphite text prompt; phone: the same AlertDialog as before.
+    final name = await showAdaptiveTextPrompt(
+      context,
+      title: context.l10n.newCategory,
+      hint: context.l10n.personaGym,
+      cancelLabel: context.l10n.cancel,
+      confirmLabel: context.l10n.create,
     );
     if (name == null || !mounted) return;
     // Stamped with the mode it was made in, so it stops appearing as an empty
@@ -653,9 +835,15 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
 
   /// Rename or delete a category (long-press its tab). Deleting keeps every
   /// title — it only drops the label.
+  ///
+  /// Windows (home-3): shown as a centred graphite dialog instead of a bottom
+  /// sheet (showAdaptiveSheet); a right-click on the tab opens
+  /// [_categoryMenu] at the cursor instead.
   Future<void> _manageCategory(BuildContext context, ListCategory c) async {
-    final action = await showModalBottomSheet<String>(
-      context: context,
+    final action = await showAdaptiveSheet<String>(
+      context,
+      // Desktop: the dialog's title bar names the category.
+      title: c.name,
       backgroundColor: AppColors.surface,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
@@ -664,13 +852,15 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 18, 20, 6),
-              child: Align(
-                alignment: AlignmentDirectional.centerStart,
-                child: Text(c.name, style: AppText.title),
+            // Phone heading; the desktop dialog already has a title bar.
+            if (!DesktopSheetScope.of(ctx))
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 18, 20, 6),
+                child: Align(
+                  alignment: AlignmentDirectional.centerStart,
+                  child: Text(c.name, style: AppText.title),
+                ),
               ),
-            ),
             ListTile(
               leading: const Icon(
                 Icons.edit_outlined,
@@ -697,7 +887,39 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
       ),
     );
     if (action == null || !mounted) return;
+    await _applyCategoryAction(c, action);
+  }
 
+  /// Windows (home-3): right-click menu of a category tab, at the cursor.
+  Future<void> _categoryMenu(
+    BuildContext context,
+    ListCategory c,
+    Offset at,
+  ) async {
+    final action = await showDesktopContextMenu<String>(
+      context,
+      position: at,
+      items: [
+        DesktopMenuItem(
+          label: context.l10n.rename,
+          icon: Icons.edit_outlined,
+          value: 'rename',
+        ),
+        DesktopMenuItem(
+          label: context.l10n.deleteCategory,
+          icon: Icons.delete_outline_rounded,
+          value: 'delete',
+          destructive: true,
+        ),
+      ],
+    );
+    if (action == null || !mounted) return;
+    await _applyCategoryAction(c, action);
+  }
+
+  /// Runs a category action picked from the sheet or the desktop menu:
+  /// 'delete' drops the label (titles stay), 'rename' asks for a new name.
+  Future<void> _applyCategoryAction(ListCategory c, String action) async {
     if (action == 'delete') {
       await sl<CategoryStore>().delete(c.id);
       if (!mounted) return;
@@ -708,30 +930,14 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
       return;
     }
 
-    final controller = TextEditingController(text: c.name);
-    final name = await showDialog<String>(
-      context: this.context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppColors.surface,
-        title: Text(context.l10n.renameCategory, style: AppText.title),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          style: AppText.body.copyWith(color: AppColors.textPrimary),
-          onSubmitted: (v) => Navigator.pop(ctx, v),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: Text(context.l10n.cancel),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text),
-            style: FilledButton.styleFrom(backgroundColor: AppColors.accent),
-            child: Text(context.l10n.rename),
-          ),
-        ],
-      ),
+    // Windows: graphite text prompt prefilled with the current name; phone:
+    // the same AlertDialog as before.
+    final name = await showAdaptiveTextPrompt(
+      context,
+      title: context.l10n.renameCategory,
+      initialValue: c.name,
+      cancelLabel: context.l10n.cancel,
+      confirmLabel: context.l10n.rename,
     );
     if (name == null || !mounted) return;
     final ok = await sl<CategoryStore>().rename(c.id, name);
@@ -822,8 +1028,18 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
     ),
   );
 
+  ContentMode _selectedKind(BuildContext context) => libraryKindForTracker(
+    context.read<TrackerListCubit>().state.tracker,
+    widget.pinnedTracker == null
+        ? _kind
+        : (widget.pinnedKind ?? sl<ContentModeCubit>().state),
+  );
+
   Widget _kindTabs(BuildContext context) {
-    const kinds = ContentMode.values;
+    final kinds = libraryKindsForTracker(
+      context.read<TrackerListCubit>().state.tracker,
+    );
+    final selected = _selectedKind(context);
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 2, 16, 10),
       child: LayoutBuilder(
@@ -845,7 +1061,7 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
                   alignment: Alignment(
                     kinds.length == 1
                         ? 0
-                        : -1 + 2 * (kinds.indexOf(_kind) / (kinds.length - 1)),
+                        : -1 + 2 * (kinds.indexOf(selected) / (kinds.length - 1)),
                     0,
                   ),
                   child: Container(
@@ -863,8 +1079,14 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
                         child: GestureDetector(
                           behavior: HitTestBehavior.opaque,
                           onTap: () => setState(() {
+                            if (selected.isReading != k.isReading) {
+                              _customListFilter = null;
+                            }
+                            // Our Classic list keeps its own kind; New-style
+                            // desktop lists derive it from the dock instead.
                             _localKind = k;
                             _dropCategoryForeignTo(k);
+                            context.read<TrackerListCubit>().selectKind(k);
                           }),
                           child: Center(
                             child: Text(
@@ -872,7 +1094,7 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
                               style: AppText.body.copyWith(
                                 fontSize: 13.5,
                                 fontWeight: FontWeight.w700,
-                                color: _kind == k
+                                color: selected == k
                                     ? Colors.white
                                     : AppColors.textSecondary,
                               ),
@@ -904,8 +1126,11 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
                 context,
                 entries,
                 onTap: (item) => _openItem(context, item),
-                onMore: (entry) =>
-                    showListStatusSheet(context, item: entry.item),
+                // Windows (home-3): right-click opens a menu at the cursor;
+                // the status editor then opens as a centred dialog.
+                onMore: (entry) => _desktop
+                    ? _myListPosterMenu(context, entry)
+                    : showListStatusSheet(context, item: entry.item),
               );
         return RefreshIndicator(
           color: AppColors.accent,
@@ -939,10 +1164,19 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
         );
       case TrackerListStatus.error:
         _shuffleAction = null;
-        content = EmptyState(
-          icon: Icons.cloud_off_rounded,
-          message: context.l10n.couldnTLoadPullToRefresh,
-        );
+        // Windows (home-4): a mouse cannot pull, so say so plainly and give
+        // a Refresh button instead.
+        content = _desktop
+            ? EmptyState(
+                icon: Icons.cloud_off_rounded,
+                message: context.l10n.couldntLoadThisList,
+                actionLabel: context.l10n.refresh,
+                onAction: () => unawaited(_refreshShownList()),
+              )
+            : EmptyState(
+                icon: Icons.cloud_off_rounded,
+                message: context.l10n.couldnTLoadPullToRefresh,
+              );
       case TrackerListStatus.idle:
       case TrackerListStatus.ready:
         if (tlState.entries.isEmpty) _shuffleAction = null;
@@ -955,18 +1189,11 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
                 context,
                 tlState.entries,
                 onTap: (item) => _openTrackerItem(context, item),
-                onMore: (entry) => showTrackerEntrySheet(
-                  context,
-                  tracker: tlState.tracker!,
-                  item: entry.item,
-                  status: entry.status,
-                  progress: entry.progress,
-                  score: entry.score,
-                  tmdbIsTv: entry.tmdbIsTv,
-                  customLists: entry.customLists,
-                  onFind: () => _openTrackerItem(context, entry.item),
-                  onChanged: () => context.read<TrackerListCubit>().refresh(),
-                ),
+                // Windows (home-3): menu at the cursor first; the editor
+                // then opens as a centred dialog.
+                onMore: (entry) => _desktop
+                    ? _trackerPosterMenu(context, tlState, entry)
+                    : _editTrackerEntry(context, tlState, entry),
               );
     }
 
@@ -989,6 +1216,79 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
             ),
     );
   }
+
+  /// The per-card tracker editor (status, progress, score) for [entry].
+  Future<void> _editTrackerEntry(
+    BuildContext context,
+    TrackerListState tlState,
+    MyListEntry entry,
+  ) => showTrackerEntrySheet(
+    context,
+    tracker: tlState.tracker!,
+    item: entry.item,
+    status: entry.status,
+    progress: entry.progress,
+    score: entry.score,
+    tmdbIsTv: entry.tmdbIsTv,
+    customLists: entry.customLists,
+    isPrivate: entry.isPrivate,
+    onFind: () => _openTrackerItem(context, entry.item),
+    onChanged: () => context.read<TrackerListCubit>().refresh(),
+  );
+
+  /// Windows (home-3): right-click menu of a poster on your own list, at the
+  /// cursor (DesktopPointer's last right-click).
+  Future<void> _myListPosterMenu(BuildContext context, MyListEntry entry) =>
+      showDesktopContextMenu<void>(
+        context,
+        items: [
+          DesktopMenuItem(
+            label: context.l10n.details,
+            icon: Icons.info_outline_rounded,
+            onTap: () => _openItem(context, entry.item),
+          ),
+          DesktopMenuItem(
+            label: context.l10n.changeStatusEllipsis,
+            icon: Icons.bookmark_border_rounded,
+            onTap: () =>
+                unawaited(showListStatusSheet(context, item: entry.item)),
+          ),
+          if (_cats != null)
+            DesktopMenuItem(
+              label: context.l10n.categoriesEllipsis,
+              icon: Icons.folder_outlined,
+              onTap: () => unawaited(showCategoryPicker(context, entry.item)),
+            ),
+          const DesktopMenuItem.divider(),
+          DesktopMenuItem(
+            label: context.l10n.removeFromMyList,
+            icon: Icons.delete_outline_rounded,
+            destructive: true,
+            onTap: () => unawaited(removeFromListEverywhere(entry.item)),
+          ),
+        ],
+      );
+
+  /// Windows (home-3): right-click menu of a poster on a tracker list.
+  Future<void> _trackerPosterMenu(
+    BuildContext context,
+    TrackerListState tlState,
+    MyListEntry entry,
+  ) => showDesktopContextMenu<void>(
+    context,
+    items: [
+      DesktopMenuItem(
+        label: context.l10n.details,
+        icon: Icons.info_outline_rounded,
+        onTap: () => _openTrackerItem(context, entry.item),
+      ),
+      DesktopMenuItem(
+        label: context.l10n.editOnTracker(tlState.tracker?.displayName ?? context.l10n.trackerFallbackName),
+        icon: Icons.edit_outlined,
+        onTap: () => unawaited(_editTrackerEntry(context, tlState, entry)),
+      ),
+    ],
+  );
 
   // ── Shared grid: status tabs (with counts) + poster grid ──────────────────
 
@@ -1018,9 +1318,8 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
     // The kind tab decides, not the app's current mode — the point of the
     // tabs is seeing all three without leaving the mode you're browsing in.
     // A tracker screen has no tabs and keeps following the app mode.
-    final mode = widget.pinnedTracker == null
-        ? _kind
-        : (widget.pinnedKind ?? sl<ContentModeCubit>().state);
+    final mode = _selectedKind(context);
+    // New-style desktop lists also split Streaming into anime vs movie/TV.
     final modeEntries = _followDock
         ? libraryEntriesForDock(entries, mode, ZModePrefs.streamKind)
         : entries.where((e) => mode.matchesProvider(e.item.type)).toList();
@@ -1033,6 +1332,9 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
     // picks the sort defaults below — the tracker lists share this widget.
     final trackerState = context.read<TrackerListCubit>().state;
     final isMyList = trackerState.isMyList;
+    final categoryCounts = isMyList
+        ? (_categoryCounts?.forEntries(entries, mode) ?? const <String, int>{})
+        : const <String, int>{};
 
     // The account's own list names first — a list created but not yet filled
     // still deserves a tab. Anything an entry claims to be in is unioned on
@@ -1060,7 +1362,7 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
           id: 'status:${st.name}',
           label: shortLabelFor(
             st,
-            reading: sl<ContentModeCubit>().state.isReading,
+            reading: mode.isReading,
           ),
           count: modeEntries.where((e) => e.status == st).length,
           test: (e) => e.status == st,
@@ -1073,14 +1375,16 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
       // under Manga and Novel as an empty tab.
       if (isMyList)
         for (final c in (_cats?.all() ?? const <ListCategory>[]).where(
-          _categoryFitsKind(modeEntries),
+          _categoryFitsKind(categoryCounts),
         ))
           LibraryTab(
             id: 'cat:${c.id}',
             label: c.name,
-            count: _categoryCount(modeEntries, c),
+            count: categoryCounts[c.id] ?? 0,
             test: (e) => _cats?.isIn(e.item, c.id) ?? false,
             onLongPress: () => _manageCategory(context, c),
+            // Windows (home-3): right-click menu at the cursor.
+            onContextMenu: (at) => _categoryMenu(context, c, at),
           ),
       // AniList's own custom lists. Only ever non-empty on that tab — MAL and
       // Simkl have no such concept, and My List uses categories instead.
@@ -1162,6 +1466,12 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
               child: PosterCard(
                 title: entry.item.title,
                 logoItem: entry.item,
+                topRightBadge:
+                    isMyList && entry.item.sourceId == stremioSourceId
+                    ? const StremioLibraryBadge()
+                    : entry.isPrivate
+                    ? const PrivateTrackerBadge()
+                    : null,
                 imageUrl: entry.item.cover,
                 wideImageUrl: entry.item.banner,
                 genres: entry.item.genres,
@@ -1247,14 +1557,6 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
     );
   }
 
-  /// How many of [entries] — already narrowed to the kind on screen — are in
-  /// [c].
-  int _categoryCount(List<MyListEntry> entries, ListCategory c) {
-    final cats = _cats;
-    if (cats == null) return 0;
-    return entries.where((e) => cats.isIn(e.item, c.id)).length;
-  }
-
   /// Drop the selected category when it does not belong to [k].
   ///
   /// The mode row only ever changed the kind, and [_categoryFitsKind] keeps
@@ -1286,15 +1588,15 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
   /// they are empty everywhere. That last rule is why a new category used to
   /// appear in all three modes, and it is left alone here so the categories
   /// already on people's devices do not look deleted from two of them.
-  bool Function(ListCategory) _categoryFitsKind(List<MyListEntry> entries) {
+  bool Function(ListCategory) _categoryFitsKind(Map<String, int> counts) {
     final cats = _cats;
     return (c) {
       if (cats == null) return false;
       if (_categoryFilter == c.id) return true;
       final madeIn = c.kind;
       if (madeIn != null) return madeIn == _kind.name;
-      if (_categoryCount(entries, c) > 0) return true;
-      return cats.countIn(c.id) == 0;
+      if ((counts[c.id] ?? 0) > 0) return true;
+      return (_categoryCounts?.total(c.id) ?? 0) == 0;
     };
   }
 

@@ -30,7 +30,8 @@ typedef HlsAudioMux =
 /// background_downloader equivalent for segmented HLS. Progress is reported via
 /// [onProgress]; [canceled] is polled between segments to abort.
 class HlsDownloader {
-  HlsDownloader(this._dio, {
+  HlsDownloader(
+    this._dio, {
     this.muxAudio,
     this.isHostCoolingDown,
     this.onRateLimited,
@@ -56,9 +57,8 @@ class HlsDownloader {
   bool get rateLimited => _rateLimited;
 
   /// Keep response bodies and signed URLs out of user-visible error messages.
-  String? get _rateLimitMessage => _rateLimited
-      ? downloadFailureMessage(null, statusCode: 429)
-      : null;
+  String? get _rateLimitMessage =>
+      _rateLimited ? downloadFailureMessage(null, statusCode: 429) : null;
 
   /// Stop new requests after throttling; already in-flight segments may settle.
   bool _mayRequest(Uri url) {
@@ -77,7 +77,10 @@ class HlsDownloader {
     _rateLimited = true;
     _receivedRateLimitResponse = true;
     _rateLimitedUri = response.realUri;
-    await onRateLimited!(response.realUri, response.headers.value('retry-after'));
+    await onRateLimited!(
+      response.realUri,
+      response.headers.value('retry-after'),
+    );
   }
 
   final Dio _dio;
@@ -147,7 +150,8 @@ class HlsDownloader {
     Uint8List? key;
     if (pl.keyUrl != null) {
       key = await _fetchBytes(pl.keyUrl!, headers);
-      if (key == null || key.length != 16) return _rateLimitMessage ?? 'AES key fetch failed';
+      if (key == null || key.length != 16)
+        return _rateLimitMessage ?? 'AES key fetch failed';
     }
 
     // 4. Download segments with bounded parallelism, writing strictly in order.
@@ -236,7 +240,9 @@ class HlsDownloader {
         if (await file.exists()) await file.delete();
       } catch (_) {}
       if (canceled()) return 'canceled';
-      return _rateLimitMessage ?? failReason ?? 'incomplete ($nextWrite/$total segments)';
+      return _rateLimitMessage ??
+          failReason ??
+          'incomplete ($nextWrite/$total segments)';
     }
     if (selectedAudio != null) {
       final audio = selectedAudio!;
@@ -244,7 +250,8 @@ class HlsDownloader {
       try {
         final audioPath = '${scratch.path}/audio.media';
         final mergedPath = '${scratch.path}/merged.ts';
-        final audioDownloader = HlsDownloader(_dio,
+        final audioDownloader = HlsDownloader(
+          _dio,
           isHostCoolingDown: isHostCoolingDown,
           onRateLimited: onRateLimited,
         );
@@ -260,7 +267,8 @@ class HlsDownloader {
         if (audioDownloader.rateLimited) {
           _rateLimited = true;
           _rateLimitedUri = audioDownloader.rateLimitedUri;
-          _receivedRateLimitResponse = audioDownloader.receivedRateLimitResponse;
+          _receivedRateLimitResponse =
+              audioDownloader.receivedRateLimitResponse;
         }
         if (error != null) {
           await file.delete();

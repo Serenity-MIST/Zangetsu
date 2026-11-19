@@ -7,8 +7,7 @@ import 'zmode_ids.dart';
 /// The user's preferred sweep order of installed sources, per content type —
 /// separate lists for Anime and Movies/TV (they share one installed pool, but
 /// a source that's great for one can return nothing for the other, so which
-/// goes first should differ). Manga/novel get their own buckets too, for
-/// symmetry, though only Anime/Movies-TV are exposed in Settings today.
+/// goes first should differ). Manga and novel get their own lists too.
 ///
 /// Only the ids the user has actually reordered are stored; anything
 /// installed but never touched keeps its natural order, appended after.
@@ -21,26 +20,47 @@ class SourceOrderPrefs {
   static Future<SourceOrderPrefs> open() async =>
       SourceOrderPrefs._(await openBoxSafely<List>(boxName));
 
-  /// One bucket for everything that plays, separate ones for reading.
+  /// Anime, Movies/TV, manga and novel each keep their own order, limit and
+  /// off-list. Movies and TV share one (Settings shows them as one
+  /// "Movies / TV" list).
   ///
-  /// Anime and Movies/TV used to be split. They share one installed pool, so
-  /// the split only ever meant keeping two orders of the same sources — twice
-  /// the list to maintain for a distinction most people don't draw. Manga and
-  /// novel stay their own because they genuinely are different sources.
+  /// Anime and Movies/TV were stored in one shared 'video' bucket for a while
+  /// even though the screen showed two lists: dragging a source in the Movies
+  /// view moved the anime order too, and the limit slider changed both. They
+  /// are separate again, under NEW keys ('video:anime' / 'video:movie'), so
+  /// neither the shared bucket nor the even older 'anime' / 'movie' keys can
+  /// be mistaken for a fresh choice. Until a list is saved under its new key
+  /// it reads the shared 'video' value (then the oldest keys), so both lists
+  /// start exactly where the shared one was.
   static String bucketOf(ZKind kind) => switch (kind) {
     ZKind.manga => 'manga',
     ZKind.novel => 'novel',
-    _ => 'video',
+    ZKind.anime => 'video:anime',
+    _ => 'video:movie',
   };
 
-  /// The pre-merge keys, so an order set before the split went away is still
-  /// honoured instead of silently resetting to nothing.
-  static const List<String> _legacyVideoKeys = ['anime', 'movie'];
+  /// True for the two playable buckets, which migrate from older keys.
+  static bool _isVideo(ZKind kind) =>
+      kind != ZKind.manga && kind != ZKind.novel;
 
-  List? _rawFor(String key, {required bool video, String suffix = ''}) {
-    final direct = _box.get('$key$suffix');
-    if (direct != null || !video) return direct;
-    for (final legacy in _legacyVideoKeys) {
+  /// The shared bucket both video lists used before they were split again.
+  static const String _sharedVideoKey = 'video';
+
+  /// The pre-merge keys, so an order set before the shared bucket existed is
+  /// still honoured instead of silently resetting to nothing. The kind's own
+  /// old key is checked first: anime prefers the old anime order, Movies/TV
+  /// the old movie order.
+  static List<String> _legacyVideoKeys(ZKind kind) =>
+      kind == ZKind.anime ? const ['anime', 'movie'] : const ['movie', 'anime'];
+
+  /// The stored value for [kind] under [suffix] ('' = order, ':off', ':cap'),
+  /// falling back to the older shared / legacy keys for the video kinds.
+  List? _rawFor(ZKind kind, {String suffix = ''}) {
+    final direct = _box.get('${bucketOf(kind)}$suffix');
+    if (direct != null || !_isVideo(kind)) return direct;
+    final shared = _box.get('$_sharedVideoKey$suffix');
+    if (shared != null) return shared;
+    for (final legacy in _legacyVideoKeys(kind)) {
       final old = _box.get('$legacy$suffix');
       if (old != null) return old;
     }
@@ -50,8 +70,7 @@ class SourceOrderPrefs {
   /// The saved priority order for [kind]'s bucket, as source ids. Empty when
   /// the user has never reordered this bucket.
   List<String> get(ZKind kind) {
-    final bucket = bucketOf(kind);
-    final raw = _rawFor(bucket, video: bucket == 'video');
+    final raw = _rawFor(kind);
     if (raw == null) return const [];
     return raw.whereType<String>().toList();
   }
@@ -59,12 +78,11 @@ class SourceOrderPrefs {
   Future<void> set(ZKind kind, List<String> orderedIds) =>
       _box.put(bucketOf(kind), orderedIds);
 
-  /// Clears migrated pins too, so Unpin all cannot revive the legacy order.
-  /// Exclusions and the sweep cap are separate choices and remain untouched.
-  Future<void> clear(ZKind kind) async {
-    final bucket = bucketOf(kind);
-    await _box.deleteAll([bucket, if (bucket == 'video') ..._legacyVideoKeys]);
-  }
+  /// Unpin all for ONE list. Writes an empty list instead of deleting the
+  /// key: a missing key falls back to the shared / legacy values above, which
+  /// would bring the old pins straight back. Exclusions and the sweep cap are
+  /// separate choices and remain untouched.
+  Future<void> clear(ZKind kind) => _box.put(bucketOf(kind), const <String>[]);
 
   // ── Sources the user has switched off for Auto Resolve ──────────────────
   //
@@ -91,8 +109,10 @@ class SourceOrderPrefs {
   /// box the orders live in, so there is one entry in settings backup rather
   /// than two. Clamped on read as well as write: a value left by an older or
   /// newer build must not be able to switch the cap off or shrink it to one.
+  /// Anime and Movies/TV each have their own; until one is set, the old
+  /// shared value applies.
   int cap(ZKind kind) {
-    final raw = _box.get(_capKey(kind));
+    final raw = _rawFor(kind, suffix: ':cap');
     final first = (raw == null || raw.isEmpty) ? null : raw.first;
     final n = first is int ? first : int.tryParse('$first');
     return (n ?? kAutoResolveDefaultCap).clamp(minCap, kAutoResolveCap);
@@ -103,9 +123,11 @@ class SourceOrderPrefs {
 
   static String _offKey(ZKind kind) => '${bucketOf(kind)}:off';
 
+  /// Sources switched off for Auto Resolve in [kind]'s list (the "Use in Auto
+  /// Resolve" switch on Source Priority). Raw storage: what the sweep actually
+  /// skips is decided by `excludedForSweep` in zmode_module.
   Set<String> excluded(ZKind kind) {
-    final bucket = bucketOf(kind);
-    final raw = _rawFor(bucket, video: bucket == 'video', suffix: ':off');
+    final raw = _rawFor(kind, suffix: ':off');
     if (raw == null) return const {};
     return raw.whereType<String>().toSet();
   }

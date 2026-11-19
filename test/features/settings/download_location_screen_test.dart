@@ -5,22 +5,30 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:get_it/get_it.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/download/download_prefs.dart';
+import 'package:watch_app/core/download/download_manager.dart';
 import 'package:watch_app/features/settings/download_location_screen.dart';
 
+class _DownloadManager extends Fake implements DownloadManager {
+  @override
+  Future<List<({String path, String label, bool removable})>>
+  listDownloadVolumes() async => const [];
+}
+
 void main() {
-  late Directory _dir;
+  late Directory tempDir;
 
   setUp(() async {
-    _dir = await Directory.systemTemp.createTemp();
-    Hive.init(_dir.path);
+    tempDir = await Directory.systemTemp.createTemp();
+    Hive.init(tempDir.path);
     await Hive.openBox(DownloadPrefs.boxName);
     GetIt.instance.registerSingleton<DownloadPrefs>(DownloadPrefs());
+    GetIt.instance.registerSingleton<DownloadManager>(_DownloadManager());
   });
 
   tearDown(() async {
     await GetIt.instance.reset();
     await Hive.deleteFromDisk();
-    if (_dir.existsSync()) await _dir.delete(recursive: true);
+    if (tempDir.existsSync()) await tempDir.delete(recursive: true);
   });
 
   testWidgets('renders Choose folder tile and default current-location label',
@@ -31,9 +39,8 @@ void main() {
     await tester.pump();
 
     expect(find.text('Choose folder…'), findsOneWidget);
-    expect(find.text(Platform.isWindows
-        ? 'Choose a folder before your first download'
-        : 'Downloads › Zangetsu'), findsOneWidget);
+    // Phone target (Windows has its own page and test), whatever the host.
+    expect(find.text('Downloads › Zangetsu'), findsOneWidget);
   });
 
   group('folderLabelFromUri', () {

@@ -57,3 +57,8 @@ class MangaLangPrefs extends LangPrefs {
 class AnimeLangPrefs extends LangPrefs {
   AnimeLangPrefs() : super('aniyomi_lang_prefs');
 }
+
+/// Language filter for the Mangayomi catalog (streaming, manga and novels).
+class MangayomiLangPrefs extends LangPrefs {
+  MangayomiLangPrefs() : super('mangayomi_lang_prefs');
+}

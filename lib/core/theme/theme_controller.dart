@@ -17,6 +17,9 @@ class ThemeController {
   static const String _key = 'accent';
   static const String _amoledKey = 'amoled';
   static const String _materialYouKey = 'materialYou';
+  static const String _adaptiveKey = 'adaptiveColour';
+  static const String _titleLogoKey = 'titleLogo';
+  static const String _bgKey = 'backgroundColour';
 
   /// Near-black palette used when AMOLED is on (bg + card surfaces).
   static const Color amoledBg = Color(0xFF000000);
@@ -147,10 +150,47 @@ class ThemeController {
       AppColors.surface = d.surface;
       AppColors.surface2 = d.surface2;
     } else {
-      AppColors.bg = AppColors.defaultBg;
+      final custom = backgroundColour;
+      AppColors.bg = custom == null ? AppColors.defaultBg : darkened(custom);
       AppColors.surface = AppColors.defaultSurface;
       AppColors.surface2 = AppColors.defaultSurface2;
     }
+  }
+
+  /// Ceiling for a custom background's HSV value (#6B). The app draws white
+  /// text on it, so anything lighter would drop body text below 4.5:1. The
+  /// background picker caps its brightness slider here too, so the wheel never
+  /// offers shades that would be silently darkened.
+  static const double maxBackgroundValue = 0.42;
+
+  /// The picked app background, or null while the stock background is in use.
+  /// Device-wide, like [adaptiveColour].
+  static Color? get backgroundColour {
+    if (!Hive.isBoxOpen(boxName)) return null;
+    final v = _box.get(_bgKey) as int?;
+    return v == null ? null : Color(v);
+  }
+
+  /// Persist a custom app background and rebuild listeners. Home and Detail
+  /// keep the adaptive poster tint when that is on; every other screen uses
+  /// this colour.
+  static Future<void> setBackgroundColour(Color? colour) async {
+    if (colour == null) {
+      await _box.delete(_bgKey);
+    } else {
+      await _box.put(_bgKey, colour.toARGB32());
+    }
+    _applyColors();
+    revision.value++;
+  }
+
+  /// Clamps a pick to a dark tone, keeping its hue and saturation. Only the
+  /// value changes, so a vivid red still reads as red — just a background red.
+  static Color darkened(Color colour) {
+    final hsv = HSVColor.fromColor(colour);
+    return hsv.value <= maxBackgroundValue
+        ? colour
+        : hsv.withValue(maxBackgroundValue).toColor();
   }
 
   /// Opens the box and applies the saved accent + AMOLED choice. Call once
@@ -169,6 +209,35 @@ class ThemeController {
   static Future<void> setAmoled(bool on) async {
     await _box.put(_amoledKey, on);
     _applyColors();
+    revision.value++;
+  }
+
+  /// Whether the poster-tinted background (Home + Detail) is on. Off by
+  /// default. Device-wide, not per-profile — see the appearance screen.
+  static bool get adaptiveColour {
+    // Screens are pumped in tests without opening the theme box — treat that
+    // as off rather than throwing during build.
+    if (!Hive.isBoxOpen(boxName)) return false;
+    return _box.get(_adaptiveKey, defaultValue: false) as bool;
+  }
+
+  /// Persist the poster-tint toggle and rebuild listeners.
+  static Future<void> setAdaptiveColour(bool on) async {
+    await _box.put(_adaptiveKey, on);
+    revision.value++;
+  }
+
+  /// Whether the Detail screen shows the official TMDB title logo instead of
+  /// plain text. On by default. Device-wide, like [adaptiveColour]. A title
+  /// with no logo still shows text — the toggle only unlocks the logo look.
+  static bool get titleLogo {
+    if (!Hive.isBoxOpen(boxName)) return true;
+    return _box.get(_titleLogoKey, defaultValue: true) as bool;
+  }
+
+  /// Persist the title-logo toggle and rebuild listeners.
+  static Future<void> setTitleLogo(bool on) async {
+    await _box.put(_titleLogoKey, on);
     revision.value++;
   }
 

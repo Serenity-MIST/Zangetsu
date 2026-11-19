@@ -23,16 +23,82 @@ String downloadDestinationLabel({
 class DownloadPrefs {
   static Future<bool>? _folderPick;
 
+  /// Why the last desktop folder pick was rejected (e.g. a read-only folder),
+  /// or null when it succeeded or was cancelled. Shown by the location screen.
+  String? lastFolderError;
+
+  /// Test hook replacing the native Windows folder picker.
+  static Future<String?> Function()? debugPickDirectory;
+
   /// Saves a desktop download directory chosen in-app; cancellation is false.
+  /// A folder Zangetsu cannot write into is rejected (false, with
+  /// [lastFolderError] set) so downloads never fail later for that reason.
   Future<bool> chooseDesktopFolder() async {
-    final path = await FilePicker.getDirectoryPath(
-      dialogTitle: 'Choose where Zangetsu saves downloads',
-    );
+    lastFolderError = null;
+    final pick = debugPickDirectory;
+    final path = pick != null
+        ? await pick()
+        : await FilePicker.getDirectoryPath(
+            dialogTitle: 'Choose where Zangetsu saves downloads',
+          );
     if (path == null) return false;
-    await Directory(path).create(recursive: true);
+    if (!await isWritableFolder(path)) {
+      lastFolderError =
+          "Zangetsu can't save files in $path. Choose another folder.";
+      return false;
+    }
     await setLocation(path, path);
     await setKeepPrivate(false);
     return true;
+  }
+
+  /// Creates [path] if needed and proves a file can be written and removed
+  /// there. Protected folders (e.g. C:\Windows) and read-only drives fail.
+  static Future<bool> isWritableFolder(String path) async {
+    try {
+      await Directory(path).create(recursive: true);
+      final probe = File(
+        '$path${Platform.pathSeparator}.zangetsu-write-test-${DateTime.now().microsecondsSinceEpoch}',
+      );
+      await probe.writeAsString('ok', flush: true);
+      await probe.delete();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Windows default download folder (`Downloads\Zangetsu`), or null when the
+  /// app storage layer has not resolved it (other platforms, tests).
+  static String? get windowsDefaultFolder =>
+      Platform.isWindows ? DesktopStorage.downloadsRoot : null;
+
+  /// Whether new downloads already go to the platform default location.
+  bool get isDefaultLocation {
+    final current = locationUri;
+    if (current == null || current.isEmpty) return true;
+    final fallback = windowsDefaultFolder;
+    return fallback != null && _samePath(current, fallback);
+  }
+
+  /// Case- and separator-insensitive Windows path comparison.
+  static bool _samePath(String a, String b) {
+    String norm(String s) =>
+        s.replaceAll('/', r'\').replaceAll(RegExp(r'\\+$'), '').toLowerCase();
+    return norm(a) == norm(b);
+  }
+
+  /// Back to the default location. On Windows that is the real default folder
+  /// (`Downloads\Zangetsu`) applied immediately — not an empty value that
+  /// would make the next download ask for a folder. Elsewhere it clears the
+  /// custom folder, which means the shared Downloads/Zangetsu location.
+  Future<void> resetToDefault() async {
+    final fallback = windowsDefaultFolder;
+    if (fallback != null) {
+      await setLocation(fallback, fallback);
+      return;
+    }
+    await setLocation(null, null);
   }
 
   /// Joins concurrent folder prompts when Windows lacks a usable filesystem path.
@@ -67,23 +133,36 @@ class DownloadPrefs {
 
   /// Read a host-only, device-local cooldown without retaining stream URLs.
   DateTime? hostCooldownUntil(Uri url, {DateTime? now}) {
-    if (url.host.isEmpty || (url.scheme != 'http' && url.scheme != 'https')) return null;
+    if (url.host.isEmpty || (url.scheme != 'http' && url.scheme != 'https'))
+      return null;
     final raw = _box.get('windowsHostCooldown:${url.host.toLowerCase()}');
-    if (raw is! int || raw <= (now ?? DateTime.now()).millisecondsSinceEpoch || raw > 8640000000000000) return null;
+    if (raw is! int ||
+        raw <= (now ?? DateTime.now()).millisecondsSinceEpoch ||
+        raw > 8640000000000000)
+      return null;
     return DateTime.fromMillisecondsSinceEpoch(raw, isUtc: true);
   }
 
   /// Persist cooldown before another request; repeated hints cannot shorten it.
-  Future<DateTime?> rememberHostCooldown(Uri url, String? retryAfter, {DateTime? now}) async {
-    if (url.host.isEmpty || (url.scheme != 'http' && url.scheme != 'https')) return null;
+  Future<DateTime?> rememberHostCooldown(
+    Uri url,
+    String? retryAfter, {
+    DateTime? now,
+  }) async {
+    if (url.host.isEmpty || (url.scheme != 'http' && url.scheme != 'https'))
+      return null;
     final instant = now ?? DateTime.now();
     final requested = downloadRetryDeadline(retryAfter, instant);
     final previous = hostCooldownUntil(url, now: instant);
-    final deadline = previous != null && previous.isAfter(requested) ? previous : requested;
-    await _box.put('windowsHostCooldown:${url.host.toLowerCase()}', deadline.millisecondsSinceEpoch);
+    final deadline = previous != null && previous.isAfter(requested)
+        ? previous
+        : requested;
+    await _box.put(
+      'windowsHostCooldown:${url.host.toLowerCase()}',
+      deadline.millisecondsSinceEpoch,
+    );
     return deadline;
   }
-
 
   /// The picked SAF directory tree URI, or null for the default location.
   String? get locationUri => _box.get('locationUri') as String?;

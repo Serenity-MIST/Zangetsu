@@ -144,6 +144,45 @@ class _EpisodesPanelState extends State<_EpisodesPanel> {
     }
   }
 
+  /// Selects season [sn] and scrolls its header into view (shared by the
+  /// phone popup and the Windows desktop menu).
+  void _pickSeason(List<_PanelItem> items, int sn) {
+    setState(() => _season = sn);
+    _scrollTo(
+      _offsetOf(items, (it) => it.isHeader && it.season == sn),
+      animate: true,
+    );
+  }
+
+  /// The "S2 ▾" season pill in the panel header; [s] is the type scale.
+  Widget _seasonPill(int selSeason, double s) => DecoratedBox(
+    decoration: BoxDecoration(
+      color: AppColors.surface2,
+      borderRadius: BorderRadius.circular(8),
+    ),
+    child: Padding(
+      padding: const EdgeInsets.fromLTRB(9, 4, 5, 4),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            'S$selSeason',
+            style: AppText.caption.copyWith(
+              color: AppColors.textPrimary,
+              fontWeight: FontWeight.w700,
+              fontSize: 12 * s,
+            ),
+          ),
+          const Icon(
+            Icons.expand_more_rounded,
+            size: 16,
+            color: AppColors.textSecondary,
+          ),
+        ],
+      ),
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
     final w = MediaQuery.of(context).size.width;
@@ -246,7 +285,36 @@ class _EpisodesPanelState extends State<_EpisodesPanel> {
                       // costs none, which is a whole extra episode visible. It
                       // also can't break on an odd season count the way a
                       // fixed row of chips does.
-                      if (seasons.length > 1)
+                      // Windows: the same pill drops the graphite desktop
+                      // menu below itself instead of the Material popup.
+                      if (seasons.length > 1 && playerMenusDocked)
+                        Builder(
+                          builder: (pillContext) => Tooltip(
+                            message: context.l10n.season,
+                            child: InkWell(
+                              key: const ValueKey('episodes-panel-season-menu'),
+                              borderRadius: BorderRadius.circular(8),
+                              onTap: () => showDesktopContextMenu<int>(
+                                context,
+                                anchor: pillContext,
+                                items: [
+                                  for (final sn in seasons)
+                                    DesktopMenuItem(
+                                      label: context.l10n.seasonNumber(sn),
+                                      value: sn,
+                                      // Tick marks the season shown now.
+                                      checked: sn == selSeason,
+                                      onTap: () {
+                                        if (mounted) _pickSeason(items, sn);
+                                      },
+                                    ),
+                                ],
+                              ),
+                              child: _seasonPill(selSeason, s),
+                            ),
+                          ),
+                        )
+                      else if (seasons.length > 1)
                         PopupMenuButton<int>(
                           initialValue: selSeason,
                           tooltip: context.l10n.season,
@@ -254,16 +322,7 @@ class _EpisodesPanelState extends State<_EpisodesPanel> {
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(11),
                           ),
-                          onSelected: (sn) {
-                            setState(() => _season = sn);
-                            _scrollTo(
-                              _offsetOf(
-                                items,
-                                (it) => it.isHeader && it.season == sn,
-                              ),
-                              animate: true,
-                            );
-                          },
+                          onSelected: (sn) => _pickSeason(items, sn),
                           itemBuilder: (c) => [
                             for (final sn in seasons)
                               PopupMenuItem<int>(
@@ -283,33 +342,7 @@ class _EpisodesPanelState extends State<_EpisodesPanel> {
                                 ),
                               ),
                           ],
-                          child: DecoratedBox(
-                            decoration: BoxDecoration(
-                              color: AppColors.surface2,
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Padding(
-                              padding: const EdgeInsets.fromLTRB(9, 4, 5, 4),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Text(
-                                    'S$selSeason',
-                                    style: AppText.caption.copyWith(
-                                      color: AppColors.textPrimary,
-                                      fontWeight: FontWeight.w700,
-                                      fontSize: 12 * s,
-                                    ),
-                                  ),
-                                  const Icon(
-                                    Icons.expand_more_rounded,
-                                    size: 16,
-                                    color: AppColors.textSecondary,
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
+                          child: _seasonPill(selSeason, s),
                         ),
                       IconButton(
                         icon: const Icon(

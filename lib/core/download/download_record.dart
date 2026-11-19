@@ -1,7 +1,8 @@
 import 'download_server_preference.dart';
 
 /// Retain the index when a Windows media path is temporarily missing.
-const missingSavedDownloadMessage = 'The saved file is unavailable at its recorded location. Choose its download folder to recover local files.';
+const missingSavedDownloadMessage =
+    'The saved file is unavailable at its recorded location. Choose its download folder to recover local files.';
 
 /// Lifecycle of one downloaded episode/movie.
 enum DownloadStatus {
@@ -89,14 +90,16 @@ class DownloadRecord {
     required this.episodeId,
     required this.episodeUrl,
     this.episodeNumber,
-    this.episodeThumbnail,
-    this.season,
+    int? season,
+    int? episodeSeason,
     this.storageKey = '',
     this.downloadRoot,
     required this.episodeTitle,
+    this.episodeThumbnail,
     required this.category,
     required this.quality,
     this.serverPreference,
+    this.resolveSourceId,
     this.pendingAudioFinalization = false,
     this.status = DownloadStatus.queued,
     this.progress = 0,
@@ -107,6 +110,10 @@ class DownloadRecord {
     this.error,
     this.subtitles = const [],
     this.malId,
+    this.anilistId,
+    this.tmdbId,
+    this.tmdbIsTv = false,
+    this.imdbId,
     this.isTorrent = false,
     this.recoveredFromDisk = false,
     this.retryAt,
@@ -114,7 +121,9 @@ class DownloadRecord {
     this.retryCount = 0,
     this.autoResumePending = false,
     required this.createdAt,
-  });
+  }) : season = season ?? episodeSeason,
+       // Mirror both season names so either caller spelling round-trips.
+       episodeSeason = episodeSeason ?? season;
 
   final String id;
   final String sourceId;
@@ -127,9 +136,13 @@ class DownloadRecord {
   final String episodeUrl;
   final double? episodeNumber;
 
-  /// Optional source episode artwork; null preserves older offline records.
-  final String? episodeThumbnail;
+  /// Source-reported season (Windows naming). Kept in sync with
+  /// [episodeSeason] by the constructor; absent on older downloads.
   final int? season;
+
+  /// Source-reported season for offline ordering (upstream naming); always
+  /// equal to [season]. Both keys persist so either app version can read it.
+  final int? episodeSeason;
 
   /// Device-local file generation. Automatic mirrors/resume keep it; explicit
   /// fresh downloads get a new key so retained media is never overwritten.
@@ -140,10 +153,20 @@ class DownloadRecord {
   /// Null preserves legacy/mobile records without migrating their saved files.
   final String? downloadRoot;
   final String episodeTitle;
+
+  /// This episode's own still, when the source or TMDB had one. Falls back to
+  /// [cover] in the UI; null on records saved before it was captured.
+  final String? episodeThumbnail;
   final String category; // sub/dub — kept for re-resolution + offline history
   final String quality; // requested quality label (e.g. '1080p' / 'best')
   /// Batch server choice survives retries/restarts without storing a stream URL.
   final DownloadServerPreference? serverPreference;
+
+  /// The real source the viewer picked links from, when the record itself is
+  /// keyed to the catalogue (`zm`) entry. Re-resolves ask this source by name
+  /// (falling back to the sweep) so a retry fetches the same source again.
+  /// Null on older records and ordinary-source downloads.
+  final String? resolveSourceId;
 
   /// Complete local media awaits Windows audio selection, not another transfer.
   /// Old records default false so partial files are never promoted by inference.
@@ -166,8 +189,16 @@ class DownloadRecord {
   final String? error;
   final List<OfflineSubtitle> subtitles; // soft-sub files saved for offline use
   final int? malId; // anime MAL id → AniList auto-scrobble on offline playback
-  final bool
-  isTorrent; // downloaded via the torrent engine (not background_downloader)
+
+  /// Other catalogue ids captured at download time. They travel with the file
+  /// (and into the folder manifest) so offline subtitle search and playback can
+  /// match the exact title instead of guessing from its name.
+  final int? anilistId, tmdbId;
+  final bool tmdbIsTv;
+  final String? imdbId;
+  // Downloaded via the torrent engine rather than background_downloader.
+  final bool isTorrent;
+
   /// Local media recovered without its original provider/audio metadata.
   /// Availability does not certify its original language or full episode length.
   final bool recoveredFromDisk;
@@ -217,14 +248,16 @@ class DownloadRecord {
     episodeId: episodeId,
     episodeUrl: episodeUrl,
     episodeNumber: episodeNumber,
-    episodeThumbnail: episodeThumbnail ?? this.episodeThumbnail,
     season: season,
+    episodeSeason: episodeSeason,
     storageKey: storageKey ?? this.storageKey,
     downloadRoot: downloadRoot ?? this.downloadRoot,
     episodeTitle: episodeTitle,
+    episodeThumbnail: episodeThumbnail ?? this.episodeThumbnail,
     category: category,
     quality: quality,
     serverPreference: serverPreference,
+    resolveSourceId: resolveSourceId,
     pendingAudioFinalization:
         pendingAudioFinalization ?? this.pendingAudioFinalization,
     status: status ?? this.status,
@@ -238,6 +271,10 @@ class DownloadRecord {
     error: error != null ? error() : this.error,
     subtitles: subtitles ?? this.subtitles,
     malId: malId,
+    anilistId: anilistId,
+    tmdbId: tmdbId,
+    tmdbIsTv: tmdbIsTv,
+    imdbId: imdbId,
     isTorrent: isTorrent ?? this.isTorrent,
     recoveredFromDisk: recoveredFromDisk,
     retryAt: retryAt != null ? retryAt() : this.retryAt,
@@ -258,14 +295,16 @@ class DownloadRecord {
     'episodeId': episodeId,
     'episodeUrl': episodeUrl,
     'episodeNumber': episodeNumber,
-    'episodeThumbnail': episodeThumbnail,
     'season': season,
+    'episodeSeason': episodeSeason,
     'storageKey': storageKey,
     'downloadRoot': downloadRoot,
     'episodeTitle': episodeTitle,
+    'episodeThumbnail': episodeThumbnail,
     'category': category,
     'quality': quality,
     'serverPreference': serverPreference?.toMap(),
+    if (resolveSourceId != null) 'resolveSourceId': resolveSourceId,
     'pendingAudioFinalization': pendingAudioFinalization,
     'status': status.name,
     'progress': progress,
@@ -276,6 +315,10 @@ class DownloadRecord {
     'error': error,
     'subtitles': subtitles.map((s) => s.toMap()).toList(),
     'malId': malId,
+    if (anilistId != null) 'anilistId': anilistId,
+    if (tmdbId != null) 'tmdbId': tmdbId,
+    if (tmdbIsTv) 'tmdbIsTv': true,
+    if (imdbId != null) 'imdbId': imdbId,
     'isTorrent': isTorrent,
     'recoveredFromDisk': recoveredFromDisk,
     'retryAt': retryAt,
@@ -300,15 +343,23 @@ class DownloadRecord {
       episodeId: m['episodeId'] as String? ?? '',
       episodeUrl: m['episodeUrl'] as String? ?? '',
       episodeNumber: (m['episodeNumber'] as num?)?.toDouble(),
-      episodeThumbnail: m['episodeThumbnail'] is String ? m['episodeThumbnail'] as String : null,
+      // Accept either season key so records saved by the Windows build
+      // ('season') and by upstream ('episodeSeason') both load.
       season: (m['season'] as num?)?.toInt(),
+      episodeSeason: (m['episodeSeason'] as num?)?.toInt(),
       storageKey: m['storageKey'] as String? ?? '',
       downloadRoot: m['downloadRoot'] as String?,
       episodeTitle: m['episodeTitle'] as String? ?? '',
+      episodeThumbnail: m['episodeThumbnail'] is String
+          ? m['episodeThumbnail'] as String
+          : null,
       category: m['category'] as String? ?? 'sub',
       quality: m['quality'] as String? ?? 'best',
       serverPreference: m['serverPreference'] is Map
           ? DownloadServerPreference.fromMap(m['serverPreference'] as Map)
+          : null,
+      resolveSourceId: m['resolveSourceId'] is String
+          ? m['resolveSourceId'] as String
           : null,
       pendingAudioFinalization: m['pendingAudioFinalization'] == true,
       status: _statusFromName(m['status'] as String?),
@@ -328,6 +379,10 @@ class DownloadRecord {
           .where((s) => s.path.isNotEmpty)
           .toList(),
       malId: (m['malId'] as num?)?.toInt(),
+      anilistId: (m['anilistId'] as num?)?.toInt(),
+      tmdbId: (m['tmdbId'] as num?)?.toInt(),
+      tmdbIsTv: m['tmdbIsTv'] == true,
+      imdbId: m['imdbId'] is String ? m['imdbId'] as String : null,
       isTorrent: (m['isTorrent'] as bool?) ?? false,
       recoveredFromDisk: m['recoveredFromDisk'] == true,
       retryAt: (m['retryAt'] as num?)?.toInt(),

@@ -6,11 +6,13 @@ import 'dart:ui' show FramePhase;
 import 'package:flutter/scheduler.dart';
 
 import '../../core/app_mode.dart';
+import '../../core/desktop/desktop_chrome_colors.dart';
 import '../../core/di/injector.dart';
 import '../../core/models/episode.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/tv/tv_focusable.dart';
+import '../../core/ui/desktop_docked_panel.dart';
 import '../../core/ui/source_switcher.dart';
 import '../../core/zmode/playback_resolver.dart';
 
@@ -36,19 +38,51 @@ import '../../core/zmode/playback_resolver.dart';
 Future<SourceProbe?> showEpisodeSourcesSheet(
   BuildContext context, {
   required Episode episode,
-}) => showDialog<SourceProbe>(
-  context: context,
-  builder: (_) => Dialog(
-    backgroundColor: AppColors.surface,
-    insetPadding: const EdgeInsets.symmetric(horizontal: 28, vertical: 40),
-    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
-    child: _EpisodeSourcesBody(episode: episode),
-  ),
-);
+}) {
+  // Windows: graphite dialog (panel surface + edge, radius 14) that Esc
+  // closes, with a real close button and right-aligned footer buttons.
+  if (desktopPanelsEnabled) {
+    return showDialog<SourceProbe>(
+      context: context,
+      // Same as the desktop dialog kit: stay under the window's title bar.
+      useRootNavigator: false,
+      builder: (_) => DesktopEscCloses(
+        child: Dialog(
+          backgroundColor: DesktopPanelColors.surface,
+          surfaceTintColor: Colors.transparent,
+          insetPadding: const EdgeInsets.all(24),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+            side: BorderSide(color: DesktopPanelColors.edge),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: ConstrainedBox(
+            // A list of source names; wider than this just adds empty space.
+            constraints: const BoxConstraints(maxWidth: 480),
+            child: _EpisodeSourcesBody(episode: episode, desktop: true),
+          ),
+        ),
+      ),
+    );
+  }
+  return showDialog<SourceProbe>(
+    context: context,
+    builder: (_) => Dialog(
+      backgroundColor: AppColors.surface,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 28, vertical: 40),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      child: _EpisodeSourcesBody(episode: episode),
+    ),
+  );
+}
 
 class _EpisodeSourcesBody extends StatefulWidget {
-  const _EpisodeSourcesBody({required this.episode});
+  const _EpisodeSourcesBody({required this.episode, this.desktop = false});
   final Episode episode;
+
+  /// True on Windows: graphite close button, progress track and a
+  /// right-aligned footer instead of the phone's full-width pill buttons.
+  final bool desktop;
 
   @override
   State<_EpisodeSourcesBody> createState() => _EpisodeSourcesBodyState();
@@ -232,6 +266,15 @@ class _EpisodeSourcesBodyState extends State<_EpisodeSourcesBody> {
                   ),
                   // A dialog with a running job in it needs a way out that
                   // isn't guessing whether tapping outside will work.
+                  // Windows: a focusable IconButton with a tooltip.
+                  if (widget.desktop)
+                    IconButton(
+                      tooltip: 'Close (Esc)',
+                      onPressed: () => Navigator.pop(context),
+                      icon: const Icon(Icons.close_rounded, size: 20),
+                      color: AppColors.textSecondary,
+                    )
+                  else
                   _tvAware(
                     onTap: () => Navigator.pop(context),
                     semanticLabel: 'Close',
@@ -259,7 +302,10 @@ class _EpisodeSourcesBodyState extends State<_EpisodeSourcesBody> {
                   borderRadius: BorderRadius.circular(2),
                   child: LinearProgressIndicator(
                     minHeight: 3,
-                    backgroundColor: AppColors.hairline,
+                    // Windows: the graphite panel's edge colour as the track.
+                    backgroundColor: widget.desktop
+                        ? DesktopPanelColors.edge
+                        : AppColors.hairline,
                     color: AppColors.accent,
                   ),
                 ),
@@ -289,7 +335,39 @@ class _EpisodeSourcesBodyState extends State<_EpisodeSourcesBody> {
                   ),
                 ),
               ],
-              if (!_done) ...[
+              // Windows: one right-aligned button row (Stop while checking,
+              // or check the rest once a pass ends early).
+              if (widget.desktop) ...[
+                if (!_done || more) ...[
+                  const SizedBox(height: 16),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      if (!_done)
+                        TextButton(
+                          onPressed: _stop,
+                          style: TextButton.styleFrom(
+                            foregroundColor: AppColors.textSecondary,
+                          ),
+                          child: const Text('Stop'),
+                        )
+                      else
+                        FilledButton(
+                          onPressed: _start,
+                          style: FilledButton.styleFrom(
+                            backgroundColor: AppColors.accent,
+                            foregroundColor: DesktopChrome.onAccent(
+                              AppColors.accent,
+                            ),
+                          ),
+                          child: Text(
+                            'Check the remaining ${_total - _asked.length}',
+                          ),
+                        ),
+                    ],
+                  ),
+                ],
+              ] else if (!_done) ...[
                 const SizedBox(height: 12),
                 _WideButton(
                   label: 'Stop',

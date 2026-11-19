@@ -1,10 +1,10 @@
-import 'dart:io';
 // Shared chrome widgets for both readers (manga + novel) — restyles the
 // top/bottom bars and settings sheets to match the player's own polish (see
 // _SheetSurface/_SheetSectionHeader and the top/bottom control scrims in
 // player_screen.dart). Pure presentation: no reader state or behavior lives
 // here, callers wire every callback through unchanged.
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/theme/app_colors.dart';
@@ -58,7 +58,7 @@ class ReaderScrim extends StatelessWidget {
 /// [Slider], so a caller's existing wiring (`onChangeStart`/`onChanged`/
 /// `onChangeEnd`, a `ValueListenableBuilder` around `value`, etc.) is
 /// untouched.
-class ReaderSlider extends StatelessWidget {
+class ReaderSlider extends StatefulWidget {
   const ReaderSlider({
     super.key,
     required this.value,
@@ -68,6 +68,7 @@ class ReaderSlider extends StatelessWidget {
     this.onChangeStart,
     required this.onChanged,
     this.onChangeEnd,
+    this.labelFor,
   });
 
   final double value;
@@ -78,8 +79,116 @@ class ReaderSlider extends StatelessWidget {
   final ValueChanged<double> onChanged;
   final ValueChanged<double>? onChangeEnd;
 
+  /// Windows only (reader-12): text for a slider value, e.g. 'Page 12 / 30'.
+  /// Shown in the value bubble while dragging and in a small pill above the
+  /// track while the mouse hovers it. Ignored on phones.
+  final String Function(double value)? labelFor;
+
+  @override
+  State<ReaderSlider> createState() => _ReaderSliderState();
+}
+
+/// Tracks the hovered value for the Windows hover label.
+class _ReaderSliderState extends State<ReaderSlider> {
+  /// Matches the overlay radius below: the track starts and ends this far in
+  /// from the slider's edges, so a hover x maps to the same value a click does.
+  static const double _trackInset = 16;
+
+  /// Hovered value and its x position, or null while the mouse is elsewhere.
+  double? _hoverValue;
+  double _hoverX = 0;
+
+  bool get _desktop => defaultTargetPlatform == TargetPlatform.windows;
+
+  /// Converts a hover x position into the value a click there would pick,
+  /// snapped to the divisions like the slider itself.
+  void _hover(double x, double width) {
+    final track = width - _trackInset * 2;
+    if (track <= 0) return;
+    final t = ((x - _trackInset) / track).clamp(0.0, 1.0);
+    var v = widget.min + t * (widget.max - widget.min);
+    final d = widget.divisions;
+    if (d != null && d > 0) {
+      final step = (widget.max - widget.min) / d;
+      v = widget.min + ((v - widget.min) / step).round() * step;
+    }
+    final snappedX =
+        _trackInset +
+        (widget.max == widget.min
+                ? 0
+                : (v - widget.min) / (widget.max - widget.min)) *
+            track;
+    if (v == _hoverValue && snappedX == _hoverX) return;
+    setState(() {
+      _hoverValue = v;
+      _hoverX = snappedX;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
+    final labelFor = _desktop ? widget.labelFor : null;
+    final slider = _slider(context, labelFor);
+    if (!_desktop) return slider;
+    // Windows (reader-9): the slider never takes keyboard focus, so arrow
+    // keys keep turning pages instead of nudging the thumb after a drag.
+    final unfocusable = ExcludeFocus(child: slider);
+    if (labelFor == null) return unfocusable;
+    return LayoutBuilder(
+      builder: (context, constraints) => MouseRegion(
+        onHover: (e) => _hover(e.localPosition.dx, constraints.maxWidth),
+        // onExit can fire while the bar is being torn down; skip setState
+        // once the slider is gone.
+        onExit: (_) {
+          if (mounted) setState(() => _hoverValue = null);
+        },
+        child: Stack(
+          // The hover pill floats above the bar, outside the slider's box.
+          clipBehavior: Clip.none,
+          children: [
+            unfocusable,
+            if (_hoverValue != null)
+              Positioned(
+                left: _hoverX - 60,
+                width: 120,
+                bottom: 44,
+                child: IgnorePointer(
+                  child: Center(
+                    child: Container(
+                      key: const ValueKey('reader-slider-hover-label'),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 5,
+                      ),
+                      decoration: BoxDecoration(
+                        color: _kPillFill,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: _kPillBorder),
+                        boxShadow: _kPillShadow,
+                      ),
+                      child: Text(
+                        labelFor(_hoverValue!),
+                        maxLines: 1,
+                        style: AppText.caption.copyWith(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// The themed Material slider itself; [labelFor] adds the drag bubble.
+  Widget _slider(
+    BuildContext context,
+    String Function(double value)? labelFor,
+  ) {
     return SliderTheme(
       data: SliderTheme.of(context).copyWith(
         activeTrackColor: AppColors.accent,
@@ -94,13 +203,15 @@ class ReaderSlider extends StatelessWidget {
         overlayShape: const RoundSliderOverlayShape(overlayRadius: 16),
       ),
       child: Slider(
-        value: value,
-        min: min,
-        max: max,
-        divisions: divisions,
-        onChangeStart: onChangeStart,
-        onChanged: onChanged,
-        onChangeEnd: onChangeEnd,
+        value: widget.value,
+        min: widget.min,
+        max: widget.max,
+        divisions: widget.divisions,
+        // Windows drag bubble ('Page 12 / 30'); null keeps phones unchanged.
+        label: labelFor?.call(widget.value),
+        onChangeStart: widget.onChangeStart,
+        onChanged: widget.onChanged,
+        onChangeEnd: widget.onChangeEnd,
       ),
     );
   }
@@ -110,19 +221,25 @@ class ReaderSlider extends StatelessWidget {
 /// next-chapter). [enabled] both dims the icon and detaches [onTap] — an
 /// `IconButton` with a null `onPressed` simply doesn't fire, so a disabled
 /// button can't be tapped through.
+///
+/// [tooltip] (reader-12) names what the button leads to, e.g. the chapter a
+/// skip button opens. On Windows the button never takes keyboard focus
+/// (reader-9), so a click leaves the arrow keys with the page.
 Widget readerBarButton(
   IconData icon,
   VoidCallback onTap, {
   bool enabled = true,
   Color color = Colors.white,
+  String? tooltip,
 }) {
-  return IconButton(
+  final desktop = defaultTargetPlatform == TargetPlatform.windows;
+  final button = IconButton(
     icon: Icon(icon, color: enabled ? color : color.withValues(alpha: 0.3)),
-    visualDensity: Platform.isWindows
-        ? VisualDensity.compact
-        : VisualDensity.standard,
+    visualDensity: desktop ? VisualDensity.compact : VisualDensity.standard,
+    tooltip: tooltip,
     onPressed: enabled ? onTap : null,
   );
+  return desktop ? ExcludeFocus(child: button) : button;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,8 +326,8 @@ class ReaderPillIconButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final button = SizedBox(
-      width: Platform.isWindows ? 42 : size,
-      height: Platform.isWindows ? 42 : size,
+      width: (defaultTargetPlatform == TargetPlatform.windows) ? 42 : size,
+      height: (defaultTargetPlatform == TargetPlatform.windows) ? 42 : size,
       child: ReaderPillSurface(
         radius: size / 2,
         onTap: onTap,
@@ -219,12 +336,17 @@ class ReaderPillIconButton extends StatelessWidget {
     );
     // Labelled for TalkBack: an icon-only round button is otherwise an
     // unnamed tap target, which is exactly the gap flagged on the player.
-    return tooltip == null
+    final labelled = tooltip == null
         ? button
         : Tooltip(
             message: tooltip!,
             child: Semantics(button: true, label: tooltip, child: button),
           );
+    // Windows (reader-9): bar buttons never hold keyboard focus, so the
+    // reader's page keys keep working after a click.
+    return defaultTargetPlatform == TargetPlatform.windows
+        ? ExcludeFocus(child: labelled)
+        : labelled;
   }
 }
 
@@ -251,7 +373,7 @@ class ReaderTitlePill extends StatelessWidget {
     // a button but exposes nothing to activate — it announces as a label and
     // TalkBack can't press it. Merging instead folds the two Texts into one
     // node while keeping the tap.
-    return MergeSemantics(
+    final pill = MergeSemantics(
       child: Semantics(
         button: true,
         label: '$title, $subtitle. Choose chapter',
@@ -264,11 +386,13 @@ class ReaderTitlePill extends StatelessWidget {
         // Still inside a Flexible, so a screen too narrow for this plus the two
         // buttons clamps it down instead of overflowing.
         child: SizedBox(
-          width: Platform.isWindows
+          width: (defaultTargetPlatform == TargetPlatform.windows)
               ? 420
               : MediaQuery.sizeOf(context).width * 0.52,
           child: SizedBox(
-            height: Platform.isWindows ? 42 : kReaderPillHeight,
+            height: (defaultTargetPlatform == TargetPlatform.windows)
+                ? 42
+                : kReaderPillHeight,
             child: ReaderPillSurface(
               radius: kReaderPillHeight / 2,
               onTap: onTap,
@@ -307,6 +431,10 @@ class ReaderTitlePill extends StatelessWidget {
         ),
       ),
     );
+    // Windows (reader-9): clicking the pill must not steal the page keys.
+    return defaultTargetPlatform == TargetPlatform.windows
+        ? ExcludeFocus(child: pill)
+        : pill;
   }
 }
 
@@ -392,6 +520,7 @@ Widget readerSheetBody({
   String? subtitle,
   required List<Widget> children,
 }) {
+  final desktop = defaultTargetPlatform == TargetPlatform.windows;
   return ReaderSheetShell(
     child: SafeArea(
       top: false,
@@ -408,18 +537,37 @@ Widget readerSheetBody({
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Center(
-                  child: Container(
-                    margin: const EdgeInsets.only(bottom: 4),
-                    width: 36,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: AppColors.textTertiary.withValues(alpha: 0.5),
-                      borderRadius: BorderRadius.circular(2),
+                // Windows shows this in a docked side panel (showReaderPanel):
+                // no drag handle to grab there, so it gets a close button.
+                if (desktop)
+                  Row(
+                    children: [
+                      Expanded(child: Text(title, style: AppText.headline)),
+                      IconButton(
+                        key: const ValueKey('reader-sheet-close'),
+                        tooltip: MaterialLocalizations.of(
+                          context,
+                        ).closeButtonTooltip,
+                        onPressed: () => Navigator.of(context).maybePop(),
+                        icon: const Icon(Icons.close_rounded),
+                        color: AppColors.textSecondary,
+                      ),
+                    ],
+                  )
+                else ...[
+                  Center(
+                    child: Container(
+                      margin: const EdgeInsets.only(bottom: 4),
+                      width: 36,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: AppColors.textTertiary.withValues(alpha: 0.5),
+                        borderRadius: BorderRadius.circular(2),
+                      ),
                     ),
                   ),
-                ),
-                Text(title, style: AppText.headline),
+                  Text(title, style: AppText.headline),
+                ],
                 if (subtitle != null)
                   Padding(
                     padding: const EdgeInsets.only(top: 4),

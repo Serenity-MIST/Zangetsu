@@ -74,11 +74,62 @@ void main() {
       });
       await tester.pumpWidget(const MaterialApp(home: _Reader()));
       await tester.pumpAndSettle();
-      expect(nativeState, !initialFullscreen);
+      // reader-4 C: "Reader fullscreen" on makes the reader full screen and
+      // closing restores the window; off leaves the window as the user had
+      // it (no native calls at all).
+      final readerTurnsItOn = !initialFullscreen;
+      expect(nativeState, readerTurnsItOn ? true : initialFullscreen);
       await tester.pumpWidget(const SizedBox());
       await tester.pumpAndSettle();
       expect(nativeState, initialFullscreen);
-      expect(setters, [!initialFullscreen, initialFullscreen]);
+      expect(setters, readerTurnsItOn ? [true, false] : isEmpty);
     }, skip: !Platform.isWindows);
   }
+
+  // Re-applying comfort (e.g. toggling Keep screen on in the panel) must not
+  // undo a full screen the user entered with F; closing still restores.
+  testWidgets('F full screen survives an unrelated comfort re-apply', (
+    tester,
+  ) async {
+    late Directory directory;
+    await tester.runAsync(() async {
+      directory = await Directory.systemTemp.createTemp('reader-window-');
+      Hive.init(directory.path);
+      await ReaderPrefs.init();
+      await sl.reset();
+      final prefs = ReaderPrefs();
+      sl.registerSingleton<ReaderPrefs>(prefs);
+      await prefs.setFullscreen(false);
+    });
+    var nativeState = false;
+    const channel = MethodChannel('com.spyou.zangetsu/window');
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (
+      call,
+    ) async {
+      if (call.method == 'isFullscreen') return nativeState;
+      if (call.method == 'setFullscreen') nativeState = call.arguments as bool;
+      return null;
+    });
+    addTearDown(() async {
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        channel,
+        null,
+      );
+      await sl.reset();
+      await Hive.close();
+      await directory.delete(recursive: true);
+    });
+    await tester.pumpWidget(const MaterialApp(home: _Reader()));
+    await tester.pumpAndSettle();
+    final state = tester.state<_ReaderState>(find.byType(_Reader));
+    state.toggleReaderFullscreen();
+    await tester.pumpAndSettle();
+    expect(nativeState, isTrue);
+    state.applyReaderComfort();
+    await tester.pumpAndSettle();
+    expect(nativeState, isTrue);
+    await tester.pumpWidget(const SizedBox());
+    await tester.pumpAndSettle();
+    expect(nativeState, isFalse);
+  }, skip: !Platform.isWindows);
 }

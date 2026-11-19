@@ -223,6 +223,7 @@ class TvPlayerActivity : Activity() {
     private var subBgColor = android.graphics.Color.TRANSPARENT
     private var subEdgeType = CaptionStyleCompat.EDGE_TYPE_OUTLINE
     private var subFontPath: String? = null
+    private var subTypeface = android.graphics.Typeface.DEFAULT
     private var subFontFamily = ""
     private var subBgOpacity = 0f
     private var subOutlineId = "outline"
@@ -284,10 +285,29 @@ class TvPlayerActivity : Activity() {
             reportTiming(positionMs = t)
         }
     }
+    private var lastTrackingAt = 0L
     private val ticker = object : Runnable {
         override fun run() {
             updateProgress()
             updateSkip()
+            // Slow heartbeat: keeps the live tracker's progress moving during
+            // continuous playback (event reports alone only cover the start).
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastTrackingAt >= 10_000L) {
+                lastTrackingAt = now
+                val p = player
+                if (p != null && p.isPlaying && p.duration > 0) {
+                    MainActivity.tvBridge?.invokeMethod(
+                        "trackingTick",
+                        mapOf(
+                            "index" to currentIndex,
+                            "positionMs" to p.currentPosition.coerceAtLeast(0L),
+                            "durationMs" to p.duration,
+                            "playing" to true,
+                        ),
+                    )
+                }
+            }
             handler.postDelayed(this, 500)
         }
     }
@@ -444,6 +464,7 @@ class TvPlayerActivity : Activity() {
         playerView.addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
             if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) {
                 updateAspectRatioButtonVisibility()
+                player?.currentCues?.let { playerView.subtitleView?.setCues(repositionCues(it.cues)) }
             }
         }
 
@@ -1720,6 +1741,7 @@ class TvPlayerActivity : Activity() {
         // Custom font first, system behind it — otherwise a font without
         // Arabic glyphs renders boxes (see subtitleTypeface).
         val tf = subtitleTypeface(subFontPath.takeUnless { it.isNullOrBlank() })
+        subTypeface = tf
         playerView.subtitleView?.apply {
             setApplyEmbeddedStyles(false)
             setApplyEmbeddedFontSizes(false)
@@ -1748,14 +1770,19 @@ class TvPlayerActivity : Activity() {
      * keeping simultaneous cues on separate rows. Media3's
      * [SubtitleView.setBottomPaddingFraction] only shifts cues that leave line
      * unset — most VTT/SRT/ASS cues set their own line, so without this remapping
-     * Low/Middle/High look identical. See [SubtitleCuePositioning].
+     * Low/Middle/High look identical. See [TvSubtitleCuePositioning].
      */
-    private fun repositionCues(cues: List<Cue>): List<Cue> =
-        SubtitleCuePositioning.position(
+    private fun repositionCues(cues: List<Cue>): List<Cue> {
+        val view = playerView.subtitleView ?: return cues
+        return TvSubtitleCuePositioning.position(
             cues,
             positionPercent = subPositionPref,
             textSizeFraction = SubtitleView.DEFAULT_TEXT_SIZE_FRACTION * subScale,
+            width = view.width - view.paddingLeft - view.paddingRight,
+            height = view.height - view.paddingTop - view.paddingBottom,
+            typeface = subTypeface,
         )
+    }
 
     private fun buildCaptionPos() {
         menuTitle("Position")
@@ -2062,6 +2089,7 @@ class TvPlayerActivity : Activity() {
     private fun bindViews() {
         root = findViewById(R.id.player_root)
         playerView = findViewById(R.id.player_view)
+        playerView.keepSubtitlesInViewport()
         loading = findViewById(R.id.loading)
         skipButton = findViewById(R.id.skip_button)
         menuPanel = findViewById(R.id.menu_panel)
@@ -2554,15 +2582,9 @@ class TvPlayerActivity : Activity() {
         }
     }
 
-    /**
-     * The TV-only preference selects renderer priority. Hardware-only remains
-     * the default; extension decoders are available only when explicitly
-     * selected, with either hardware-first (ON) or software-first (PREFER)
-     * ordering. Decoder fallback allows ExoPlayer to try the other renderer if
-     * the preferred decoder cannot initialize.
-     */
+    /** Hardware-first by default; explicit TV decoder choices keep their priority. */
     private fun renderersFactory(): RenderersFactory =
-        when (intent.getIntExtra(EXTRA_DECODER_MODE, DECODER_MODE_HARDWARE_ONLY)) {
+        when (intent.getIntExtra(EXTRA_DECODER_MODE, DECODER_MODE_HARDWARE_FIRST)) {
             DECODER_MODE_HARDWARE_FIRST -> NextRenderersFactory(this)
                 .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
                 .setEnableDecoderFallback(true)

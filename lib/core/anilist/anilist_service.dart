@@ -5,12 +5,15 @@ import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../desktop/desktop_oauth.dart';
 import '../environment.dart';
 import '../models/media_item.dart';
 import '../models/provider_info.dart';
 import '../models/watch_status.dart';
 import '../platform/apple_tv.dart';
 import '../tracker/tracker.dart';
+import '../tracker/tracker_sync_queue.dart'
+    show TrackerWriteProblem, TrackerWriteScope;
 import '../ui/global_messenger.dart';
 import 'anilist_api.dart';
 import '../di/injector.dart';
@@ -40,6 +43,34 @@ ProviderType aniListProviderType(MediaKind kind, String? format) {
 /// The malId dedupe set is per-call ON PURPOSE: MAL's anime and manga id
 /// spaces overlap (anime 21 and manga 21 are different titles), so sharing one
 /// set across kinds would silently swallow manga entries.
+/// When the newest released episode of [media] came out, best effort.
+///
+/// Airing: episodes are weekly, so the last one aired about seven days before
+/// [nextAiringEpisode.airingAt] (none yet when the next one is episode 1).
+/// Finished: its `endDate`. Anything else (not yet aired, no dates): null.
+DateTime? aniListLatestReleaseAt(Map media) {
+  final next = media['nextAiringEpisode'];
+  if (next is Map) {
+    final ep = (next['episode'] as num?)?.toInt();
+    final at = (next['airingAt'] as num?)?.toInt();
+    if (ep == null || ep <= 1 || at == null) return null;
+    return DateTime.fromMillisecondsSinceEpoch(
+      at * 1000,
+    ).subtract(const Duration(days: 7));
+  }
+  final end = media['endDate'];
+  if (media['status'] == 'FINISHED' && end is Map) {
+    final y = (end['year'] as num?)?.toInt();
+    if (y == null) return null;
+    return DateTime(
+      y,
+      (end['month'] as num?)?.toInt() ?? 12,
+      (end['day'] as num?)?.toInt() ?? 28,
+    );
+  }
+  return null;
+}
+
 List<TrackerListItem> parseAniListCollection(Object? data, MediaKind kind) {
   final collection = (data is Map && data['data'] is Map)
       ? (data['data'] as Map)['MediaListCollection']
@@ -101,39 +132,43 @@ List<TrackerListItem> parseAniListCollection(Object? data, MediaKind kind) {
       }
       // AniList reports updatedAt in unix SECONDS; 0 means never set.
       final updatedSec = (e['updatedAt'] as num?)?.toInt();
-      out.add(TrackerListItem(
-        customLists: lists,
-        updatedAt: (updatedSec == null || updatedSec <= 0)
-            ? null
-            : DateTime.fromMillisecondsSinceEpoch(updatedSec * 1000),
-        item: MediaItem(
-          id: kind == MediaKind.manga
-              ? 'tracker:anilist:manga:$key'
-              : 'tracker:anilist:$key',
-          title: title,
-          // The variant the display isn't, so a tracker entry can still be
-          // matched to a source that indexes by the other one.
-          englishTitle: altTitle,
-          cover: cover,
-          url: '',
-          type: aniListProviderType(kind, media['format'] as String?),
-          sourceId: '',
-          malId: malId,
-          anilistId: anilistId,
+      out.add(
+        TrackerListItem(
+          customLists: lists,
+          isPrivate: e['private'] == true,
+          updatedAt: (updatedSec == null || updatedSec <= 0)
+              ? null
+              : DateTime.fromMillisecondsSinceEpoch(updatedSec * 1000),
+          item: MediaItem(
+            id: kind == MediaKind.manga
+                ? 'tracker:anilist:manga:$key'
+                : 'tracker:anilist:$key',
+            title: title,
+            // The variant the display isn't, so a tracker entry can still be
+            // matched to a source that indexes by the other one.
+            englishTitle: altTitle,
+            cover: cover,
+            url: '',
+            type: aniListProviderType(kind, media['format'] as String?),
+            sourceId: '',
+            malId: malId,
+            anilistId: anilistId,
+          ),
+          status: status,
+          // Chapters read for a reading kind, episodes watched for anime —
+          // AniList uses the one `progress` field for both.
+          progress: (e['progress'] as num?)?.toInt(),
+          score: score,
+          // Totals ride along on the same list read (no extra requests); manga
+          // reports chapters, anime episodes. nextAiringEpisode nests one level.
+          totalEpisodes:
+              (media['episodes'] as num? ?? media['chapters'] as num?)?.toInt(),
+          nextAiringEpisode:
+              ((media['nextAiringEpisode'] as Map?)?['episode'] as num?)
+                  ?.toInt(),
+          latestReleaseAt: aniListLatestReleaseAt(media),
         ),
-        status: status,
-        // Chapters read for a reading kind, episodes watched for anime —
-        // AniList uses the one `progress` field for both.
-        progress: (e['progress'] as num?)?.toInt(),
-        score: score,
-        // Totals ride along on the same list read (no extra requests); manga
-        // reports chapters, anime episodes. nextAiringEpisode nests one level.
-        totalEpisodes: (media['episodes'] as num? ?? media['chapters'] as num?)
-            ?.toInt(),
-        nextAiringEpisode: ((media['nextAiringEpisode'] as Map?)?['episode']
-                as num?)
-            ?.toInt(),
-      ));
+      );
       idx++;
     }
   }
@@ -151,9 +186,12 @@ class AniListService extends ChangeNotifier implements Tracker {
     if (isAppleTv) return;
     _linkSub = _appLinks.uriLinkStream.listen(_onLink, onError: (_) {});
     // Cover the cold-start case (browser relaunched the app with the redirect).
-    _appLinks.getInitialLink().then((uri) {
-      if (uri != null) _onLink(uri);
-    }).catchError((_) {});
+    _appLinks
+        .getInitialLink()
+        .then((uri) {
+          if (uri != null) _onLink(uri);
+        })
+        .catchError((_) {});
   }
 
   final Dio _dio;
@@ -239,28 +277,54 @@ class AniListService extends ChangeNotifier implements Tracker {
     if (p != null && !p.isCompleted) p.complete(ok);
   }
 
+  /// Safe, user-facing reason the last [connect] failed; null on success or
+  /// when there is nothing more specific than "cancelled".
+  String? lastConnectionError;
+
+  /// Abandons a sign-in that is still waiting for the browser redirect.
+  void cancelConnect() {
+    if (_pending == null) return;
+    lastConnectionError = 'Sign-in cancelled.';
+    _resolvePending(false);
+  }
+
   /// Open AniList consent in the browser. Resolves true once the redirect comes
   /// back with a valid token and the viewer is fetched; false on cancel/timeout.
   @override
   Future<bool> connect() async {
+    final active = _pending;
+    if (active != null) return active.future;
+    lastConnectionError = null;
     final authUrl = Uri.parse(
       'https://anilist.co/api/v2/oauth/authorize'
       '?client_id=${Environment.anilistClientId}&response_type=token',
     );
-    _pending = Completer<bool>();
+    // Windows: point zangetsu:// at this exe before the browser can redirect.
+    final callbackError = await DesktopOAuth.ensureBrowserCallback();
+    if (callbackError != null) {
+      lastConnectionError = callbackError;
+      return false;
+    }
+    final pending = Completer<bool>();
+    _pending = pending;
     final launched = await launchUrl(
       authUrl,
       mode: LaunchMode.externalApplication,
     );
     if (!launched) {
-      _pending = null;
+      if (identical(_pending, pending)) _pending = null;
+      lastConnectionError = 'The sign-in browser could not be opened.';
       return false;
     }
     try {
-      return await _pending!.future.timeout(const Duration(minutes: 3));
-    } catch (_) {
-      _pending = null;
+      return await pending.future.timeout(const Duration(minutes: 3));
+    } on TimeoutException {
+      lastConnectionError = DesktopOAuth.noCallbackMessage(displayName);
       return false;
+    } catch (_) {
+      return false;
+    } finally {
+      if (identical(_pending, pending)) _pending = null;
     }
   }
 
@@ -382,10 +446,14 @@ class AniListService extends ChangeNotifier implements Tracker {
       kind: kind,
       novel: novel,
     );
-    debugPrint('[AniList] scrobble ep$episode (mal=$malId title="$title") -> $r');
+    debugPrint(
+      '[AniList] scrobble ep$episode (mal=$malId title="$title") -> $r',
+    );
     // Stay silent on success — only surface a real failure (so a sync can't
     // break unnoticed). Unmatched/skipped are quiet too.
-    if (r == _Scrobble.failed) {
+    // On Windows the sync outbox watching this write shows its own one-time
+    // notice instead, so the failure isn't announced twice.
+    if (r == _Scrobble.failed && !TrackerWriteScope.active) {
       showGlobalSnack('AniList sync failed — will retry');
     }
   }
@@ -418,6 +486,10 @@ class AniListService extends ChangeNotifier implements Tracker {
       progress: progress,
       status: status,
     );
+    // Tell the Windows sync outbox (track-2) how it went; a no-op outside a
+    // hub write. The AniList API layer can't tell an expired login from a
+    // dropped connection, so a failure is reported as retryable.
+    _reportWrite(ok);
     if (ok) {
       await _store.setScrobbledProgress(mediaId, progress);
       await _store.removePending(
@@ -485,11 +557,35 @@ class AniListService extends ChangeNotifier implements Tracker {
         progress: media.total!,
         status: 'COMPLETED',
       );
+      _reportWrite(ok);
       if (ok) await _store.setScrobbledProgress(media.id, media.total!);
     } else {
-      await _api.saveStatus(mediaId: media.id, status: status.anilist);
+      _reportWrite(
+        await _api.saveStatus(mediaId: media.id, status: status.anilist),
+      );
     }
   }
+
+  /// Reports one write's result to the sync outbox (track-2). No-op unless a
+  /// [TrackerHub] write is watching.
+  void _reportWrite(bool ok) {
+    if (ok) {
+      TrackerWriteScope.reportSent();
+    } else {
+      TrackerWriteScope.report(
+        TrackerWriteProblem.network,
+        'AniList did not accept the update',
+      );
+    }
+  }
+
+  /// The saved login has expired (AniList tokens can't be refreshed), but the
+  /// account was connected before. The app then shows "needs sign-in"
+  /// instead of quietly treating the account as never connected.
+  bool get signInExpired =>
+      !_store.hasValidToken &&
+      (_store.token?.isNotEmpty ?? false) &&
+      _store.viewerId != null;
 
   /// Mark an anime as CURRENT (Watching) the moment playback starts — so it
   /// appears on AniList immediately, before any episode crosses the 92% scrobble
@@ -509,11 +605,13 @@ class AniListService extends ChangeNotifier implements Tracker {
     final media = await _resolveMedia(malId, title, kind);
     if (media == null) return;
     final total = media.total;
-    if (total != null && total > 0 &&
+    if (total != null &&
+        total > 0 &&
         _store.scrobbledProgress(media.id) >= total) {
       return; // already completed — don't downgrade to Watching
     }
     final ok = await _api.saveStatus(mediaId: media.id, status: 'CURRENT');
+    _reportWrite(ok);
     debugPrint('[AniList] markWatching (mal=$malId title="$title") -> $ok');
   }
 
@@ -561,7 +659,10 @@ class AniListService extends ChangeNotifier implements Tracker {
     }
   }
 
-  Future<List<TrackerListItem>> _fetchListOf(MediaKind kind, String user) async {
+  Future<List<TrackerListItem>> _fetchListOf(
+    MediaKind kind,
+    String user,
+  ) async {
     try {
       final res = await _dio.post<dynamic>(
         'https://graphql.anilist.co',
@@ -598,10 +699,11 @@ class AniListService extends ChangeNotifier implements Tracker {
     if (!isConnected) return;
     // A pinned id wins over title/malId resolution — same precedence as
     // fetchEntry, so a corrected match is deleted instead of the guess.
-    final mediaId = int.tryParse(pinnedId ?? '') ??
+    final mediaId =
+        int.tryParse(pinnedId ?? '') ??
         (await _resolveMedia(malId, title, kind))?.id;
     if (mediaId == null) return;
-    await _api.deleteEntry(mediaId);
+    _reportWrite(await _api.deleteEntry(mediaId));
     await _store.setScrobbledProgress(mediaId, 0);
   }
 
@@ -657,11 +759,14 @@ class AniListService extends ChangeNotifier implements Tracker {
     MediaKind kind = MediaKind.anime,
   }) async {
     if (!isConnected) return false;
-    final mediaId = int.tryParse(pinnedId ?? '') ??
+    final mediaId =
+        int.tryParse(pinnedId ?? '') ??
         (await _resolveMedia(malId, title, kind))?.id;
     if (mediaId == null) {
-      debugPrint('[AniList] setCustomLists: could not resolve media '
-          '(malId=$malId title="$title")');
+      debugPrint(
+        '[AniList] setCustomLists: could not resolve media '
+        '(malId=$malId title="$title")',
+      );
       return false;
     }
     try {
@@ -695,13 +800,16 @@ class AniListService extends ChangeNotifier implements Tracker {
     final entry = m['mediaListEntry'];
     final na = m['nextAiringEpisode'];
     final airAt = (na is Map) ? (na['airingAt'] as num?)?.toInt() : null;
-    final rawScore =
-        (entry is Map) ? (entry['score'] as num?)?.toDouble() : null;
+    final rawScore = (entry is Map)
+        ? (entry['score'] as num?)?.toDouble()
+        : null;
     final t = m['title'];
     return TrackerEntry(
       trackerName: displayName,
       onList: entry is Map,
-      url: 'https://anilist.co/'
+      isPrivate: entry is Map && entry['private'] == true,
+      url:
+          'https://anilist.co/'
           '${kind == MediaKind.manga ? 'manga' : 'anime'}/$mediaId',
       title: aniListTitle(t, titleLanguagePref),
       status: (entry is Map)
@@ -731,19 +839,31 @@ class AniListService extends ChangeNotifier implements Tracker {
     WatchStatus? status,
     double? score,
     int? progress,
+    bool? isPrivate,
     MediaKind kind = MediaKind.anime,
   }) async {
-    if (!isConnected) return;
+    if (!isConnected) {
+      if (isPrivate != null) throw StateError('AniList is disconnected');
+      return;
+    }
     final mediaId =
         int.tryParse(pinnedId ?? '') ??
         (await _resolveMedia(malId, title, kind))?.id;
-    if (mediaId == null) return;
+    if (mediaId == null) {
+      if (isPrivate != null) throw StateError('AniList entry not found');
+      return;
+    }
     final ok = await _api.saveEntry(
       mediaId: mediaId,
       status: status?.anilist,
+      isPrivate: isPrivate,
       progress: progress,
       scoreRaw: score == null ? null : (score * 10).round().clamp(0, 100),
     );
+    _reportWrite(ok);
+    if (!ok && isPrivate != null) {
+      throw StateError('Could not update AniList privacy');
+    }
     // Keep the scrobbler's high-water mark in step with a manual progress edit,
     // so auto-scrobble won't later "undo" it or re-push an older episode.
     if (ok && progress != null) {

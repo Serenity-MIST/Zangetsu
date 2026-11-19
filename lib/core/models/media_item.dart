@@ -23,6 +23,17 @@ class MediaItem extends Equatable {
   /// home hero. Null outside Z Mode — every existing source keeps rendering
   /// its hero from [cover], exactly as before this field existed.
   final String? banner;
+
+  /// Addon title artwork; kept out of saved list and cloud payloads.
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  final String? titleLogo;
+
+  /// Catalogue artwork shape; a browse hint, not saved library data.
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  final String? posterShape;
+
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  final String? landscapePoster;
   final String url;
   final ProviderType type;
   final String sourceId;
@@ -119,6 +130,9 @@ class MediaItem extends Equatable {
     this.cover,
     this.coverHeaders,
     this.banner,
+    this.titleLogo,
+    this.posterShape,
+    this.landscapePoster,
     required this.url,
     required this.type,
     required this.sourceId,
@@ -147,6 +161,7 @@ class MediaItem extends Equatable {
     String? id,
     String? url,
     ProviderType? type,
+    String? titleLogo,
     String? sourceId,
     int? subCount,
     int? dubCount,
@@ -163,6 +178,9 @@ class MediaItem extends Equatable {
     cover: cover,
     coverHeaders: coverHeaders,
     banner: banner,
+    titleLogo: titleLogo ?? this.titleLogo,
+    posterShape: posterShape,
+    landscapePoster: landscapePoster,
     url: url ?? this.url,
     type: type ?? this.type,
     sourceId: sourceId ?? this.sourceId,
@@ -196,6 +214,9 @@ class MediaItem extends Equatable {
     cover,
     coverHeaders,
     banner,
+    titleLogo,
+    posterShape,
+    landscapePoster,
     url,
     type,
     sourceId,

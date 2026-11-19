@@ -4,6 +4,16 @@ import '../../core/error/exceptions.dart';
 import 'dart:async';
 
 import 'desktop_home_page.dart';
+import 'desktop_continue_store.dart';
+import 'desktop_source_catalogue_split.dart';
+import '../../core/desktop/desktop_catalogue_switch.dart';
+import '../../core/desktop/desktop_undo_toast.dart';
+import '../../core/reading/read_store.dart';
+import 'desktop_home_downloads.dart';
+import '../../core/boot_network.dart';
+import '../../core/download/chapter_download_store.dart';
+import '../../core/download/download_manager.dart';
+import '../downloads/desktop_download_library.dart';
 
 import 'dart:io';
 
@@ -16,12 +26,17 @@ import 'package:hive_flutter/hive_flutter.dart';
 import '../../core/app_mode.dart';
 import '../../core/aniyomi/aniyomi_image_provider.dart';
 import '../../core/di/injector.dart';
+import '../../core/stremio/stremio_poster_shape.dart';
+import '../../core/stremio/stremio_ref.dart';
 import '../../core/metadata/streaming_service.dart';
+import '../../core/metadata/streaming_providers.dart';
+import '../../core/ui/streaming_prefs.dart';
 import '../../core/zmode/tmdb_catalogue.dart';
 import '../../core/platform/apple_tv.dart';
 import '../../core/mihon/mihon_extension_service.dart';
 import '../../core/mihon/mihon_image_provider.dart';
 import '../../core/mode/content_mode.dart';
+import '../../core/ui/nav_prefs.dart';
 import '../../core/mode/content_mode_cubit.dart';
 import '../../core/models/watch_status.dart';
 import '../../core/tracker/tracker_hub.dart';
@@ -31,6 +46,7 @@ import '../../core/ui/artwork_quality.dart';
 import '../../core/update/extension_auto_updater.dart';
 import '../../core/provider/cloudstream_provider.dart';
 import '../../core/provider/provider_manager.dart';
+import '../../core/mangayomi/mangayomi_cloudflare.dart';
 import '../../core/models/episode.dart';
 import '../../core/models/home_row.dart';
 import '../../core/models/home_section.dart';
@@ -65,6 +81,8 @@ import '../settings/streaming_services_screen.dart';
 import '../sources/aniyomi_repo_tab.dart' show kAniyomiReposBoxName;
 import '../sources/providers_hub_screen.dart';
 import '../sources/source_picker_row_actions.dart';
+// Wraps the Providers hub in the desktop settings look on Windows (src-3).
+import '../sources/sources_desktop_kit.dart' show DesktopProviderScope;
 import '../sources/zangetsu_sources_screen.dart';
 import '../update/update_dialog.dart';
 import 'continue_section.dart';
@@ -76,7 +94,8 @@ import '../../core/ui/featured_banner_edge.dart';
 import '../../core/ui/featured_banner_panels.dart';
 import '../../core/ui/featured_carousel.dart';
 import '../../core/ui/featured_hero.dart';
-import '../../core/metadata/title_logo_service.dart';
+import '../../core/theme/theme_controller.dart';
+import '../../core/ui/poster_palette.dart';
 import 'metadata_switch_sheet.dart';
 import 'home_banner_header.dart';
 import 'home_catalogue_prefs.dart';
@@ -92,7 +111,6 @@ import '../auth/reconnect.dart';
 import '../detail/detail_screen.dart';
 import '../history/history_screen.dart';
 import '../player/player_screen.dart';
-import '../schedule/schedule_screen.dart';
 import '../shell/dock_icons.dart';
 import '../../core/zmode/source_matcher.dart';
 import '../../core/zmode/metadata_repository.dart';
@@ -100,12 +118,13 @@ import '../../core/zmode/playback_resolver.dart';
 import '../../core/zmode/zmode_ids.dart';
 import 'streaming_services_row.dart';
 import 'cubit/home_cubit.dart';
+import 'cubit/home_rows_composer.dart';
 import 'home_screen_tv.dart';
-import 'lists_hub_screen.dart';
 import 'genres_screen.dart';
 import 'search_screen.dart';
 import 'cubit/tracker_home_rows.dart' show releasedCount;
 import 'see_all_screen.dart';
+import '../downloads/resume_downloaded.dart';
 
 /// Provides the [HomeCubit] (which owns the three browse rows + the carousel's
 /// trending source) and kicks off the first load. The view itself stays
@@ -122,6 +141,143 @@ class HomeScreen extends StatelessWidget {
     return BlocProvider.value(
       value: sl<HomeCubit>(),
       child: _HomeView(isTabActive: isTabActive),
+    );
+  }
+}
+
+/// Launch-time checks: the GitHub update dialog, the one-time community
+/// welcome and developer announcements, then the daily extension auto-update
+/// (or the Android read-only source-update notification).
+///
+/// They run at most once per app process, from whichever host asks first.
+/// Windows starts them from RootShell at launch, so a Start page other than
+/// Home still gets them; phones start them when Home mounts (unchanged). The
+/// static flag means Home mounting later never runs them a second time.
+abstract final class AppLaunchChecks {
+  static bool _started = false;
+
+  /// Whether the checks have already been started this process.
+  static bool get started => _started;
+
+  /// Replaces the real checks in tests (no network, no dialogs).
+  @visibleForTesting
+  static void Function(State host)? debugRunOverride;
+
+  /// Clears the once-per-process flag between tests.
+  @visibleForTesting
+  static void debugReset() {
+    _started = false;
+    debugRunOverride = null;
+  }
+
+  /// Starts the checks against [host] (its context shows the dialogs) unless
+  /// they already started. Returns true when this call started them.
+  static bool runOnce(State host) {
+    if (_started || isAppleTv) return false;
+    _started = true;
+    final override = debugRunOverride;
+    if (override != null) {
+      override(host);
+      return true;
+    }
+    // Silently check GitHub Releases; the dialog only appears if a newer,
+    // non-skipped version exists. Best-effort — never blocks startup.
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!host.mounted) return;
+      await maybeShowUpdateDialog(host.context);
+      // One-time community welcome (its own flag, independent of the per-id
+      // announcement feed), then any new developer announcement — all awaited
+      // in sequence so the modals never fight over the stack.
+      if (host.mounted) await maybeShowCommunitySheet(host.context);
+      if (host.mounted) await maybeShowAnnouncement(host.context);
+    });
+    unawaited(_checkSourceUpdates(host));
+    return true;
+  }
+
+  /// Best-effort, non-blocking check for source updates on launch. The
+  /// auto-update path applies updates (throttled to ~once a day); otherwise the
+  /// READ-ONLY Android path re-fetches catalogs and posts a notification when
+  /// updates exist and the user left that toggle on. Deferred a few seconds so
+  /// it never competes with first content load, and fully guarded so it can
+  /// NEVER affect startup or playback.
+  static Future<void> _checkSourceUpdates(State host) async {
+    final prefs = sl<PlaybackPrefs>();
+    final autoUpdate = prefs.autoUpdateExtensions;
+    // The read-only notify path below is Android-only; keep that gate unless
+    // we're auto-updating (JS providers auto-update on any platform).
+    if (!autoUpdate && !Platform.isAndroid) return;
+    await Future<void>.delayed(const Duration(seconds: 4));
+    if (!host.mounted) return;
+
+    // Auto-update path: apply updates across all ecosystems, throttled to
+    // ~once a day across launches. Best-effort — never touches startup.
+    if (autoUpdate) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      const dayMs = 24 * 60 * 60 * 1000;
+      if (now - prefs.lastExtensionUpdateMs < dayMs) return;
+      await prefs.setLastExtensionUpdateMs(now);
+      final updated = await ExtensionAutoUpdater.run();
+      if (!host.mounted) return;
+      await announceExtensionUpdates(host.context, updated);
+      return;
+    }
+
+    try {
+      final csManager = sl<CloudStreamManager>();
+      final csCount = await csManager.checkAllUpdates();
+
+      var aniCount = 0;
+      try {
+        final repoUrls = Hive.isBoxOpen(kAniyomiReposBoxName)
+            ? Hive.box<String>(kAniyomiReposBoxName).values.toList()
+            : const <String>[];
+        if (repoUrls.isNotEmpty) {
+          aniCount = await sl<AniyomiManager>().checkAllUpdates(repoUrls);
+        }
+      } catch (_) {
+        /* aniyomi check must never break the CS check or startup */
+      }
+
+      final total = csCount + aniCount;
+      if (total > 0 && csManager.notifyUpdates) {
+        await NotificationService.instance.showSourceUpdates(count: total);
+      }
+    } catch (_) {
+      /* never affects startup */
+    }
+  }
+
+  /// Tells the user how many extensions the daily auto-update refreshed.
+  ///
+  /// Phones post a system notification. The Windows build has no notification
+  /// backend for this, so it shows an in-app floating toast instead.
+  @visibleForTesting
+  static Future<void> announceExtensionUpdates(
+    BuildContext context,
+    int updated,
+  ) async {
+    if (updated <= 0) return;
+    final body =
+        '$updated extension${updated == 1 ? '' : 's'} updated to the latest version.';
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      final messenger =
+          ScaffoldMessenger.maybeOf(context) ?? rootMessengerKey.currentState;
+      messenger?.showSnackBar(
+        SnackBar(
+          key: const ValueKey('extensions-updated-toast'),
+          content: Text(body),
+          behavior: SnackBarBehavior.floating,
+          width: 440,
+          duration: const Duration(seconds: 4),
+        ),
+      );
+      return;
+    }
+    await NotificationService.instance.showMessage(
+      id: 779100,
+      title: context.l10n.extensionsUpdated,
+      body: body,
     );
   }
 }
@@ -146,9 +302,29 @@ class _HomeViewState extends State<_HomeView>
   final _sourceCatalogueController = SourceCatalogueHomeController();
   StreamSubscription<ContentMode>? _sourceCatalogueModeSubscription;
   late final ValueNotifier<bool> _sourceCatalogueSelection;
-  String? _sourceCatalogueSourceId = HomeCataloguePrefs.sourceId;
+  // Per-mode pick, loaded in initState (needs the cubit) and reloaded on
+  // every mode switch — a single shared id is what made manga forget anime.
+  String? _sourceCatalogueSourceId;
   List<HomeSection> _sourceCatalogueSections = const [];
-  bool _sourceCatalogueSelected = HomeCataloguePrefs.sourceSelected;
+  bool _sourceCatalogueSelected = HomeCataloguePrefs.catalogueShown;
+
+  /// Windows Home Continue lists (home-10): only notifies when entries are
+  /// added, removed or reordered, never on a plain position save. Created on
+  /// first use by the desktop Home and disposed with this state.
+  DesktopContinueStore? _continueStore;
+  DesktopContinueStore get _continue =>
+      _continueStore ??= DesktopContinueStore.fromHistory(
+        watch: sl.isRegistered<WatchHistory>() ? sl<WatchHistory>() : null,
+        read: sl.isRegistered<ReadHistory>() ? sl<ReadHistory>() : null,
+      );
+
+  /// Windows (home-11 B): the last rows a source catalogue loaded, kept on
+  /// screen while a refresh of the same source is in flight.
+  ({String key, List<HomeSection> sections})? _lastDesktopSourceRows;
+
+  /// Windows (home-6): ids + labels last published to the shell's catalogue
+  /// switch, so it is only republished when the choices really change.
+  String? _publishedCatalogueSignature;
 
   /// Hero metadata cache: key = "sourceId:id". Futures are stored so they're
   /// never re-fetched on carousel rotation; pre-warmed when hero items load.
@@ -156,6 +332,10 @@ class _HomeViewState extends State<_HomeView>
   bool _heroPrewarmed = false;
   bool _resumePrewarmed = false;
   bool _openingSourceCatalogueItem = false;
+
+  /// Poster-tinted background colour for the hero-driven adaptive wash
+  /// (null → normal theme background). Fed by [FeaturedHero.onArtColor].
+  final ValueNotifier<Color?> _heroTint = ValueNotifier(null);
 
   // ── Logo-strike mode transition ──────────────────────────────────────────
   // Tapping a mode card runs a full-screen overlay: the Zangetsu mark springs
@@ -167,22 +347,30 @@ class _HomeViewState extends State<_HomeView>
   bool _slashSwapped = false;
   ContentMode? _slashTarget;
 
-  // Auto update-check runs at most once per app process (not on every rebuild
-  // or tab revisit). Static so it survives this widget being recreated.
-  static bool _updateChecked = false;
-
   @override
   void initState() {
     super.initState();
     _sourceCatalogueSelection = HomeCataloguePrefs.sourceSelection;
     _sourceCatalogueSelection.addListener(_onSourceCatalogueSelectionChanged);
+    HomeCataloguePrefs.revision.addListener(_onCatalogueRevision);
+    _sourceCatalogueSourceId = HomeCataloguePrefs.sourceIdFor(
+      sl<ContentModeCubit>().state,
+    );
     _sourceCatalogueModeSubscription = sl<ContentModeCubit>().stream.listen((
-      _,
+      mode,
     ) {
-      if (mounted && _sourceCatalogueSelected) {
-        setState(() => _sourceCatalogueSections = const []);
+      if (!mounted) return;
+      if (_sourceCatalogueSelected) {
+        // Reload THIS mode's saved source: the content widget resolves its
+        // fallback from the id we hand it, so handing it the other mode's id
+        // would persist a fallback over this mode's real pick.
+        setState(() {
+          _sourceCatalogueSourceId = HomeCataloguePrefs.sourceIdFor(mode);
+          _sourceCatalogueSections = const [];
+        });
       }
     });
+    ThemeController.revision.addListener(_onThemeRevision);
     // Swap the content mode at the slash's peak (hidden behind the scrim), then
     // tear the overlay down once it finishes.
     _slashCtrl =
@@ -216,21 +404,10 @@ class _HomeViewState extends State<_HomeView>
       final cubit = context.read<HomeCubit>();
       if (cubit.state.sections == null && !cubit.state.loading) cubit.load();
     }
-    // Silently check GitHub Releases once on launch; the dialog only appears if
-    // a newer, non-skipped version exists. Best-effort — never blocks startup.
-    if (!_updateChecked && !isAppleTv) {
-      _updateChecked = true;
-      WidgetsBinding.instance.addPostFrameCallback((_) async {
-        if (!mounted) return;
-        await maybeShowUpdateDialog(context);
-        // One-time community welcome (its own flag, independent of the per-id
-        // announcement feed), then any new developer announcement — all awaited
-        // in sequence so the modals never fight over the stack.
-        if (mounted) await maybeShowCommunitySheet(context);
-        if (mounted) await maybeShowAnnouncement(context);
-      });
-      _checkSourceUpdates();
-    }
+    // Launch checks (update dialog, welcome sheets, extension updates). On
+    // Windows RootShell already started them at launch, whatever the Start
+    // page, so this is a no-op there; phones keep running them from Home.
+    AppLaunchChecks.runOnce(this);
   }
 
   @override
@@ -239,18 +416,55 @@ class _HomeViewState extends State<_HomeView>
     _sourceCatalogueSelection.removeListener(
       _onSourceCatalogueSelectionChanged,
     );
+    HomeCataloguePrefs.revision.removeListener(_onCatalogueRevision);
     _slashCtrl.dispose();
+    ThemeController.revision.removeListener(_onThemeRevision);
+    _heroTint.dispose();
+    _continueStore?.dispose();
+    // Home owns the shell's catalogue switch content; drop it with Home.
+    // Deferred to after the frame: clearing now would rebuild the shell's
+    // switcher while this tree is being torn down. Skipped if a new Home
+    // published its own options in the meantime.
+    if (_publishedCatalogueSignature != null) {
+      final published = DesktopCatalogueSwitch.options.value;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (identical(DesktopCatalogueSwitch.options.value, published)) {
+          DesktopCatalogueSwitch.clear();
+        }
+      });
+      WidgetsBinding.instance.scheduleFrame();
+    }
     super.dispose();
   }
 
+  void _onThemeRevision() {
+    if (mounted) setState(() {});
+  }
+
   void _onSourceCatalogueSelectionChanged() {
-    final selected = _sourceCatalogueSelection.value;
-    if (!mounted || selected == _sourceCatalogueSelected) return;
+    _refreshCatalogueSelection();
+  }
+
+  void _onCatalogueRevision() {
+    _refreshCatalogueSelection();
+  }
+
+  void _refreshCatalogueSelection() {
+    if (!mounted) return;
+    final selected = HomeCataloguePrefs.catalogueShown;
+    final sourceId = HomeCataloguePrefs.sourceIdFor(
+      sl<ContentModeCubit>().state,
+    );
+    if (selected == _sourceCatalogueSelected &&
+        sourceId == _sourceCatalogueSourceId) {
+      return;
+    }
     setState(() {
       _sourceCatalogueSelected = selected;
+      _sourceCatalogueSourceId = sourceId;
       _sourceCatalogueSections = const [];
-      if (selected) {
-        _sourceCatalogueSourceId ??= sl<ActiveSourceCubit>().state;
+      if (selected && sourceId == null) {
+        _sourceCatalogueSourceId = sl<ActiveSourceCubit>().state;
       }
     });
   }
@@ -258,12 +472,18 @@ class _HomeViewState extends State<_HomeView>
   Future<void> _openHomeCataloguePicker() async {
     final selection = await showMetadataSwitchSheet(
       context,
-      sourceCatalogueSelected: _sourceCatalogueSelected,
+      sourceCatalogueSelected: HomeCataloguePrefs.sourceSelected,
+      stremioCatalogueSelected: HomeCataloguePrefs.stremioSelected,
     );
     if (!mounted || selection == null) return;
-    final showSourceCatalogue = selection == HomeCatalogueSelection.source;
-    if (showSourceCatalogue == _sourceCatalogueSelected) return;
-    await HomeCataloguePrefs.setSourceSelected(showSourceCatalogue);
+    final mode = sl<ContentModeCubit>().state;
+    final kind = switch (selection) {
+      HomeCatalogueSelection.metadata => HomeCatalogueKind.metadata,
+      HomeCatalogueSelection.source => HomeCatalogueKind.source,
+      HomeCatalogueSelection.stremio => HomeCatalogueKind.stremio,
+    };
+    if (kind == HomeCataloguePrefs.catalogueKind) return;
+    await HomeCataloguePrefs.setCatalogue(mode, kind);
   }
 
   void _selectHomeCatalogueSource(String sourceId) {
@@ -272,7 +492,9 @@ class _HomeViewState extends State<_HomeView>
       _sourceCatalogueSourceId = sourceId;
       _sourceCatalogueSections = const [];
     });
-    unawaited(HomeCataloguePrefs.setSourceId(sourceId));
+    unawaited(
+      HomeCataloguePrefs.setSourceIdFor(sl<ContentModeCubit>().state, sourceId),
+    );
   }
 
   void _setSourceCatalogueSections(List<HomeSection> sections) {
@@ -283,70 +505,13 @@ class _HomeViewState extends State<_HomeView>
   List<MediaItem> get _sourceCatalogueHeroItems {
     final sections = _sourceCatalogueSections;
     if (sections.isEmpty) return const [];
+    if (_sourceCatalogueSourceId == 'stremio') {
+      return stremioHeroItems(sections);
+    }
     for (final section in sections) {
       if (section.title.startsWith('Trending')) return section.items;
     }
     return sections.first.items;
-  }
-
-  /// Best-effort, non-blocking check for CloudStream source updates on launch.
-  /// READ-ONLY (re-fetches catalogs, downloads nothing); posts a notification
-  /// when updates exist and the user left that toggle on. Deferred a few seconds
-  /// so it never competes with first content load, and fully guarded so it can
-  /// NEVER affect startup or playback.
-  Future<void> _checkSourceUpdates() async {
-    final prefs = sl<PlaybackPrefs>();
-    final autoUpdate = prefs.autoUpdateExtensions;
-    // The read-only notify path below is Android-only; keep that gate unless
-    // we're auto-updating (JS providers auto-update on any platform).
-    if (!autoUpdate && !Platform.isAndroid) return;
-    await Future<void>.delayed(const Duration(seconds: 4));
-    if (!mounted) return;
-
-    // Auto-update path: apply updates across all ecosystems, throttled to
-    // ~once a day across launches. Best-effort — never touches startup.
-    if (autoUpdate) {
-      final now = DateTime.now().millisecondsSinceEpoch;
-      const dayMs = 24 * 60 * 60 * 1000;
-      if (now - prefs.lastExtensionUpdateMs < dayMs) return;
-      await prefs.setLastExtensionUpdateMs(now);
-      final updated = await ExtensionAutoUpdater.run();
-      if (!mounted) return;
-      if (updated > 0) {
-        final title = context.l10n.extensionsUpdated;
-        await NotificationService.instance.showMessage(
-          id: 779100,
-          title: title,
-          body:
-              '$updated extension${updated == 1 ? '' : 's'} updated to the latest version.',
-        );
-      }
-      return;
-    }
-
-    try {
-      final csManager = sl<CloudStreamManager>();
-      final csCount = await csManager.checkAllUpdates();
-
-      var aniCount = 0;
-      try {
-        final repoUrls = Hive.isBoxOpen(kAniyomiReposBoxName)
-            ? Hive.box<String>(kAniyomiReposBoxName).values.toList()
-            : const <String>[];
-        if (repoUrls.isNotEmpty) {
-          aniCount = await sl<AniyomiManager>().checkAllUpdates(repoUrls);
-        }
-      } catch (_) {
-        /* aniyomi check must never break the CS check or startup */
-      }
-
-      final total = csCount + aniCount;
-      if (total > 0 && csManager.notifyUpdates) {
-        await NotificationService.instance.showSourceUpdates(count: total);
-      }
-    } catch (_) {
-      /* never affects startup */
-    }
   }
 
   /// Genres + episode count for the hero banner (lazily fetched, cached).
@@ -438,17 +603,15 @@ class _HomeViewState extends State<_HomeView>
     _heroPrewarmed = true;
     _prewarmResume();
     _heroMeta(items.first);
-    // Warm the TMDB title logos for the whole carousel up front. The service
-    // resolves them SEQUENTIALLY (so no request burst at TMDB) and caches both
-    // in memory and on disk — so each logo is ready before its banner rotates
-    // in (no pop-in), and it barely touches TMDB on later launches.
-    sl<TitleLogoService>().prefetch(items);
   }
 
   void _openDetail(MediaItem item) {
+    // Only rebuild Home if this visit actually changed My List — Continue
+    // Watching/Reading rows already listen to their Hive boxes, so a blanket
+    // setState made every back-press rebuild the whole page for nothing.
+    final listRev = _myList.revision.value;
     Navigator.push(context, DetailScreen.route(item)).then((_) {
-      // Refresh Continue Watching + My List row when returning from detail.
-      if (mounted) setState(() {});
+      if (mounted && _myList.revision.value != listRev) setState(() {});
     });
   }
 
@@ -671,6 +834,7 @@ class _HomeViewState extends State<_HomeView>
           cover: item.cover,
           coverHeaders: item.coverHeaders,
           showUrl: item.url,
+          downloadShowId: item.id,
           category: category,
           malId: item.malId,
           scrobbleTitle: item.type == ProviderType.anime ? item.title : null,
@@ -686,7 +850,20 @@ class _HomeViewState extends State<_HomeView>
   /// player resolves the episode list behind its own branded loader (no blocking
   /// pre-navigation spinner).
   Future<void> _resume(HistoryEntry e) async {
-    await Navigator.push(
+    // A downloaded episode resumes from the saved file (works offline).
+    final local = await resumeFromDownload(
+      context,
+      e,
+      onlineEpisodes: () => _repo.episodes(
+        e.showUrl,
+        category: e.category,
+        sourceId: e.sourceId,
+      ),
+      onlineSources: (u) => _repo.sources(u, sourceId: e.sourceId, fast: true),
+    );
+    if (!mounted) return;
+    if (!local) {
+      await Navigator.push(
       context,
       MaterialPageRoute(
         builder: (_) => PlayerScreen(
@@ -713,6 +890,7 @@ class _HomeViewState extends State<_HomeView>
         ),
       ),
     );
+    }
     if (mounted) setState(() {});
   }
 
@@ -755,6 +933,7 @@ class _HomeViewState extends State<_HomeView>
   /// Floating brand header — always positioned on top of the hero or bg.
   Widget _buildHeader({bool edgeBanner = false}) {
     Widget sourceSwitcher() {
+      if (HomeCataloguePrefs.stremioSelected) return const SizedBox.shrink();
       if (!_sourceCatalogueSelected) return const HomeSourceSwitcherSlot();
       final sourceId = _sourceCatalogueSourceId;
       if (sourceId == null) return const SizedBox.shrink();
@@ -814,7 +993,7 @@ class _HomeViewState extends State<_HomeView>
                   ),
                 );
           final actions = [
-            _headerDownloadButton(edgeBanner: edgeBanner),
+            HomeDownloadsAction(edgeBanner: edgeBanner),
             _notificationBell(context, edgeBanner: edgeBanner),
             HomeSearchAction(
               edgeBanner: edgeBanner,
@@ -846,7 +1025,8 @@ class _HomeViewState extends State<_HomeView>
                         valueListenable: ZModePrefs.revision,
                         builder: (context, _, _) {
                           final showSource =
-                              _sourceCatalogueSelected || !ZModePrefs.enabled;
+                              !HomeCataloguePrefs.stremioSelected &&
+                              (_sourceCatalogueSelected || !ZModePrefs.enabled);
                           return ValueListenableBuilder<bool>(
                             valueListenable: IncognitoMode.notifier,
                             builder: (context, incognito, _) {
@@ -890,13 +1070,16 @@ class _HomeViewState extends State<_HomeView>
     );
   }
 
+  /// Clears the adaptive tint after the current frame — [bannerBuilder] runs
+  /// during build, so the notifier must not be written synchronously there.
+  void _clearHeroTintSoon() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _heroTint.value = null;
+    });
+  }
+
   /// The banner for [bannerId], with the same items and the same callbacks
   /// whichever one is showing.
-  ///
-  /// [BannerStyle.defaultId] returns the carousel exactly as it was written —
-  /// this switch is the only thing standing between Home and the banner every
-  /// install already has, and the other branch is a separate widget that never
-  /// runs unless someone opts in.
   Widget _featuredBanner(String bannerId, List<MediaItem> heroItems) {
     final reading = sl<ContentModeCubit>().state.isReading;
     void toggleList(MediaItem m) {
@@ -927,6 +1110,7 @@ class _HomeViewState extends State<_HomeView>
 
     switch (bannerId) {
       case BannerStyle.panelsId:
+        _clearHeroTintSoon();
         return FeaturedBannerPanels(
           items: heroItems,
           reading: reading,
@@ -940,8 +1124,15 @@ class _HomeViewState extends State<_HomeView>
         return FeaturedBannerEdge(
           items: heroItems,
           reading: reading,
+          isActive: widget.isTabActive,
           onInfo: onInfo,
           meta: _heroMeta,
+          onArtColor: ThemeController.adaptiveColour
+              ? (c) => _heroTint.value = c == null
+                    ? null
+                    : tintFromDominant(c, blend: adaptiveColourBlend)
+              : null,
+          backgroundTint: ThemeController.adaptiveColour ? _heroTint : null,
         );
       default:
         // Auto-rotating carousel (up to 6 trending items)
@@ -954,28 +1145,15 @@ class _HomeViewState extends State<_HomeView>
           onToggleList: toggleList,
           meta: _heroMeta,
           style: HeroTransition.cinematic,
+          onArtColor: ThemeController.adaptiveColour
+              ? (c) => _heroTint.value = c == null
+                    ? null
+                    : tintFromDominant(c, blend: adaptiveColourBlend)
+              : null,
+          backgroundTint: ThemeController.adaptiveColour ? _heroTint : null,
           isActive: widget.isTabActive,
         );
     }
-  }
-
-  /// Header download shortcut → [DownloadsScreen]. Same shape as
-  /// [HomeSearchAction]: flat icon, no badge — the screen itself is the
-  /// progress view, so there's nothing to surface here. Pushed as a normal
-  /// route (with back), unlike the dock tab which suppresses it.
-  Widget _headerDownloadButton({bool edgeBanner = false}) {
-    return IconButton(
-      icon: DockIcon(
-        DockGlyph.download,
-        color: edgeBanner ? Colors.white : AppColors.textSecondary,
-        size: 22,
-      ),
-      tooltip: context.l10n.downloads,
-      style: edgeBanner ? _edgeHeaderButtonStyle() : null,
-      onPressed: () => Navigator.of(
-        context,
-      ).push(MaterialPageRoute<void>(builder: (_) => const DownloadsScreen())),
-    );
   }
 
   /// Flat bell → Notifications screen. The accent dot shows while any
@@ -1038,31 +1216,73 @@ class _HomeViewState extends State<_HomeView>
   /// already guaranteed non-empty by [SourceRepository.home].
   Widget _sectionRow(HomeSection section, {bool sourceCatalogue = false}) {
     final items = section.items;
+    final aspects = items
+        .map(
+          (item) => stremioPosterAspect(
+            item,
+            landscape: posterLayout(context) == PosterCardLayout.wide,
+          ),
+        )
+        .toList();
+    final widths = [
+      for (final aspect in aspects)
+        aspect == null
+            ? posterRowWidth(context)
+            : (aspect > 1
+                      ? 184
+                      : aspect == 1
+                      ? 144
+                      : 116) *
+                  posterCardScale(context),
+    ];
+    final heights = [
+      for (var i = 0; i < items.length; i++)
+        aspects[i] == null
+            ? posterRowHeight(context)
+            : posterCellHeight(
+                widths[i],
+                artAspectRatio: aspects[i],
+                textScaler: MediaQuery.textScalerOf(context),
+                titleInside: posterTitleInside(
+                  context,
+                  wide: aspects[i]! > 1,
+                  item: items[i],
+                ),
+              ),
+    ];
     return _animated(
       ContentRow(
         title: section.title,
         itemWidth: posterRowWidth(context),
-        itemHeight: posterRowHeight(context),
+        itemWidthForIndex: (i) => widths[i],
+        itemHeight: heights.fold<double>(0, (a, b) => a > b ? a : b),
         itemCount: items.length,
         onSeeAll: () => _openSeeAll(section, sourceCatalogue: sourceCatalogue),
-        itemBuilder: (c, i) => PosterCard(
-          title: items[i].title,
-          logoItem: items[i],
-          imageUrl: items[i].cover,
-          headers: items[i].coverHeaders,
-          cellWidth: posterRowWidth(c),
-          wideImageUrl: items[i].banner,
-          genres: items[i].genres,
-          isAdult: items[i].isAdult,
-          qualityBadge: items[i].quality,
-          scoreBadge: items[i].score,
-          dubBadge: items[i].dubBadge,
-          onTap: () => sourceCatalogue
-              ? _openSourceCatalogueDetail(items[i])
-              : _openDetail(items[i]),
-          onLongPress: () => sourceCatalogue
-              ? _showSourceCatalogueInfo(items[i])
-              : _showInfo(items[i]),
+        itemBuilder: (c, i) => Align(
+          alignment: Alignment.topLeft,
+          child: SizedBox(
+            height: heights[i],
+            child: PosterCard(
+              title: items[i].title,
+              logoItem: items[i],
+              imageUrl: items[i].cover,
+              headers: items[i].coverHeaders,
+              cellWidth: widths[i],
+              wideOverride: aspects[i] == null ? null : aspects[i]! > 1,
+              wideImageUrl: items[i].banner,
+              genres: items[i].genres,
+              isAdult: items[i].isAdult,
+              qualityBadge: items[i].quality,
+              scoreBadge: items[i].score,
+              dubBadge: items[i].dubBadge,
+              onTap: () => sourceCatalogue
+                  ? _openSourceCatalogueDetail(items[i])
+                  : _openDetail(items[i]),
+              onLongPress: () => sourceCatalogue
+                  ? _showSourceCatalogueInfo(items[i])
+                  : _showInfo(items[i]),
+            ),
+          ),
         ),
       ),
     );
@@ -1191,10 +1411,13 @@ class _HomeViewState extends State<_HomeView>
       bloc: sl<ContentModeCubit>(),
       builder: (context, mode) => SourceCatalogueHomeContent(
         controller: _sourceCatalogueController,
-        initialSourceId: _sourceCatalogueSourceId,
+        // Fresh prefs read, not the field: the cubit emits before our stream
+        // listener refreshes the field, and handing the content a stale
+        // (other-mode) id here is exactly what persisted fallbacks over picks.
+        initialSourceId: HomeCataloguePrefs.sourceIdFor(mode),
         onSourceSelected: (sourceId) {
           _sourceCatalogueSourceId = sourceId;
-          unawaited(HomeCataloguePrefs.setSourceId(sourceId));
+          unawaited(HomeCataloguePrefs.setSourceIdFor(mode, sourceId));
         },
         onSectionsChanged: _setSourceCatalogueSections,
         sectionBuilder: (section) =>
@@ -1374,27 +1597,16 @@ class _HomeViewState extends State<_HomeView>
     );
   }
 
-  /// A row of cards under the banner, showing the modes you're NOT in plus —
-  /// in Anime mode only — a Schedule card (Schedule has nothing to show in a
-  /// reading mode; see [DockTab.isAnimeOnly]). Reactive to [ContentModeCubit]
-  /// so they re-label the instant a switch lands. Tapping a mode card runs
-  /// the sword-slash into that mode; Schedule opens the same [ScheduleScreen]
-  /// its dock tab does.
+  /// Mode shortcuts and Genres for the active catalogue.
   Widget _modeCards() {
     return BlocBuilder<ContentModeCubit, ContentMode>(
       bloc: sl<ContentModeCubit>(),
       builder: (context, current) {
-        // Z Mode drives the mode from its own controls, so the switcher cards
-        // would duplicate them. The hub card stays in BOTH modes: with no
-        // Schedule dock tab and no tracker cards, it is the only way in.
+        // Z Mode owns mode switching; the Windows home has its own mode
+        // controls, so the switcher cards would duplicate them there too.
         final others = ZModePrefs.enabled || _isDesktop
             ? const <ContentMode>[]
             : ContentMode.values.where((m) => m != current).toList();
-        // One row now. Schedule and the tracker libraries used to be a card
-        // each below this one, which meant a second row of near-identical
-        // slabs that grew with every tracker and had to be filtered per mode
-        // to stay a readable width. They live behind [ListsHubScreen] instead,
-        // so this row no longer changes shape with what you have connected.
         // A brand new install has watched nothing and read nothing, so every
         // card below falls through to its flat fill and the row opens dead.
         // The catalogue is already loaded underneath it, so borrow from that
@@ -1410,31 +1622,21 @@ class _HomeViewState extends State<_HomeView>
           return next < spare.length ? spare[next++] : own;
         }
 
+        final cards = <Widget>[
+          for (final m in others) _modeCard(m, orBorrow(_modeArt(m))),
+          // Genres shortcut is temporarily disabled.
+          // if (sl.isRegistered<MetadataRepository>() &&
+          //     sl<MetadataRepository>().supportsFilters)
+          //   _genresCard(orBorrow(_genresArt())),
+        ];
+        if (cards.isEmpty) return const SizedBox.shrink();
         return Padding(
           padding: const EdgeInsets.fromLTRB(16, 6, 16, 6),
           child: Row(
             children: [
-              for (final m in others) ...[
-                Expanded(child: _modeCard(m, orBorrow(_modeArt(m)))),
-                const SizedBox(width: 12),
-              ],
-              // Even halves with Genres beside it. Alone it still fills the
-              // row, so the old flex:2 (which existed to beat the switcher
-              // cards to a readable width) no longer buys anything.
-              Expanded(child: _hubCard(orBorrow(_modeArt(ContentMode.anime)))),
-              // Genres only means something on a catalogue that can actually
-              // narrow itself. MAL and Simkl take the parameter and answer
-              // with the same unfiltered list, so the card is not offered
-              // there rather than opening onto a screen that lies.
-              //
-              // isRegistered, not a bare sl<>: this row builds before the
-              // repository exists in some shells (and in every test that only
-              // cares about the dock), and a missing card is a better answer
-              // there than throwing the whole Home tree away.
-              if (sl.isRegistered<MetadataRepository>() &&
-                  sl<MetadataRepository>().supportsFilters) ...[
-                const SizedBox(width: 12),
-                Expanded(child: _genresCard(orBorrow(_genresArt()))),
+              for (var i = 0; i < cards.length; i++) ...[
+                if (i > 0) const SizedBox(width: 12),
+                Expanded(child: cards[i]),
               ],
             ],
           ),
@@ -1471,65 +1673,6 @@ class _HomeViewState extends State<_HomeView>
                     Flexible(
                       child: Text(
                         m.label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: AppText.body.copyWith(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w700,
-                          fontSize: 14,
-                          shadows: const [
-                            Shadow(color: Colors.black, blurRadius: 6),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// Same card shell as [_modeCard], but for [ListsHubScreen] — Schedule plus
-  /// every connected tracker library. One door rather than a card each, so the
-  /// row keeps its shape whether you have no trackers or four.
-  Widget _hubCard(({String? cover, Map<String, String>? headers}) art) {
-    return GestureDetector(
-      key: const ValueKey('home_lists_hub_card'),
-      onTap: _slashing
-          ? null
-          : () => Navigator.of(context).push(
-              MaterialPageRoute<void>(builder: (_) => const ListsHubScreen()),
-            ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(16),
-        child: SizedBox(
-          height: _isDesktop ? 76 : 52,
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
-              // Always the last thing you WATCHED, in every mode. Anime and
-              // movies share [WatchHistory], so this is a show cover whether
-              // you are browsing manga or not — and on the flat fallback
-              // gradient this card looked dead next to the switchers.
-              _cardBg(art, scrim: _neutralScrim, empty: _emptyTint(0.22, 0.11)),
-              Center(
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const DockIcon(
-                      DockGlyph.calendar,
-                      color: Colors.white,
-                      filled: true,
-                      size: 18,
-                    ),
-                    const SizedBox(width: 8),
-                    Flexible(
-                      child: Text(
-                        context.l10n.scheduleAndLists,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: AppText.body.copyWith(
@@ -1602,6 +1745,7 @@ class _HomeViewState extends State<_HomeView>
   /// same [_modeArt] put one image twice in a two-card row. Prefer something
   /// read rather than watched, else the second distinct thing watched, else
   /// nothing — at which point the tint below carries the difference.
+  // ignore: unused_element
   ({String? cover, Map<String, String>? headers}) _genresArt() {
     for (final m in const [ContentMode.manga, ContentMode.novel]) {
       final a = _modeArt(m);
@@ -1623,6 +1767,7 @@ class _HomeViewState extends State<_HomeView>
 
   /// Same card shell again, for [GenresScreen] — the genre list for whatever
   /// mode you are in, each one a way straight into a filtered Search.
+  // ignore: unused_element
   Widget _genresCard(({String? cover, Map<String, String>? headers}) art) {
     return GestureDetector(
       key: const ValueKey('home_genres_card'),
@@ -2006,25 +2151,541 @@ class _HomeViewState extends State<_HomeView>
               if (challenge != null) {
                 throw CloudflareRequiredException(challenge);
               }
+              // Windows (home-11 B): remembered so a later refresh of this
+              // same source keeps these rows on screen while it loads.
+              _lastDesktopSourceRows = (key: key, sections: sections);
               return sections;
             });
     }
     return _newDesktopSourceFuture!;
   }
 
+  /// Maps the saved Home rows arrangement ([HomeState.rows], Settings > Home
+  /// rows) onto the desktop Home: order, visibility and reset all come from
+  /// the same merge the phone renders. Null before the first merge, which
+  /// keeps the desktop's built-in order.
+  List<DesktopHomeRow>? _desktopHomeRows(
+    List<HomeRow>? rows,
+    List<HomeSection> sections,
+    ContentMode mode,
+  ) {
+    if (rows == null && !_sourceCatalogueSelected) return null;
+    final out = <DesktopHomeRow>[];
+    if (_sourceCatalogueSelected) {
+      // Same rule as the phone: a source catalogue keeps only the Continue
+      // row and the catalogue's position from the layout.
+      var inserted = false;
+      void insertCatalogue() {
+        if (inserted) return;
+        inserted = true;
+        // home-11 A: the banner's titles are not repeated as a shelf.
+        out.addAll(_desktopSourceShelves(sections));
+      }
+
+      // Before the first merge there is no saved layout: Continue first,
+      // then the catalogue (the desktop's built-in order).
+      if (rows == null) out.add(DesktopHomeRow.resume());
+      for (final row in rows ?? const <HomeRow>[]) {
+        if (row is LocalContinueHomeRow) {
+          out.add(DesktopHomeRow.resume());
+        } else if (row is ProviderHomeRow || row is StreamingServicesHomeRow) {
+          insertCatalogue();
+        }
+      }
+      insertCatalogue();
+      return out;
+    }
+    // The phone feeds its banner from a first section it then leaves out of
+    // the rows (providerRowSections), so the editor never lists it. Desktop
+    // keeps that section as a shelf just above the first catalogue row, as it
+    // always has, so no catalogue content disappears.
+    final listed = providerRowSections(sections, isTv: false);
+    final unlisted = sections.length > listed.length ? sections.first : null;
+    var placedUnlisted = unlisted == null;
+    void placeUnlisted() {
+      if (placedUnlisted) return;
+      placedUnlisted = true;
+      out.add(DesktopHomeRow.shelf(unlisted!));
+    }
+
+    for (final row in rows ?? const <HomeRow>[]) {
+      switch (row) {
+        case LocalContinueHomeRow():
+          out.add(DesktopHomeRow.resume());
+        case ProviderHomeRow(:final section):
+          placeUnlisted();
+          out.add(DesktopHomeRow.shelf(section));
+        case StreamingServicesHomeRow():
+          out.add(
+            DesktopHomeRow.custom(
+              (context) => DesktopHomeServicesShelf(
+                key: const ValueKey('desktop-home-services'),
+                title: context.l10n.streamingServices,
+                load: () => sl.isRegistered<StreamingProvidersService>()
+                    ? sl<StreamingProvidersService>().list(
+                        StreamingPrefs.region,
+                      )
+                    : Future.value(const <StreamingService>[]),
+                onOpen: (service) => unawaited(_openStreamingService(service)),
+                onAll: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => const StreamingServicesScreen(),
+                  ),
+                ),
+              ),
+            ),
+          );
+        case TrackerContinueHomeRow(:final items, :final trackerName):
+          out.add(
+            _desktopTrackerShelf(
+              title: context.l10n.homeRowTrackerContinue(trackerName),
+              items: items,
+              trackerName: trackerName,
+              status: WatchStatus.watching,
+              onAll: () =>
+                  _openTrackerList(trackerName, WatchStatus.watching),
+              progress: true,
+            ),
+          );
+        case NewEpisodesHomeRow(:final items, :final trackerName):
+          out.add(
+            _desktopTrackerShelf(
+              title: context.l10n.homeRowNewEpisodes,
+              items: items,
+              trackerName: trackerName,
+              status: WatchStatus.watching,
+              onAll: () => _openNewEpisodes(items),
+              // Always shown: the count is why the title is in this row.
+              tags: (e) => ['+${releasedCount(e) - (e.progress ?? 0)}'],
+            ),
+          );
+        case TrackerListHomeRow(:final status, :final items, :final trackerName):
+          out.add(
+            _desktopTrackerShelf(
+              title: trackerStatusLabel(
+                context,
+                status,
+                reading: mode.isReading,
+              ),
+              items: items,
+              trackerName: trackerName,
+              status: status,
+              onAll: () => _openTrackerList(trackerName, status),
+              progress: true,
+            ),
+          );
+      }
+    }
+    placeUnlisted();
+    return out;
+  }
+
+  /// Windows (home-11 A): banner titles of a source catalogue
+  /// (see [desktopSourceCatalogueSplit]).
+  List<MediaItem> _desktopSourceFeatured(List<HomeSection> sections) =>
+      desktopSourceCatalogueSplit(sections).featured;
+
+  /// Windows (home-11 A): the shelves of a source catalogue, without the
+  /// titles already in the banner. A trimmed lone section still opens the
+  /// whole original section (and its paging) from See all.
+  List<DesktopHomeRow> _desktopSourceShelves(List<HomeSection> sections) {
+    final split = desktopSourceCatalogueSplit(sections);
+    final whole = split.trimmedFrom;
+    return [
+      for (final s in split.shelves)
+        DesktopHomeRow.shelf(
+          s,
+          onAll: whole == null
+              ? null
+              : () => _openSeeAll(whole, sourceCatalogue: true),
+        ),
+    ];
+  }
+
+  /// A tracker row (Continue on tracker, New episodes, a status list) as a
+  /// desktop poster shelf. Opens and menus go through the tracker paths, and
+  /// the episode count shows only while Poster cards > Watch progress is on.
+  DesktopHomeRow _desktopTrackerShelf({
+    required String title,
+    required List<TrackerListItem> items,
+    required String trackerName,
+    required WatchStatus status,
+    required VoidCallback onAll,
+    bool progress = false,
+    List<String> Function(TrackerListItem)? tags,
+  }) {
+    final entries = Map<MediaItem, TrackerListItem>.identity()
+      ..addEntries(items.map((e) => MapEntry(e.item, e)));
+    return DesktopHomeRow.shelf(
+      HomeSection(title: title, items: [for (final e in items) e.item]),
+      onOpen: _openTrackerItem,
+      onAll: onAll,
+      onMenu: (item) => unawaited(
+        showDesktopHomeMenu(
+          context,
+          title: item.title,
+          actions: [
+            (label: 'Details', icon: 'info', run: () => _openTrackerItem(item)),
+            (
+              label: 'Open $trackerName list',
+              icon: 'bookmark',
+              run: () => _openTrackerList(trackerName, status),
+            ),
+          ],
+        ),
+      ),
+      tagsFor: tags == null
+          ? null
+          : (item) => entries[item] == null ? const [] : tags(entries[item]!),
+      progressFor: progress
+          ? (item) => entries[item] == null
+                ? null
+                : trackerProgressSubtitle(entries[item]!)
+          : null,
+    );
+  }
+
+  // ── Windows Continue menu actions (home-8) ─────────────────────────────────
+
+  /// The show behind a Continue watching card, for Details (same stub the
+  /// phone info sheet uses).
+  MediaItem _continueWatchItem(HistoryEntry e) => MediaItem(
+    id: e.showId,
+    title: e.showTitle,
+    cover: e.cover,
+    coverHeaders: e.coverHeaders,
+    url: e.showUrl,
+    type: ProviderType.anime,
+    sourceId: e.sourceId,
+  );
+
+  /// The title behind a Continue reading card, for Details.
+  MediaItem _continueReadItem(ReadEntry e) => MediaItem(
+    id: e.showId,
+    title: e.title,
+    cover: e.cover,
+    url: e.detailUrl,
+    type: e.type,
+    sourceId: e.sourceId,
+  );
+
+  /// home-8 A: removes the card at once and offers Undo, which puts the
+  /// exact entry (episode + position) back.
+  Future<void> _removeWatchFromContinue(HistoryEntry e) async {
+    final history = sl<WatchHistory>();
+    final removal = history.remove(e.sourceId, e.showId);
+    if (mounted) {
+      showUndoToast(
+        context,
+        message: context.l10n.removedFromContinueWatching,
+        onUndo: () => unawaited(() async {
+          // Let the remove (and its cloud delete) finish first, so the
+          // restored row is the one that stays.
+          try {
+            await removal;
+          } catch (_) {}
+          await history.restore(e);
+        }()),
+      );
+    }
+    try {
+      await removal;
+    } catch (_) {
+      showGlobalSnack(appL10n.couldntRemoveFromContinueWatching);
+    }
+  }
+
+  /// home-8 A for reading: remove with Undo.
+  Future<void> _removeReadingFromContinue(ReadEntry e) async {
+    final history = sl<ReadHistory>();
+    final removal = history.remove(e.sourceId, e.showId);
+    if (mounted) {
+      showUndoToast(
+        context,
+        message: context.l10n.removedFromContinueReading,
+        onUndo: () => unawaited(() async {
+          try {
+            await removal;
+          } catch (_) {}
+          await history.save(e, flush: true);
+        }()),
+      );
+    }
+    try {
+      await removal;
+    } catch (_) {
+      showGlobalSnack(appL10n.couldntRemoveFromContinueReading);
+    }
+  }
+
+  /// home-8 B: plays the Continue episode from 0:00. The episode's own resume
+  /// mark is reset too, otherwise the player would jump back to it.
+  Future<void> _restartEpisode(HistoryEntry e) async {
+    if (sl.isRegistered<ResumeStore>()) {
+      await sl<ResumeStore>().save(
+        e.sourceId,
+        e.showUrl,
+        e.episodeId,
+        Duration.zero,
+        e.duration,
+      );
+    }
+    if (!mounted) return;
+    await _resume(
+      HistoryEntry(
+        sourceId: e.sourceId,
+        showId: e.showId,
+        showTitle: e.showTitle,
+        cover: e.cover,
+        coverHeaders: e.coverHeaders,
+        thumbnail: e.thumbnail,
+        showUrl: e.showUrl,
+        category: e.category,
+        episodeId: e.episodeId,
+        episodeNumber: e.episodeNumber,
+        episodeUrl: e.episodeUrl,
+        position: Duration.zero,
+        duration: e.duration,
+        updatedAt: e.updatedAt,
+        malId: e.malId,
+      ),
+    );
+  }
+
+  /// home-8 B: marks the Continue episode watched (episode list tick + a
+  /// finished history row, which drops the card from Continue).
+  Future<void> _markEpisodeWatched(HistoryEntry e) async {
+    if (sl.isRegistered<ResumeStore>()) {
+      await sl<ResumeStore>().setWatched(
+        e.sourceId,
+        e.showUrl,
+        e.episodeId,
+        watched: true,
+      );
+    }
+    // A row with no known length still has to count as finished.
+    final length = e.duration > Duration.zero
+        ? e.duration
+        : const Duration(milliseconds: 1);
+    await sl<WatchHistory>().save(
+      HistoryEntry(
+        sourceId: e.sourceId,
+        showId: e.showId,
+        showTitle: e.showTitle,
+        cover: e.cover,
+        coverHeaders: e.coverHeaders,
+        thumbnail: e.thumbnail,
+        showUrl: e.showUrl,
+        category: e.category,
+        episodeId: e.episodeId,
+        episodeNumber: e.episodeNumber,
+        episodeUrl: e.episodeUrl,
+        position: length,
+        duration: length,
+        updatedAt: e.updatedAt,
+        malId: e.malId,
+      ),
+      flush: true,
+    );
+  }
+
+  /// home-8 B for reading: opens the Continue chapter from its first page.
+  Future<void> _restartReading(ReadEntry e) async {
+    if (sl.isRegistered<ReadStore>()) {
+      // Unmarking clears the saved position, so the reader starts at page 1.
+      await sl<ReadStore>().setRead(
+        e.sourceId,
+        e.showId,
+        e.chapterId,
+        read: false,
+      );
+    }
+    if (!mounted) return;
+    await _resumeReading(e);
+  }
+
+  /// home-8 B for reading: marks the Continue chapter read.
+  Future<void> _markReadingDone(ReadEntry e) async {
+    if (sl.isRegistered<ReadStore>()) {
+      await sl<ReadStore>().setRead(
+        e.sourceId,
+        e.showId,
+        e.chapterId,
+        read: true,
+      );
+    }
+    await sl<ReadHistory>().save(readEntryMarkedRead(e), flush: true);
+  }
+
+  // ── Windows catalogue choices (home-6) ─────────────────────────────────────
+
+  /// Every catalogue Home can show in [mode]: the metadata catalogues, the
+  /// generic browse catalogue and the loaded extensions. Used by the hero's
+  /// "Choose catalogue" menu and published to the shell's catalogue switch.
+  List<
+    ({String id, String group, String label, String icon, VoidCallback run})
+  >
+  _desktopCatalogueChoices(ContentMode mode) {
+    final catalogues = context.l10n.cataloguesGroup;
+    final extensions = context.l10n.extensionsGroup;
+    final meta = sl.isRegistered<MetadataProviderPrefs>();
+    return [
+      if (meta &&
+          (mode == ContentMode.manga ||
+              (mode == ContentMode.anime &&
+                  ZModePrefs.streamKind == StreamKind.anime)))
+        for (final provider in AnimeProvider.values)
+          (
+            id: 'meta:anime:${provider.name}',
+            group: catalogues,
+            label: provider == AnimeProvider.anilist
+                ? 'AniList catalogue'
+                : 'MyAnimeList catalogue',
+            icon: 'blocks',
+            run: () => unawaited(_selectDesktopAnimeCatalogue(provider)),
+          ),
+      if (meta &&
+          mode == ContentMode.anime &&
+          ZModePrefs.streamKind == StreamKind.movie)
+        for (final provider in VideoProvider.values)
+          (
+            id: 'meta:video:${provider.name}',
+            group: catalogues,
+            label: provider == VideoProvider.tmdb
+                ? 'TMDB catalogue'
+                : 'Simkl catalogue',
+            icon: 'blocks',
+            run: () => unawaited(_selectDesktopVideoCatalogue(provider)),
+          ),
+      (
+        id: 'browse',
+        group: catalogues,
+        label: 'Browse catalogue',
+        icon: 'blocks',
+        run: () => unawaited(HomeCataloguePrefs.setSourceSelected(false)),
+      ),
+      for (final source in sl<SourceRepository>().loadedSources.where(
+        (source) => switch (mode) {
+          ContentMode.manga => source.id.startsWith('mihon:'),
+          ContentMode.novel => source.id.startsWith('lnr:'),
+          ContentMode.anime =>
+            !source.id.startsWith('mihon:') && !source.id.startsWith('lnr:'),
+        },
+      ))
+        (
+          id: 'source:${source.id}',
+          group: extensions,
+          label: source.id == stremioSourceId
+              ? 'Stremio catalogue'
+              : source.name,
+          // Extension sources use the Settings > Sources 'blocks' icon so a
+          // source looks the same in the catalogue menu and on the rail.
+          icon: source.id == stremioSourceId ? 'clapperboard' : 'blocks',
+          run: () {
+            // Stremio is its own catalogue kind (installed addon
+            // catalogues), not an ordinary source: saving it via
+            // setSourceSelected would flip the kind back to "source" and
+            // lose the Stremio rows.
+            if (source.id == stremioSourceId) {
+              unawaited(
+                HomeCataloguePrefs.setCatalogue(
+                  mode,
+                  HomeCatalogueKind.stremio,
+                ),
+              );
+              return;
+            }
+            _selectHomeCatalogueSource(source.id);
+            unawaited(HomeCataloguePrefs.setSourceSelected(true));
+          },
+        ),
+    ];
+  }
+
+  /// Compact pill name for a [_desktopCatalogueChoices] entry: just the
+  /// tracker / source name ('AniList', 'MAL', 'TMDB', 'Simkl', 'Browse',
+  /// 'Stremio'), without the menu's "catalogue" suffix. Extension sources
+  /// already carry their plain name in [label].
+  String _desktopCatalogueShortLabel(String id, String label) => switch (id) {
+    'meta:anime:anilist' => 'AniList',
+    'meta:anime:mal' => 'MAL',
+    'meta:video:tmdb' => 'TMDB',
+    'meta:video:simkl' => 'Simkl',
+    'browse' => 'Browse',
+    _ when id == 'source:$stremioSourceId' => 'Stremio',
+    _ => label,
+  };
+
+  /// Id (in [_desktopCatalogueChoices] terms) of the catalogue on screen.
+  String _desktopCurrentCatalogueId(ContentMode mode) {
+    if (HomeCataloguePrefs.stremioSelected) return 'source:$stremioSourceId';
+    if (_sourceCatalogueSelected) return 'source:$_sourceCatalogueSourceId';
+    if (!sl.isRegistered<MetadataProviderPrefs>()) return 'browse';
+    final prefs = sl<MetadataProviderPrefs>();
+    if (mode == ContentMode.manga ||
+        (mode == ContentMode.anime &&
+            ZModePrefs.streamKind == StreamKind.anime)) {
+      return 'meta:anime:${prefs.anime.name}';
+    }
+    if (mode == ContentMode.anime && ZModePrefs.streamKind == StreamKind.movie) {
+      return 'meta:video:${prefs.video.name}';
+    }
+    return 'browse';
+  }
+
+  /// home-6: hands the catalogue choices to the shell's switcher. Only
+  /// republished when ids, labels or the current one change, and after the
+  /// frame, because the switcher's listeners rebuild other widgets.
+  void _publishDesktopCatalogues(
+    List<
+      ({String id, String group, String label, String icon, VoidCallback run})
+    >
+    choices,
+  ) {
+    final mode = sl<ContentModeCubit>().state;
+    final currentId = _desktopCurrentCatalogueId(mode);
+    final signature = [
+      mode.name,
+      currentId,
+      for (final c in choices) '${c.id}=${c.label}',
+    ].join('\n');
+    if (signature == _publishedCatalogueSignature) return;
+    _publishedCatalogueSignature = signature;
+    final options = [
+      for (final c in choices)
+        DesktopCatalogueOption(
+          id: c.id,
+          label: c.label,
+          shortLabel: _desktopCatalogueShortLabel(c.id, c.label),
+          group: c.group,
+          // Fallback matches the Sources 'blocks' icon, not the puzzle.
+          icon: desktopHomeMenuIcon(c.icon) ?? Icons.widgets_outlined,
+          onSelect: c.run,
+        ),
+    ];
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      // A newer publish (or dispose) since this frame wins.
+      if (!mounted || _publishedCatalogueSignature != signature) return;
+      DesktopCatalogueSwitch.publish(options, currentId: currentId);
+    });
+  }
+
   /// A fresh Windows presentation consumes the existing data owners and route
   /// callbacks. None of the phone/previous desktop presentation is composed.
-  Widget _buildNewDesktopHome() => BlocBuilder<ContentModeCubit, ContentMode>(
+  ///
+  /// home-10: history drives this through [DesktopContinueStore], which only
+  /// notifies when Continue entries are added, removed or reordered (not on
+  /// every player position save), and refreshes when Home is uncovered.
+  Widget _buildNewDesktopHome() => DesktopContinueRefresher(
+    store: _continue,
+    child: BlocBuilder<ContentModeCubit, ContentMode>(
     bloc: sl<ContentModeCubit>(),
     builder: (context, mode) => BlocBuilder<HomeCubit, HomeState>(
-      builder: (context, state) => AnimatedBuilder(
-        animation: Listenable.merge([
-          if (Hive.isBoxOpen(WatchHistory.boxName))
-            Hive.box<Map>(WatchHistory.boxName).listenable(),
-          if (Hive.isBoxOpen(ReadHistory.boxName))
-            Hive.box<Map>(ReadHistory.boxName).listenable(),
-        ]),
-        builder: (context, _) {
+      // home-10: no history listener here. Only the Continue block (and the
+      // hero's play label) listen to the store via continueListenable, so a
+      // history change does not rebuild the shelves and downloads of Home.
+      builder: (context, state) => Builder(
+        builder: (context) {
           Widget render(
             List<HomeSection> sections, {
             bool loading = false,
@@ -2036,41 +2697,24 @@ class _HomeViewState extends State<_HomeView>
             final verificationUrl = _sourceCatalogueSelected
                 ? sourceVerificationUrl
                 : state.cloudflareUrl;
-            final watched = Hive.isBoxOpen(WatchHistory.boxName)
-                ? sl<WatchHistory>().recent()
-                : <HistoryEntry>[];
-            final read = Hive.isBoxOpen(ReadHistory.boxName)
-                ? sl<ReadHistory>().recent(
-                    type: mode == ContentMode.manga
-                        ? ProviderType.manga
-                        : ProviderType.novel,
-                  )
-                : <ReadEntry>[];
-            final releases =
-                context.read<HomeCubit>().desktopReleaseRow?.items ??
-                const <TrackerListItem>[];
+            // home-10: lists and lookups come precomputed from the store.
+            final store = _continue;
+            final readType = mode == ContentMode.manga
+                ? ProviderType.manga
+                : ProviderType.novel;
+            final releaseRow = context.read<HomeCubit>().desktopReleaseRow;
+            final releases = releaseRow?.items ?? const <TrackerListItem>[];
+            // home-11 A: a source catalogue's banner titles are not repeated
+            // as the first shelf (see _desktopSourceShelves).
             final featured = _sourceCatalogueSelected
-                ? (sections.isEmpty
-                      ? const <MediaItem>[]
-                      : sections.first.items)
+                ? _desktopSourceFeatured(sections)
                 : state.heroItems;
             void open(MediaItem item) => _sourceCatalogueSelected
                 ? _openSourceCatalogueDetail(item)
                 : _openDetail(item);
-            HistoryEntry? historyFor(MediaItem item) => watched
-                .where(
-                  (e) =>
-                      (e.showId == item.id && e.sourceId == item.sourceId) ||
-                      e.showUrl == item.url,
-                )
-                .firstOrNull;
-            ReadEntry? readingFor(MediaItem item) => read
-                .where(
-                  (e) =>
-                      (e.showId == item.id && e.sourceId == item.sourceId) ||
-                      e.detailUrl == item.url,
-                )
-                .firstOrNull;
+            // Map reads by show id / URL instead of a search per poster.
+            HistoryEntry? historyFor(MediaItem item) => store.historyFor(item);
+            ReadEntry? readingFor(MediaItem item) => store.readingFor(item);
             void play(MediaItem item) {
               final readingEntry = mode.isReading ? readingFor(item) : null;
               final videoEntry = mode.isReading ? null : historyFor(item);
@@ -2110,9 +2754,35 @@ class _HomeViewState extends State<_HomeView>
                 ],
               ),
             );
-            return DesktopHomePage(
+            // Catalogue choices for the hero's "Choose catalogue" menu; the
+            // same list feeds the shell's catalogue switch (home-6).
+            final catalogues = _desktopCatalogueChoices(mode);
+            _publishDesktopCatalogues(catalogues);
+            // Rebuilds when downloads change or the offline state flips, so the
+            // saved-shows shelf appears and disappears by itself.
+            return ListenableBuilder(
+              listenable: Listenable.merge([
+                sl<DownloadManager>(),
+                sl<ChapterDownloadStore>().listenable(),
+                BootConnectivity.instance.offline,
+              ]),
+              builder: (context, _) => DesktopHomePage(
               key: ValueKey(
                 'desktop-home:${mode.name}:${ZModePrefs.streamKind.name}:${_sourceCatalogueSelected ? _sourceCatalogueSourceId : 'catalogue'}',
+              ),
+              offline: BootConnectivity.instance.offline.value,
+              onDownloads: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(builder: (_) => const DownloadsScreen()),
+              ),
+              downloads: desktopHomeDownloads(
+                collections: desktopDownloadCollections(
+                  videos: sl<DownloadManager>().all,
+                  chapters: sl<ChapterDownloadStore>().all(),
+                ),
+                reading: mode.isReading,
+                open: (collection) => Navigator.of(
+                  context,
+                ).push(desktopDownloadCollectionRoute(collection)),
               ),
               // Reauthentication preserves the cached account and library. Capture
               // the data owner before awaiting a dialog that may outlive Home.
@@ -2130,6 +2800,8 @@ class _HomeViewState extends State<_HomeView>
               reconnectLabel: context.l10n.reconnectToSync,
               featured: featured,
               sections: sections,
+              // Settings > Home rows: order, visibility and reset.
+              rows: _desktopHomeRows(state.rows, sections, mode),
               reading: mode.isReading,
               loading: loading,
               onVerify: verificationUrl == null
@@ -2183,12 +2855,18 @@ class _HomeViewState extends State<_HomeView>
                     _newDesktopSourceKey = null;
                   });
                 } else {
-                  await context.read<HomeCubit>().load(reset: true);
+                  // No reset: a refresh keeps the rows on screen while it
+                  // fetches, and keeps them if the fetch fails (offline).
+                  await context.read<HomeCubit>().load();
                 }
               },
-              resume: mode.isReading
+              // home-10: the Continue block rebuilds on its own when the
+              // store notifies and reads the fresh lists via resumeItems.
+              resume: const [],
+              continueListenable: store,
+              resumeItems: () => mode.isReading
                   ? [
-                      for (final e in read)
+                      for (final e in store.reading(readType))
                         DesktopHomeResume(
                           title: e.title,
                           subtitle: e.chapterNumber == null
@@ -2208,14 +2886,28 @@ class _HomeViewState extends State<_HomeView>
                                   icon: 'book-open',
                                   run: () => unawaited(_resumeReading(e)),
                                 ),
+                                // home-8 B: the same handy actions as video.
+                                (
+                                  label: context.l10n.details,
+                                  icon: 'info',
+                                  run: () => _openDetail(_continueReadItem(e)),
+                                ),
+                                (
+                                  label: context.l10n.readChapterFromStart,
+                                  icon: 'rotate-cw',
+                                  run: () => unawaited(_restartReading(e)),
+                                ),
+                                (
+                                  label: context.l10n.markChapterRead,
+                                  icon: 'check',
+                                  run: () => unawaited(_markReadingDone(e)),
+                                ),
                                 (
                                   label: 'Remove from Continue',
                                   icon: 'history',
+                                  // home-8 A: undoable.
                                   run: () => unawaited(
-                                    sl<ReadHistory>().remove(
-                                      e.sourceId,
-                                      e.showId,
-                                    ),
+                                    _removeReadingFromContinue(e),
                                   ),
                                 ),
                               ],
@@ -2224,7 +2916,7 @@ class _HomeViewState extends State<_HomeView>
                         ),
                     ]
                   : [
-                      for (final e in watched)
+                      for (final e in store.watched)
                         DesktopHomeResume(
                           title: e.showTitle,
                           subtitle: e.episodeNumber == null
@@ -2247,14 +2939,29 @@ class _HomeViewState extends State<_HomeView>
                                   icon: 'play',
                                   run: () => unawaited(_resume(e)),
                                 ),
+                                // home-8 B: Details, Restart and Mark watched.
+                                (
+                                  label: context.l10n.details,
+                                  icon: 'info',
+                                  run: () =>
+                                      _openDetail(_continueWatchItem(e)),
+                                ),
+                                (
+                                  label: context.l10n.restartEpisode,
+                                  icon: 'rotate-cw',
+                                  run: () => unawaited(_restartEpisode(e)),
+                                ),
+                                (
+                                  label: context.l10n.markEpisodeWatched,
+                                  icon: 'check',
+                                  run: () => unawaited(_markEpisodeWatched(e)),
+                                ),
                                 (
                                   label: 'Remove from Continue',
                                   icon: 'history',
+                                  // home-8 A: undoable.
                                   run: () => unawaited(
-                                    sl<WatchHistory>().remove(
-                                      e.sourceId,
-                                      e.showId,
-                                    ),
+                                    _removeWatchFromContinue(e),
                                   ),
                                 ),
                               ],
@@ -2262,14 +2969,40 @@ class _HomeViewState extends State<_HomeView>
                           ),
                         ),
                     ],
+              // home-7: every fresh release is passed (the page shows five
+              // plus "+N more"), worded for the mode, with the poster menu.
               releases: [
                 for (final entry in releases)
                   DesktopHomeRelease(
                     title: entry.item.title,
-                    subtitle: 'Episode ${releasedCount(entry)} available',
+                    subtitle: mode.isReading
+                        ? context.l10n.chapterNAvailable('${releasedCount(entry)}')
+                        : context.l10n.episodeNAvailable('${releasedCount(entry)}'),
                     image: entry.item.cover,
                     headers: entry.item.coverHeaders,
                     open: () => _openTrackerEntry(entry),
+                    menu: () => unawaited(
+                      showDesktopHomeMenu(
+                        context,
+                        title: entry.item.title,
+                        actions: [
+                          (
+                            label: context.l10n.details,
+                            icon: 'info',
+                            run: () => _openTrackerEntry(entry),
+                          ),
+                          if (releaseRow != null)
+                            (
+                              label: context.l10n.openTrackerList(releaseRow.trackerName),
+                              icon: 'bookmark',
+                              run: () => _openTrackerList(
+                                releaseRow.trackerName,
+                                WatchStatus.watching,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
                   ),
               ],
               // Catalogue choice is accessed from the small hero overline.
@@ -2278,68 +3011,32 @@ class _HomeViewState extends State<_HomeView>
                   context,
                   title: 'Choose catalogue',
                   actions: [
-                    if (sl.isRegistered<MetadataProviderPrefs>() &&
-                        (mode == ContentMode.manga ||
-                            (mode == ContentMode.anime &&
-                                ZModePrefs.streamKind == StreamKind.anime)))
-                      for (final provider in AnimeProvider.values)
-                        (
-                          label: provider == AnimeProvider.anilist
-                              ? 'AniList catalogue'
-                              : 'MyAnimeList catalogue',
-                          icon: 'blocks',
-                          run: () =>
-                              unawaited(_selectDesktopAnimeCatalogue(provider)),
-                        ),
-                    if (sl.isRegistered<MetadataProviderPrefs>() &&
-                        mode == ContentMode.anime &&
-                        ZModePrefs.streamKind == StreamKind.movie)
-                      for (final provider in VideoProvider.values)
-                        (
-                          label: provider == VideoProvider.tmdb
-                              ? 'TMDB catalogue'
-                              : 'Simkl catalogue',
-                          icon: 'blocks',
-                          run: () =>
-                              unawaited(_selectDesktopVideoCatalogue(provider)),
-                        ),
-                    (
-                      label: 'Browse catalogue',
-                      icon: 'blocks',
-                      run: () => unawaited(
-                        HomeCataloguePrefs.setSourceSelected(false),
-                      ),
-                    ),
-                    for (final source
-                        in sl<SourceRepository>().loadedSources.where(
-                          (source) => switch (mode) {
-                            ContentMode.manga => source.id.startsWith('mihon:'),
-                            ContentMode.novel => source.id.startsWith('lnr:'),
-                            ContentMode.anime =>
-                              !source.id.startsWith('mihon:') &&
-                                  !source.id.startsWith('lnr:'),
-                          },
-                        ))
+                    for (final choice in catalogues)
                       (
-                        label: source.name,
-                        icon: 'puzzle',
-                        run: () {
-                          _selectHomeCatalogueSource(source.id);
-                          unawaited(HomeCataloguePrefs.setSourceSelected(true));
-                        },
+                        label: choice.label,
+                        icon: choice.icon,
+                        run: choice.run,
                       ),
                   ],
                 ),
               ),
-
+              ),
             );
           }
 
           if (_sourceCatalogueSelected) {
+            final future = _newDesktopSourceRows(mode);
             return FutureBuilder<List<HomeSection>>(
-              future: _newDesktopSourceRows(mode),
+              future: future,
               builder: (context, snap) => render(
-                snap.data ?? const [],
+                // home-11 B: while a refresh of the same source loads, keep
+                // its last rows on screen (with the thin progress bar)
+                // instead of emptying the page.
+                snap.connectionState == ConnectionState.done
+                    ? (snap.data ?? const [])
+                    : (_lastDesktopSourceRows?.key == _newDesktopSourceKey
+                          ? _lastDesktopSourceRows!.sections
+                          : const []),
                 loading: snap.connectionState != ConnectionState.done,
                 sourceVerificationUrl: snap.error is CloudflareRequiredException
                     ? (snap.error as CloudflareRequiredException).url
@@ -2363,6 +3060,7 @@ class _HomeViewState extends State<_HomeView>
           );
         },
       ),
+    ),
     ),
   );
 
@@ -2394,6 +3092,10 @@ class _HomeViewState extends State<_HomeView>
               // its own SafeArea(bottom: false).
               body: Stack(
                 children: [
+                  // Adaptive colour: poster-tinted wash behind everything, only
+                  // while the setting is on (Theme & colour → Adaptive colour).
+                  if (ThemeController.adaptiveColour)
+                    PosterTintLayer(notifier: _heroTint),
                   RefreshIndicator(
                     color: AppColors.accent,
                     onRefresh: () {
@@ -2447,12 +3149,16 @@ class _HomeViewState extends State<_HomeView>
                             _sourceCatalogueSelected || ZModePrefs.enabled
                             ? false
                             : switch (sl<ContentModeCubit>().state) {
-                                ContentMode.manga => !activeId.startsWith(
-                                  'mihon:',
-                                ),
-                                ContentMode.novel => !activeId.startsWith(
-                                  'lnr:',
-                                ),
+                                ContentMode.manga =>
+                                  !sourceIdMatchesContentMode(
+                                    activeId,
+                                    ContentMode.manga,
+                                  ),
+                                ContentMode.novel =>
+                                  !sourceIdMatchesContentMode(
+                                    activeId,
+                                    ContentMode.novel,
+                                  ),
                                 ContentMode.anime => false,
                               };
                         return Padding(
@@ -2469,6 +3175,12 @@ class _HomeViewState extends State<_HomeView>
                                         : state.heroItems;
                                     final hasHero = heroItems.isNotEmpty;
                                     if (hasHero) _prewarmHeroMeta(heroItems);
+                                    // No hero (loading / empty / no source):
+                                    // clear any wash left over from the last
+                                    // poster.
+                                    if (!hasHero || noSourceForMode) {
+                                      _clearHeroTintSoon();
+                                    }
 
                                     return HomeBannerHeader(
                                       headerAboveBanner: _isDesktop,
@@ -2483,10 +3195,7 @@ class _HomeViewState extends State<_HomeView>
                                 ),
                               ),
 
-                              // ── Mode cards, and Schedule ──────────────────────────────
-                              // Unconditional: _modeCards drops the mode switchers
-                              // itself under Z Mode and keeps Schedule, which has no
-                              // other entry point since it left the dock.
+                              // Mode shortcuts and Genres.
                               SliverToBoxAdapter(child: _modeCards()),
 
                               // ── Reconnect banner (session lapsed → sync is off) ───────
@@ -2563,20 +3272,32 @@ class _HomeViewState extends State<_HomeView>
                                     onInstallSources: () =>
                                         Navigator.of(context).push(
                                           MaterialPageRoute<void>(
+                                            // src-3: desktop settings look on
+                                            // Windows (pass-through elsewhere).
                                             builder: (_) =>
-                                                const ProvidersHubScreen(),
+                                                const DesktopProviderScope(
+                                                  child: ProvidersHubScreen(),
+                                                ),
                                           ),
                                         ),
-                                    // Cloudflare-blocked (Mihon) source: offer the visible
-                                    // solve, then reload once the user closes the WebView.
+                                    // Cloudflare-blocked source: solve, then reload after
+                                    // the user closes the WebView.
                                     cloudflareUrl: state.cloudflareUrl,
                                     onSolveCloudflare:
                                         state.cloudflareUrl == null
                                         ? null
                                         : () async {
-                                            await MihonExtensionService.solveCloudflare(
-                                              state.cloudflareUrl!,
-                                            );
+                                            if (_repo.sourceId.startsWith(
+                                              'mg:',
+                                            )) {
+                                              await MangayomiCloudflare.solve(
+                                                state.cloudflareUrl!,
+                                              );
+                                            } else {
+                                              await MihonExtensionService.solveCloudflare(
+                                                state.cloudflareUrl!,
+                                              );
+                                            }
                                             if (context.mounted) {
                                               context.read<HomeCubit>().load(
                                                 reset: true,
@@ -2608,9 +3329,45 @@ class _HomeViewState extends State<_HomeView>
   }
 }
 
-/// Opens [SearchScreen] — the primary way into search now that it's off the
-/// dock. Normally Search follows Z Mode; Home passes [fixedSourceId] when its
-/// Source Catalogue is selected so the query stays on that source.
+/// Header download shortcut → [DownloadsScreen]. Hidden while Downloads is
+/// a dock tab, so the bar and the header never offer it twice — same rule
+/// as [HomeSearchAction].
+class HomeDownloadsAction extends StatelessWidget {
+  const HomeDownloadsAction({super.key, this.edgeBanner = false});
+
+  final bool edgeBanner;
+
+  @override
+  Widget build(BuildContext context) {
+    // Bare NavPrefs reads no Hive box and returns the default dock (no
+    // Downloads) — the same guard the shell uses for widget tests.
+    final prefs = sl.isRegistered<NavPrefs>() ? sl<NavPrefs>() : NavPrefs();
+    return ListenableBuilder(
+      listenable: prefs,
+      builder: (context, _) => prefs.tabs.contains(DockTab.downloads)
+          ? const SizedBox.shrink()
+          : IconButton(
+              icon: DockIcon(
+                DockGlyph.download,
+                color: edgeBanner ? Colors.white : AppColors.textSecondary,
+                size: 22,
+              ),
+              tooltip: context.l10n.downloads,
+              style: edgeBanner ? _edgeHeaderButtonStyle() : null,
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => const DownloadsScreen(),
+                ),
+              ),
+            ),
+    );
+  }
+}
+
+/// Opens [SearchScreen] — the Home header way in. Hidden while Search is a
+/// dock tab, so the bar and the header never offer it twice. Normally Search
+/// follows Z Mode; Home passes [fixedSourceId] when its Source Catalogue is
+/// selected so the query stays on that source.
 class HomeSearchAction extends StatelessWidget {
   const HomeSearchAction({
     super.key,
@@ -2623,19 +3380,27 @@ class HomeSearchAction extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return IconButton(
-      icon: DockIcon(
-        DockGlyph.search,
-        color: edgeBanner ? Colors.white : AppColors.textSecondary,
-        size: 22,
-      ),
-      tooltip: context.l10n.search,
-      style: edgeBanner ? _edgeHeaderButtonStyle() : null,
-      onPressed: () => Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => SearchScreen(fixedSourceId: fixedSourceId),
-        ),
-      ),
+    // Bare NavPrefs reads no Hive box and returns the default dock (no
+    // Search) — the same guard the shell uses for widget tests.
+    final prefs = sl.isRegistered<NavPrefs>() ? sl<NavPrefs>() : NavPrefs();
+    return ListenableBuilder(
+      listenable: prefs,
+      builder: (context, _) => prefs.tabs.contains(DockTab.search)
+          ? const SizedBox.shrink()
+          : IconButton(
+              icon: DockIcon(
+                DockGlyph.search,
+                color: edgeBanner ? Colors.white : AppColors.textSecondary,
+                size: 22,
+              ),
+              tooltip: context.l10n.search,
+              style: edgeBanner ? _edgeHeaderButtonStyle() : null,
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => SearchScreen(fixedSourceId: fixedSourceId),
+                ),
+              ),
+            ),
     );
   }
 }
@@ -2712,6 +3477,7 @@ class HomeLoadedEmptyView extends StatelessWidget {
     required this.onInstallSources,
     this.cloudflareUrl,
     this.onSolveCloudflare,
+    this.cloudflareUnsupported = false,
     this.offline = false,
     this.isMetadataProvider = false,
     this.rateLimitedSeconds,
@@ -2740,16 +3506,19 @@ class HomeLoadedEmptyView extends StatelessWidget {
   /// [onSolveCloudflare] opens the visible solve WebView and reloads after.
   final String? cloudflareUrl;
   final Future<void> Function()? onSolveCloudflare;
+  final bool cloudflareUnsupported;
 
   @override
   Widget build(BuildContext context) {
     // A Cloudflare block takes priority over the no-sources guide: the source
     // IS installed, it's just gated behind a challenge the user can solve.
-    if (cloudflareUrl != null && onSolveCloudflare != null) {
+    if (cloudflareUrl != null &&
+        (onSolveCloudflare != null || cloudflareUnsupported)) {
       return _SourceUnavailable(
         sourceName: sourceName,
         onRetry: onRetry,
         onSolveCloudflare: onSolveCloudflare,
+        cloudflareUnsupported: cloudflareUnsupported,
       );
     }
     if (offline) {
@@ -2857,6 +3626,7 @@ class _SourceUnavailable extends StatelessWidget {
     required this.sourceName,
     required this.onRetry,
     this.onSolveCloudflare,
+    this.cloudflareUnsupported = false,
     this.offline = false,
     this.isMetadataProvider = false,
     this.rateLimitedSeconds,
@@ -2879,12 +3649,13 @@ class _SourceUnavailable extends StatelessWidget {
   /// When set, this is a Cloudflare block (not a generic outage): show a shield
   /// + a primary "Solve Cloudflare" action that opens the visible solve WebView.
   final Future<void> Function()? onSolveCloudflare;
+  final bool cloudflareUnsupported;
 
   static const Color _cloudflareOrange = Color(0xFFF48120);
 
   @override
   Widget build(BuildContext context) {
-    final isCloudflare = onSolveCloudflare != null;
+    final isCloudflare = onSolveCloudflare != null || cloudflareUnsupported;
     return Padding(
       padding: const EdgeInsets.fromLTRB(36, 40, 36, 56),
       child: Column(
@@ -2930,8 +3701,11 @@ class _SourceUnavailable extends StatelessWidget {
           const SizedBox(height: 10),
           Text(
             isCloudflare
-                ? 'Complete the Cloudflare check once and this source will '
-                      'load normally from then on.'
+                ? cloudflareUnsupported
+                      ? 'Cloudflare verification for Mangayomi sources is not '
+                            'available on iOS yet. Unprotected sources still work.'
+                      : 'Complete the Cloudflare check once and this source will '
+                            'load normally from then on.'
                 : offline
                 ? "Nothing could reach the network. Check your connection "
                       "and try again — $sourceName is probably fine."
@@ -2949,36 +3723,38 @@ class _SourceUnavailable extends StatelessWidget {
           ),
           const SizedBox(height: 24),
           if (isCloudflare) ...[
-            ElevatedButton.icon(
-              onPressed: () => onSolveCloudflare!(),
-              icon: const Icon(Icons.shield_rounded, size: 20),
-              label: Text(context.l10n.solveCloudflare),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: _cloudflareOrange,
-                foregroundColor: Colors.white,
-                elevation: 0,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 30,
-                  vertical: 13,
-                ),
-                textStyle: const TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600,
-                ),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(26),
+            if (!cloudflareUnsupported) ...[
+              ElevatedButton.icon(
+                onPressed: () => onSolveCloudflare!(),
+                icon: const Icon(Icons.shield_rounded, size: 20),
+                label: Text(context.l10n.solveCloudflare),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: _cloudflareOrange,
+                  foregroundColor: Colors.white,
+                  elevation: 0,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 30,
+                    vertical: 13,
+                  ),
+                  textStyle: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(26),
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(height: 6),
-            TextButton.icon(
-              onPressed: onRetry,
-              icon: const Icon(Icons.refresh_rounded, size: 18),
-              label: Text(context.l10n.retry),
-              style: TextButton.styleFrom(
-                foregroundColor: AppColors.textSecondary,
+              const SizedBox(height: 6),
+              TextButton.icon(
+                onPressed: onRetry,
+                icon: const Icon(Icons.refresh_rounded, size: 18),
+                label: Text(context.l10n.retry),
+                style: TextButton.styleFrom(
+                  foregroundColor: AppColors.textSecondary,
+                ),
               ),
-            ),
+            ],
           ] else
             ElevatedButton.icon(
               onPressed: onRetry,

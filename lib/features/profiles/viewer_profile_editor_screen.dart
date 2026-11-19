@@ -4,21 +4,28 @@ import 'dart:typed_data';
 import 'package:dio/dio.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../../core/di/injector.dart';
 import '../../core/profiles/profile_avatar_uploader.dart';
+import '../../core/profiles/profile_lock_store.dart';
+import 'profile_lock_gate.dart';
 import '../../core/profiles/klipy_gif_service.dart';
 import '../../core/profiles/viewer_profile.dart';
 import '../../core/profiles/viewer_profile_avatar.dart';
 import '../../core/supabase/supabase_service.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
+import '../../core/ui/desktop_docked_panel.dart' show desktopPanelsEnabled;
 import '../../core/ui/settings_widgets.dart';
+import 'desktop_avatar_input.dart';
 import '../auth/auth_cubit.dart';
 import '../auth/auth_screens.dart' show requireLogin;
 import 'klipy_gif_picker.dart';
+import 'profile_unlock.dart' show hasLegacyPcPin, unlockWithLegacyPcPin;
+import '../../l10n/l10n.dart';
 
 Future<void> openViewerProfileEditor(
   BuildContext context,
@@ -194,11 +201,74 @@ class _ViewerProfileEditorScreenState extends State<ViewerProfileEditorScreen> {
   late String? _photoUrl = widget.profile?.photoUrl;
   late String? _coverUrl = widget.profile?.coverUrl;
   bool _uploading = false;
+  bool _locked = false;
   String? _photoError;
   String? _coverError;
   final _uploadedUrls = <String>{};
   String? _uploadToken;
   bool _saved = false;
+
+  ProfileLockStore? get _locks =>
+      sl.isRegistered<ProfileLockStore>() ? sl<ProfileLockStore>() : null;
+
+  @override
+  void initState() {
+    super.initState();
+    final id = widget.profile?.id;
+    final locks = _locks;
+    if (id != null && locks != null) {
+      locks
+          .isLocked(id)
+          .then(
+            (v) {
+              if (mounted) setState(() => _locked = _locked || v);
+            },
+            onError: (Object error) {
+              if (mounted) setState(() => _locked = true);
+            },
+          );
+      // Windows: an old PC-only PIN not yet moved still protects the profile.
+      hasLegacyPcPin(id).then((v) {
+        if (v && mounted) setState(() => _locked = true);
+      });
+    }
+  }
+
+  Future<void> _manageLock() async {
+    final profile = widget.profile;
+    final locks = _locks;
+    if (profile == null || locks == null) return;
+    // Windows: move an old PC-only PIN into the synced lock first, so the
+    // card below always manages the one lock shared with phone and TV.
+    if (await hasLegacyPcPin(profile.id)) {
+      if (!mounted || !await unlockWithLegacyPcPin(context, profile)) return;
+      if (await hasLegacyPcPin(profile.id)) {
+        // Still offline or signed out: the old PIN stays until it can move.
+        if (mounted) {
+          ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Connect to the internet to manage this profile lock. '
+                'The PIN set on this PC keeps protecting it until then.',
+              ),
+            ),
+          );
+        }
+        return;
+      }
+      if (!mounted) return;
+      // Moved (or already synced): the shared lock now protects it.
+      setState(() => _locked = true);
+    }
+    if (!mounted) return;
+    final result = await manageProfilePin(
+      context,
+      profileId: profile.id,
+      profileName: profile.name,
+      locks: locks,
+    );
+    if (result != null && mounted) setState(() => _locked = result);
+  }
 
   bool get _canSave =>
       _name.text.trim().isNotEmpty &&
@@ -219,6 +289,42 @@ class _ViewerProfileEditorScreenState extends State<ViewerProfileEditorScreen> {
     _name.dispose();
     _bio.dispose();
     super.dispose();
+  }
+
+  /// Windows (acct-6): the avatar choices open as a menu anchored to the
+  /// avatar (or its button) instead of a bottom sheet.
+  Future<void> _pickPhotoDesktop(BuildContext anchor) async {
+    if (!requireLogin(context, action: 'change a profile avatar')) return;
+    final action = await showDesktopAvatarMenu(context, anchor: anchor);
+    if (action == null || !mounted) return;
+    switch (action) {
+      case DesktopAvatarAction.uploadImage:
+        await _pickStillPhoto();
+      case DesktopAvatarAction.uploadGif:
+        await _pickGif();
+      case DesktopAvatarAction.searchGifs:
+        await _searchGifs();
+    }
+  }
+
+  /// Opens the KLIPY search and uses the chosen GIF as the avatar.
+  Future<void> _searchGifs() async {
+    final service = widget.klipyGifService ?? KlipyGifService.shared;
+    final gif = await showProfileKlipyGifPicker(context, service);
+    if (gif == null || !mounted) return;
+    setState(() {
+      _photoUrl = gif.avatarUrl;
+      _photoError = null;
+    });
+  }
+
+  /// Opens the avatar choices: a desktop menu on Windows, the sheet on phone.
+  void _openPhotoChoices(BuildContext anchor) {
+    if (desktopPanelsEnabled) {
+      unawaited(_pickPhotoDesktop(anchor));
+    } else {
+      unawaited(_pickPhoto());
+    }
   }
 
   Future<void> _pickPhoto() async {
@@ -292,13 +398,7 @@ class _ViewerProfileEditorScreenState extends State<ViewerProfileEditorScreen> {
       return;
     }
     if (source == _PhotoSource.klipy) {
-      final service = widget.klipyGifService ?? KlipyGifService.shared;
-      final gif = await showProfileKlipyGifPicker(context, service);
-      if (gif == null || !mounted) return;
-      setState(() {
-        _photoUrl = gif.avatarUrl;
-        _photoError = null;
-      });
+      await _searchGifs();
       return;
     }
     await _pickStillPhoto();
@@ -533,98 +633,142 @@ class _ViewerProfileEditorScreenState extends State<ViewerProfileEditorScreen> {
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    Row(
-                      children: [
-                        SizedBox.square(
-                          dimension: 76,
-                          child: CircleAvatar(
-                            backgroundColor: viewerProfileAvatarColor(_avatar),
-                            child: ProfileAvatarFace(
-                              profile: previewProfile,
-                              photoUrl: _photoUrl,
-                              iconSize: 36,
-                              photoDiameter: 70,
-                              klipyGifService: widget.klipyGifService,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 16),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                'Profile avatar',
-                                style: AppText.caption.copyWith(
-                                  color: AppColors.textSecondary,
-                                ),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                _name.text.trim().isEmpty
-                                    ? 'New profile'
-                                    : _name.text.trim(),
-                                key: const ValueKey(
-                                  'profile-editor-preview-name',
-                                ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: AppText.title,
-                              ),
-                              const SizedBox(height: 8),
-                              Wrap(
-                                spacing: 4,
-                                crossAxisAlignment: WrapCrossAlignment.center,
-                                children: [
-                                  FilledButton.tonalIcon(
-                                    onPressed: _uploading ? null : _pickPhoto,
-                                    icon: _uploading
-                                        ? const SizedBox.square(
-                                            dimension: 16,
-                                            child: CircularProgressIndicator(
-                                              strokeWidth: 2,
-                                            ),
-                                          )
-                                        : const Icon(
-                                            Icons.photo_outlined,
-                                            size: 18,
-                                          ),
-                                    label: Text(
-                                      _uploading
-                                          ? 'Uploading…'
-                                          : _photoUrl == null
-                                          ? 'Choose avatar'
-                                          : 'Change avatar',
-                                    ),
+                    // Windows: an image dropped on (or pasted onto) the
+                    // avatar row uploads as the avatar. Phone: unchanged.
+                    DesktopAvatarDropZone(
+                      key: const ValueKey('profile-editor-avatar-drop'),
+                      enabled: !_uploading,
+                      onImage: (bytes) => unawaited(_uploadAvatarBytes(bytes)),
+                      onError: (message) =>
+                          setState(() => _photoError = message),
+                      child: Row(
+                        children: [
+                          Builder(
+                            builder: (avatarContext) {
+                              final face = SizedBox.square(
+                                dimension: 76,
+                                child: CircleAvatar(
+                                  backgroundColor: viewerProfileAvatarColor(
+                                    _avatar,
                                   ),
-                                  if (_photoUrl != null)
-                                    IconButton.filledTonal(
-                                      tooltip: 'Remove avatar',
-                                      onPressed: _uploading
-                                          ? null
-                                          : () => setState(
-                                              () => _photoUrl = null,
-                                            ),
-                                      icon: const Icon(
-                                        Icons.delete_outline_rounded,
-                                        size: 18,
-                                      ),
-                                    ),
-                                ],
-                              ),
-                              if (_photoError != null) ...[
+                                  child: ProfileAvatarFace(
+                                    profile: previewProfile,
+                                    photoUrl: _photoUrl,
+                                    iconSize: 36,
+                                    photoDiameter: 70,
+                                    klipyGifService: widget.klipyGifService,
+                                  ),
+                                ),
+                              );
+                              if (!desktopPanelsEnabled) return face;
+                              // Windows: clicking the avatar opens the avatar
+                              // menu right below it.
+                              return Tooltip(
+                                message: context.l10n.changeAvatarDropPaste,
+                                child: InkWell(
+                                  key: const ValueKey(
+                                    'profile-editor-avatar-button',
+                                  ),
+                                  customBorder: const CircleBorder(),
+                                  onTap: _uploading
+                                      ? null
+                                      : () => _openPhotoChoices(avatarContext),
+                                  child: face,
+                                ),
+                              );
+                            },
+                          ),
+                          const SizedBox(width: 16),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Profile avatar',
+                                  style: AppText.caption.copyWith(
+                                    color: AppColors.textSecondary,
+                                  ),
+                                ),
                                 const SizedBox(height: 4),
                                 Text(
-                                  _photoError!,
-                                  style: AppText.caption.copyWith(
-                                    color: Theme.of(context).colorScheme.error,
+                                  _name.text.trim().isEmpty
+                                      ? 'New profile'
+                                      : _name.text.trim(),
+                                  key: const ValueKey(
+                                    'profile-editor-preview-name',
                                   ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: AppText.title,
                                 ),
+                                const SizedBox(height: 8),
+                                Wrap(
+                                  spacing: 4,
+                                  crossAxisAlignment: WrapCrossAlignment.center,
+                                  children: [
+                                    Builder(
+                                      builder: (buttonContext) =>
+                                          FilledButton.tonalIcon(
+                                            key: const ValueKey(
+                                              'profile-editor-choose-avatar',
+                                            ),
+                                            onPressed: _uploading
+                                                ? null
+                                                : () => _openPhotoChoices(
+                                                    buttonContext,
+                                                  ),
+                                            icon: _uploading
+                                                ? const SizedBox.square(
+                                                    dimension: 16,
+                                                    child:
+                                                        CircularProgressIndicator(
+                                                          strokeWidth: 2,
+                                                        ),
+                                                  )
+                                                : const Icon(
+                                                    Icons.photo_outlined,
+                                                    size: 18,
+                                                  ),
+                                            label: Text(
+                                              _uploading
+                                                  ? 'Uploading…'
+                                                  : _photoUrl == null
+                                                  ? 'Choose avatar'
+                                                  : 'Change avatar',
+                                            ),
+                                          ),
+                                    ),
+                                    if (_photoUrl != null)
+                                      IconButton.filledTonal(
+                                        tooltip: 'Remove avatar',
+                                        onPressed: _uploading
+                                            ? null
+                                            : () => setState(
+                                                () => _photoUrl = null,
+                                              ),
+                                        icon: const Icon(
+                                          Icons.delete_outline_rounded,
+                                          size: 18,
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                                if (_photoError != null) ...[
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    _photoError!,
+                                    style: AppText.caption.copyWith(
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.error,
+                                    ),
+                                  ),
+                                ],
                               ],
-                            ],
+                            ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                     const SizedBox(height: 18),
                     TextField(
@@ -759,11 +903,38 @@ class _ViewerProfileEditorScreenState extends State<ViewerProfileEditorScreen> {
                   ),
                 ],
               ),
+              // The synced account lock, on every platform (Windows too): one
+              // PIN locks the profile on phone, TV and PC.
+              const SizedBox(height: 10),
+              SettingsCard(
+                key: const ValueKey('profile-editor-lock-card'),
+                margin: EdgeInsets.zero,
+                children: [
+                  SettingsTile(
+                    icon: Icons.lock_rounded,
+                    title: 'Profile lock',
+                    subtitle: _locked
+                        ? 'PIN required to open this profile'
+                        : 'Ask for a PIN before opening this profile',
+                    trailing: Icon(
+                      _locked ? Icons.lock_rounded : Icons.lock_open_rounded,
+                      color: _locked
+                          ? AppColors.accent
+                          : AppColors.textTertiary,
+                    ),
+                    onTap: _manageLock,
+                  ),
+                ],
+              ),
               const SizedBox(height: 10),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 4),
                 child: Text(
-                  'Kids profiles hide adult-rated catalogue titles only when ratings are available. This is not a parental lock.',
+                  // Windows: say where the lock applies, since older PC
+                  // builds kept the PIN on this PC only.
+                  defaultTargetPlatform == TargetPlatform.windows
+                      ? 'The profile PIN is saved to your account, so it locks this profile on your phone, TV and PC. This PC can check it offline after it has been used here once. Kids profiles hide adult-rated catalogue titles only when ratings are available.'
+                      : 'Kids profiles hide adult-rated catalogue titles only when ratings are available. This is not a parental lock.',
                   style: AppText.caption.copyWith(
                     color: AppColors.textTertiary,
                   ),

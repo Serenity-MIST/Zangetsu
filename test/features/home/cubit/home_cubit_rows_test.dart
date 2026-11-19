@@ -75,14 +75,14 @@ class _FakeTracker implements Tracker {
   _FakeTracker({
     this.name = 'AniList',
     this.connected = true,
-    this.reading = true,
     List<TrackerListItem>? library,
     this.error,
   }) : library = library ?? const [];
 
   final String name;
   bool connected;
-  final bool reading;
+  // Every fake tracker in these tests supports reading.
+  final bool reading = true;
   List<TrackerListItem> library;
   Object? error;
   int fetchCount = 0;
@@ -123,6 +123,7 @@ TrackerListItem _entry(
   int? totalEpisodes,
   int? nextAiringEpisode,
   DateTime? updatedAt,
+  DateTime? latestReleaseAt,
 }) => TrackerListItem(
   item: _item(title),
   status: status,
@@ -130,6 +131,7 @@ TrackerListItem _entry(
   totalEpisodes: totalEpisodes,
   nextAiringEpisode: nextAiringEpisode,
   updatedAt: updatedAt,
+  latestReleaseAt: latestReleaseAt,
 );
 
 void main() {
@@ -158,7 +160,11 @@ void main() {
     () async {
       final tracker = _FakeTracker(
         library: [
-          _entry('Fresh series', progress: 2, totalEpisodes: 12),
+          _entry('Fresh series', progress: 2, totalEpisodes: 12,
+              latestReleaseAt: DateTime.now().subtract(const Duration(days: 2))),
+          // Finished long ago: unwatched episodes, but nothing is NEW.
+          _entry('Old finished', progress: 2, totalEpisodes: 12,
+              latestReleaseAt: DateTime(2023, 6, 1)),
           _entry('Caught up', progress: 12, totalEpisodes: 12),
           _entry('Unknown release', progress: 1),
         ],

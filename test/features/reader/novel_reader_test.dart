@@ -287,6 +287,7 @@ class _FakeTracker extends ChangeNotifier implements Tracker {
     WatchStatus? status,
     double? score,
     int? progress,
+    bool? isPrivate,
     MediaKind kind = MediaKind.anime,
   }) async {}
 
@@ -409,6 +410,24 @@ void main() {
       expect(novelFontFamily('serif'), 'serif');
       expect(novelFontFamily('system'), isNull);
       expect(novelFontFamily('nonsense'), 'Inter');
+      expect(novelFontFallback('serif'), isNull);
+    });
+
+    test('Windows names real installed faces for Serif and System', () {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      expect(novelFontFamily('serif'), 'Georgia');
+      expect(novelFontFallback('serif'), ['Cambria', 'Times New Roman']);
+      expect(novelFontFamily('system'), 'Segoe UI');
+      expect(novelFontFamily('inter'), 'Inter');
+      expect(novelFontFallback('inter'), isNull);
+      // The faces ship with Windows; check them on a Windows host.
+      if (Platform.isWindows) {
+        final fonts = '${Platform.environment['WINDIR']}\\Fonts';
+        expect(File('$fonts\\georgia.ttf').existsSync(), isTrue);
+        expect(File('$fonts\\segoeui.ttf').existsSync(), isTrue);
+      }
+      debugDefaultTargetPlatformOverride = null;
     });
   });
 

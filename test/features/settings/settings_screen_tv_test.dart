@@ -21,7 +21,6 @@ import 'package:get_it/get_it.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/anilist/anilist_service.dart';
 import 'package:watch_app/core/app_mode.dart';
-import 'package:watch_app/core/appwrite/appwrite_service.dart';
 import 'package:watch_app/core/download/download_prefs.dart';
 import 'package:watch_app/core/locale/locale_controller.dart';
 import 'package:watch_app/core/playback/playback_prefs.dart';
@@ -38,15 +37,8 @@ import 'package:watch_app/core/tracker/simkl_service.dart';
 import 'package:watch_app/core/tv/tv_focusable.dart';
 import 'package:watch_app/core/tv/tv_list_focusable.dart';
 import 'package:watch_app/features/auth/auth_cubit.dart';
-import 'package:watch_app/features/auth/migration_bridge.dart';
 import 'package:watch_app/features/settings/settings_screen.dart';
 import 'package:watch_app/l10n/app_localizations.dart';
-
-MigrationBridge _fakeBridge() => MigrationBridge(
-  invoke: (_, __) async => const {'ok': false},
-  signInPassword: (_, __) async => false,
-  verifyOtp: (_, __) async => false,
-);
 
 // ── Minimal stubs ─────────────────────────────────────────────────────────────
 
@@ -97,6 +89,7 @@ class _StubSimkl implements SimklService {
 /// Registers the GetIt singletons needed for [SettingsScreen] with [AppMode.isTv].
 Future<void> _registerStubs() async {
   await Hive.openBox(PlaybackPrefs.boxName);
+  await Hive.openBox(SearchPrefs.boxName);
   await Hive.openBox(DownloadPrefs.boxName);
   await Hive.openBox(TorrentPrefs.boxName);
   await Hive.openBox(ThemeController.boxName);
@@ -166,11 +159,7 @@ void main() {
     'TV SettingsScreen keeps sign-in available inside Profiles & account',
     (tester) async {
       _mockPathProvider(tester);
-      final authCubit = AuthCubit(
-        SupabaseService(),
-        AppwriteService(),
-        _fakeBridge(),
-      );
+      final authCubit = AuthCubit(SupabaseService());
       addTearDown(authCubit.close);
       GetIt.instance.registerSingleton<AuthCubit>(authCubit);
 
@@ -196,11 +185,7 @@ void main() {
     await tester.binding.setSurfaceSize(const Size(1280, 2200));
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
-    final authCubit = AuthCubit(
-      SupabaseService(),
-      AppwriteService(),
-      _fakeBridge(),
-    );
+    final authCubit = AuthCubit(SupabaseService());
     addTearDown(authCubit.close);
 
     await tester.pumpWidget(
@@ -234,11 +219,7 @@ void main() {
     tester,
   ) async {
     _mockPathProvider(tester);
-    final authCubit = AuthCubit(
-      SupabaseService(),
-      AppwriteService(),
-      _fakeBridge(),
-    );
+    final authCubit = AuthCubit(SupabaseService());
     addTearDown(authCubit.close);
 
     await tester.pumpWidget(
@@ -264,11 +245,7 @@ void main() {
     await tester.binding.setSurfaceSize(const Size(1280, 2200));
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
-    final authCubit = AuthCubit(
-      SupabaseService(),
-      AppwriteService(),
-      _fakeBridge(),
-    );
+    final authCubit = AuthCubit(SupabaseService());
     addTearDown(authCubit.close);
 
     await tester.pumpWidget(
@@ -294,11 +271,7 @@ void main() {
     'TV SettingsScreen only the first TvFocusable has autofocus=true',
     (tester) async {
       _mockPathProvider(tester);
-      final authCubit = AuthCubit(
-        SupabaseService(),
-        AppwriteService(),
-        _fakeBridge(),
-      );
+      final authCubit = AuthCubit(SupabaseService());
       addTearDown(authCubit.close);
 
       await tester.pumpWidget(
@@ -325,11 +298,7 @@ void main() {
       await tester.binding.setSurfaceSize(const Size(1280, 2200));
       addTearDown(() => tester.binding.setSurfaceSize(null));
 
-      final authCubit = AuthCubit(
-        SupabaseService(),
-        AppwriteService(),
-        _fakeBridge(),
-      );
+      final authCubit = AuthCubit(SupabaseService());
       addTearDown(authCubit.close);
 
       await tester.pumpWidget(

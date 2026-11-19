@@ -7,6 +7,7 @@
 #include "../in_app_webview/in_app_webview_settings.h"
 #include "../types/url_request.h"
 #include "../types/user_script.h"
+#include "../utils/com_apartment.h"
 #include "../utils/flutter.h"
 #include "../utils/log.h"
 #include "../utils/string.h"
@@ -21,36 +22,62 @@ namespace flutter_inappwebview_plugin
     ChannelDelegate(plugin->registrar->messenger(), InAppWebViewManager::METHOD_CHANNEL_NAME)
   {
     ++live_managers_;
+    // Zangetsu patch: make sure the platform thread is a COM STA before any
+    // WinRT/composition object is created on it.
+    ensureComApartment();
     if (!rohelper_) {
       rohelper_ = std::make_unique<rx::RoHelper>(RO_INIT_SINGLETHREADED);
-
-      if (rohelper_->WinRtAvailable()) {
-        DispatcherQueueOptions options{ sizeof(DispatcherQueueOptions),
-                                       DQTYPE_THREAD_CURRENT, DQTAT_COM_STA };
-
-        if (FAILED(rohelper_->CreateDispatcherQueueController(
-          options, dispatcher_queue_controller_.put()))) {
-          std::cerr << "Creating DispatcherQueueController failed." << std::endl;
-          return;
-        }
-
-        if (!isGraphicsCaptureSessionSupported()) {
-          std::cerr << "Windows::Graphics::Capture::GraphicsCaptureSession is not "
-            "supported."
-            << std::endl;
-          return;
-        }
-
-        graphics_context_ = std::make_unique<GraphicsContext>(rohelper_.get());
-        compositor_ = graphics_context_->CreateCompositor();
-        valid_ = graphics_context_->IsValid();
-      }
+      initSharedGraphics();
     }
 
     windowClass_.lpszClassName = CustomPlatformView::CLASS_NAME;
     windowClass_.lpfnWndProc = &DefWindowProc;
 
     RegisterClass(&windowClass_);
+  }
+
+  void InAppWebViewManager::initSharedGraphics()
+  {
+    // Zangetsu patch: moved out of the constructor so the shared objects can
+    // be rebuilt when the platform thread's COM apartment had to be repaired
+    // (objects from a torn-down apartment cannot host new WebViews).
+    graphics_generation_ = comApartmentGeneration.load();
+    valid_ = false;
+    if (!rohelper_ || !rohelper_->WinRtAvailable()) {
+      return;
+    }
+
+    DispatcherQueueOptions options{ sizeof(DispatcherQueueOptions),
+                                   DQTYPE_THREAD_CURRENT, DQTAT_COM_STA };
+
+    if (FAILED(rohelper_->CreateDispatcherQueueController(
+      options, dispatcher_queue_controller_.put()))) {
+      std::cerr << "Creating DispatcherQueueController failed." << std::endl;
+      return;
+    }
+
+    HSTRING className;
+    HSTRING_HEADER classNameHeader;
+    ABI::Windows::Graphics::Capture::IGraphicsCaptureSessionStatics* capture_session_statics = nullptr;
+    boolean is_supported = false;
+    if (FAILED(rohelper_->GetStringReference(
+      RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureSession,
+      &className, &classNameHeader)) ||
+      FAILED(rohelper_->GetActivationFactory(
+        className,
+        __uuidof(ABI::Windows::Graphics::Capture::IGraphicsCaptureSessionStatics),
+        (void**)&capture_session_statics)) ||
+      FAILED(capture_session_statics->IsSupported(&is_supported)) ||
+      !is_supported) {
+      std::cerr << "Windows::Graphics::Capture::GraphicsCaptureSession is not "
+        "supported."
+        << std::endl;
+      return;
+    }
+
+    graphics_context_ = std::make_unique<GraphicsContext>(rohelper_.get());
+    compositor_ = graphics_context_->CreateCompositor();
+    valid_ = graphics_context_->IsValid();
   }
 
   void InAppWebViewManager::HandleMethodCall(const flutter::MethodCall<flutter::EncodableValue>& method_call,
@@ -60,12 +87,9 @@ namespace flutter_inappwebview_plugin
     auto& methodName = method_call.method_name();
 
     if (string_equals(methodName, "createInAppWebView")) {
-      if (isSupported()) {
-        createInAppWebView(arguments, std::move(result));
-      }
-      else {
-        result->Error("0", "Creating an InAppWebView instance is not supported! Graphics Context is not valid!");
-      }
+      // Zangetsu patch: createInAppWebView repairs COM and rebuilds the shared
+      // graphics when needed, then reports an unsupported context itself.
+      createInAppWebView(arguments, std::move(result));
     }
     else if (string_equals(methodName, "dispose")) {
       auto id = get_fl_map_value<int64_t>(*arguments, "id");
@@ -94,6 +118,27 @@ namespace flutter_inappwebview_plugin
 
     if (!plugin) {
       result_->Error("0", "Cannot create the InAppWebView instance!");
+      return;
+    }
+
+    // Zangetsu patch: repair the platform thread's COM apartment when needed.
+    // If it had been torn down, the shared composition objects belong to the
+    // dead apartment: leak them on purpose (releasing them there is unsafe)
+    // and build fresh ones before hosting this WebView.
+    const auto comHr = ensureComApartment();
+    if (FAILED(comHr)) {
+      result_->Error("0", "Cannot create the InAppWebView instance: " + getHRMessage(comHr) +
+        " (" + describeComApartment() + ")");
+      return;
+    }
+    if (rohelper_ && graphics_generation_ != comApartmentGeneration.load()) {
+      (void)compositor_.detach();
+      (void)graphics_context_.release();
+      (void)dispatcher_queue_controller_.detach();
+      initSharedGraphics();
+    }
+    if (!isSupported()) {
+      result_->Error("0", "Creating an InAppWebView instance is not supported! Graphics Context is not valid!");
       return;
     }
 

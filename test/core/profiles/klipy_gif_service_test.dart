@@ -10,7 +10,8 @@ void main() {
     final adapter = _Adapter();
     final service = KlipyGifService(
       Dio()..httpClientAdapter = adapter,
-      apiKey: 'test-key',
+      baseUrl: 'https://sync.zangetsu.online/klipy/v1',
+      accessToken: () => 'test-access-token',
     );
 
     final results = await service.search(' cat, dance! ');
@@ -18,19 +19,23 @@ void main() {
     expect(results.map((gif) => gif.slug), ['first-gif', 'second-gif']);
     expect(results.first.thumbnailUrl, 'https://static.klipy.com/first-xs.gif');
     expect(results.first.avatarUrl, 'https://static.klipy.com/first-sm.gif');
-    expect(adapter.request!.uri.path, '/api/v1/test-key/gifs/search');
-    expect(adapter.request!.queryParameters['q'], ' cat, dance! ');
-    expect(adapter.request!.queryParameters['content_filter'], 'high');
-    expect(adapter.request!.queryParameters['format_filter'], 'gif');
+    expect(adapter.request!.uri.path, '/klipy/v1/gifs/search');
+    expect(adapter.request!.uri.host, 'sync.zangetsu.online');
+    expect(
+      adapter.request!.headers['Authorization'],
+      'Bearer test-access-token',
+    );
+    expect(adapter.request!.queryParameters, {'q': ' cat, dance! '});
   });
 
   test(
-    'avatar reference resolves directly from KLIPY and is reused in memory',
+    'avatar reference resolves through the authenticated proxy and is reused',
     () async {
       final adapter = _Adapter();
       final service = KlipyGifService(
         Dio()..httpClientAdapter = adapter,
-        apiKey: 'test-key',
+        baseUrl: 'https://sync.zangetsu.online/klipy/v1',
+        accessToken: () => 'test-access-token',
       );
 
       final first = await service.avatarUrlForSlug('first-gif');
@@ -39,8 +44,12 @@ void main() {
       expect(first, 'https://static.klipy.com/first-sm.gif');
       expect(second, first);
       expect(adapter.requests, 1);
-      expect(adapter.request!.uri.path, '/api/v1/test-key/gifs/items');
-      expect(adapter.request!.queryParameters['slugs'], 'first-gif');
+      expect(adapter.request!.uri.path, '/klipy/v1/gifs/items');
+      expect(
+        adapter.request!.headers['Authorization'],
+        'Bearer test-access-token',
+      );
+      expect(adapter.request!.queryParameters, {'slugs': 'first-gif'});
     },
   );
 
@@ -48,7 +57,8 @@ void main() {
     final adapter = _Adapter()..failNextItems = true;
     final service = KlipyGifService(
       Dio()..httpClientAdapter = adapter,
-      apiKey: 'test-key',
+      baseUrl: 'https://sync.zangetsu.online/klipy/v1',
+      accessToken: () => 'test-access-token',
     );
 
     expect(await service.avatarUrlForSlug('first-gif'), isNull);
@@ -69,6 +79,56 @@ void main() {
     final gif = KlipyGif.fromJson(_item('hi-6365--kK1W3DOGN', 'zoro'));
 
     expect(gif?.slug, 'hi-6365--kK1W3DOGN');
+  });
+
+  test('does not call the proxy while signed out', () async {
+    final adapter = _Adapter();
+    final service = KlipyGifService(
+      Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://sync.zangetsu.online/klipy/v1',
+      accessToken: () => null,
+    );
+
+    expect(service.isConfigured, isTrue);
+    expect(service.isSignedIn, isFalse);
+    expect(await service.search('cat'), isEmpty);
+    expect(await service.avatarUrlForSlug('first-gif'), isNull);
+    await service.registerSelection(
+      const KlipyGif(
+        slug: 'first-gif',
+        title: '',
+        thumbnailUrl: 'https://static.klipy.com/first-xs.gif',
+        avatarUrl: 'https://static.klipy.com/first-sm.gif',
+      ),
+      'cat',
+    );
+    expect(adapter.requests, 0);
+  });
+
+  test('selection tracking uses the authenticated proxy route', () async {
+    final adapter = _Adapter();
+    final service = KlipyGifService(
+      Dio()..httpClientAdapter = adapter,
+      baseUrl: 'https://sync.zangetsu.online/klipy/v1',
+      accessToken: () => 'test-access-token',
+    );
+
+    await service.registerSelection(
+      const KlipyGif(
+        slug: 'first-gif',
+        title: '',
+        thumbnailUrl: 'https://static.klipy.com/first-xs.gif',
+        avatarUrl: 'https://static.klipy.com/first-sm.gif',
+      ),
+      'cat',
+    );
+
+    expect(adapter.request!.uri.path, '/klipy/v1/gifs/share/first-gif');
+    expect(
+      adapter.request!.headers['Authorization'],
+      'Bearer test-access-token',
+    );
+    expect(adapter.request!.data, {'q': 'cat'});
   });
 }
 

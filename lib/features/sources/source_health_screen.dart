@@ -1,8 +1,14 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
+import '../../core/provider/js_engine.dart' show JsEngine;
+import '../../core/repository/source_actions.dart' as source_actions;
+import '../../core/ui/desktop_docked_panel.dart';
 import 'manage_source_route.dart';
+import 'sources_desktop_kit.dart' show DesktopProviderScope;
 import '../../core/ui/settings_widgets.dart';
 import '../../core/ui/desktop_settings_surface.dart';
 
@@ -16,6 +22,7 @@ import '../search/bloc/search_bloc.dart' show SearchBloc;
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/tv/tv_list_focusable.dart';
+import '../../core/tv/tv_focusable.dart';
 import '../../l10n/l10n.dart';
 
 /// "Test sources" — probes every enabled source concurrently and shows, per
@@ -105,6 +112,18 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
   /// off the UI isolate, which is a much bigger change than this screen.
   static const int _maxConcurrentDeep = 2;
 
+  /// Deep-check pool size for this run (src-1). On Windows, JS providers now
+  /// run in [JsEngine]'s own isolate, so a deep check no longer blocks the UI
+  /// and the full [_maxConcurrent] pool is safe. Phone keeps the cap of 2 so
+  /// its behaviour is unchanged. LNReader plugins (`lnr:` ids) still run on
+  /// the UI isolate everywhere, so [_runTests] keeps their deep checks at
+  /// [_maxConcurrentDeep] in flight even inside the bigger pool.
+  static int get _deepPoolSize =>
+      defaultTargetPlatform == TargetPlatform.windows &&
+          JsEngine.runsOffUiIsolate
+      ? _maxConcurrent
+      : _maxConcurrentDeep;
+
   List<_ProbeResult> _results = const [];
   bool _testing = false;
 
@@ -139,12 +158,47 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
     // [_maxConcurrent] probes are ever in flight.
     final queue = List<_ProbeResult>.of(_results);
     var next = 0;
+
+    // src-1: LNReader plugins still run on the UI isolate, so when the deep
+    // pool is bigger than the old cap (Windows), a small slot counter keeps
+    // at most [_maxConcurrentDeep] of their deep checks in flight. A worker
+    // waiting for a slot just pauses; the other workers keep going.
+    final pool = deep ? _deepPoolSize : _maxConcurrent;
+    final capLnr = deep && pool > _maxConcurrentDeep;
+    var lnrFree = _maxConcurrentDeep;
+    final lnrWaiters = <Completer<void>>[];
+    Future<void> takeLnrSlot() async {
+      if (lnrFree > 0) {
+        lnrFree--;
+        return;
+      }
+      final waiter = Completer<void>();
+      lnrWaiters.add(waiter);
+      await waiter.future;
+    }
+
+    // Hands the slot straight to the next waiter, or frees it.
+    void giveLnrSlot() {
+      if (lnrWaiters.isNotEmpty) {
+        lnrWaiters.removeAt(0).complete();
+      } else {
+        lnrFree++;
+      }
+    }
+
     Future<void> worker() async {
       while (true) {
         if (gen != _runGen || !mounted) return;
         final i = next++;
         if (i >= queue.length) return;
-        await _probe(queue[i], deep: deep, gen: gen);
+        final r = queue[i];
+        final limited = capLnr && r.id.startsWith('lnr:');
+        if (limited) await takeLnrSlot();
+        try {
+          await _probe(r, deep: deep, gen: gen);
+        } finally {
+          if (limited) giveLnrSlot();
+        }
         // Hand the frame back between sources — without this a run of
         // synchronous provider work never lets the list repaint.
         await Future<void>.delayed(Duration.zero);
@@ -152,8 +206,7 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
     }
 
     await Future.wait([
-      for (var i = 0; i < (deep ? _maxConcurrentDeep : _maxConcurrent); i++)
-        worker(),
+      for (var i = 0; i < pool; i++) worker(),
     ]);
 
     if (mounted && gen == _runGen) setState(() => _testing = false);
@@ -307,6 +360,10 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Windows: the desktop settings look whatever opened it (src-3 A).
+    if (desktopPanelsEnabled && !DesktopSettingsScope.contains(context)) {
+      return DesktopProviderScope(child: Builder(builder: build));
+    }
     // context.l10n.working means it returned results — not merely that it answered.
     final working = _results
         .where((r) => !r.running && r.outcome == SourceOutcome.ok)
@@ -387,6 +444,7 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
                               color: AppColors.hairline,
                             ),
                           _HealthRow(
+                            autofocus: i == 0,
                             result: _results[i],
                             present: _present,
                             onDisable: _results[i].isCloudStream
@@ -506,12 +564,65 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
               onManage: canManageSource(result.id)
                   ? () => openManageSource(context, result.id)
                   : null,
+              // Windows: Verify on Blocked rows (src-9 A).
+              onVerify: desktopPanelsEnabled
+                  ? () => _verifyAndRetest(result)
+                  : null,
             ),
           ],
         ),
       );
     },
   );
+
+  /// Re-tests one source (after a verification) without restarting the run.
+  /// Uses the current run's generation, so a newer full run still wins.
+  Future<void> _retestOne(_ProbeResult r) async {
+    if (!mounted) return;
+    setState(() {
+      r.running = true;
+      r.outcome = null;
+      r.deepOk = null;
+      r.deepNote = null;
+    });
+    await _probe(r, gen: _runGen, deep: _deep);
+  }
+
+  /// src-9 A: a Blocked (Cloudflare) source gets a Verify button. It opens
+  /// the site's verification window and, once that is passed, re-tests just
+  /// that source so the row updates in place.
+  Future<void> _verifyAndRetest(_ProbeResult r) async {
+    final messenger = ScaffoldMessenger.of(context);
+    // Read before the awaits below so no context is used across them.
+    final l10n = context.l10n;
+    void say(String text) => messenger
+      ..clearSnackBars()
+      ..showSnackBar(SnackBar(content: Text(text)));
+    final target = await _repo.cfSolveTargetFor(r.id);
+    if (!mounted) return;
+    if (target == null || target.isEmpty) {
+      say(l10n.sourceNoSiteToVerify(r.name));
+      return;
+    }
+    bool verified;
+    try {
+      verified = await source_actions.verifySourceChallenge(r.id, target);
+    } on PlatformException catch (error) {
+      if (error.code == 'CANCELLED') return;
+      say(l10n.verificationFailedError(error.message ?? error.code));
+      return;
+    } catch (error) {
+      say(l10n.verificationFailedError('$error'));
+      return;
+    }
+    if (!mounted) return;
+    if (!verified) {
+      say(l10n.verificationNotCompleted);
+      return;
+    }
+    say(l10n.verifiedTestingAgain(r.name));
+    await _retestOne(r);
+  }
 
   /// Inline action for a dead source: drop it from cross-source search (the same
   /// search-only toggle the source picker uses). Reversible from search settings.
@@ -537,9 +648,15 @@ class _HealthRow extends StatelessWidget {
     this.onDisable,
     this.playbackFails = 0,
     this.onManage,
+    this.onVerify,
+    this.autofocus = false,
   });
 
   final _ProbeResult result;
+
+  /// Opens the site's verification and re-tests the source; shown on
+  /// Blocked rows (src-9 A). Null hides it (phone / TV).
+  final VoidCallback? onVerify;
   final ({Color color, IconData icon, String label}) Function(SourceOutcome)
   present;
   final bool searchIncluded;
@@ -553,6 +670,21 @@ class _HealthRow extends StatelessWidget {
   /// Opens the Sources screen that owns this source, where uninstalling lives.
   /// Null when the source has no such screen (Z-Mode).
   final VoidCallback? onManage;
+  final bool autofocus;
+
+  Widget _focusForTv(Widget child) {
+    if (!sl.isRegistered<AppMode>() || !sl<AppMode>().isTv) return child;
+    // Every result needs a remote target, including rows without actions.
+    return TvFocusable(
+      autofocus: autofocus,
+      scale: 1,
+      variant: TvFocusVariant.row,
+      semanticLabel: result.name,
+      isButton: false,
+      onTap: () {},
+      child: child,
+    );
+  }
 
   bool get _playbackDead => playbackFails >= SourceHealthStore.deadAfterTitles;
 
@@ -642,6 +774,23 @@ class _HealthRow extends StatelessWidget {
               ),
             ),
             if (!result.running &&
+                result.outcome == SourceOutcome.blocked &&
+                onVerify != null) ...[
+              // Blocked = a Cloudflare check; verifying it is the fix.
+              const SizedBox(height: 10),
+              Align(
+                alignment: AlignmentDirectional.centerEnd,
+                child: Tooltip(
+                  message: context.l10n.openSitePassCheckTestAgain,
+                  child: FilledButton.icon(
+                    key: ValueKey('health-verify-${result.id}'),
+                    onPressed: onVerify,
+                    icon: const Icon(Icons.verified_user_outlined, size: 18),
+                    label: Text(context.l10n.verify),
+                  ),
+                ),
+              ),
+            ] else if (!result.running &&
                 _isDead &&
                 onDisable != null &&
                 searchIncluded) ...[
@@ -676,54 +825,56 @@ class _HealthRow extends StatelessWidget {
       child: Row(
         children: [
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  result.name,
-                  style: AppText.headline.copyWith(fontSize: 15),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                const SizedBox(height: 3),
-                Row(
-                  children: [
-                    if (result.running)
-                      Text(context.l10n.testing, style: AppText.caption)
-                    else if (p != null) ...[
-                      Icon(p.icon, size: 14, color: p.color),
-                      const SizedBox(width: 5),
-                      Text(
-                        p.label,
-                        style: AppText.caption.copyWith(
-                          color: p.color,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      if (_meta != null) ...[
-                        Text('  ·  ', style: AppText.caption),
-                        Flexible(
-                          child: Text(
-                            _meta!,
-                            style: AppText.caption,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
+            child: _focusForTv(
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    result.name,
+                    style: AppText.headline.copyWith(fontSize: 15),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 3),
+                  Row(
+                    children: [
+                      if (result.running)
+                        Text(context.l10n.testing, style: AppText.caption)
+                      else if (p != null) ...[
+                        Icon(p.icon, size: 14, color: p.color),
+                        const SizedBox(width: 5),
+                        Text(
+                          p.label,
+                          style: AppText.caption.copyWith(
+                            color: p.color,
+                            fontWeight: FontWeight.w600,
                           ),
                         ),
+                        if (_meta != null) ...[
+                          Text('  ·  ', style: AppText.caption),
+                          Flexible(
+                            child: Text(
+                              _meta!,
+                              style: AppText.caption,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ],
                       ],
                     ],
-                  ],
-                ),
-                if (!result.running && !searchIncluded) ...[
-                  const SizedBox(height: 3),
-                  Text(
-                    context.l10n.notSearched,
-                    style: AppText.overline.copyWith(
-                      color: AppColors.textTertiary,
-                    ),
                   ),
+                  if (!result.running && !searchIncluded) ...[
+                    const SizedBox(height: 3),
+                    Text(
+                      context.l10n.notSearched,
+                      style: AppText.overline.copyWith(
+                        color: AppColors.textTertiary,
+                      ),
+                    ),
+                  ],
                 ],
-              ],
+              ),
             ),
           ),
           if (result.running)

@@ -3,7 +3,9 @@ import 'package:flutter/material.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text.dart';
 import '../di/injector.dart';
+import '../desktop/desktop_dialogs.dart';
 import '../playback/playback_prefs.dart';
+import 'desktop_docked_panel.dart';
 
 /// What to do when someone opens something other than where they left off.
 enum JumpChoice {
@@ -56,6 +58,40 @@ Future<JumpChoice?> showJumpPrompt(
   required bool reading,
 }) {
   final what = reading ? 'chapter' : 'episode';
+  // Windows: the graphite choice dialog (title row with close button, two
+  // option rows, arrows + Enter, Esc). "Just look" is first, so a plain
+  // Enter keeps the safe answer. Dismissing still returns null.
+  if (desktopPanelsEnabled) {
+    return showDesktopChoiceDialog<JumpChoice>(
+      context,
+      title: 'Jump to this $what?',
+      description:
+          'You left off somewhere else. Take a look without losing your '
+          'place, or move your progress here.',
+      options: const [
+        (JumpChoice.peek, 'Just look'),
+        (JumpChoice.move, 'Move progress here'),
+      ],
+      // One-line explanations so each row says what it does to progress.
+      optionSubtitles: {
+        JumpChoice.peek: 'Open it without saving progress',
+        JumpChoice.move: 'Your progress moves to this $what',
+      },
+      // Same icons the phone buttons use.
+      leading: {
+        JumpChoice.peek: Icon(
+          Icons.visibility_outlined,
+          color: AppColors.accent,
+          size: 20,
+        ),
+        JumpChoice.move: Icon(
+          Icons.done_all_rounded,
+          color: AppColors.accent,
+          size: 20,
+        ),
+      },
+    );
+  }
   return showDialog<JumpChoice>(
     context: context,
     builder: (ctx) => Dialog(

@@ -4,6 +4,7 @@ import '../../core/zmode/tmdb_catalogue.dart';
 import '../settings/streaming_services_screen_tv.dart';
 import 'cubit/home_rows_composer.dart';
 import 'dart:async';
+import '../../core/stremio/stremio_poster_shape.dart';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
@@ -16,8 +17,10 @@ import '../../core/di/injector.dart';
 import '../../core/platform/apple_tv.dart';
 import '../../core/ui/global_messenger.dart';
 import '../../core/ui/native_cover_provider.dart';
+import '../../core/ui/banner_image_preloader.dart';
 import '../../core/metadata/title_logo_service.dart';
 import '../../core/mihon/mihon_extension_service.dart';
+import '../../core/mangayomi/mangayomi_cloudflare.dart';
 import '../../core/models/episode.dart';
 import '../../core/models/home_section.dart';
 import '../../core/models/media_detail.dart';
@@ -29,7 +32,6 @@ import '../../core/playback/playback_prefs.dart';
 import '../../core/playback/resume_store.dart';
 import '../../core/playback/title_prefs.dart';
 import '../../core/playback/watch_history.dart';
-import '../../core/provider/provider_manager.dart';
 import '../../core/provider/provider_registry.dart';
 import '../../core/repository/catalogue_repository.dart';
 import '../../core/repository/source_repository.dart';
@@ -100,10 +102,13 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
   @override
   void initState() {
     super.initState();
-    _sourceCatalogueSelected = HomeCataloguePrefs.sourceSelected;
-    _sourceCatalogueSourceId = HomeCataloguePrefs.sourceId;
+    _sourceCatalogueSelected = HomeCataloguePrefs.catalogueShown;
+    _sourceCatalogueSourceId = HomeCataloguePrefs.sourceIdFor(
+      sl<ContentModeCubit>().state,
+    );
     _sourceCatalogueSelection = HomeCataloguePrefs.sourceSelection
       ..addListener(_onSourceCatalogueSelectionChanged);
+    HomeCataloguePrefs.revision.addListener(_onCatalogueRevision);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       if (isAppleTv) setState(() => _historyLive = true);
@@ -123,30 +128,53 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
     _sourceCatalogueSelection.removeListener(
       _onSourceCatalogueSelectionChanged,
     );
+    HomeCataloguePrefs.revision.removeListener(_onCatalogueRevision);
     super.dispose();
   }
 
   void _onSourceCatalogueSelectionChanged() {
-    final selected = _sourceCatalogueSelection.value;
-    if (!mounted || selected == _sourceCatalogueSelected) return;
+    _refreshCatalogueSelection();
+  }
+
+  void _onCatalogueRevision() {
+    _refreshCatalogueSelection();
+  }
+
+  void _refreshCatalogueSelection() {
+    if (!mounted) return;
+    final selected = HomeCataloguePrefs.catalogueShown;
+    final sourceId = HomeCataloguePrefs.sourceIdFor(
+      sl<ContentModeCubit>().state,
+    );
+    if (selected == _sourceCatalogueSelected &&
+        sourceId == _sourceCatalogueSourceId) {
+      return;
+    }
     setState(() {
       _sourceCatalogueSelected = selected;
       _sourceCatalogueSections = const [];
-      if (selected) {
+      _sourceCatalogueSourceId = sourceId;
+      if (selected && sourceId == null) {
         final activeId = context.read<ActiveSourceCubit>().state;
         if (sl.isRegistered<SourceRepository>() &&
             sl<SourceRepository>().loadedSources.any(
               (source) => source.id == activeId,
             )) {
-          _sourceCatalogueSourceId ??= activeId;
+          _sourceCatalogueSourceId = activeId;
         }
       }
     });
   }
 
-  Future<void> _selectCatalogueTab({StreamKind? kind}) async {
+  Future<void> _selectCatalogueTab({
+    StreamKind? kind,
+    HomeCatalogueKind catalogue = HomeCatalogueKind.metadata,
+  }) async {
     if (kind != null) await ZModePrefs.setStreamKind(kind);
-    await HomeCataloguePrefs.setSourceSelected(kind == null);
+    await HomeCataloguePrefs.setCatalogue(
+      sl<ContentModeCubit>().state,
+      catalogue,
+    );
   }
 
   void _selectHomeCatalogueSource(String sourceId) {
@@ -155,7 +183,9 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
       _sourceCatalogueSourceId = sourceId;
       _sourceCatalogueSections = const [];
     });
-    unawaited(HomeCataloguePrefs.setSourceId(sourceId));
+    unawaited(
+      HomeCataloguePrefs.setSourceIdFor(sl<ContentModeCubit>().state, sourceId),
+    );
   }
 
   void _setSourceCatalogueSections(List<HomeSection> sections) {
@@ -166,6 +196,9 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
   List<MediaItem> get _sourceCatalogueHeroItems {
     final sections = _sourceCatalogueSections;
     if (sections.isEmpty) return const [];
+    if (_sourceCatalogueSourceId == 'stremio') {
+      return stremioHeroItems(sections);
+    }
     for (final section in sections) {
       if (section.title.startsWith('Trending')) return section.items;
     }
@@ -180,6 +213,10 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
         sl<SourceRepository>().loadedSources.any(
           (source) => source.id == sourceId,
         );
+    final showSource =
+        _sourceCatalogueSelected &&
+        sourceIsAvailable &&
+        !HomeCataloguePrefs.stremioSelected;
     Widget tab(String label, String key, bool selected, VoidCallback onTap) =>
         TvFocusable(
           key: ValueKey(key),
@@ -215,71 +252,89 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
         child: SizedBox(
           key: const ValueKey('tv-home-header'),
           height: 56,
-          child: Stack(
-            alignment: Alignment.center,
+          child: Row(
             children: [
-              Align(
-                alignment: Alignment.centerLeft,
-                child: Image.asset(
-                  'assets/icon/logo_mark.png',
-                  width: 42,
-                  height: 42,
-                ),
-              ),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  tab(
-                    'Anime',
-                    'tv-home-tab-anime',
-                    !_sourceCatalogueSelected &&
-                        ZModePrefs.streamKind == StreamKind.anime,
-                    () =>
-                        unawaited(_selectCatalogueTab(kind: StreamKind.anime)),
-                  ),
-                  tab(
-                    'Movies & TV',
-                    'tv-home-tab-movie',
-                    !_sourceCatalogueSelected &&
-                        ZModePrefs.streamKind == StreamKind.movie,
-                    () =>
-                        unawaited(_selectCatalogueTab(kind: StreamKind.movie)),
-                  ),
-                  tab(
-                    'Source Catalogue',
-                    'tv-home-tab-source',
-                    _sourceCatalogueSelected,
-                    () => unawaited(_selectCatalogueTab()),
-                  ),
-                ],
-              ),
-              if (_sourceCatalogueSelected && sourceIsAvailable)
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Text(
-                        'Source · ',
-                        style: TextStyle(color: AppColors.textSecondary),
-                      ),
-                      SourceSwitcher(
-                        currentId: sourceId,
-                        onChanged: _selectHomeCatalogueSource,
-                        trailingBuilder: (id) => SourcePickerRowActions(
-                          sourceId: id,
-                          onCloudflareSolved: (solvedId) async {
-                            if (!mounted ||
-                                solvedId != _sourceCatalogueSourceId) {
-                              return;
-                            }
-                            await _sourceCatalogueController.refresh();
-                          },
+              Image.asset('assets/icon/logo_mark.png', width: 42, height: 42),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Center(
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.all(4),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        tab(
+                          'Anime',
+                          'tv-home-tab-anime',
+                          !_sourceCatalogueSelected &&
+                              ZModePrefs.streamKind == StreamKind.anime,
+                          () => unawaited(
+                            _selectCatalogueTab(kind: StreamKind.anime),
+                          ),
                         ),
-                      ),
-                    ],
+                        tab(
+                          'Movies & TV',
+                          'tv-home-tab-movie',
+                          !_sourceCatalogueSelected &&
+                              ZModePrefs.streamKind == StreamKind.movie,
+                          () => unawaited(
+                            _selectCatalogueTab(kind: StreamKind.movie),
+                          ),
+                        ),
+                        tab(
+                          'Source Catalogue',
+                          'tv-home-tab-source',
+                          _sourceCatalogueSelected &&
+                              !HomeCataloguePrefs.stremioSelected,
+                          () => unawaited(
+                            _selectCatalogueTab(
+                              catalogue: HomeCatalogueKind.source,
+                            ),
+                          ),
+                        ),
+                        tab(
+                          'Stremio',
+                          'tv-home-tab-stremio',
+                          HomeCataloguePrefs.stremioSelected,
+                          () => unawaited(
+                            _selectCatalogueTab(
+                              catalogue: HomeCatalogueKind.stremio,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
+              ),
+              const SizedBox(width: 12),
+              if (showSource)
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text(
+                      'Source · ',
+                      style: TextStyle(color: AppColors.textSecondary),
+                    ),
+                    SourceSwitcher(
+                      currentId: sourceId,
+                      onChanged: _selectHomeCatalogueSource,
+                      trailingBuilder: (id) => SourcePickerRowActions(
+                        sourceId: id,
+                        onCloudflareSolved: (solvedId) async {
+                          if (!mounted ||
+                              solvedId != _sourceCatalogueSourceId) {
+                            return;
+                          }
+                          await _sourceCatalogueController.refresh();
+                        },
+                      ),
+                    ),
+                  ],
+                )
+              else
+                const SizedBox(width: 42),
             ],
           ),
         ),
@@ -382,29 +437,22 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
       '[tv-home] _resume · sourceId=${e.sourceId} '
       'showUrl=${e.showUrl} episodeId=${e.episodeId}',
     );
-    // On TV the QuickJS runtime is empty at boot (loadAll is skipped) and
-    // providers load on demand — ensure the JS provider is loaded before
-    // hitting _providerFor, which would otherwise throw "Provider not loaded".
+    // On TV the QuickJS runtime is empty at boot (loadAll is skipped), so use
+    // the source-aware loader: it loads JS providers and leaves native sources
+    // to their own managers.
     // Metadata pseudo-sources (zm) don't live in the runtime — they resolve
     // through CatalogueRouter → PlaybackResolver, so skip the check for them.
     if (e.sourceId != ZmodeIds.sourceId &&
-        sl<ProviderManager>().get(e.sourceId) == null) {
-      debugPrint('[tv-home] _resume · loading runtime for ${e.sourceId} ...');
-      final ok = await sl<ProviderRegistry>()
-          .ensureRuntimeLoaded(e.sourceId)
-          .catchError((_) => false);
-      if (!ok || sl<ProviderManager>().get(e.sourceId) == null) {
-        debugPrint('[tv-home] _resume · RUNTIME LOAD FAILED for ${e.sourceId}');
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Could not load ${e.sourceId} — skipping resume'),
-            ),
-          );
-        }
-        return;
+        !await sl<SourceRepository>().ensureSourceLoaded(e.sourceId)) {
+      debugPrint('[tv-home] _resume · source load FAILED for ${e.sourceId}');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not load ${e.sourceId} — skipping resume'),
+          ),
+        );
       }
-      debugPrint('[tv-home] _resume · runtime loaded for ${e.sourceId}');
+      return;
     }
     List<Episode> episodes;
     try {
@@ -693,8 +741,14 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
     final noSourceForMode = ZModePrefs.enabled
         ? false
         : switch (mode) {
-            ContentMode.manga => !activeId.startsWith('mihon:'),
-            ContentMode.novel => !activeId.startsWith('lnr:'),
+            ContentMode.manga => !sourceIdMatchesContentMode(
+              activeId,
+              ContentMode.manga,
+            ),
+            ContentMode.novel => !sourceIdMatchesContentMode(
+              activeId,
+              ContentMode.novel,
+            ),
             ContentMode.anime => false,
             null => false,
           };
@@ -724,10 +778,14 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
           onSolveCloudflare: state.cloudflareUrl == null
               ? null
               : () async {
-                  // Mihon Cloudflare solve — same path as phone Home.
-                  await MihonExtensionService.solveCloudflare(
-                    state.cloudflareUrl!,
-                  );
+                  // Native-extension Cloudflare solve — same path as phone Home.
+                  if (repo.sourceId.startsWith('mg:')) {
+                    await MangayomiCloudflare.solve(state.cloudflareUrl!);
+                  } else {
+                    await MihonExtensionService.solveCloudflare(
+                      state.cloudflareUrl!,
+                    );
+                  }
                   if (context.mounted) {
                     context.read<HomeCubit>().load(reset: true);
                   }
@@ -944,11 +1002,15 @@ class _HomeScreenTvState extends State<HomeScreenTv> {
     Widget sourceCatalogueContent(ContentMode contentMode) =>
         SourceCatalogueHomeContent(
           controller: _sourceCatalogueController,
-          initialSourceId: _sourceCatalogueSourceId,
+          initialSourceId: HomeCataloguePrefs.sourceIdFor(contentMode),
           mode: contentMode,
           onSourceSelected: (sourceId) {
             _sourceCatalogueSourceId = sourceId;
-            unawaited(HomeCataloguePrefs.setSourceId(sourceId));
+            if (HomeCataloguePrefs.sourceIdFor(contentMode) != sourceId) {
+              unawaited(
+                HomeCataloguePrefs.setSourceIdFor(contentMode, sourceId),
+              );
+            }
           },
           onSectionsChanged: _setSourceCatalogueSections,
           showSourcePicker: false,

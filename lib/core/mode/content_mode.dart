@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
-import '../models/provider_info.dart';
-import '../mangayomi/mangayomi_source_id.dart';
 import 'package:zangetsu_source_bridge/zangetsu_source_bridge.dart';
+
+import '../mangayomi/mangayomi_source_id.dart';
+import '../models/provider_info.dart';
 
 /// The app-wide content mode. Anime is the default and covers the whole
 /// existing video app (anime + movie sources); manga/novel are reading modes.

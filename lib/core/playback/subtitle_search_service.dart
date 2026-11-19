@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:path_provider/path_provider.dart';
 
 import '../di/injector.dart';
@@ -87,15 +88,57 @@ class SubtitleSearchService {
     'Accept': 'application/json',
   };
 
+  /// Builds the OpenSubtitles query for one search.
+  ///
+  /// A series must be searched by its parent ids plus season and episode:
+  /// `imdb_id` / `tmdb_id` alone name the whole show, so the API returns
+  /// subtitles for arbitrary episodes (the "wrong episode" bug). When a series
+  /// has an id and an exact season and episode, the title is left out on
+  /// purpose, because a localised or alternate title would only exclude correct
+  /// results. Without ids, the title is the only handle available.
+  @visibleForTesting
+  static Map<String, dynamic> buildSearchParams(
+    String query, {
+    String language = 'en',
+    String? imdbId,
+    int? tmdbId,
+    bool isTv = false,
+    int? season,
+    int? episode,
+  }) {
+    final imdb = imdbId?.trim() ?? '';
+    final exactEpisode = isTv && season != null && episode != null;
+    final hasId = imdb.isNotEmpty || tmdbId != null;
+    return {
+      if (!(exactEpisode && hasId)) 'query': query.trim(),
+      if (language.trim().isNotEmpty) 'languages': language.trim(),
+      if (exactEpisode && hasId) ...{
+        if (imdb.isNotEmpty) 'parent_imdb_id': imdb,
+        // ignore: use_null_aware_elements
+        if (tmdbId != null) 'parent_tmdb_id': tmdbId,
+        'season_number': season,
+        'episode_number': episode,
+      } else ...{
+        if (imdb.isNotEmpty) 'imdb_id': imdb,
+        // ignore: use_null_aware_elements
+        if (tmdbId != null) 'tmdb_id': tmdbId,
+      },
+    };
+  }
+
   /// Searches OpenSubtitles for [query]. [language] is a 2-letter code (default
   /// `en`); pass an empty string for all languages. Optional [imdbId] and
-  /// [tmdbId] improve accuracy when available (the API accepts them alongside
-  /// the title query). Returns the top results (already deduped by file id).
+  /// [tmdbId] improve accuracy when available. For a series pass [isTv] with
+  /// the exact [season] and [episode] (see [buildSearchParams]). Returns the
+  /// top results (already deduped by file id).
   Future<List<SubtitleSearchResult>> search(
     String query, {
     String language = 'en',
     String? imdbId,
     int? tmdbId,
+    bool isTv = false,
+    int? season,
+    int? episode,
   }) async {
     final q = query.trim();
     if (q.isEmpty) return const [];
@@ -103,13 +146,15 @@ class SubtitleSearchService {
     try {
       final res = await _dio.get<Map<String, dynamic>>(
         '$_base/subtitles',
-        queryParameters: {
-          'query': q,
-          if (language.trim().isNotEmpty) 'languages': language.trim(),
-          if (imdbId != null && imdbId.trim().isNotEmpty) 'imdb_id': imdbId.trim(),
-          // ignore: use_null_aware_elements
-          if (tmdbId != null) 'tmdb_id': tmdbId,
-        },
+        queryParameters: buildSearchParams(
+          q,
+          language: language,
+          imdbId: imdbId,
+          tmdbId: tmdbId,
+          isTv: isTv,
+          season: season,
+          episode: episode,
+        ),
         options: Options(headers: headers),
       );
       final data = (res.data?['data'] as List?) ?? const [];

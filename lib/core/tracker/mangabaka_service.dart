@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
-import 'dart:io';
 
 import 'package:app_links/app_links.dart';
 import 'package:crypto/crypto.dart';
@@ -19,6 +18,8 @@ import '../models/provider_info.dart';
 import '../models/watch_status.dart';
 import '../platform/apple_tv.dart';
 import 'tracker.dart';
+// track-2: reports write results to the tracker sync outbox.
+import 'tracker_sync_queue.dart' show TrackerWriteScope;
 
 /// MangaBaka tracker — **manga, manhwa, manhua AND novels**. No anime: the
 /// site has /manga, /manhwa, /manhua and /novel sections and nothing else, and
@@ -206,8 +207,13 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
     try {
       // Use the user's browser for website checks and account approval. The
       // runner forwards the registered callback to this instance's PKCE flow.
-      if (Platform.isWindows) {
-        await DesktopOAuth.prepareBrowserCallback();
+      // Windows: point zangetsu:// at this exe before the browser can redirect.
+      final callbackError = await DesktopOAuth.ensureBrowserCallback();
+      if (callbackError != null) {
+        lastConnectionError = callbackError;
+        return false;
+      }
+      if (DesktopOAuth.usesRegisteredCallback) {
         _traceConnection('Windows callback registered');
       }
       final ok =
@@ -378,6 +384,15 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
     } catch (_) {
       // A malformed token must not fail the connect — the name is cosmetic.
     }
+  }
+
+  /// Abandons a browser sign-in that is waiting for its callback (the user
+  /// closed the tab or changed their mind). A later callback is ignored
+  /// because the in-memory verifier and state are cleared by [connect].
+  void cancelConnect() {
+    if (_pending == null || _exchanging) return;
+    lastConnectionError = 'Sign-in cancelled.';
+    _resolvePending(false);
   }
 
   void _resolvePending(bool ok) {
@@ -903,7 +918,12 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
         '${Environment.mangabakaApi}/v1/my/library/$seriesId',
         data: body,
       );
-      if (r.statusCode != 404) return;
+      if (r.statusCode != 404) {
+        // track-2: tell the sync outbox whether the edit landed, so a
+        // failed one is queued and retried (no-op outside a watched write).
+        _reportWrite(r.statusCode);
+        return;
+      }
       final add = await _authenticated(
         'POST',
         '${Environment.mangabakaApi}/v1/my/library/batch',
@@ -912,8 +932,23 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
         ],
       );
       debugPrint('[mb] add $seriesId -> ${add.statusCode}');
-    } catch (_) {
-      // Best-effort, like every other tracker write.
+      // track-2: the add is the real write when the entry did not exist.
+      _reportWrite(add.statusCode);
+    } catch (e) {
+      // Best-effort, like every other tracker write; the outbox still hears
+      // about it so it can retry later.
+      TrackerWriteScope.reportError(e);
+    }
+  }
+
+  /// track-2: reports one write's HTTP [code] to the sync outbox, like
+  /// mal_service._patch does: 2xx counts as sent, anything else is classified
+  /// (401/403 needs sign-in, 5xx/429 retried, other 4xx refused for good).
+  void _reportWrite(int? code) {
+    if (code != null && code >= 200 && code < 300) {
+      TrackerWriteScope.reportSent();
+    } else {
+      TrackerWriteScope.reportStatus(code);
     }
   }
 
@@ -988,6 +1023,7 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
     WatchStatus? status,
     double? score,
     int? progress,
+    bool? isPrivate,
     MediaKind kind = MediaKind.anime,
   }) async {
     if (!_canWrite(kind)) return;
@@ -1024,11 +1060,17 @@ class MangaBakaService extends ChangeNotifier implements Tracker {
     );
     if (id == null) return;
     try {
-      await _authenticated(
+      final res = await _authenticated(
         'DELETE',
         '${Environment.mangabakaApi}/v1/my/library/$id',
       );
-    } catch (_) {}
+      // track-2: 404 means the entry is already gone, which is what the
+      // user wanted, so it counts as sent rather than refused.
+      _reportWrite(res.statusCode == 404 ? 200 : res.statusCode);
+    } catch (e) {
+      // Still quiet for direct callers; the outbox queues it for a retry.
+      TrackerWriteScope.reportError(e);
+    }
   }
 
   @override

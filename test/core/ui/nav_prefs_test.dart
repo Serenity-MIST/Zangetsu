@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/ui/nav_prefs.dart';
@@ -59,9 +60,10 @@ void main() {
       expect(sanitized(NavPrefs.defaultTabs), NavPrefs.defaultTabs);
     });
 
-    // Search left the dock for a Home header icon; Schedule left it for the
-    // card row on Home. Sources went the other way — it was a header icon and
-    // is now a destination, which is why Downloads is no longer a default.
+    // Search is opt-in (header icon while it's off the bar); Schedule left
+    // for the card row on Home. Sources went the other way — it was a header
+    // icon and is now a destination, which is why Downloads is no longer a
+    // default.
     test('the default dock has neither Search nor Schedule', () {
       expect(NavPrefs.defaultTabs, [
         DockTab.home,
@@ -80,12 +82,10 @@ void main() {
     });
   });
 
-  // Task 17: DockTab.search was removed from the enum (Search moved to a
-  // Home header icon, off the dock entirely). A user who saved their dock
-  // while Search still existed has 'search' sitting in their Hive box as a
-  // plain string — this drives that through the real getter (not
-  // sanitizeForTest, which only ever sees already-parsed DockTabs) to prove
-  // it degrades to a sane dock rather than crashing or leaving a blank slot.
+  // Task 17 follow-up: Search is a dock tab again (opt-in, off by default).
+  // A user who saved their dock while it existed has 'search' sitting in
+  // their Hive box as a plain string — this drives that through the real
+  // getter to prove it resolves rather than dropping.
   group('NavPrefs.tabs against a legacy stored value', () {
     late Directory dir;
 
@@ -101,7 +101,7 @@ void main() {
     });
 
     test(
-      'a saved list restores Search and drops an unknown Schedule entry',
+      'a saved list naming Search resolves it; unknown entries drop',
       () async {
         // What NavPrefs.defaultTabs used to ship as, back when it had 5 slots.
         // The box key ('tabs') is the persisted format itself — see _tabsKey.
@@ -112,8 +112,7 @@ void main() {
 
         expect(out, contains(DockTab.profile));
         expect(out.length, greaterThanOrEqualTo(NavPrefs.minTabs));
-        // Downloads is in defaultTabs now, but this list was SAVED by the user
-        // and never had it — only the unknown 'search'/'schedule' entries drop.
+        // Only the unknown 'schedule' entry drops — 'search' is a real tab now.
         expect(out, [
           DockTab.home,
           DockTab.search,
@@ -126,7 +125,7 @@ void main() {
     test(
       'a saved list that is mostly just Search falls back to default',
       () async {
-        // Below minTabs once the unknown 'search' entry is stripped.
+        // Below minTabs: Search resolves but two tabs aren't a dock.
         await Hive.box(NavPrefs.boxName).put('tabs', ['search', 'profile']);
         final out = NavPrefs().tabs;
 
@@ -134,12 +133,77 @@ void main() {
       },
     );
 
+    test('Search is savable as a tab but is not a default one', () async {
+      await NavPrefs().setTabs([DockTab.home, DockTab.search, DockTab.profile]);
+      expect(NavPrefs().tabs, contains(DockTab.search));
+      expect(NavPrefs.defaultTabs, isNot(contains(DockTab.search)));
+      await NavPrefs().reset();
+    });
+
     test('with nothing chosen, the app opens on the leftmost tab', () {
       expect(NavPrefs().startTab, NavPrefs.defaultTabs.first);
     });
 
     test('keep-dock-expanded is off by default', () {
       expect(NavPrefs().isDefault, isTrue);
+    });
+
+    test(
+      'navbar visibility starts off and preserves existing glass settings',
+      () async {
+        final prefs = NavPrefs();
+        final tint = prefs.glassTint;
+        final quality = prefs.glassQuality;
+        final blur = prefs.glassBlurEnabled;
+        expect(prefs.glassVisibility, 0);
+        await prefs.setGlassVisibility(0.6);
+        expect(NavPrefs().glassVisibility, 0.6);
+        expect(prefs.glassTint, tint);
+        expect(prefs.glassQuality, quality);
+        expect(prefs.glassBlurEnabled, blur);
+        expect(prefs.isDefault, isFalse);
+        await prefs.reset();
+        expect(prefs.glassVisibility, 0);
+        expect(prefs.isDefault, isTrue);
+      },
+    );
+
+    test(
+      'navbar visibility bounds and invalid stored values are safe',
+      () async {
+        final prefs = NavPrefs();
+        await prefs.setGlassVisibility(2);
+        expect(prefs.glassVisibility, 1);
+        await prefs.setGlassVisibility(-1);
+        expect(prefs.glassVisibility, 0);
+        await prefs.setGlassVisibility(double.nan);
+        expect(prefs.glassVisibility, 0);
+        for (final value in ['invalid', double.nan, double.infinity]) {
+          await Hive.box(NavPrefs.boxName).put('glassVisibility', value);
+          expect(prefs.glassVisibility, 0);
+        }
+        await prefs.reset();
+      },
+    );
+
+    test('extra glass blur starts on and can be turned off', () async {
+      expect(NavPrefs().glassBlurEnabled, isTrue);
+
+      await NavPrefs().setGlassBlurEnabled(false);
+      expect(NavPrefs().glassBlurEnabled, isFalse);
+
+      await NavPrefs().reset();
+      expect(NavPrefs().glassBlurEnabled, isTrue);
+    });
+
+    test('liquid is the default, but a chosen dock is preserved', () async {
+      expect(NavPrefs().style, NavBarStyle.liquid);
+
+      await NavPrefs().setStyle(NavBarStyle.dock);
+      expect(NavPrefs().style, NavBarStyle.dock);
+
+      await NavPrefs().reset();
+      expect(NavPrefs().style, NavBarStyle.liquid);
     });
 
     test(
@@ -194,6 +258,56 @@ void main() {
     );
   });
 
+  // Windows "Start page": the desktop sidebar is fixed, so the start page is
+  // validated against the desktop pages rather than the phone dock (whose
+  // default does not include Downloads).
+  group('NavPrefs.startTab on Windows', () {
+    late Directory dir;
+
+    setUp(() async {
+      dir = await Directory.systemTemp.createTemp('nav_prefs_start_test');
+      Hive.init(dir.path);
+      await NavPrefs.init();
+    });
+
+    tearDown(() async {
+      debugDefaultTargetPlatformOverride = null;
+      await Hive.close();
+      await dir.delete(recursive: true);
+    });
+
+    test('Downloads survives on Windows though the phone dock lacks it', () async {
+      final prefs = NavPrefs();
+      await prefs.setStartTab(DockTab.downloads);
+      // Phone: Downloads is not in the default dock, so it falls back.
+      expect(prefs.startTab, DockTab.home);
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      expect(prefs.startTab, DockTab.downloads);
+      // And it persists across a reopen of the real box.
+      await Hive.box(NavPrefs.boxName).close();
+      await NavPrefs.init();
+      expect(NavPrefs().startTab, DockTab.downloads);
+    });
+
+    test('every desktop start page round-trips on Windows', () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      final prefs = NavPrefs();
+      for (final tab in NavPrefs.desktopStartTabs) {
+        await prefs.setStartTab(tab);
+        expect(prefs.startTab, tab);
+      }
+    });
+
+    test('pages without a sidebar item fall back to Home on Windows', () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      final prefs = NavPrefs();
+      await prefs.setStartTab(DockTab.history);
+      expect(prefs.startTab, DockTab.home);
+      await prefs.setStartTab(DockTab.profile);
+      expect(prefs.startTab, DockTab.home);
+    });
+  });
+
   group('DockTab', () {
     test('only Profile is pinned', () {
       expect(DockTab.values.where((t) => t.isPinned), [DockTab.profile]);
@@ -211,10 +325,11 @@ void main() {
       }
     });
 
-    // Task 17: Search is off the dock entirely, not just hidden by default —
-    // there's no enum member left for it to offer.
-    test('Search is a stable dock destination', () {
+    // Search is back as an opt-in dock tab — a real member, but absent from
+    // the default dock so untouched installs look exactly as before.
+    test('Search is a dock tab but not a default one', () {
       expect(DockTab.values.map((t) => t.name), contains('search'));
+      expect(NavPrefs.defaultTabs, isNot(contains(DockTab.search)));
     });
   });
 }

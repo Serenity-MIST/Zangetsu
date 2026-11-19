@@ -1,7 +1,10 @@
 import 'package:flutter/material.dart';
 
 import '../../core/app_mode.dart';
+import '../../core/desktop/desktop_dialogs.dart';
 import '../../core/di/injector.dart';
+import '../../core/ui/desktop_docked_panel.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import '../../core/models/source_pref.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
@@ -10,6 +13,7 @@ import '../../core/tv/tv_list_focusable.dart';
 import '../../core/tv/tv_text_field.dart';
 import '../../core/ui/settings_widgets.dart';
 import '../../l10n/l10n.dart';
+import 'sources_desktop_kit.dart' show DesktopProviderScope;
 
 /// An Aniyomi/Mihon source's own settings, drawn by us.
 ///
@@ -160,6 +164,23 @@ class _SourcePrefsScreenState extends State<SourcePrefsScreen> {
       if (picked != null) await _set(i, picked);
       return;
     }
+    if (desktopPanelsEnabled) {
+      // Windows: the shared desktop choice dialog instead of a phone bottom
+      // sheet (src-7 A), searchable when the list is long.
+      final picked = await showDesktopChoiceDialog<String>(
+        context,
+        title: p.title,
+        description: p.summary.isEmpty ? null : p.summary,
+        options: [
+          for (var j = 0; j < p.entries.length; j++)
+            (p.values[j], p.entries[j]),
+        ],
+        current: p.asText,
+        searchable: p.entries.length > 8,
+      );
+      if (picked != null) await _set(i, picked);
+      return;
+    }
     final picked = await showModalBottomSheet<String>(
       context: context,
       isScrollControlled: true,
@@ -220,6 +241,33 @@ class _SourcePrefsScreenState extends State<SourcePrefsScreen> {
         ],
       );
       if (saved == true) await _set(i, chosen.toList());
+      return;
+    }
+    if (desktopPanelsEnabled) {
+      // Windows: the graphite multi-choice dialog used by the app's own
+      // desktop settings (src-7 A). It saves on close like those do, and
+      // writes the whole set once, only when something changed.
+      final before = {...chosen};
+      await showGraphiteSettingsMultiChoice<String>(
+        context,
+        title: p.title,
+        description: p.summary,
+        options: [
+          for (var j = 0; j < p.entries.length; j++)
+            (p.values[j], p.entries[j]),
+        ],
+        selected: chosen,
+      );
+      if (!mounted) return;
+      final changed =
+          before.length != chosen.length || !before.containsAll(chosen);
+      if (changed) {
+        // Keep the source's own order rather than tap order.
+        await _set(i, [
+          for (final v in p.values)
+            if (chosen.contains(v)) v,
+        ]);
+      }
       return;
     }
     final saved = await showModalBottomSheet<bool>(
@@ -303,6 +351,11 @@ class _SourcePrefsScreenState extends State<SourcePrefsScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Windows: desktop settings header from any entry point (src-3 A).
+    return DesktopProviderScope(child: _scaffold());
+  }
+
+  Widget _scaffold() {
     return Scaffold(
       backgroundColor: AppColors.bg,
       appBar: settingsAppBar(widget.title),

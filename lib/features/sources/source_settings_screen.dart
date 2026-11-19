@@ -16,6 +16,8 @@ import '../../core/tv/tv_text_field.dart';
 import '../../core/ui/settings_widgets.dart';
 import '../../core/ui/desktop_settings_surface.dart';
 import '../../core/ui/states.dart';
+import '../../core/ui/desktop_docked_panel.dart';
+import 'sources_desktop_kit.dart' show DesktopProviderScope;
 import '../../l10n/l10n.dart';
 
 /// Generic per-provider settings form rendered from the provider's
@@ -62,7 +64,13 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
       ProviderRegistry.providerKey(widget.repoUrl, widget.sourceId);
 
   bool get _isTv => sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
-  bool get _isDesktop => !_isTv && DesktopSettingsScope.contains(context);
+
+  /// Desktop layout inside the settings workspace and, on Windows, from any
+  /// other entry point too (a provider screen pushed it on the root
+  /// navigator, outside the workspace scope) — src-3 A.
+  bool get _isDesktop =>
+      !_isTv &&
+      (DesktopSettingsScope.contains(context) || desktopPanelsEnabled);
 
   @override
   void initState() {
@@ -608,6 +616,11 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Windows: the scope gives the app bar its desktop header (src-3 A).
+    return DesktopProviderScope(child: _scaffold(context));
+  }
+
+  Widget _scaffold(BuildContext context) {
     return Scaffold(
       backgroundColor: AppColors.bg,
       appBar: settingsAppBar(widget.displayName ?? widget.sourceId),

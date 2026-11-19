@@ -121,12 +121,16 @@ RoHelper::RoHelper(RO_INIT_TYPE init_type)
   if (SUCCEEDED(result) || result == S_FALSE || result == RPC_E_CHANGED_MODE) {
     mWinRtAvailable = true;
   }
+  // Zangetsu patch: RPC_E_CHANGED_MODE takes no reference, so uninitializing
+  // for it later would tear down the platform thread's COM apartment.
+  mRoInitialized = SUCCEEDED(result);
 #endif
 }
 
 RoHelper::~RoHelper() {
 #ifndef WINUWP
-  if (mWinRtAvailable) {
+  // Zangetsu patch: only balance a reference RoInitialize actually took.
+  if (mWinRtAvailable && mRoInitialized) {
     RoUninitialize();
   }
 

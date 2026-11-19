@@ -3,6 +3,7 @@ import 'package:equatable/equatable.dart';
 import '../../../core/models/media_detail.dart' show MediaStatus;
 import '../../../core/models/media_item.dart';
 import '../../../core/models/provider_info.dart';
+import '../../../core/mangayomi/mangayomi_source_id.dart';
 import '../../../core/playback/source_health_store.dart' show SourceOutcome;
 
 enum SearchStatus { idle, loading, success, error }
@@ -139,8 +140,10 @@ class SourceResultGroup extends Equatable {
     required this.sourceName,
     required this.items,
     this.arrivalIndex = 0,
+    this.addonName,
   });
 
+  final String? addonName;
   final String sourceId;
   final String sourceName;
   final List<MediaItem> items;
@@ -155,10 +158,17 @@ class SourceResultGroup extends Equatable {
     sourceName: sourceName,
     items: items,
     arrivalIndex: arrivalIndex,
+    addonName: addonName,
   );
 
   @override
-  List<Object?> get props => [sourceId, sourceName, items, arrivalIndex];
+  List<Object?> get props => [
+    sourceId,
+    sourceName,
+    items,
+    arrivalIndex,
+    addonName,
+  ];
 }
 
 /// Sentinel source-filter value meaning "all sources".
@@ -173,7 +183,8 @@ enum SearchEcosystem {
   cloudstream('CloudStream'),
   aniyomi('Aniyomi'),
   mihon('Mihon'),
-  lnreader('LNReader');
+  lnreader('LNReader'),
+  mangayomi('Mangayomi');
 
   const SearchEcosystem(this.label);
   final String label;
@@ -191,6 +202,9 @@ SearchEcosystem ecosystemOf(String sourceId) {
   // A future ecosystem (Mangayomi, say) is one prefix and one enum value.
   if (sourceId.startsWith('mihon:')) return SearchEcosystem.mihon;
   if (sourceId.startsWith('lnr:')) return SearchEcosystem.lnreader;
+  if (mangayomiContentTypeOf(sourceId) != null) {
+    return SearchEcosystem.mangayomi;
+  }
   return SearchEcosystem.zangetsu;
 }
 
@@ -209,6 +223,7 @@ List<SearchEcosystem> ecosystemTabsFor(Iterable<String> sourceIds) {
       SearchEcosystem.aniyomi,
       SearchEcosystem.mihon,
       SearchEcosystem.lnreader,
+      SearchEcosystem.mangayomi,
     ])
       if (present.contains(e)) e,
   ];

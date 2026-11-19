@@ -36,6 +36,14 @@ class LnReaderHttpResponse {
 /// and [call] drives resolution itself: pump the JS event loop, drain the
 /// outbox, run the injected [fetch] for each request, feed the result back
 /// with `__resolveFetch`, repeat until the call's result lands.
+///
+/// Threading (src-1 follow-up): this runtime still runs on the UI isolate on
+/// every platform, Windows included. It does not go through `JsEngine`, so
+/// `JsEngine.runsOffUiIsolate` does not cover LNReader plugins. Moving them
+/// off-thread would need its own isolate host (the cheerio bundle, the
+/// require() harness and the fetch outbox loop above all live here), which
+/// is separate work. Callers that run many plugin calls at once should keep
+/// their own concurrency low for `lnr:` sources until then.
 class LnReaderRuntime {
   LnReaderRuntime({
     required Future<LnReaderHttpResponse> Function(String url, Map init)

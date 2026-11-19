@@ -4,6 +4,8 @@ import 'package:background_downloader/background_downloader.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../../core/desktop/desktop_dialogs.dart';
+import '../../core/desktop/desktop_sheet.dart';
 import '../../core/di/injector.dart';
 import '../../core/download/chapter_download.dart';
 import '../../core/download/chapter_download_store.dart';
@@ -13,6 +15,7 @@ import '../../core/models/episode.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/ui/app_toast.dart';
+import '../../core/ui/desktop_docked_panel.dart';
 import '../../core/ui/settings_widgets.dart';
 import '../../l10n/l10n.dart';
 import '../settings/download_location_screen.dart';
@@ -27,8 +30,14 @@ Future<void> showEpubExportSheet(
   required String showTitle,
   required List<Episode> chapters,
 }) {
-  return showModalBottomSheet<void>(
-    context: context,
+  // show-2: a graphite side panel on Windows (a form with several rows, so
+  // it docks like the other long desktop panels); the phone sheet elsewhere.
+  return showAdaptiveSheet<void>(
+    context,
+    title: context.l10n.exportAsEpub,
+    subtitle: showTitle,
+    desktopStyle: DesktopSheetStyle.sidePanel,
+    desktopWidth: 460,
     isScrollControlled: true,
     backgroundColor: AppColors.surface,
     shape: const RoundedRectangleBorder(
@@ -98,7 +107,20 @@ class _EpubExportBodyState extends State<_EpubExportBody> {
   }
 
   Future<void> _pickIndex({required bool isStart}) async {
-    final chosen = await showModalBottomSheet<int>(
+    // show-2: Windows picks from the searchable graphite choice dialog.
+    final chosen = desktopPanelsEnabled
+        ? await showDesktopChoiceDialog<int>(
+            context,
+            title: isStart ? context.l10n.startChapter : context.l10n.endChapter,
+            current: isStart ? _startIdx : _endIdx,
+            searchable: true,
+            searchHint: context.l10n.findChapter,
+            options: [
+              for (var i = 0; i < _downloaded.length; i++)
+                (i, _downloaded[i].title),
+            ],
+          )
+        : await showModalBottomSheet<int>(
       context: context,
       backgroundColor: AppColors.surface,
       shape: const RoundedRectangleBorder(
@@ -123,7 +145,7 @@ class _EpubExportBodyState extends State<_EpubExportBody> {
         ),
       ),
     );
-    if (chosen == null) return;
+    if (chosen == null || !mounted) return;
     setState(() {
       if (isStart) {
         _startIdx = chosen;
@@ -277,6 +299,8 @@ class _EpubExportBodyState extends State<_EpubExportBody> {
     final canExport = downloadedCount > 0 && !_exporting;
     final folderLabel =
         sl<DownloadPrefs>().locationLabel ?? l10n.downloadsZangetsu;
+    // True inside the Windows side panel (show-2).
+    final desktop = DesktopSheetScope.of(context);
 
     return SafeArea(
       child: Padding(
@@ -288,21 +312,26 @@ class _EpubExportBodyState extends State<_EpubExportBody> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              const SizedBox(height: 12),
-              Center(
-                child: Container(
-                  width: 36,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: AppColors.textTertiary.withValues(alpha: 0.5),
-                    borderRadius: BorderRadius.circular(2),
+              // The Windows panel's title bar already names the export, so
+              // the drag handle and headline are phone-only.
+              if (!desktop) ...[
+                const SizedBox(height: 12),
+                Center(
+                  child: Container(
+                    width: 36,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: AppColors.textTertiary.withValues(alpha: 0.5),
+                      borderRadius: BorderRadius.circular(2),
+                    ),
                   ),
                 ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 12, 20, 4),
-                child: Text(l10n.exportAsEpub, style: AppText.headline),
-              ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 12, 20, 4),
+                  child: Text(l10n.exportAsEpub, style: AppText.headline),
+                ),
+              ] else
+                const SizedBox(height: 12),
               Padding(
                 padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
                 child: Text(

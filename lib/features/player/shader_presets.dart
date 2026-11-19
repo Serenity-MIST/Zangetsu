@@ -7,8 +7,10 @@ import '../../core/platform/app_paths.dart';
 ///   • STYLE (the filter): off / a Sharpen / b De-blur / c Denoise
 ///   • TIER (GPU cost): mid (light M networks) / high (heavy VL + auto-downscale)
 /// The `.glsl` files are downloaded on demand (not bundled) and fed to mpv via
-/// `glsl-shaders`. When on, playback runs on the gpu-next/Vulkan renderer so the
-/// shaders stay smooth.
+/// `glsl-shaders`. When on, phone playback runs on the gpu-next/Vulkan renderer
+/// so the shaders stay smooth. Windows keeps its embedded libmpv render output
+/// (the same mpv GPU renderer through ANGLE); if the shaders fail there the
+/// player switches them off and says so.
 class ShaderStyle {
   final String id; // 'off' | 'a' | 'b' | 'c'
   final String label;
@@ -146,7 +148,7 @@ class ShaderPresets {
         }
         onProgress?.call((i + 1) / _allFiles.length);
       }
-      return refreshDownloaded();
+      return await refreshDownloaded();
     } catch (_) {
       await refreshDownloaded();
       return false;
@@ -162,6 +164,16 @@ class ShaderPresets {
     final files = _chains[tier]?[style];
     if (files == null || files.isEmpty) return '';
     final dir = await _dir();
-    return files.map((f) => '${dir.path}/$f').join(':');
+    final paths = [for (final f in files) '${dir.path}/$f'];
+    // A missing file makes mpv log a load error; hand it nothing instead so
+    // the caller can fall back to plain rendering.
+    if (!paths.every((p) => File(p).existsSync())) return '';
+    return joinShaderPaths(paths, windows: Platform.isWindows);
   }
+
+  /// mpv path lists use ';' on Windows and ':' elsewhere. With ':' on
+  /// Windows the drive letter ("C:\...") splits every path, so no shader
+  /// loads at all.
+  static String joinShaderPaths(List<String> paths, {required bool windows}) =>
+      paths.join(windows ? ';' : ':');
 }

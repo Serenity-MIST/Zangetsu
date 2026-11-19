@@ -1,4 +1,5 @@
-import 'dart:io';
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/material.dart';
 
 import '../../core/di/injector.dart';
@@ -35,14 +36,22 @@ class _PlayerControlsScreenState extends State<PlayerControlsScreen> {
       top: _prefs.playerBarTop ?? PlayerControlsConfig.defaultTop,
       left: _prefs.playerBarLeft ?? PlayerControlsConfig.defaultLeft,
       right: _prefs.playerBarRight ?? PlayerControlsConfig.defaultRight,
-    ).sanitised();
+    ).sanitised(unavailable: _unavailable);
     _top = [...cfg.top];
     _left = [...cfg.left];
     _right = [...cfg.right];
   }
 
-  PlayerControlsConfig get _cfg =>
-      PlayerControlsConfig(top: _top, left: _left, right: _right);
+  /// Controls this platform can't show (Cast / PiP on Windows). Kept out of
+  /// the editor, the preview, Hidden and the top-bar count.
+  final Set<String> _unavailable = unavailablePlayerControls();
+
+  PlayerControlsConfig get _cfg => PlayerControlsConfig(
+    top: _top,
+    left: _left,
+    right: _right,
+    unavailable: _unavailable,
+  );
 
   void _apply(VoidCallback change) {
     setState(change);
@@ -80,17 +89,21 @@ class _PlayerControlsScreenState extends State<PlayerControlsScreen> {
   Future<void> _reset() async {
     await _prefs.resetPlayerBar();
     if (!mounted) return;
+    // Same defaults the player reads, minus what this platform can't show.
+    final cfg = PlayerControlsConfig.defaults.sanitised(
+      unavailable: _unavailable,
+    );
     setState(() {
-      _top = [...PlayerControlsConfig.defaultTop];
-      _left = [...PlayerControlsConfig.defaultLeft];
-      _right = [...PlayerControlsConfig.defaultRight];
+      _top = [...cfg.top];
+      _left = [...cfg.left];
+      _right = [...cfg.right];
     });
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar(
         context.l10n.playerControls,
         actions: [
@@ -384,7 +397,7 @@ class _PlayerControlsScreenState extends State<PlayerControlsScreen> {
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 4),
             child: Icon(
-              Platform.isWindows && id == 'rotate'
+              _windowsUi && id == 'rotate'
                   ? Icons.fullscreen_rounded
                   : controlById(id)?.icon ?? Icons.help_outline,
               size: 16,
@@ -539,7 +552,7 @@ class _PlayerControlsScreenState extends State<PlayerControlsScreen> {
             const SizedBox(width: 29),
           // Keep the stable stored id, but name the action the PC player uses.
           Icon(
-            Platform.isWindows && id == 'rotate'
+            _windowsUi && id == 'rotate'
                 ? Icons.fullscreen_rounded
                 : c.icon,
             size: 20,
@@ -548,7 +561,7 @@ class _PlayerControlsScreenState extends State<PlayerControlsScreen> {
           const SizedBox(width: 12),
           Expanded(
             child: Text(
-              Platform.isWindows && id == 'rotate' ? 'Fullscreen' : c.label,
+              _windowsUi && id == 'rotate' ? 'Fullscreen' : c.label,
               style: AppText.body.copyWith(color: tint, fontSize: 14.5),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
@@ -637,3 +650,7 @@ class _PlayerControlsScreenState extends State<PlayerControlsScreen> {
     );
   }
 }
+
+/// Windows desktop UI (the PC player names "rotate" Fullscreen). Read through
+/// [defaultTargetPlatform] so phone tests on a Windows host stay phone.
+bool get _windowsUi => defaultTargetPlatform == TargetPlatform.windows;

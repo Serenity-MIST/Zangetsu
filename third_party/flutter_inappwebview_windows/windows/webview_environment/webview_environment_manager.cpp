@@ -3,6 +3,7 @@
 #include <flutter/standard_method_codec.h>
 
 #include "../in_app_webview/in_app_webview_settings.h"
+#include "../utils/com_apartment.h"
 #include "../utils/flutter.h"
 #include "../utils/log.h"
 #include "../utils/string.h"
@@ -65,7 +66,10 @@ namespace flutter_inappwebview_plugin
           result_->Success(true);
         }
         else {
-          result_->Error("0", "Cannot create WebViewEnvironment: " + getHRMessage(errorCode));
+          // Zangetsu patch: include the HRESULT and the thread's COM apartment
+          // so a remaining failure can be diagnosed from the app log.
+          result_->Error("0", "Cannot create WebViewEnvironment: " + getHRMessage(errorCode) +
+            " (hr=" + std::to_string(static_cast<long>(errorCode)) + ", " + describeComApartment() + ")");
           if (map_contains(webViewEnvironments, id)) {
             webViewEnvironments.erase(id);
           }

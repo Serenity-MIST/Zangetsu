@@ -1,7 +1,9 @@
 // lib/features/watch_together/ui/watch_party_lobby_screen.dart
 import 'package:flutter/material.dart';
 
+import '../../../core/desktop/desktop_text_prompt.dart';
 import '../../../core/di/injector.dart';
+import '../../../core/ui/desktop_docked_panel.dart' show desktopPanelsEnabled;
 import '../../auth/auth_cubit.dart';
 import '../model/room_state.dart';
 import '../watch_together_controller.dart';
@@ -265,6 +267,17 @@ Future<void> routeAfterJoin(
 // ─────────────────────────────────────────────────────────────────────────────
 
 Future<String?> _askCode(BuildContext context) {
+  // Windows: graphite one-field prompt (Enter joins, Esc cancels). Phone
+  // keeps the Material dialog below.
+  if (desktopPanelsEnabled) {
+    return showDesktopTextPrompt(
+      context,
+      title: context.l10n.enterRoomCode,
+      hint: context.l10n.eGABC234,
+      confirmLabel: context.l10n.join,
+      textCapitalization: TextCapitalization.characters,
+    );
+  }
   final ctrl = TextEditingController();
   return showDialog<String>(
     context: context,

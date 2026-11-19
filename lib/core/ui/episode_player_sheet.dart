@@ -1,12 +1,17 @@
-import 'dart:io';
-import 'frosted_sheet.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import 'frosted_sheet.dart';
+
 import '../models/video_source.dart';
+import 'copy_playback_link.dart';
+import '../desktop/desktop_context_menu.dart';
+import 'desktop_docked_panel.dart';
 import '../playback/external_player.dart';
 import '../playback/source_selection.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text.dart';
+import '../../l10n/l10n.dart';
 
 /// What a long-press on an episode chose: which player to open it in, this
 /// once. An empty [package] means the built-in player.
@@ -43,6 +48,34 @@ enum EpisodeAction {
   /// answer. Different from [playMirror]: that picks between mirrors within
   /// the one source already matched, this is about which SOURCE to use at all.
   whereToWatch,
+
+  /// Windows menu only: play this episode the normal way (same as a click).
+  play,
+
+  /// Windows menu only: start downloading this episode.
+  download,
+
+  /// Windows menu only: delete this episode's finished download.
+  deleteDownload,
+
+  /// Windows menu only: open Explorer with the downloaded file selected.
+  showInFolder,
+}
+
+/// Where this episode's download stands, for the Windows right-click menu.
+/// The caller looks it up so the menu can offer the right download rows.
+enum EpisodeDownloadMenuState {
+  /// No download rows at all (reading, or downloads not offered here).
+  unavailable,
+
+  /// Nothing saved yet: offer Download.
+  none,
+
+  /// Queued or downloading: shown as a disabled row, nothing to act on.
+  inProgress,
+
+  /// A finished file exists: offer Show in folder and Delete download.
+  done,
 }
 
 /// The long-press menu itself. Kept separate from the player sheet so the
@@ -76,7 +109,92 @@ Future<EpisodeAction?> showEpisodeActionSheet(
   /// resolves to the reader, so there is no player to pick, no mirror to
   /// choose, no stream to reload, and no point surveying sources for one.
   bool reading = false,
+
+  /// Windows menu only: which download rows to show. The phone sheet ignores
+  /// it, so phones keep exactly the rows they had.
+  EpisodeDownloadMenuState downloadState = EpisodeDownloadMenuState.unavailable,
 }) {
+  // The menu rows, shared by the phone sheet and the Windows panel.
+  List<Widget> actionRows(BuildContext menuContext, {bool desktop = false}) => [
+    if (!reading) ...[
+      // External players are Android only, so Windows has nothing to pick.
+      if (!desktop)
+        _PlayerRow(
+          icon: Icons.play_circle_outline_rounded,
+          label: 'Play with…',
+          trailingText: currentPlayerLabel,
+          onTap: () => Navigator.pop(menuContext, EpisodeAction.pickPlayer),
+        ),
+      _PlayerRow(
+        icon: Icons.swap_horiz_rounded,
+        label: 'Play mirror',
+        subtitle: 'Choose the source before it starts',
+        onTap: () => Navigator.pop(menuContext, EpisodeAction.playMirror),
+      ),
+    ],
+    // Streaming only, like the two rows above it: reading gets the
+    // marking rows and nothing else.
+    if (canSurveySources && !reading)
+      _PlayerRow(
+        icon: Icons.travel_explore_rounded,
+        label: 'Where to watch',
+        subtitle: 'See which of your sources has this episode',
+        onTap: () => Navigator.pop(menuContext, EpisodeAction.whereToWatch),
+      ),
+    if (!reading)
+      _PlayerRow(
+        icon: Icons.refresh_rounded,
+        label: 'Reload links',
+        subtitle: 'Fetch fresh streams if playback keeps failing',
+        onTap: () => Navigator.pop(menuContext, EpisodeAction.reloadLinks),
+      ),
+    Divider(
+      height: 1,
+      color: desktop ? DesktopPanelColors.edge : AppColors.hairline,
+    ),
+    _PlayerRow(
+      icon: isWatched
+          ? Icons.remove_done_rounded
+          : Icons.check_circle_outline_rounded,
+      label: reading
+          ? (isWatched ? 'Mark as unread' : 'Mark as read')
+          : (isWatched ? 'Mark as unwatched' : 'Mark as watched'),
+      subtitle: tracksToServices
+          ? 'Also updates your connected trackers'
+          : null,
+      onTap: () => Navigator.pop(menuContext, EpisodeAction.toggleWatched),
+    ),
+    _PlayerRow(
+      icon: Icons.done_all_rounded,
+      label: reading
+          ? 'Mark this and all above as read'
+          : 'Mark this and all above as watched',
+      onTap: () => Navigator.pop(menuContext, EpisodeAction.markAboveWatched),
+    ),
+    if (reading && canOpenInBrowser)
+      _PlayerRow(
+        icon: Icons.public_rounded,
+        label: 'Open in browser',
+        subtitle: "Read it on the source's own site",
+        onTap: () => Navigator.pop(menuContext, EpisodeAction.openInBrowser),
+      ),
+  ];
+  // Windows (right-click / long-press an episode): a compact context menu at
+  // the mouse pointer (position null -> DesktopPointer's last click), like
+  // every other right-click menu on Windows. It also carries the download
+  // rows the phone sheet never had.
+  if (desktopPanelsEnabled) {
+    return showDesktopContextMenu<EpisodeAction>(
+      context,
+      items: episodeDesktopMenuItems(
+        isWatched: isWatched,
+        reading: reading,
+        canSurveySources: canSurveySources,
+        canOpenInBrowser: canOpenInBrowser,
+        downloadState: downloadState,
+      ),
+    );
+  }
   // Without isScrollControlled a sheet is capped at 9/16 of the screen
   // (_kDefaultScrollControlDisabledMaxHeightRatio) and anything past that is
   // simply clipped — no scrolling, no warning. These rows come to ~493dp once
@@ -86,9 +204,7 @@ Future<EpisodeAction?> showEpisodeActionSheet(
   // already gets, for the same reason.
   return showModalBottomSheet<EpisodeAction>(
     context: context,
-    backgroundColor: Platform.isWindows
-        ? Colors.transparent
-        : AppColors.surface,
+    backgroundColor: _frostedSheets ? Colors.transparent : AppColors.surface,
     shape: const RoundedRectangleBorder(
       borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
     ),
@@ -126,74 +242,7 @@ Future<EpisodeAction?> showEpisodeActionSheet(
                     ),
                   ),
                 ),
-                if (!reading) ...[
-                  _PlayerRow(
-                    icon: Icons.play_circle_outline_rounded,
-                    label: 'Play with…',
-                    trailingText: currentPlayerLabel,
-                    onTap: () =>
-                        Navigator.pop(sheetContext, EpisodeAction.pickPlayer),
-                  ),
-                  _PlayerRow(
-                    icon: Icons.swap_horiz_rounded,
-                    label: 'Play mirror',
-                    subtitle: 'Choose the source before it starts',
-                    onTap: () =>
-                        Navigator.pop(sheetContext, EpisodeAction.playMirror),
-                  ),
-                ],
-                // Streaming only, like the two rows above it: reading gets the
-                // marking rows and nothing else.
-                if (canSurveySources && !reading)
-                  _PlayerRow(
-                    icon: Icons.travel_explore_rounded,
-                    label: 'Where to watch',
-                    subtitle: 'See which of your sources has this episode',
-                    onTap: () =>
-                        Navigator.pop(sheetContext, EpisodeAction.whereToWatch),
-                  ),
-                if (!reading)
-                  _PlayerRow(
-                    icon: Icons.refresh_rounded,
-                    label: 'Reload links',
-                    subtitle: 'Fetch fresh streams if playback keeps failing',
-                    onTap: () =>
-                        Navigator.pop(sheetContext, EpisodeAction.reloadLinks),
-                  ),
-                Divider(height: 1, color: AppColors.hairline),
-                _PlayerRow(
-                  icon: isWatched
-                      ? Icons.remove_done_rounded
-                      : Icons.check_circle_outline_rounded,
-                  label: reading
-                      ? (isWatched ? 'Mark as unread' : 'Mark as read')
-                      : (isWatched ? 'Mark as unwatched' : 'Mark as watched'),
-                  subtitle: tracksToServices
-                      ? 'Also updates your connected trackers'
-                      : null,
-                  onTap: () =>
-                      Navigator.pop(sheetContext, EpisodeAction.toggleWatched),
-                ),
-                _PlayerRow(
-                  icon: Icons.done_all_rounded,
-                  label: reading
-                      ? 'Mark this and all above as read'
-                      : 'Mark this and all above as watched',
-                  onTap: () => Navigator.pop(
-                    sheetContext,
-                    EpisodeAction.markAboveWatched,
-                  ),
-                ),
-                if (reading && canOpenInBrowser)
-                  _PlayerRow(
-                    icon: Icons.public_rounded,
-                    label: 'Open in browser',
-                    subtitle: "Read it on the source's own site",
-                    onTap: () => Navigator.pop(
-                      sheetContext,
-                      EpisodeAction.openInBrowser,
-                    ),
-                  ),
+                ...actionRows(sheetContext),
                 const SizedBox(height: 8),
               ],
             ),
@@ -203,6 +252,109 @@ Future<EpisodeAction?> showEpisodeActionSheet(
     ),
   );
 }
+
+/// The rows of the Windows episode right-click menu. Public so tests can
+/// check which rows a given download state produces without opening a menu.
+///
+/// Order: playback first (Play is what a click does, so it leads), then the
+/// download rows for the episode's current download state, then the marking
+/// rows. Reading keeps only the marking rows plus Open in browser, like the
+/// phone sheet.
+@visibleForTesting
+List<DesktopMenuItem<EpisodeAction>> episodeDesktopMenuItems({
+  required bool isWatched,
+  bool reading = false,
+  bool canSurveySources = false,
+  bool canOpenInBrowser = false,
+  EpisodeDownloadMenuState downloadState = EpisodeDownloadMenuState.unavailable,
+}) => [
+  // Labels use appL10n (no context here); it follows the app language.
+  if (!reading) ...[
+    DesktopMenuItem(
+      label: appL10n.play,
+      icon: Icons.play_arrow_rounded,
+      value: EpisodeAction.play,
+    ),
+    DesktopMenuItem(
+      label: appL10n.playMirror,
+      icon: Icons.swap_horiz_rounded,
+      value: EpisodeAction.playMirror,
+    ),
+    // Metadata titles only, same rule as the phone sheet.
+    if (canSurveySources)
+      DesktopMenuItem(
+        label: appL10n.whereToWatch,
+        icon: Icons.travel_explore_rounded,
+        value: EpisodeAction.whereToWatch,
+      ),
+    DesktopMenuItem(
+      label: appL10n.reloadLinks,
+      icon: Icons.refresh_rounded,
+      value: EpisodeAction.reloadLinks,
+    ),
+    // Download rows follow what is actually saved for this episode.
+    if (downloadState != EpisodeDownloadMenuState.unavailable) ...[
+      const DesktopMenuItem<EpisodeAction>.divider(),
+      ...switch (downloadState) {
+        EpisodeDownloadMenuState.none => [
+          DesktopMenuItem(
+            label: appL10n.download,
+            icon: Icons.download_rounded,
+            value: EpisodeAction.download,
+          ),
+        ],
+        // Already queued: say so instead of offering a second download.
+        EpisodeDownloadMenuState.inProgress => [
+          DesktopMenuItem<EpisodeAction>(
+            label: appL10n.downloading,
+            icon: Icons.downloading_rounded,
+            enabled: false,
+          ),
+        ],
+        EpisodeDownloadMenuState.done => [
+          DesktopMenuItem(
+            label: appL10n.showInFolder,
+            icon: Icons.folder_open_rounded,
+            value: EpisodeAction.showInFolder,
+          ),
+          DesktopMenuItem(
+            label: appL10n.deleteDownload,
+            icon: Icons.delete_outline_rounded,
+            value: EpisodeAction.deleteDownload,
+            destructive: true,
+          ),
+        ],
+        EpisodeDownloadMenuState.unavailable =>
+          const <DesktopMenuItem<EpisodeAction>>[],
+      },
+    ],
+    const DesktopMenuItem<EpisodeAction>.divider(),
+  ],
+  DesktopMenuItem(
+    label: reading
+        ? (isWatched ? appL10n.markAsUnread : appL10n.markAsRead)
+        : (isWatched ? appL10n.markAsUnwatched : appL10n.markAsWatched),
+    icon: isWatched
+        ? Icons.remove_done_rounded
+        : Icons.check_circle_outline_rounded,
+    value: EpisodeAction.toggleWatched,
+  ),
+  DesktopMenuItem(
+    label: reading
+        ? appL10n.markThisAndAboveRead
+        : appL10n.markAllAboveWatched,
+    icon: Icons.done_all_rounded,
+    value: EpisodeAction.markAboveWatched,
+  ),
+  if (reading && canOpenInBrowser) ...[
+    const DesktopMenuItem<EpisodeAction>.divider(),
+    DesktopMenuItem(
+      label: appL10n.openInBrowser,
+      icon: Icons.public_rounded,
+      value: EpisodeAction.openInBrowser,
+    ),
+  ],
+];
 
 /// Long-press an episode → pick where it plays, for this episode only.
 ///
@@ -222,9 +374,7 @@ Future<PlayerChoice?> showEpisodePlayerSheet(
 
   return showModalBottomSheet<PlayerChoice>(
     context: context,
-    backgroundColor: Platform.isWindows
-        ? Colors.transparent
-        : AppColors.surface,
+    backgroundColor: _frostedSheets ? Colors.transparent : AppColors.surface,
     shape: const RoundedRectangleBorder(
       borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
     ),
@@ -357,11 +507,45 @@ Future<VideoSource?> showMirrorSheet(
   required List<VideoSource> sources,
 }) {
   final kinds = availableKinds(sources);
+  // One row per mirror, grouped by audio kind and sorted by quality.
+  List<Widget> mirrorRows(
+    BuildContext sheetContext, {
+    bool desktop = false,
+  }) => [
+    for (final k in kinds)
+      for (final s in sortByQuality(sourcesForKind(sources, k)))
+        _PlayerRow(
+          icon: Icons.play_arrow_rounded,
+          // Same shape the player's own Sources sheet uses: the provider's
+          // mirror name when it has one, otherwise the audio kind — and never
+          // a stray "UNKNOWN •" for sources that don't declare sub/dub.
+          label: s.label?.trim().isNotEmpty == true
+              ? s.label!.trim()
+              : '${k != AudioKind.unknown ? '${k.name.toUpperCase()} • ' : ''}'
+                    '${s.quality ?? s.container.name.toUpperCase()}',
+          subtitle: s.label?.trim().isNotEmpty == true ? s.quality : null,
+          onTap: () => Navigator.pop(sheetContext, s),
+          onLongPress: () => copyPlaybackLink(sheetContext, s.url),
+          // Mouse: right-click copies too (Windows panel only).
+          onSecondaryTap: desktop
+              ? () => copyPlaybackLink(sheetContext, s.url)
+              : null,
+        ),
+  ];
+  // Windows: the right-docked graphite panel (title row + close, Esc and
+  // click-outside close) instead of a phone drag-handle sheet.
+  if (desktopPanelsEnabled) {
+    return _showEpisodeDesktopPanel<VideoSource>(
+      context,
+      dialogKey: const ValueKey('mirror-desktop-panel'),
+      title: 'Play mirror',
+      subtitle: episodeLabel,
+      rows: (panelContext) => mirrorRows(panelContext, desktop: true),
+    );
+  }
   return showModalBottomSheet<VideoSource>(
     context: context,
-    backgroundColor: Platform.isWindows
-        ? Colors.transparent
-        : AppColors.surface,
+    backgroundColor: _frostedSheets ? Colors.transparent : AppColors.surface,
     shape: const RoundedRectangleBorder(
       borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
     ),
@@ -406,23 +590,7 @@ Future<VideoSource?> showMirrorSheet(
                     ),
                   ),
                 ),
-                for (final k in kinds)
-                  for (final s in sortByQuality(sourcesForKind(sources, k)))
-                    _PlayerRow(
-                      icon: Icons.play_arrow_rounded,
-                      // Same shape the player's own Sources sheet uses: the
-                      // provider's mirror name when it has one, otherwise the
-                      // audio kind — and never a stray "UNKNOWN •" for sources
-                      // that don't declare sub/dub.
-                      label: s.label?.trim().isNotEmpty == true
-                          ? s.label!.trim()
-                          : '${k != AudioKind.unknown ? '${k.name.toUpperCase()} • ' : ''}'
-                                '${s.quality ?? s.container.name.toUpperCase()}',
-                      subtitle: s.label?.trim().isNotEmpty == true
-                          ? s.quality
-                          : null,
-                      onTap: () => Navigator.pop(sheetContext, s),
-                    ),
+                ...mirrorRows(sheetContext),
                 const SizedBox(height: 8),
               ],
             ),
@@ -438,6 +606,8 @@ class _PlayerRow extends StatelessWidget {
     required this.icon,
     required this.label,
     required this.onTap,
+    this.onLongPress,
+    this.onSecondaryTap,
     this.isDefault = false,
     this.subtitle,
     this.trailingText,
@@ -446,6 +616,10 @@ class _PlayerRow extends StatelessWidget {
   final IconData icon;
   final String label;
   final VoidCallback onTap;
+  final VoidCallback? onLongPress;
+
+  /// Right-click action (Windows panels only; null leaves the tile as is).
+  final VoidCallback? onSecondaryTap;
 
   /// Marks the row a plain tap would have used. Marked rather than sorted to
   /// the top, so the list doesn't reshuffle when the Settings default changes.
@@ -456,7 +630,7 @@ class _PlayerRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final trailing = trailingText ?? (isDefault ? 'Default' : null);
-    return ListTile(
+    final tile = ListTile(
       leading: Icon(icon, color: AppColors.textSecondary),
       title: Text(label, style: AppText.body),
       subtitle: subtitle == null
@@ -472,10 +646,47 @@ class _PlayerRow extends StatelessWidget {
               style: AppText.caption.copyWith(color: AppColors.textSecondary),
             ),
       onTap: onTap,
+      onLongPress: onLongPress,
     );
+    if (onSecondaryTap == null) return tile;
+    return GestureDetector(onSecondaryTap: onSecondaryTap, child: tile);
   }
 }
 
+/// Windows target. Uses the target platform, not the host OS, so phone tests
+/// on a Windows host keep the plain phone sheet. (Windows itself now takes
+/// the docked panels below; only TV mode would still reach a sheet there.)
+bool get _frostedSheets => defaultTargetPlatform == TargetPlatform.windows;
+
 /// Applies the desktop translucent sheet surface without altering mobile sheets.
 Widget _sheetSurface(Widget child) =>
-    Platform.isWindows ? FrostedSheet(child: child) : child;
+    _frostedSheets ? FrostedSheet(child: child) : child;
+
+/// Windows: an episode menu opens as the right-docked graphite panel (title
+/// row + close button, Esc and click-outside close) instead of a phone
+/// drag-handle sheet. [rows] receives the panel's context for popping.
+Future<T?> _showEpisodeDesktopPanel<T>(
+  BuildContext context, {
+  required Key dialogKey,
+  required String title,
+  String? subtitle,
+  required List<Widget> Function(BuildContext panelContext) rows,
+}) => showDesktopDockedPanel<T>(
+  context,
+  dialogKey: dialogKey,
+  builder: (panelContext) => Column(
+    mainAxisSize: MainAxisSize.min,
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      DesktopPanelTitleBar(title: title, subtitle: subtitle),
+      Divider(height: 1, color: DesktopPanelColors.edge),
+      Flexible(
+        child: ListView(
+          shrinkWrap: true,
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          children: rows(panelContext),
+        ),
+      ),
+    ],
+  ),
+);

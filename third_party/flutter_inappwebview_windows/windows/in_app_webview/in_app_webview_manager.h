@@ -60,6 +60,12 @@ namespace flutter_inappwebview_plugin
     WNDCLASS windowClass_ = {};
     inline static bool valid_ = false;
     inline static size_t live_managers_ = 0;
+    // Zangetsu patch: COM apartment generation (see utils/com_apartment.h) the
+    // shared dispatcher queue, graphics context and compositor were built in.
+    inline static unsigned int graphics_generation_ = 0;
+    // Zangetsu patch: (re)builds the shared dispatcher queue, graphics
+    // context and compositor on the current (platform) thread.
+    static void initSharedGraphics();
   };
 }
 #endif //FLUTTER_INAPPWEBVIEW_PLUGIN_IN_APP_WEBVIEW_MANAGER_H_

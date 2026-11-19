@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
 
+import '../../core/desktop/desktop_dialogs.dart';
+import '../../core/desktop/desktop_sheet.dart';
 import '../../core/models/episode.dart';
 import '../../core/reading/chapter_nav.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
+import '../../core/ui/desktop_docked_panel.dart';
 import '../../l10n/l10n.dart';
 import 'chapter_download_selection.dart';
 
@@ -51,8 +54,34 @@ class _ChapterDownloadRangeSheetState extends State<ChapterDownloadRangeSheet> {
     return '$prefix${widget.isChapter ? ' ' : ''}${chapterNumberLabel(widget.chapters, index)} · ${chapter.title}';
   }
 
+  /// Windows (show-2): the endpoint picker is the searchable graphite choice
+  /// dialog (type to filter, arrows + Enter, tick on the current row).
+  /// Rows before the start can't end the range, so they're left out.
+  Future<int?> _pickIndexDesktop({required bool isStart}) {
+    final chapters = widget.chapters;
+    return showDesktopChoiceDialog<int>(
+      context,
+      title: isStart ? context.l10n.startChapter : context.l10n.endChapter,
+      current: isStart ? _fromIndex : _toIndex,
+      searchable: true,
+      searchHint: widget.isChapter
+          ? context.l10n.findChapter
+          : context.l10n.findEpisode,
+      options: [
+        for (var i = 0; i < chapters.length; i++)
+          if (isStart || i >= _fromIndex) (i, _itemLabel(i)),
+      ],
+      optionSubtitles: {
+        for (var i = 0; i < chapters.length; i++)
+          if (chapters[i].scanlator != null) i: chapters[i].scanlator!,
+      },
+    );
+  }
+
   Future<void> _pickIndex({required bool isStart}) async {
-    final picked = await showModalBottomSheet<int>(
+    final picked = desktopPanelsEnabled
+        ? await _pickIndexDesktop(isStart: isStart)
+        : await showModalBottomSheet<int>(
       context: context,
       isScrollControlled: true,
       backgroundColor: AppColors.surface,
@@ -98,19 +127,23 @@ class _ChapterDownloadRangeSheetState extends State<ChapterDownloadRangeSheet> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Center(
-              child: Container(
-                margin: const EdgeInsets.only(bottom: 14),
-                width: 36,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: AppColors.textTertiary.withValues(alpha: 0.5),
-                  borderRadius: BorderRadius.circular(2),
+            // Inside the Windows dialog the title bar carries the heading, so
+            // the drag handle and headline are phone-only.
+            if (!DesktopSheetScope.of(context)) ...[
+              Center(
+                child: Container(
+                  margin: const EdgeInsets.only(bottom: 14),
+                  width: 36,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: AppColors.textTertiary.withValues(alpha: 0.5),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
                 ),
               ),
-            ),
-            Text(context.l10n.custom, style: AppText.headline),
-            const SizedBox(height: 8),
+              Text(context.l10n.custom, style: AppText.headline),
+              const SizedBox(height: 8),
+            ],
             _RangeEndpointTile(
               label: context.l10n.startChapter,
               value: chapters.isEmpty ? '' : _itemLabel(_fromIndex),

@@ -19,8 +19,25 @@ class DesktopFlareSolverr {
 
   static HttpServer? _server;
   static Future<Uri>? _starting;
-  static Future<void> _queue = Future.value();
   static String? _key;
+
+  /// Replays allowed to run at once. The engine gives each replay only 15s
+  /// to answer, and a source home asks for popular and latest together, so a
+  /// strictly one-at-a-time queue made the second request time out while it
+  /// waited. A few headless views sharing one profile is safe in WebView2.
+  static const int _maxParallelReplays = 3;
+  static int _activeReplays = 0;
+  static final List<Completer<void>> _replayWaiters = [];
+
+  /// Upper bound for one browser replay. Kept under the engine's 15s read
+  /// limit so a slow page fails here (and is logged) instead of the engine
+  /// giving up first with a bare "Read timed out".
+  @visibleForTesting
+  static const Duration replayTimeout = Duration(seconds: 13);
+
+  /// One WebView2 environment (browser process) shared by all replays, so
+  /// each request does not pay for starting a new one. Cleared on failure.
+  static Future<WebViewEnvironment>? _environment;
   static final Set<String> _verifiedHosts = {};
 
   /// Allows retries only for a host the user has manually verified.
@@ -51,31 +68,58 @@ class DesktopFlareSolverr {
     if (!hasVerifiedUrl('${body['url']}')) {
       throw StateError('Visible verification is required');
     }
-    final result = Completer<Map<String, dynamic>>();
-    final previous = _queue;
-    _queue = () async {
+    // Wait for a free slot (see [_maxParallelReplays]).
+    while (_activeReplays >= _maxParallelReplays) {
+      final waiter = Completer<void>();
+      _replayWaiters.add(waiter);
+      await waiter.future;
+    }
+    _activeReplays++;
+    final clock = Stopwatch()..start();
+    final host = Uri.tryParse('${body['url']}')?.host ?? 'invalid';
+    try {
+      AppLogger.instance.log('[browser-replay] start $host');
+      final response = await (browserRequestOverride ?? _solve)(body);
+      AppLogger.instance.log(
+        '[browser-replay] finished $host ${clock.elapsedMilliseconds}ms',
+      );
+      return response;
+    } catch (error) {
+      // Record the failure category and host without exporting page bodies,
+      // cookies or full request URLs, so production failures are diagnosable.
+      AppLogger.instance.log(
+        '[browser-replay] failed $host ${error.runtimeType} '
+        '${clock.elapsedMilliseconds}ms: ${_short(error)}',
+      );
+      rethrow;
+    } finally {
+      // Free the slot; the next waiter (if any) re-checks the count.
+      _activeReplays--;
+      if (_replayWaiters.isNotEmpty) _replayWaiters.removeAt(0).complete();
+    }
+  }
+
+  /// First line of an error, capped, for the replay log.
+  static String _short(Object error) {
+    final text = '$error'.split('\n').first;
+    return text.length > 160 ? '${text.substring(0, 160)}…' : text;
+  }
+
+  /// The shared replay environment, created on first use. A failed creation
+  /// is forgotten so the next replay tries again.
+  static Future<WebViewEnvironment> _sharedEnvironment() {
+    return _environment ??= () async {
       try {
-        await previous;
-      } catch (_) {
-        /* Retry remains usable after a failed site. */
-      }
-      try {
-        final clock = Stopwatch()..start();
-        final host = Uri.tryParse('${body['url']}')?.host ?? 'invalid';
-        AppLogger.instance.log('[browser-replay] start $host');
-        final response = await (browserRequestOverride ?? _solve)(body);
-        AppLogger.instance.log(
-          '[browser-replay] finished $host ${clock.elapsedMilliseconds}ms',
+        return await WebViewEnvironment.create(
+          settings: WebViewEnvironmentSettings(
+            userDataFolder: (await writableAppSubdir('browser')).path,
+          ),
         );
-        result.complete(response);
-      } catch (error, stack) {
-        // Record the failure category without exporting page bodies, cookies
-        // or request URLs, so production verification failures are diagnosable.
-        AppLogger.instance.log('[browser-replay] failed ${error.runtimeType}');
-        result.completeError(error, stack);
+      } catch (_) {
+        _environment = null;
+        rethrow;
       }
     }();
-    return result.future;
   }
 
   @visibleForTesting
@@ -180,13 +224,78 @@ class DesktopFlareSolverr {
           entry.key: '${entry.value}',
     };
     final done = Completer<Map<String, dynamic>>();
-    var loading = false;
+    // True while one capture attempt runs, so the poll and onLoadStop never
+    // overlap.
+    var capturing = false;
+    // Set when the last look at the page still showed a challenge, for a
+    // clearer timeout message.
+    var sawChallenge = false;
     int? navigationStatus;
-    final environment = await WebViewEnvironment.create(
-      settings: WebViewEnvironmentSettings(
-        userDataFolder: (await writableAppSubdir('browser')).path,
-      ),
-    );
+    // Shared browser process instead of a new environment per request.
+    final environment = await _sharedEnvironment();
+
+    // Reads the page as soon as its document is parsed (readyState is no
+    // longer "loading") instead of waiting for onLoadStop: ad-heavy sites
+    // such as natomanga kept loading sub-resources past the engine's 15s
+    // limit. A challenge page is not an error yet: it may pass by itself and
+    // redirect, so this keeps waiting until [replayTimeout].
+    Future<void> capture(InAppWebViewController controller) async {
+      if (done.isCompleted || capturing) return;
+      capturing = true;
+      try {
+        final result = await controller.callAsyncJavaScript(
+          functionBody: '''
+            if (document.readyState === 'loading' ||
+                (location.protocol !== 'http:' && location.protocol !== 'https:')) {
+              return {pending: true};
+            }
+            const title = (document.title || '').toLowerCase();
+            if (title.includes('just a moment') || title.includes('attention required') ||
+                title.includes('security verification') || window._cf_chl_opt ||
+                document.querySelector('#challenge-running, #challenge-stage, #challenge-form, #cf-challenge-running')) {
+              return {challenge: true};
+            }
+            if (method === 'GET') {
+              return {status: navigationStatus || 200, url: location.href,
+                headers: {'content-type': document.contentType},
+                body: document.contentType.includes('html') ? document.documentElement.outerHTML : (document.body ? document.body.innerText : ''),
+                userAgent: navigator.userAgent};
+            }
+            const options = {method, headers, credentials: 'include'};
+            if (body != null && method !== 'GET' && method !== 'HEAD') options.body = body;
+            const response = await fetch(url, options);
+            return {status: response.status, url: response.url,
+              headers: Object.fromEntries(response.headers.entries()),
+              body: await response.text(), userAgent: navigator.userAgent};
+          ''',
+          arguments: {
+            'url': target.toString(),
+            'method': method,
+            'headers': headers,
+            'body': request['postData'],
+            'navigationStatus': navigationStatus,
+          },
+        );
+        final value = result?.value;
+        // Nothing usable yet (e.g. a navigation swapped the document).
+        if (value is! Map) return;
+        if (value['pending'] == true) return;
+        if (value['challenge'] == true) {
+          sawChallenge = true;
+          return;
+        }
+        if (!done.isCompleted) done.complete(Map<String, dynamic>.from(value));
+      } catch (error, stack) {
+        // A script error mid-navigation is retried by the poll; a failed
+        // fetch for a POST is final.
+        if (method != 'GET' && !done.isCompleted) {
+          done.completeError(error, stack);
+        }
+      } finally {
+        capturing = false;
+      }
+    }
+
     late final HeadlessInAppWebView browser;
     browser = HeadlessInAppWebView(
       webViewEnvironment: environment,
@@ -196,48 +305,7 @@ class DesktopFlareSolverr {
       ),
       initialSettings: InAppWebViewSettings(javaScriptEnabled: true),
       onLoadStart: (_, _) => navigationStatus = null,
-      onLoadStop: (controller, _) async {
-        if (done.isCompleted || loading) return;
-        loading = true;
-        try {
-          final result = await controller.callAsyncJavaScript(
-            functionBody: '''
-              if (method === 'GET') {
-                const title = document.title.toLowerCase();
-                if (title.includes('just a moment') || title.includes('attention required') ||
-                    document.querySelector('#challenge-running, #challenge-stage')) {
-                  throw new Error('The website is still showing a verification challenge');
-                }
-                return {status: navigationStatus || 200, url: location.href,
-                  headers: {'content-type': document.contentType},
-                  body: document.contentType.includes('html') ? document.documentElement.outerHTML : document.body.innerText,
-                  userAgent: navigator.userAgent};
-              }
-              const options = {method, headers, credentials: 'include'};
-              if (body != null && method !== 'GET' && method !== 'HEAD') options.body = body;
-              const response = await fetch(url, options);
-              return {status: response.status, url: response.url,
-                headers: Object.fromEntries(response.headers.entries()),
-                body: await response.text(), userAgent: navigator.userAgent};
-            ''',
-            arguments: {
-              'url': target.toString(),
-              'method': method,
-              'headers': headers,
-              'body': request['postData'],
-              'navigationStatus': navigationStatus,
-            },
-          );
-          final value = result?.value;
-          if (value is Map) {
-            done.complete(Map<String, dynamic>.from(value));
-          } else {
-            throw StateError('The browser returned no response');
-          }
-        } catch (error, stack) {
-          if (!done.isCompleted) done.completeError(error, stack);
-        }
-      },
+      onLoadStop: (controller, _) => capture(controller),
       onReceivedError: (_, webRequest, error) {
         if (webRequest.isForMainFrame == true && !done.isCompleted) {
           done.completeError(StateError(error.description));
@@ -249,9 +317,32 @@ class DesktopFlareSolverr {
         }
       },
     );
+    Timer? poll;
     try {
-      await browser.run();
-      final result = await done.future.timeout(const Duration(seconds: 18));
+      try {
+        await browser.run();
+      } catch (_) {
+        // The shared browser process may have died: start a fresh one for
+        // the next replay.
+        _environment = null;
+        rethrow;
+      }
+      // Poll the document so a parsed page is captured before every ad and
+      // image on it has finished loading.
+      poll = Timer.periodic(const Duration(milliseconds: 400), (_) {
+        final controller = browser.webViewController;
+        if (controller != null) capture(controller);
+      });
+      final Map<String, dynamic> result;
+      try {
+        result = await done.future.timeout(replayTimeout);
+      } on TimeoutException {
+        throw StateError(
+          sawChallenge
+              ? 'The website is still showing a verification challenge'
+              : 'The website did not load in time',
+        );
+      }
       final status = (result['status'] as num?)?.toInt() ?? 0;
       if (status == 403 || status == 429 || status == 503 || status == 0) {
         throw StateError(
@@ -259,7 +350,9 @@ class DesktopFlareSolverr {
         );
       }
       final manager = CookieManager.instance(webViewEnvironment: environment);
-      final cookies = await manager.getCookies(url: WebUri(target.toString()));
+      final cookies = await manager
+          .getCookies(url: WebUri(target.toString()))
+          .timeout(const Duration(seconds: 3), onTimeout: () => <Cookie>[]);
       return {
         'status': 'ok',
         'message': 'Challenge solved',
@@ -286,8 +379,10 @@ class DesktopFlareSolverr {
         },
       };
     } finally {
+      poll?.cancel();
+      // Only the headless view goes; the shared environment stays for the
+      // next replay.
       await browser.dispose();
-      await environment.dispose();
     }
   }
 }

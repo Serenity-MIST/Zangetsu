@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
 
@@ -28,6 +29,7 @@ const List<String> kBundledSubtitleFonts = [
 const List<(String, String)> kPlayerInfoFields = [
   ('resolution', 'Resolution'),
   ('source', 'Source'),
+  ('provider', 'Provider'),
   ('quality', 'Quality'),
   ('vcodec', 'Video codec'),
   ('acodec', 'Audio codec'),
@@ -41,6 +43,17 @@ const List<(String, String)> kPlayerInfoFields = [
   ('strack', 'Subtitle track'),
   ('af', 'Audio boost'),
 ];
+
+/// Provider row text for the in-player info overlay: human name + raw id
+/// ("HiAnime (ani:7667)"), so opaque numeric Aniyomi ids are knowable while
+/// CS slugs stay exact. Falls back to the bare id when no name resolves.
+String providerInfoLabel(String id, String? Function(String) lookup) {
+  try {
+    final name = lookup(id);
+    if (name != null && name.isNotEmpty && name != id) return '$name ($id)';
+  } catch (_) {}
+  return id;
+}
 
 /// The mpv video output (renderer) for a given user [choice].
 ///
@@ -194,6 +207,50 @@ String resolveHwdec({
   }
 }
 
+/// Windows wording for the Video decoder choices. Same stored ids as the
+/// phone list; each label names what [resolveHwdec] hands mpv on a PC
+/// (`d3d11va-copy`, `d3d11va`, `no`, `auto-safe`).
+const List<(String, String)> kWindowsDecoderOptions = [
+  ('copy', 'Hardware, D3D11 copy (recommended)'),
+  ('direct', 'Hardware, D3D11 direct (lighter)'),
+  ('sw', 'Software, CPU (most compatible)'),
+  ('auto', 'Automatic (mpv picks)'),
+];
+
+/// Windows wording for the player-orientation pref. A PC never rotates, so
+/// the stored value only picks the layout the player opens in.
+/// 'system' is kept for saves made before: it follows the window's shape.
+const List<(String, String)> kWindowsPlayerOpensInOptions = [
+  ('portrait', 'Watch page'),
+  ('landscape', 'Full window'),
+];
+
+/// Label for a stored orientation value on Windows.
+String windowsPlayerOpensInLabel(String value) => switch (value) {
+  'portrait' => 'Watch page',
+  'system' => 'Match window shape',
+  _ => 'Full window',
+};
+
+/// Windows wording for Close confirmation. A PC closes the player with Esc,
+/// the mouse Back button or the on-screen back arrow, not a BACK key.
+const List<(String, String)> kWindowsCloseConfirmOptions = [
+  ('double_back', 'Press Esc or Back twice to close'),
+  ('confirm', 'Ask before closing the player'),
+  ('direct', 'Close at once'),
+];
+
+/// Label for a stored Close confirmation value on Windows.
+String windowsCloseConfirmLabel(String value) {
+  for (final (v, label) in kWindowsCloseConfirmOptions) {
+    if (v == value) return label;
+  }
+  return kWindowsCloseConfirmOptions.first.$2;
+}
+
+/// The Windows "double back" hint shown after the first press.
+const String kWindowsPressAgainToClose = 'Press Esc or Back again to close';
+
 /// Persistent, app-wide playback preferences (default quality, sub/dub
 /// category, autoplay, speed, seek step, keep-screen-on, auto-resume). Backed
 /// by a tiny untyped Hive box read anywhere via `sl<PlaybackPrefs>()`. Values
@@ -206,6 +263,13 @@ enum PosterCardSize { small, standard, large }
 enum PosterTitlePlacement { adaptive, inside, below }
 
 enum PosterTitleStyle { text, artwork }
+
+/// How the built-in mobile player opens an episode:
+/// [PlayerPresentation.watchPage] is the portrait page (video on top, episode
+/// info below); [PlayerPresentation.fullscreen] is the fullscreen player, in
+/// whichever orientation the lock holds. TV always opens fullscreen and
+/// never reads the preference.
+enum PlayerPresentation { watchPage, fullscreen }
 
 class PlaybackPrefs {
   static const String boxName = 'playback_prefs';
@@ -290,6 +354,31 @@ class PlaybackPrefs {
   bool get keepScreenOn => _box.get('keepScreenOn', defaultValue: true) as bool;
   Future<void> setKeepScreenOn(bool value) => _box.put('keepScreenOn', value);
 
+  /// Default player orientation: 'landscape' | 'portrait' | 'system'.
+  /// Landscape is the behaviour from before this setting existed, so a
+  /// never-touched install opens exactly as it always has.
+  String get playerOrientation =>
+      _box.get('playerOrientation', defaultValue: 'landscape') as String;
+  Future<void> setPlayerOrientation(String value) =>
+      _box.put('playerOrientation', value);
+
+  /// The [DeviceOrientation] lock for a saved [playerOrientation] choice.
+  /// Unknown values fall back to landscape — never to portrait.
+  static List<DeviceOrientation> orientationLockFor(String choice) {
+    switch (choice) {
+      case 'portrait':
+        return const [DeviceOrientation.portraitUp];
+      case 'system':
+        return DeviceOrientation.values;
+      case 'landscape':
+      default:
+        return const [
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ];
+    }
+  }
+
   /// Auto-enter Picture-in-Picture when leaving the app mid-playback (Android).
   /// The manual PiP button works regardless of this setting.
   bool get autoPip => _box.get('autoPip', defaultValue: true) as bool;
@@ -305,13 +394,12 @@ class PlaybackPrefs {
   Future<void> setNativeTvPlayer(bool value) =>
       _box.put('nativeTvPlayer', value);
 
-  /// Decoder priority for native Android TV playback. The legacy boolean is
-  /// read only when this setting has not yet been saved, preserving the old
-  /// hardware-first fallback behavior for existing users.
+  /// TV defaults to hardware-first with software decoders available.
+  /// Explicit saved modes and legacy choices take priority over the default.
   TvDecoderMode get tvDecoderMode => TvDecoderMode.fromStorage(
     _box.get('tvDecoderMode'),
     legacySoftwareDecoding:
-        _box.get('tvSoftwareDecoding', defaultValue: false) == true,
+        _box.get('tvSoftwareDecoding', defaultValue: true) == true,
   );
 
   Future<void> setTvDecoderMode(TvDecoderMode value) async {
@@ -361,6 +449,16 @@ class PlaybackPrefs {
       _box.get('closeConfirmation', defaultValue: 'double_back') as String;
   Future<void> setCloseConfirmation(String value) =>
       _box.put('closeConfirmation', value);
+
+  /// What to do when online playback keeps failing or stalling and a finished
+  /// download of the same episode exists:
+  ///  • 'auto' = switch to the downloaded copy at the same position.
+  ///  • 'ask'  = offer the downloaded copy and switch only if accepted.
+  ///  • 'off'  = never switch; show the usual error.
+  String get localDownloadFallback =>
+      _box.get('localDownloadFallback', defaultValue: 'auto') as String;
+  Future<void> setLocalDownloadFallback(String value) =>
+      _box.put('localDownloadFallback', value);
 
   /// Whether installed extensions (Zangetsu / CloudStream / Aniyomi) auto-update
   /// in the background on launch, throttled to ~once a day. Off by default —
@@ -503,8 +601,10 @@ class PlaybackPrefs {
   // ── Anime4K enhancement (GLSL upscaling) ───────────────────────────────────
   // Real-time neural upscaling for low-res anime. STYLE = the filter: 'off'
   // (default), 'a' Sharpen, 'b' De-blur, 'c' Denoise. TIER = GPU cost: 'mid'
-  // (light) / 'high' (heavy). Applied via `glsl-shaders`; routed through the
-  // gpu-next renderer + deband/HQ-scaling render tuning when style != 'off'.
+  // (light) / 'high' (heavy). Applied via `glsl-shaders` with deband/HQ-scaling
+  // render tuning when style != 'off'. Phones route it through gpu-next;
+  // Windows keeps its embedded libmpv output, and the player turns the style
+  // back to 'off' if mpv reports the shaders failing there.
   String get videoShaderStyle =>
       _box.get('videoShaderStyle', defaultValue: 'off') as String;
   Future<void> setVideoShaderStyle(String value) =>
@@ -563,6 +663,32 @@ class PlaybackPrefs {
       _box.get('videoBufferLength', defaultValue: 'default') as String;
   Future<void> setVideoBufferLength(String value) =>
       _box.put('videoBufferLength', value);
+
+  bool get phoneNativeCacheEnabled =>
+      _box.get('phoneNativeCacheEnabled', defaultValue: false) == true;
+  Future<void> setPhoneNativeCacheEnabled(bool value) =>
+      _box.put('phoneNativeCacheEnabled', value);
+
+  bool get phoneDiskCacheEnabled =>
+      _box.get('phoneDiskCacheEnabled', defaultValue: false) == true;
+  Future<void> setPhoneDiskCacheEnabled(bool value) =>
+      _box.put('phoneDiskCacheEnabled', value);
+
+  int get phoneNativeCacheMb {
+    final value = _box.get('phoneNativeCacheMb');
+    return value is num && value.isFinite ? value.toInt().clamp(32, 512) : 128;
+  }
+
+  Future<void> setPhoneNativeCacheMb(int value) =>
+      _box.put('phoneNativeCacheMb', value.clamp(32, 512));
+
+  int get phoneDiskCacheGb {
+    final value = _box.get('phoneDiskCacheGb');
+    return value is num && value.isFinite ? value.toInt().clamp(1, 20) : 2;
+  }
+
+  Future<void> setPhoneDiskCacheGb(int value) =>
+      _box.put('phoneDiskCacheGb', value.clamp(1, 20));
 
   /// mpv `demuxer-max-bytes` for the current size preset (default = 128MiB).
   String get bufferMaxBytes => bufferMaxBytesFor(videoBufferSize);
@@ -839,6 +965,11 @@ class PlaybackPrefs {
 
   Future<void> setMegaSkipSeconds(int value) =>
       _box.put('megaSkipSeconds', value.clamp(megaSkipMin, megaSkipMax));
+
+  bool get autoPlayerFallback =>
+      _box.get('autoPlayerFallback', defaultValue: false) as bool;
+  Future<void> setAutoPlayerFallback(bool value) =>
+      _box.put('autoPlayerFallback', value);
 
   /// Default player. Empty string = the built-in player; otherwise the package
   /// id of an external player (e.g. 'org.videolan.vlc') to hand streams to.

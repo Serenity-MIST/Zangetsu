@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/di/injector.dart';
@@ -331,6 +332,25 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
     _save();
   }
 
+  /// Windows: move [entry] one place up (-1) or down (+1) in the saved order.
+  /// Same result as dragging it one slot, so group labels re-anchor the same
+  /// way, and it saves immediately like a drag does.
+  void _moveBy(HomeRowEntry entry, int delta) {
+    final from = _layout.indexWhere((e) => e.id == entry.id);
+    final to = from + delta;
+    if (from < 0 || to < 0 || to >= _layout.length) return;
+    setState(() {
+      final next = [..._layout];
+      next.insert(to, next.removeAt(from));
+      _layout = next;
+    });
+    _save();
+  }
+
+  /// Up/down buttons are a Windows addition for mouse and keyboard users;
+  /// phone keeps drag only.
+  bool get _showMoveButtons => defaultTargetPlatform == TargetPlatform.windows;
+
   @override
   Widget build(BuildContext context) {
     final l10n = context.l10n;
@@ -338,7 +358,7 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
     final canReset = HomeRowsPrefs.savedFor(_layoutKey) != null;
     final info = _layoutInfo;
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar(
         l10n.homeRows,
         actions: [
@@ -440,6 +460,7 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
 
   Widget _row(HomeRowEntry e, int index) {
     final tint = e.hidden ? AppColors.textTertiary : AppColors.textPrimary;
+    final position = _layout.indexWhere((x) => x.id == e.id);
     return Padding(
       key: ValueKey(e.id),
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
@@ -447,15 +468,37 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
         children: [
           ReorderableDragStartListener(
             index: index,
-            child: const Padding(
-              padding: EdgeInsetsDirectional.only(end: 10),
-              child: Icon(
-                Icons.drag_indicator_rounded,
-                size: 19,
-                color: AppColors.textTertiary,
+            child: MouseRegion(
+              cursor: _showMoveButtons
+                  ? SystemMouseCursors.grab
+                  : MouseCursor.defer,
+              child: const Padding(
+                padding: EdgeInsetsDirectional.only(end: 10),
+                child: Icon(
+                  Icons.drag_indicator_rounded,
+                  size: 19,
+                  color: AppColors.textTertiary,
+                ),
               ),
             ),
           ),
+          if (_showMoveButtons) ...[
+            _moveButton(
+              key: ValueKey('home-row-up-${e.id}'),
+              tooltip: 'Move up',
+              icon: Icons.keyboard_arrow_up_rounded,
+              onPressed: position > 0 ? () => _moveBy(e, -1) : null,
+            ),
+            _moveButton(
+              key: ValueKey('home-row-down-${e.id}'),
+              tooltip: 'Move down',
+              icon: Icons.keyboard_arrow_down_rounded,
+              onPressed: position < _layout.length - 1
+                  ? () => _moveBy(e, 1)
+                  : null,
+            ),
+            const SizedBox(width: 8),
+          ],
           Expanded(
             child: Text(
               _rowTitle(e),
@@ -473,6 +516,27 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
       ),
     );
   }
+
+  /// Compact, focusable arrow button for the Windows reorder controls.
+  Widget _moveButton({
+    required Key key,
+    required String tooltip,
+    required IconData icon,
+    required VoidCallback? onPressed,
+  }) => IconButton(
+    key: key,
+    tooltip: tooltip,
+    onPressed: onPressed,
+    icon: Icon(icon, size: 20),
+    color: AppColors.textSecondary,
+    disabledColor: AppColors.textTertiary.withValues(alpha: .35),
+    visualDensity: VisualDensity.compact,
+    padding: EdgeInsets.zero,
+    constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+    style: IconButton.styleFrom(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+    ),
+  );
 
   /// One row's label, resolved the same way Home renders it — shared helpers
   /// and l10n keys, so editor and screen can't drift.

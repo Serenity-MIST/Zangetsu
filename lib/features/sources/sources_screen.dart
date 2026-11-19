@@ -1,4 +1,3 @@
-
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
@@ -13,6 +12,7 @@ import '../../core/state/active_source_cubit.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import 'providers_hub_screen.dart';
+import 'sources_desktop_kit.dart';
 import '../../core/ui/app_dialog.dart';
 import '../../l10n/l10n.dart';
 
@@ -25,7 +25,9 @@ class SourcesScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const ProvidersHubScreen();
+    // Windows: the desktop settings look from any entry point (src-3 A);
+    // a pass-through inside the settings workspace and off Windows.
+    return const DesktopProviderScope(child: ProvidersHubScreen());
   }
 }
 

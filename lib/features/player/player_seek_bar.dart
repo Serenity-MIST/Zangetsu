@@ -1,17 +1,23 @@
 // Scrubber row, its buffered-range track and the thumbnail preview bubble.
 part of 'player_screen.dart';
 
-class _SeekRow extends StatefulWidget {
-  const _SeekRow({
+class PlayerSeekBar extends StatefulWidget {
+  const PlayerSeekBar({
+    super.key,
     required this.controller,
     required this.duration,
     required this.onInteract,
     this.trailing,
+    this.showTime = true,
   });
 
   final PlayerCubit controller;
   final Duration duration;
   final VoidCallback onInteract;
+
+  /// Shows the elapsed / total chip above the bar. The Windows theater page
+  /// turns it off because its transport row already prints the time.
+  final bool showTime;
 
   /// Sits at the far end of the timestamp's line (the MegaSkip pill). Riding
   /// the same row costs no extra height — it used to own a line to itself,
@@ -19,10 +25,10 @@ class _SeekRow extends StatefulWidget {
   final Widget? trailing;
 
   @override
-  State<_SeekRow> createState() => _SeekRowState();
+  State<PlayerSeekBar> createState() => _SeekRowState();
 }
 
-class _SeekRowState extends State<_SeekRow> {
+class _SeekRowState extends State<PlayerSeekBar> {
   // While the user is dragging the thumb, hold the value locally so the live
   // position stream doesn't yank it back (which made it feel un-draggable).
   double? _dragMs;
@@ -33,13 +39,24 @@ class _SeekRowState extends State<_SeekRow> {
   // a GPU-bound ~20fps. Sample to ~4Hz: invisible for a slowly-advancing thumb,
   // and scrubbing stays perfectly smooth because it runs off _dragMs, not this.
   late final Stream<Duration> _livePosition = widget
-      .controller.player.stream.position
+      .controller
+      .player
+      .stream
+      .position
       .map((p) => Duration(milliseconds: (p.inMilliseconds ~/ 250) * 250))
       .distinct();
 
   // Tap the right-hand time to flip between total duration and remaining time
   // (a negative countdown, e.g. "−1:00"), CloudStream-style.
   bool _showRemaining = false;
+
+  // Windows: where the mouse rests over the bar (local x), so a small time
+  // bubble can say what a click there would jump to. Null when not hovering.
+  double? _hoverX;
+
+  /// Windows only: the mouse hover bubble. Uses the target platform so phone
+  /// widget tests on a Windows host never see it.
+  bool get _hoverTimeEnabled => defaultTargetPlatform == TargetPlatform.windows;
 
   // Netflix-style scrub preview: a hidden second player/decoder renders the
   // frame at the drag position. Kept alive for the whole session so only the
@@ -117,214 +134,281 @@ class _SeekRowState extends State<_SeekRow> {
     _maybePrewarm();
     final totalMs = widget.duration.inMilliseconds;
     final max = totalMs > 0 ? totalMs.toDouble() : 1.0;
-    return StreamBuilder<Duration>(
-      stream: _livePosition,
-      builder: (context, snap) {
-        final streamMs = (snap.data ?? Duration.zero).inMilliseconds
-            .clamp(0, max.toInt())
-            .toDouble();
-        // Use the drag value while scrubbing, else the live position.
-        final value = (_dragMs ?? streamMs).clamp(0.0, max);
-        final shownPos = Duration(milliseconds: value.round());
-        return Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Elapsed / total sits above the bar so the bar itself can run the
-            // full width — easier to scrub, and it reads as one clean line.
-            // Tapping still flips the total for a remaining countdown. Anything
-            // passed as [trailing] shares this line at the far end.
-            Row(
-              children: [
-                GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: () {
-                    setState(() => _showRemaining = !_showRemaining);
-                    widget.onInteract();
-                  },
-                  child: Padding(
-                    padding: const EdgeInsets.only(bottom: 2),
-                // Same translucent chip as the button groups, so the whole
-                // bottom block reads as one set of parts.
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: 0.3),
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 3,
-                    ),
-                    child: Text(
-                      '${_fmt(shownPos)} / ${_showRemaining ? '-${_fmt(widget.duration - shownPos)}' : _fmt(widget.duration)}',
-                      style: AppText.caption.copyWith(
-                        color: Colors.white,
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.w600,
-                        height: 1.1,
-                        letterSpacing: 0.3,
-                        // Fixed-width digits: without these the label twitches
-                        // every time a 1 ticks past, since 1 is narrower than
-                        // the rest in a proportional face.
-                        fontFeatures: const [FontFeature.tabularFigures()],
-                      ),
-                    ),
-                  ),
-                ),
-                  ),
-                ),
-                if (widget.trailing != null) ...[
-                  const Spacer(),
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 2),
-                    child: widget.trailing!,
-                  ),
-                ],
-              ],
-            ),
-            SizedBox(
-              width: double.infinity,
-              child: LayoutBuilder(
-                builder: (context, cons) {
-                  final w = cons.maxWidth;
-                  final frac = max > 0 ? (value / max).clamp(0.0, 1.0) : 0.0;
-                  const bubbleW = 168.0;
-                  final left = (frac * w - bubbleW / 2).clamp(
-                    0.0,
-                    (w - bubbleW).clamp(0.0, double.infinity),
-                  );
-                  return Stack(
-                    clipBehavior: Clip.none,
-                    children: [
-                      SizedBox(
-                        width: w,
-                        child: StreamBuilder<Duration>(
-                          stream: widget.controller.player.stream.buffer,
-                          builder: (context, bufSnap) {
-                            final bufMs =
-                                (bufSnap.data ?? Duration.zero).inMilliseconds;
-                            final bufferedFrac = totalMs > 0
-                                ? (bufMs / totalMs).clamp(0.0, 1.0)
-                                : 0.0;
-                            return SliderTheme(
-                              data: SliderTheme.of(context).copyWith(
-                                activeTrackColor: AppColors.accent,
-                                inactiveTrackColor: Colors.white24,
-                                trackShape: _BufferedSliderTrackShape(
-                                  buffered: bufferedFrac,
-                                  bufferedColor: Colors.white.withValues(
-                                    alpha: 0.55,
-                                  ),
-                                  marks: [
-                                    if (totalMs > 0 &&
-                                        sl<PlaybackPrefs>().skipIntro)
-                                      for (final iv
-                                          in widget.controller.currentSkips) ...[
-                                        (iv.start.inMilliseconds / totalMs)
-                                            .clamp(0.0, 1.0),
-                                        (iv.end.inMilliseconds / totalMs)
-                                            .clamp(0.0, 1.0),
-                                      ],
-                                  ],
-                                ),
-                                thumbColor: Colors.white,
-                                overlayColor: AppColors.accentSoft,
-                                trackHeight: 6,
-                                // Thumb grows while scrubbing (YouTube-style).
-                                thumbShape: RoundSliderThumbShape(
-                                  enabledThumbRadius: _dragMs != null ? 11 : 7,
-                                ),
-                                overlayShape: const RoundSliderOverlayShape(
-                                  overlayRadius: 18,
-                                ),
+    // Playback time runs left to right even when the app language is RTL.
+    return Directionality(
+      textDirection: TextDirection.ltr,
+      child: StreamBuilder<Duration>(
+        stream: _livePosition,
+        initialData: widget.controller.player.state.position,
+        builder: (context, snap) {
+          final streamMs = (snap.data ?? Duration.zero).inMilliseconds
+              .clamp(0, max.toInt())
+              .toDouble();
+          // Use the drag value while scrubbing, else the live position.
+          final value = (_dragMs ?? streamMs).clamp(0.0, max);
+          final shownPos = Duration(milliseconds: value.round());
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Elapsed / total sits above the bar so the bar itself can run the
+              // full width — easier to scrub, and it reads as one clean line.
+              // Tapping still flips the total for a remaining countdown. Anything
+              // passed as [trailing] shares this line at the far end.
+              if (widget.showTime)
+                Row(
+                  children: [
+                    GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () {
+                        setState(() => _showRemaining = !_showRemaining);
+                        widget.onInteract();
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.only(bottom: 2),
+                        // Same translucent chip as the button groups, so the whole
+                        // bottom block reads as one set of parts.
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.3),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 3,
+                            ),
+                            child: Text(
+                              '${_fmt(shownPos)} / ${_showRemaining ? '-${_fmt(widget.duration - shownPos)}' : _fmt(widget.duration)}',
+                              style: AppText.caption.copyWith(
+                                color: Colors.white,
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w600,
+                                height: 1.1,
+                                letterSpacing: 0.3,
+                                // Fixed-width digits: without these the label twitches
+                                // every time a 1 ticks past, since 1 is narrower than
+                                // the rest in a proportional face.
+                                fontFeatures: const [
+                                  FontFeature.tabularFigures(),
+                                ],
                               ),
-                              child: Slider(
-                                min: 0,
-                                max: max,
-                                value: value,
-                                // Replaces the default inset — half the overlay
-                                // width (~18px) horizontally, the overlay height
-                                // vertically, which was most of the dead space
-                                // around the bar. Horizontal is the thumb radius
-                                // exactly: the thumb centres on the track's end,
-                                // so anything less and half the dot hangs past
-                                // the line the chips above and below sit on.
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 7,
-                                  vertical: 6,
-                                ),
-                                onChangeStart: totalMs <= 0
-                                    ? null
-                                    : (v) {
-                                        _ensurePreview();
-                                        setState(() => _dragMs = v);
-                                        _requestPreview(v);
-                                        widget.onInteract();
-                                      },
-                                onChanged: totalMs <= 0
-                                    ? null
-                                    : (v) {
-                                        setState(() => _dragMs = v);
-                                        _requestPreview(v);
-                                        widget.onInteract();
-                                      },
-                                onChangeEnd: totalMs <= 0
-                                    ? null
-                                    : (v) {
-                                        widget.controller.seekTo(
-                                          Duration(milliseconds: v.round()),
-                                        );
-                                        setState(() => _dragMs = null);
-                                        widget.onInteract();
-                                      },
-                              ),
-                            );
-                          },
-                        ),
-                      ),
-                      // Off-screen 1px Video that drives mpv frame rendering
-                      // for online previews — mpv only produces screenshot-able
-                      // frames when its texture is actually painted. Kept
-                      // mounted whenever the preview player exists (not only
-                      // mid-drag) so it stays warm between scrubs.
-                      if (_preview != null && _preview!.usesVideo)
-                        Positioned(
-                          left: 0,
-                          top: 0,
-                          width: 1,
-                          height: 1,
-                          child: IgnorePointer(
-                            child: ValueListenableBuilder<VideoController?>(
-                              valueListenable: _preview!.videoController,
-                              builder: (context, vc, _) => vc == null
-                                  ? const SizedBox.shrink()
-                                  : Video(
-                                      controller: vc,
-                                      controls: NoVideoControls,
-                                      fill: Colors.transparent,
-                                    ),
                             ),
                           ),
                         ),
-                      if (_dragMs != null)
-                        Positioned(
-                          left: left,
-                          bottom: 26,
-                          width: bubbleW,
-                          child: _PreviewBubble(
-                            preview: _preview,
-                            time: _fmt(shownPos),
+                      ),
+                    ),
+                    if (widget.trailing != null) ...[
+                      const Spacer(),
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 2),
+                        child: widget.trailing!,
+                      ),
+                    ],
+                  ],
+                ),
+              SizedBox(
+                width: double.infinity,
+                child: LayoutBuilder(
+                  builder: (context, cons) {
+                    final w = cons.maxWidth;
+                    final frac = max > 0 ? (value / max).clamp(0.0, 1.0) : 0.0;
+                    const bubbleW = 168.0;
+                    final left = (frac * w - bubbleW / 2).clamp(
+                      0.0,
+                      (w - bubbleW).clamp(0.0, double.infinity),
+                    );
+                    // Windows hover bubble: the time under the mouse. The
+                    // track is inset by the slider's 7px side padding, so
+                    // the fraction is measured on the track, not the box.
+                    final hoverX = _hoverX;
+                    final showHover =
+                        _hoverTimeEnabled &&
+                        hoverX != null &&
+                        _dragMs == null &&
+                        totalMs > 0;
+                    final hoverFrac = showHover
+                        ? ((hoverX - 7) / (w - 14).clamp(1.0, double.infinity))
+                              .clamp(0.0, 1.0)
+                        : 0.0;
+                    const hoverW = 64.0;
+                    // Kept inside the bar so the bubble is not clipped at
+                    // the ends (the watch page's video has rounded clipping).
+                    final hoverLeft = ((hoverX ?? 0) - hoverW / 2).clamp(
+                      0.0,
+                      (w - hoverW).clamp(0.0, double.infinity),
+                    );
+                    return Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        SizedBox(
+                          width: w,
+                          child: MouseRegion(
+                            // Only track the mouse on Windows; elsewhere the
+                            // region is inert (no hover on touch anyway).
+                            onHover: _hoverTimeEnabled
+                                ? (e) => setState(
+                                    () => _hoverX = e.localPosition.dx,
+                                  )
+                                : null,
+                            onExit: _hoverTimeEnabled
+                                ? (_) => setState(() => _hoverX = null)
+                                : null,
+                            child: StreamBuilder<Duration>(
+                              stream: widget.controller.player.stream.buffer,
+                              builder: (context, bufSnap) {
+                                final bufMs = (bufSnap.data ?? Duration.zero)
+                                    .inMilliseconds;
+                                final bufferedFrac = totalMs > 0
+                                    ? (bufMs / totalMs).clamp(0.0, 1.0)
+                                    : 0.0;
+                                return SliderTheme(
+                                  data: SliderTheme.of(context).copyWith(
+                                    activeTrackColor: AppColors.accent,
+                                    inactiveTrackColor: Colors.white24,
+                                    trackShape: _BufferedSliderTrackShape(
+                                      buffered: bufferedFrac,
+                                      bufferedColor: Colors.white.withValues(
+                                        alpha: 0.55,
+                                      ),
+                                      marks: [
+                                        if (totalMs > 0 &&
+                                            sl<PlaybackPrefs>().skipIntro)
+                                          for (final iv
+                                              in widget
+                                                  .controller
+                                                  .currentSkips) ...[
+                                            (iv.start.inMilliseconds / totalMs)
+                                                .clamp(0.0, 1.0),
+                                            (iv.end.inMilliseconds / totalMs)
+                                                .clamp(0.0, 1.0),
+                                          ],
+                                      ],
+                                    ),
+                                    thumbColor: Colors.white,
+                                    overlayColor: AppColors.accentSoft,
+                                    trackHeight: 6,
+                                    // Thumb grows while scrubbing (YouTube-style).
+                                    thumbShape: RoundSliderThumbShape(
+                                      enabledThumbRadius: _dragMs != null
+                                          ? 11
+                                          : 7,
+                                    ),
+                                    overlayShape: const RoundSliderOverlayShape(
+                                      overlayRadius: 18,
+                                    ),
+                                  ),
+                                  child: Slider(
+                                    min: 0,
+                                    max: max,
+                                    value: value,
+                                    // Replaces the default inset — half the overlay
+                                    // width (~18px) horizontally, the overlay height
+                                    // vertically, which was most of the dead space
+                                    // around the bar. Horizontal is the thumb radius
+                                    // exactly: the thumb centres on the track's end,
+                                    // so anything less and half the dot hangs past
+                                    // the line the chips above and below sit on.
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 7,
+                                      vertical: 6,
+                                    ),
+                                    onChangeStart: totalMs <= 0
+                                        ? null
+                                        : (v) {
+                                            _ensurePreview();
+                                            setState(() => _dragMs = v);
+                                            _requestPreview(v);
+                                            widget.onInteract();
+                                          },
+                                    onChanged: totalMs <= 0
+                                        ? null
+                                        : (v) {
+                                            setState(() => _dragMs = v);
+                                            _requestPreview(v);
+                                            widget.onInteract();
+                                          },
+                                    onChangeEnd: totalMs <= 0
+                                        ? null
+                                        : (v) {
+                                            widget.controller.seekTo(
+                                              Duration(milliseconds: v.round()),
+                                            );
+                                            setState(() => _dragMs = null);
+                                            widget.onInteract();
+                                          },
+                                  ),
+                                );
+                              },
+                            ),
                           ),
                         ),
-                    ],
-                  );
-                },
+                        // Hover time (Windows): a small bubble above the
+                        // mouse, hidden while dragging (the drag bubble
+                        // below already shows the target).
+                        if (showHover)
+                          Positioned(
+                            key: const ValueKey('seek-hover-time'),
+                            left: hoverLeft,
+                            bottom: 26,
+                            width: hoverW,
+                            child: IgnorePointer(
+                              child: Center(
+                                child: _PreviewBubble(
+                                  preview: null,
+                                  time: _fmt(
+                                    Duration(
+                                      milliseconds: (hoverFrac * totalMs)
+                                          .round(),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        // Off-screen 1px Video that drives mpv frame rendering
+                        // for online previews — mpv only produces screenshot-able
+                        // frames when its texture is actually painted. Kept
+                        // mounted whenever the preview player exists (not only
+                        // mid-drag) so it stays warm between scrubs.
+                        if (_preview != null && _preview!.usesVideo)
+                          Positioned(
+                            left: 0,
+                            top: 0,
+                            width: 1,
+                            height: 1,
+                            child: IgnorePointer(
+                              child: ValueListenableBuilder<VideoController?>(
+                                valueListenable: _preview!.videoController,
+                                builder: (context, vc, _) => vc == null
+                                    ? const SizedBox.shrink()
+                                    : Video(
+                                        controller: vc,
+                                        controls: NoVideoControls,
+                                        fill: Colors.transparent,
+                                      ),
+                              ),
+                            ),
+                          ),
+                        if (_dragMs != null)
+                          Positioned(
+                            left: left,
+                            bottom: 26,
+                            width: bubbleW,
+                            child: _PreviewBubble(
+                              preview: _preview,
+                              time: _fmt(shownPos),
+                            ),
+                          ),
+                      ],
+                    );
+                  },
+                ),
               ),
-            ),
-          ],
-        );
-      },
+            ],
+          );
+        },
+      ),
     );
   }
 }
@@ -409,7 +493,11 @@ class _BufferedSliderTrackShape extends SliderTrackShape
         final x = rect.left + rect.width * m.clamp(0.0, 1.0);
         canvas.drawRRect(
           RRect.fromRectAndRadius(
-            Rect.fromCenter(center: Offset(x, rect.center.dy), width: 3, height: h),
+            Rect.fromCenter(
+              center: Offset(x, rect.center.dy),
+              width: 3,
+              height: h,
+            ),
             const Radius.circular(1.5),
           ),
           markPaint,

@@ -223,6 +223,59 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
     return (index: 0, hasResume: false);
   }
 
+  bool _stremioSheetOpen = false;
+
+  /// Pick a link, then check that the episode and addon are still valid.
+  Future<VideoSource?> _pickStremioSource(
+    List<Episode> episodes,
+    int index,
+    MediaDetail detail,
+  ) async {
+    if (_stremioSheetOpen ||
+        index < 0 ||
+        index >= episodes.length ||
+        !StremioRef.isRef(episodes[index].url)) {
+      return null;
+    }
+    final ref = StremioRef.parse(episodes[index].url);
+    final manager = sl<StremioManager>();
+    final revision = manager.byId(ref.installationId)?.revision;
+    if (!manager.canOpen(ref)) {
+      showAppToast(context, 'This addon is no longer installed');
+      return null;
+    }
+    _stremioSheetOpen = true;
+    try {
+      final title = episodes[index].title.isEmpty
+          ? detail.title
+          : '${detail.title} · ${episodes[index].title}';
+      final picked = await showStremioEpisodeLinksSheet(
+        context,
+        manager: manager,
+        ref: ref,
+        title: title,
+        bannerUrl: detail.banner ?? detail.cover,
+        bannerHeaders: detail.coverHeaders,
+      );
+      if (!mounted || picked == null) return null;
+      if (!manager.canOpen(ref, revision: revision)) {
+        showAppToast(context, 'Addon changed — pick the link again');
+        return null;
+      }
+      if (index >= episodes.length ||
+          StremioRef.parse(episodes[index].url) != ref) {
+        showAppToast(context, 'Episode changed — pick the link again');
+        return null;
+      }
+      return picked;
+    } catch (_) {
+      if (mounted) showAppToast(context, 'Could not open Stremio links');
+      return null;
+    } finally {
+      _stremioSheetOpen = false;
+    }
+  }
+
   // ── Player launch (mirrors _DetailViewState._openPlayer exactly) ──────────
   Future<void> _openPlayer(
     List<Episode> episodes,
@@ -260,6 +313,11 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
       }
     }
     if (!mounted) return;
+    VideoSource? seed;
+    if (usesStremioLinks(widget.item.sourceId)) {
+      seed = await _pickStremioSource(episodes, index, detail);
+      if (!mounted || seed == null) return;
+    }
     // Same as the phone screen: name the source that stops short of this
     // episode and let the viewer choose the sweep rather than imposing it
     // (see [Episode.unavailable]). Re-applied on top of the TV rewrite.
@@ -278,11 +336,19 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
     final launchCategory = availableCategories.contains(preferred)
         ? preferred
         : category;
-    resolveSources(String u) => sl<CatalogueRepository>().sources(
-      u,
-      sourceId: widget.item.sourceId,
-      fast: true,
-    );
+    resolveSources(String u) {
+      final picked = seed;
+      if (picked != null && u == episodes[index].url) {
+        seed = null;
+        return Future.value([picked]);
+      }
+      return sl<CatalogueRepository>().sources(
+        u,
+        sourceId: widget.item.sourceId,
+        fast: true,
+      );
+    }
+
     await launchTvPlayback(
       context: context,
       sourceId: widget.item.sourceId,
@@ -488,25 +554,28 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
     String category,
   ) async {
     final item = widget.item;
-    final res =
-        await showModalBottomSheet<
-          ({VideoSource chosen, List<VideoSource> all})
-        >(
-          context: context,
-          backgroundColor: AppColors.surface,
-          isScrollControlled: true,
-          shape: const RoundedRectangleBorder(
-            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-          ),
-          builder: (_) => _SourcePickerSheet(
-            title: ep.title.trim().isNotEmpty ? ep.title : detail.title,
-            category: category,
-            resolve: () => sl<CatalogueRepository>().sources(
-              ep.url,
-              sourceId: item.sourceId,
-            ),
-          ),
-        );
+    final res = await showModalBottomSheet<_SingleDownloadChoice>(
+      context: context,
+      backgroundColor: AppColors.surface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => _SourcePickerSheet(
+        title: ep.title.trim().isNotEmpty ? ep.title : detail.title,
+        category: category,
+        episode: ep,
+        availableCategories: [
+          if ((detail.subCount ?? 0) > 0) 'sub',
+          if ((detail.dubCount ?? 0) > 0) 'dub',
+        ],
+        resolveEpisodes: _episodesByCategory,
+        resolve: (episode) => sl<CatalogueRepository>().sources(
+          episode.url,
+          sourceId: item.sourceId,
+        ),
+      ),
+    );
     if (res == null || !mounted) return;
     unawaited(
       sl<DownloadManager>().enqueueSource(
@@ -516,8 +585,8 @@ class _DetailScreenTvState extends State<DetailScreenTv> {
         cover: detail.cover ?? item.cover,
         coverHeaders: detail.coverHeaders ?? item.coverHeaders,
         showUrl: item.url,
-        category: category,
-        episode: ep,
+        category: res.category,
+        episode: res.episode,
         source: res.chosen,
         qualityLabel: res.chosen.quality ?? 'auto',
         fallbacks: res.all,

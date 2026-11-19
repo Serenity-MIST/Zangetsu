@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import 'desktop_settings_motion.dart';
 
 /// Desktop profile destination; live account/profile state is supplied by its
@@ -20,6 +21,30 @@ class DesktopSettingsProfile extends StatelessWidget {
   final String subtitle;
   final VoidCallback onOpen;
 
+  /// True while the background is the shipped default: keep the original
+  /// plum-tinted greys exactly.
+  static bool get _stock =>
+      AppColors.bg.toARGB32() == AppColors.defaultBg.toARGB32();
+
+  /// Card fill: the accent over the settings panel colours.
+  static List<Color> get _gradient => _stock
+      ? const [Color(0xFF241B25), Color(0xFF15151D)]
+      : [
+          Color.alphaBlend(
+            AppColors.accent.withValues(alpha: .08),
+            GraphiteSettingsColors.panelGradient.first,
+          ),
+          GraphiteSettingsColors.panelGradient.last,
+        ];
+
+  /// Card border: a faint accent edge over the panel edge.
+  static Color get _edge => _stock
+      ? const Color(0xFF3C2D3A)
+      : Color.alphaBlend(
+          AppColors.accent.withValues(alpha: .18),
+          GraphiteSettingsColors.panelEdge,
+        );
+
   @override
   Widget build(BuildContext context) => Padding(
     padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
@@ -28,11 +53,10 @@ class DesktopSettingsProfile extends StatelessWidget {
         button: true,
         child: DecoratedBox(
           decoration: BoxDecoration(
-            gradient: const LinearGradient(
-              colors: [Color(0xFF241B25), Color(0xFF15151D)],
-            ),
+            // set-9: accent-tinted card that follows Pure black / Background.
+            gradient: LinearGradient(colors: _gradient),
             borderRadius: BorderRadius.circular(20),
-            border: Border.all(color: const Color(0xFF3C2D3A)),
+            border: Border.all(color: _edge),
           ),
           child: Material(
             color: Colors.transparent,

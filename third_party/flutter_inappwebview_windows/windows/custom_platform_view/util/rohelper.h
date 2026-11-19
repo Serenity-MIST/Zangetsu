@@ -90,6 +90,9 @@ class RoHelper {
   RoUninitialize_* mFpRoUninitialize;
 
   bool mWinRtAvailable;
+  // Zangetsu patch: true only when RoInitialize took a reference that the
+  // destructor must give back (never after RPC_E_CHANGED_MODE).
+  bool mRoInitialized = false;
 
   HMODULE mComBaseModule;
   HMODULE mCoreMessagingModule;

@@ -36,6 +36,34 @@ class TransferSlots {
     return completion.future;
   }
 
+  /// Whether [id] is still waiting for a slot (not yet transferring).
+  bool isWaiting(String id) => _waiting.containsKey(id);
+
+  /// Zero-based place of [id] in the waiting line, or -1 when it is not
+  /// waiting. Lets the queue panel list items in the order they will start.
+  int waitingPosition(String id) {
+    var index = 0;
+    for (final key in _waiting.keys) {
+      if (key == id) return index;
+      index++;
+    }
+    return -1;
+  }
+
+  /// Moves a waiting job to the head of the FIFO so it gets the next free
+  /// slot ('Download next', dl-6). Returns false when [id] is not waiting.
+  bool moveToFront(String id) {
+    final completion = _waiting.remove(id);
+    if (completion == null) return false;
+    // Rebuild the insertion-ordered map with [id] first; the rest keep order.
+    final rest = Map<String, Completer<TransferLease?>>.of(_waiting);
+    _waiting
+      ..clear()
+      ..[id] = completion
+      ..addAll(rest);
+    return true;
+  }
+
   /// Removes only a pending job; active callers must stop their own transport.
   void cancelPending(String id) => _waiting.remove(id)?.complete(null);
 

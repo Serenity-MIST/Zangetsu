@@ -39,6 +39,10 @@ void main() {
     final third = await artwork.next();
     final wrapped = await artwork.next();
 
+    expect(
+      first,
+      startsWith('https://avatars.zangetsu.online/profile-picker/'),
+    );
     expect(first, endsWith('/profile-picker/one.webp'));
     expect(second, endsWith('/profile-picker/two.jpg'));
     expect(third, endsWith('/profile-picker/three.png'));

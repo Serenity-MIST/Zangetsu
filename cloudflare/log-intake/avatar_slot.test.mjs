@@ -25,6 +25,15 @@ before(() => {
         headers: { 'content-type': 'application/json' },
       });
     }
+    if (String(input).startsWith('https://sync.example/')) {
+      assert.equal(init.redirect, 'error');
+      assert.equal(JSON.parse(init.body).p_action, 'asset_delete_access');
+      return new Response(JSON.stringify({ok: true}), {status: 200});
+    }
+    if (String(input).startsWith('https://locked.example/')) {
+      return new Response('{}', {status: 403});
+    }
+    if (String(input).startsWith('https://offline.example/')) throw new Error('offline');
     return originalFetch(input, init);
   };
 });
@@ -69,7 +78,9 @@ function environment() {
   return {
     writes,
     deletes,
+    PROFILE_LOCK_API_BASE: 'https://sync.example',
     AVATAR_PUBLIC_BASE: 'https://avatars.example',
+    AVATAR_LEGACY_PUBLIC_BASE: 'https://legacy.example',
     AVATARS: {
       async put(...args) {
         writes.push(args);
@@ -171,12 +182,28 @@ test('deletes only an authenticated user’s avatar object', async () => {
   assert.deepEqual(env.deletes, [`avatars/${userId}/${id}.jpg`]);
 });
 
+test('deletes a saved avatar URL from before the domain change', async () => {
+  const env = environment();
+  const id = '11111111-1111-4111-8111-111111111111';
+  const response = await worker.fetch(
+    deleteRequest(
+      await token(),
+      `${env.AVATAR_LEGACY_PUBLIC_BASE}/avatars/${userId}/${id}.jpg`,
+    ),
+    env,
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(env.deletes, [`avatars/${userId}/${id}.jpg`]);
+});
+
 test('cannot delete another user’s photo or profile-picker artwork', async () => {
   const env = environment();
   const jwt = await token();
   const id = '11111111-1111-4111-8111-111111111111';
   for (const url of [
     `${env.AVATAR_PUBLIC_BASE}/avatars/other-user/${id}.jpg`,
+    `${env.AVATAR_LEGACY_PUBLIC_BASE}/avatars/other-user/${id}.jpg`,
     `${env.AVATAR_PUBLIC_BASE}/profile-picker/zangetsu-sword.webp`,
   ]) {
     const response = await worker.fetch(deleteRequest(jwt, url), env);
@@ -381,5 +408,16 @@ for (const [name, options] of [
 
     assert.equal(response.status, 401);
     assert.equal(env.writes.length, 0);
+  });
+}
+
+for (const [host, status] of [['locked', 403], ['offline', 503]]) {
+  test(`avatar deletion fails closed when profile authorization is ${host}`, async () => {
+    const env = environment();
+    env.PROFILE_LOCK_API_BASE = `https://${host}.example`;
+    const response = await worker.fetch(deleteRequest(await token(),
+      `https://avatars.example/avatars/${userId}/12345678-1234-4123-8123-123456789012.jpg`), env);
+    assert.equal(response.status, status);
+    assert.equal(env.deletes.length, 0);
   });
 }

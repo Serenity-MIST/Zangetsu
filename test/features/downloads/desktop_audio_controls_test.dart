@@ -17,6 +17,13 @@ class _Manager extends ChangeNotifier implements DownloadManager {
   Future<void> retry(DownloadRecord rec) async =>
       actions.add('retry:${rec.id}');
   @override
+  Future<void> moveToFront(DownloadRecord rec) async =>
+      actions.add('next:${rec.id}');
+  // dl-6: the tile asks the manager whether 'Download next' applies; every
+  // fixture row here is waiting or resumable, so it always can.
+  @override
+  bool canMoveToFront(DownloadRecord rec) => true;
+  @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
@@ -82,12 +89,26 @@ void main() {
     expect(manager.actions, ['resume:local']);
   }, variant: TargetPlatformVariant({TargetPlatform.windows}));
 
-  testWidgets('ordinary queued transfer does not gain local-worker Pause', (
+  // dl-6: an ordinary queued transfer on Windows can now be held back with
+  // Pause and moved to the front with 'Download next'.
+  testWidgets('ordinary queued transfer offers Pause and Download next', (
+    tester,
+  ) async {
+    final manager = await open(tester, DownloadStatus.queued, pending: false);
+    expect(find.text('Pause'), findsOneWidget);
+    expect(find.text('Download next'), findsOneWidget);
+    await tester.tap(find.text('Download next'));
+    await tester.pump();
+    expect(manager.actions, ['next:local']);
+  }, variant: TargetPlatformVariant({TargetPlatform.windows}));
+
+  testWidgets('Android queued transfer keeps its original menu', (
     tester,
   ) async {
     await open(tester, DownloadStatus.queued, pending: false);
     expect(find.text('Pause'), findsNothing);
-  }, variant: TargetPlatformVariant({TargetPlatform.windows}));
+    expect(find.text('Download next'), findsNothing);
+  }, variant: TargetPlatformVariant({TargetPlatform.android}));
 
   testWidgets('Windows cooldown row exposes Pause and static waiting indicator', (tester) async {
     final manager = await open(tester, DownloadStatus.queued, pending: false, waiting: true);

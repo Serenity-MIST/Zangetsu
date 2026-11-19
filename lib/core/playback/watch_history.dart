@@ -313,6 +313,17 @@ class WatchHistory {
   /// episode change, and player close.
   Future<void> save(HistoryEntry e, {bool flush = false}) async {
     if (IncognitoMode.on) return; // incognito: don't record what's watched
+    await _write(e, flush: flush);
+  }
+
+  /// Puts back an entry the user just removed (the Undo of "Remove from
+  /// Continue" / History). Unlike [save] it also runs in incognito: it only
+  /// restores a row that already existed, it records nothing new. Pushed to
+  /// the cloud straight away so the earlier cloud delete does not win.
+  Future<void> restore(HistoryEntry e) => _write(e, flush: true);
+
+  /// Local write + cloud push shared by [save] and [restore].
+  Future<void> _write(HistoryEntry e, {required bool flush}) async {
     final profileId = _profileId;
     final key = _key(e.sourceId, e.showId, profileId);
     await _box.put(key, {
@@ -375,9 +386,15 @@ class WatchHistory {
     _lastCloudPush[key] = now;
     final pendingWrite = _markPending(key, profileId);
     try {
+      // Bounded: the cloud client has no timeout of its own, and the player
+      // waits on this when you change episode, so a dead connection used to
+      // freeze "next episode" for as long as the OS took to give up. On timeout
+      // the entry simply stays marked pending and is retried later.
       await Future.wait([
         pendingWrite,
-        _remote.upsert(_rowFor(uid, e, profileId)),
+        _remote
+            .upsert(_rowFor(uid, e, profileId))
+            .timeout(const Duration(seconds: 5)),
       ]);
       if (_matchesLocalEntry(key, e)) await _clearPending(key, profileId);
     } catch (_) {
@@ -432,7 +449,12 @@ class WatchHistory {
     }
   }
 
-  HistoryEntry _fromMap(Map raw) {
+  HistoryEntry _fromMap(Map raw) => entryFromMap(raw);
+
+  /// Parses one stored row. Public so listeners of the Hive box (the Windows
+  /// Home Continue store) can read a single changed entry without re-reading
+  /// and sorting the whole history.
+  static HistoryEntry entryFromMap(Map raw) {
     final m = Map<String, dynamic>.from(raw);
     return HistoryEntry(
       sourceId: m['sourceId'] as String,

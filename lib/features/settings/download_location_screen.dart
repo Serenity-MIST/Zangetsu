@@ -1,7 +1,11 @@
 import 'dart:io';
 import 'package:background_downloader/background_downloader.dart';
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform;
 import 'package:flutter/material.dart';
 
+import '../../core/desktop/desktop_reveal.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import '../../core/di/injector.dart';
 import '../../core/download/download_manager.dart';
 import '../../core/download/download_prefs.dart';
@@ -58,12 +62,147 @@ class _DownloadLocationScreenState extends State<DownloadLocationScreen> {
     if (mounted) setState(() => _volumes = v);
   }
 
+  /// Windows build: desktop styling, real paths and Explorer actions.
+  bool get _isWindows => defaultTargetPlatform == TargetPlatform.windows;
+
   @override
   Widget build(BuildContext context) {
+    // Windows reaches this page from the Downloads dock tab, Home and the
+    // reader export too, all outside the settings workspace. Provide the
+    // desktop settings scope here so it always renders the graphite design.
+    if (_isWindows && !DesktopSettingsScope.contains(context)) {
+      return DesktopSettingsScope(child: Builder(builder: _page));
+    }
+    return _page(context);
+  }
+
+  /// Windows: pick a folder; a folder that can't be written is refused with
+  /// the reason, so the label never names a folder downloads would fail in.
+  Future<void> _chooseWindowsFolder() async {
+    final prefs = sl<DownloadPrefs>();
+    final messenger = ScaffoldMessenger.of(context);
+    final changed = await prefs.chooseDesktopFolder();
+    if (!mounted) return;
+    setState(() {});
+    final error = prefs.lastFolderError;
+    if (error != null) {
+      (messenger..hideCurrentSnackBar()).showSnackBar(SnackBar(content: Text(error)));
+    } else if (changed) {
+      (messenger..hideCurrentSnackBar()).showSnackBar(
+        SnackBar(content: Text('New downloads will save to ${prefs.locationUri}')),
+      );
+    }
+  }
+
+  /// Windows: back to Downloads\Zangetsu, applied immediately.
+  Future<void> _resetWindowsFolder() async {
+    final prefs = sl<DownloadPrefs>();
+    final messenger = ScaffoldMessenger.of(context);
+    await prefs.resetToDefault();
+    if (!mounted) return;
+    setState(() {});
+    (messenger..hideCurrentSnackBar()).showSnackBar(
+      SnackBar(content: Text('New downloads will save to ${prefs.locationUri}')),
+    );
+  }
+
+  /// Windows: opens the current download folder in File Explorer. The folder
+  /// is created on the first download, so a missing one is explained.
+  Future<void> _openWindowsFolder(String path) async {
+    final messenger = ScaffoldMessenger.of(context);
+    if (!await revealInExplorer(path)) {
+      (messenger..hideCurrentSnackBar()).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "This folder doesn't exist yet. Zangetsu creates it with your "
+            'first download.',
+          ),
+        ),
+      );
+    }
+  }
+
+  /// Windows page body: the folder as a full path, open/choose/reset actions
+  /// and a width cap so rows stay readable on a 1920px window.
+  Widget _windowsPage(BuildContext context) {
+    final prefs = sl<DownloadPrefs>();
+    final current = prefs.locationUri;
+    final hasFolder = current != null && current.isNotEmpty && !isUriPath(current);
+    final fallback = DownloadPrefs.windowsDefaultFolder;
+    return Scaffold(
+      backgroundColor: settingsPageBackground(context),
+      appBar: settingsAppBar(context.l10n.downloadLocation),
+      body: Align(
+        alignment: Alignment.topCenter,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 960),
+          child: ListView(
+            padding: const EdgeInsets.only(top: 4, bottom: 28),
+            children: [
+              SettingsSectionLabel(context.l10n.currentLocation, first: true),
+              SettingsCard(
+                children: [
+                  SettingsTile(
+                    key: const ValueKey('download-location-current'),
+                    icon: Icons.folder_rounded,
+                    title: hasFolder
+                        ? current
+                        : 'Choose a folder before your first download',
+                    subtitle: hasFolder && prefs.isDefaultLocation
+                        ? 'Default folder'
+                        : null,
+                  ),
+                  if (hasFolder)
+                    SettingsTile(
+                      key: const ValueKey('download-location-open'),
+                      icon: Icons.open_in_new_rounded,
+                      title: context.l10n.openInFileExplorer,
+                      onTap: () => _openWindowsFolder(current),
+                    ),
+                ],
+              ),
+              const SettingsSectionLabel('Change location'),
+              SettingsCard(
+                children: [
+                  SettingsTile(
+                    key: const ValueKey('download-location-choose'),
+                    icon: Icons.folder_open_outlined,
+                    title: context.l10n.chooseFolder,
+                    subtitle: 'Pick any folder or drive on this PC',
+                    onTap: _chooseWindowsFolder,
+                  ),
+                  // Hidden while the default is already in use: resetting
+                  // would change nothing.
+                  if (!prefs.isDefaultLocation && fallback != null)
+                    SettingsTile(
+                      key: const ValueKey('download-location-reset'),
+                      icon: Icons.restore_rounded,
+                      title: context.l10n.resetToDefault,
+                      subtitle: fallback,
+                      onTap: _resetWindowsFolder,
+                    ),
+                ],
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+                child: Text(
+                  context.l10n.newDownloadsSaveHere,
+                  style: AppText.caption,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _page(BuildContext context) {
+    if (_isWindows) return _windowsPage(context);
     final prefs = sl<DownloadPrefs>();
     final current = prefs.locationUri;
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar(context.l10n.downloadLocation),
       body: ListView(
         padding: const EdgeInsets.only(top: 4, bottom: 28),
@@ -89,7 +228,7 @@ class _DownloadLocationScreenState extends State<DownloadLocationScreen> {
                         downloadDestinationLabel(
                           keepPrivate: prefs.keepPrivate,
                           locationLabel: prefs.locationLabel,
-                          publicFallback: Platform.isWindows
+                          publicFallback: _isWindows
                               ? 'Choose a folder before your first download'
                               : context.l10n.downloadsZangetsu,
                         ),
@@ -141,7 +280,7 @@ class _DownloadLocationScreenState extends State<DownloadLocationScreen> {
                   icon: Icons.folder_open_outlined,
                   title: context.l10n.chooseFolder,
                   onTap: () async {
-                    if (Platform.isWindows) {
+                    if (_isWindows) {
                       await prefs.chooseDesktopFolder();
                       if (mounted) setState(() {});
                       return;
@@ -171,7 +310,7 @@ class _DownloadLocationScreenState extends State<DownloadLocationScreen> {
           // Its own section label, like every other group on this screen: without
           // one the toggle card butts straight against the folder card above and
           // reads as part of it. This is the gap that separates them.
-          if (!Platform.isWindows) ...[
+          if (!_isWindows) ...[
             SettingsSectionLabel(context.l10n.privacy),
             SettingsCard(
               children: [

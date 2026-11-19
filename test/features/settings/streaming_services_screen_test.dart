@@ -5,7 +5,6 @@ import 'package:watch_app/core/models/media_item.dart';
 import 'package:watch_app/core/models/home_section.dart';
 import 'dart:io';
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -154,7 +153,7 @@ Widget harness() => const MaterialApp(
 /// Deterministic provider data isolates region-consumer behavior from image
 /// decoding and from crossing real Hive I/O into the widget test's fake clock.
 class _ImmediateRegionProviders extends StreamingProvidersService {
-  _ImmediateRegionProviders() : super((_, __) async => null);
+  _ImmediateRegionProviders() : super((_, _) async => null);
   @override
   Future<List<StreamingService>> list(String region) => SynchronousFuture([
     region == 'US'

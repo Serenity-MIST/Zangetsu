@@ -16,6 +16,7 @@ class MyListEntry {
     this.tmdbIsTv = false,
     this.updatedAt,
     this.customLists = const [],
+    this.isPrivate = false,
   });
   final MediaItem item;
   final WatchStatus? status;
@@ -32,6 +33,7 @@ class MyListEntry {
   /// AniList's OWN custom lists this entry is in. Empty everywhere else —
   /// MAL and Simkl have no such concept. Not the app's local categories.
   final List<String> customLists;
+  final bool isPrivate;
 
   /// Simkl movies/TV are resolved by TMDB id; this marks TV shows so an edit
   /// writes to the right Simkl bucket. False for anime and the own list.
@@ -67,7 +69,9 @@ class MyListCubit extends Cubit<List<MyListEntry>> {
   static bool _unchanged(List<MyListEntry> a, List<MyListEntry> b) {
     if (a.length != b.length) return false;
     for (var i = 0; i < a.length; i++) {
-      if (a[i].item.url != b[i].item.url || a[i].status != b[i].status) {
+      if (a[i].item.url != b[i].item.url ||
+          a[i].item.savedAtMs != b[i].item.savedAtMs ||
+          a[i].status != b[i].status) {
         return false;
       }
     }

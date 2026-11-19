@@ -14,6 +14,8 @@ import '../../../core/playback/source_health_store.dart';
 import '../../../core/repository/catalogue_repository.dart';
 import '../../../core/search/title_suggestion_service.dart';
 import '../../../core/state/active_source_cubit.dart';
+import '../../../core/stremio/stremio_provider.dart';
+import '../../../core/stremio/stremio_ref.dart';
 // sourceTypeOf lives with the source picker; search_screen.dart reaches for it
 // the same way for its own mode narrowing.
 import '../../../core/ui/source_switcher.dart';
@@ -28,14 +30,21 @@ class SearchBloc extends Bloc<SearchEvent, SearchState> {
     TitleSuggestionService? suggestions,
     this.forceMode,
     this.fixedSourceId,
+    this.maxConcurrent,
+    this.recordHistory = true,
+    this.forceAllSources = false,
   }) : _repo = repo,
        _history = history,
        _prefs = prefs ?? sl<SearchPrefs>(),
        _suggestions = suggestions ?? sl<TitleSuggestionService>(),
        super(
-         _restoredState(
-           prefs ?? sl<SearchPrefs>(),
-         ).copyWith(currentSourceOnly: fixedSourceId == null ? null : true),
+         _restoredState(prefs ?? sl<SearchPrefs>()).copyWith(
+           // A pinned source wins; otherwise [forceAllSources] overrides the
+           // remembered current-source-only choice (null keeps it).
+           currentSourceOnly: fixedSourceId != null
+               ? true
+               : (forceAllSources ? false : null),
+         ),
        ) {
     on<SearchStarted>(_onStarted);
     on<SearchQueryChanged>(_onQueryChanged);
@@ -91,6 +100,21 @@ class SearchBloc extends Bloc<SearchEvent, SearchState> {
   /// Pins a Home Source Catalogue search to its selected source without
   /// changing the app-wide active source or saved search scope.
   final String? fixedSourceId;
+
+  /// How many sources one run may query at the same time. Null (the default)
+  /// keeps today's behaviour: every source is queried at once. The installed
+  /// sources fallback under catalogue search sets this so a library search
+  /// does not open a request to every installed extension in one go.
+  final int? maxConcurrent;
+
+  /// False stops [_runSearch] writing the query to [SearchHistory]. Used by a
+  /// secondary search that runs alongside the main one for the same query,
+  /// so history does not get the query twice.
+  final bool recordHistory;
+
+  /// True ignores the remembered current-source-only scope and always fans
+  /// out over every source of the mode. Default false keeps today's restore.
+  final bool forceAllSources;
 
   /// Hard cap on one source's search.
   ///
@@ -187,6 +211,11 @@ class SearchBloc extends Bloc<SearchEvent, SearchState> {
   /// away from this, we drop back to the suggestion view so typing after a
   /// completed search shows fresh suggestions instead of stale results.
   String _lastRunQuery = '';
+
+  /// The query the latest search actually ran for (not the live field text).
+  /// The Windows installed-sources section follows this, so typing while a
+  /// catalogue search loads does not re-search sources with half-typed text.
+  String get lastRunQuery => _lastRunQuery;
   // Bumped on every _runSearch. A run only emits while it's still the latest —
   // so toggling scope (or any re-run) with the SAME query can't let the previous
   // run keep streaming its (e.g. all-sources) results over the new one.
@@ -218,6 +247,10 @@ class SearchBloc extends Bloc<SearchEvent, SearchState> {
 
     final trimmed = q.trim();
     if (trimmed.isEmpty) {
+      if (fixedSourceId == stremioSourceId) {
+        _runGen++;
+        _suggestSeq++;
+      }
       // Clearing the field returns to the idle screen and drops suggestions.
       emit(
         state.copyWith(
@@ -372,7 +405,9 @@ class SearchBloc extends Bloc<SearchEvent, SearchState> {
       state.copyWith(
         query: q,
         suggestions: const [],
-        sourceFilter: kAllSources,
+        sourceFilter: fixedSourceId == stremioSourceId
+            ? state.sourceFilter
+            : kAllSources,
         ecosystem: SearchEcosystem.all,
       ),
     );
@@ -398,7 +433,7 @@ class SearchBloc extends Bloc<SearchEvent, SearchState> {
   Future<void> _runSearch(String q, Emitter<SearchState> emit) async {
     final gen = ++_runGen; // this run is superseded once a newer one starts
     _lastRunQuery = q;
-    _history.add(q);
+    if (recordHistory) _history.add(q);
 
     emit(
       state.copyWith(
@@ -410,6 +445,32 @@ class SearchBloc extends Bloc<SearchEvent, SearchState> {
         clearError: true,
       ),
     );
+
+    if (fixedSourceId == stremioSourceId &&
+        sl.isRegistered<StremioProvider>()) {
+      final groups = <SourceResultGroup>[];
+      await for (final addon in sl<StremioProvider>().searchAddons(q)) {
+        if (isClosed || gen != _runGen) return;
+        if (addon.items.isEmpty) continue;
+        groups.add(
+          SourceResultGroup(
+            sourceId: 'stremio-addon:${addon.id}',
+            sourceName: addon.category,
+            addonName: addon.name,
+            items: addon.items,
+            arrivalIndex: groups.length,
+          ),
+        );
+        emit(
+          state.copyWith(status: SearchStatus.success, groups: List.of(groups)),
+        );
+      }
+      if (isClosed || gen != _runGen) return;
+      emit(
+        state.copyWith(status: SearchStatus.success, groups: List.of(groups)),
+      );
+      return;
+    }
 
     // Choose the sources to query. In current-source-only mode that's JUST the
     // active Home source (read live, so a later source switch is picked up). In
@@ -494,74 +555,93 @@ class SearchBloc extends Bloc<SearchEvent, SearchState> {
     // arrivalIndex N, so sections render fastest-first (CloudStream-style).
     var arrived = 0;
 
+    // One source's search: query, record health, emit its group or outcome.
+    // A local closure (not a field) so overlapping runs never share it.
+    Future<void> searchOne(({String id, String name}) s) async {
+      final sw = Stopwatch()..start();
+      try {
+        final res = await _repo
+            .searchStatus(
+              q,
+              sourceId: s.id,
+              filtersJson: state.filterSelectionFor(s.id),
+              cache: true,
+            )
+            .timeout(sourceTimeout, onTimeout: _timedOut);
+        sw.stop();
+        if (isClosed || gen != _runGen) return; // superseded/closed
+        // Record health: a response over the slow threshold downgrades an
+        // otherwise-ok outcome to "slow"; error/timeout/blocked mark it dead
+        // (recoverably); empty-without-error stays ok (NOT a strike).
+        var outcome = res.outcome;
+        final responded =
+            outcome == SourceOutcome.ok || outcome == SourceOutcome.empty;
+        if (responded && sw.elapsed > SourceHealthStore.slowThreshold) {
+          outcome = SourceOutcome.slow;
+        }
+        // ignore: unawaited_futures
+        health.record(s.id, outcome, responseMs: sw.elapsedMilliseconds);
+        if (!responded && outcome != SourceOutcome.slow) {
+          failed[s.id] = outcome;
+        }
+        if (res.items.isNotEmpty) {
+          acc.add(
+            SourceResultGroup(
+              sourceId: s.id,
+              sourceName: s.name,
+              items: res.items,
+              arrivalIndex: arrived++,
+            ),
+          );
+          emit(
+            state.copyWith(
+              status: SearchStatus.success,
+              groups: List.of(acc),
+              respondedSources: {...state.respondedSources, s.id},
+              failedSources: Map.of(failed),
+            ),
+          );
+        } else {
+          // No results, but the source DID answer — mark it responded (without
+          // touching status/groups) so its pending skeleton clears instead of
+          // sitting there forever. See [SearchState.respondedSources].
+          emit(
+            state.copyWith(
+              respondedSources: {...state.respondedSources, s.id},
+              failedSources: Map.of(failed),
+            ),
+          );
+        }
+      } catch (_) {
+        // searchStatus is no-throw, but stay defensive — never let one source
+        // break the fan-out. Still mark it responded so its skeleton clears.
+        failed[s.id] = SourceOutcome.error;
+        if (!isClosed && gen == _runGen) {
+          emit(
+            state.copyWith(
+              respondedSources: {...state.respondedSources, s.id},
+              failedSources: Map.of(failed),
+            ),
+          );
+        }
+      }
+    }
+
+    // Per-run slot pool for [maxConcurrent]. Null cap: no pool, so every
+    // source starts straight away exactly as before.
+    final slots = maxConcurrent == null ? null : _SlotPool(maxConcurrent!);
+
     await Future.wait(
       sources.map((s) async {
-        final sw = Stopwatch()..start();
+        if (slots == null) return searchOne(s);
+        await slots.acquire();
         try {
-          final res = await _repo
-              .searchStatus(
-                q,
-                sourceId: s.id,
-                filtersJson: state.filterSelectionFor(s.id),
-                cache: true,
-              )
-              .timeout(sourceTimeout, onTimeout: _timedOut);
-          sw.stop();
-          if (isClosed || gen != _runGen) return; // superseded/closed
-          // Record health: a response over the slow threshold downgrades an
-          // otherwise-ok outcome to "slow"; error/timeout/blocked mark it dead
-          // (recoverably); empty-without-error stays ok (NOT a strike).
-          var outcome = res.outcome;
-          final responded =
-              outcome == SourceOutcome.ok || outcome == SourceOutcome.empty;
-          if (responded && sw.elapsed > SourceHealthStore.slowThreshold) {
-            outcome = SourceOutcome.slow;
-          }
-          // ignore: unawaited_futures
-          health.record(s.id, outcome, responseMs: sw.elapsedMilliseconds);
-          if (!responded && outcome != SourceOutcome.slow) {
-            failed[s.id] = outcome;
-          }
-          if (res.items.isNotEmpty) {
-            acc.add(
-              SourceResultGroup(
-                sourceId: s.id,
-                sourceName: s.name,
-                items: res.items,
-                arrivalIndex: arrived++,
-              ),
-            );
-            emit(
-              state.copyWith(
-                status: SearchStatus.success,
-                groups: List.of(acc),
-                respondedSources: {...state.respondedSources, s.id},
-                failedSources: Map.of(failed),
-              ),
-            );
-          } else {
-            // No results, but the source DID answer — mark it responded (without
-            // touching status/groups) so its pending skeleton clears instead of
-            // sitting there forever. See [SearchState.respondedSources].
-            emit(
-              state.copyWith(
-                respondedSources: {...state.respondedSources, s.id},
-                failedSources: Map.of(failed),
-              ),
-            );
-          }
-        } catch (_) {
-          // searchStatus is no-throw, but stay defensive — never let one source
-          // break the fan-out. Still mark it responded so its skeleton clears.
-          failed[s.id] = SourceOutcome.error;
-          if (!isClosed && gen == _runGen) {
-            emit(
-              state.copyWith(
-                respondedSources: {...state.respondedSources, s.id},
-                failedSources: Map.of(failed),
-              ),
-            );
-          }
+          // A queued source whose run was superseded while it waited for a
+          // slot never starts its request (cancel on new query).
+          if (isClosed || gen != _runGen) return;
+          await searchOne(s);
+        } finally {
+          slots.release();
         }
       }),
     );
@@ -900,5 +980,35 @@ class SearchBloc extends Bloc<SearchEvent, SearchState> {
     _modeSub?.cancel();
     MetadataProviderPrefs.revision.removeListener(_onProviderChanged);
     return super.close();
+  }
+}
+
+/// Tiny counting semaphore for [SearchBloc.maxConcurrent]: at most [_max]
+/// holders at once, the rest wait in FIFO order.
+class _SlotPool {
+  _SlotPool(int max) : _max = max < 1 ? 1 : max;
+
+  final int _max;
+  int _held = 0;
+  final _waiters = <Completer<void>>[];
+
+  /// Completes once a slot is free and taken by the caller.
+  Future<void> acquire() {
+    if (_held < _max) {
+      _held++;
+      return Future.value();
+    }
+    final c = Completer<void>();
+    _waiters.add(c);
+    return c.future;
+  }
+
+  /// Frees a slot, handing it straight to the oldest waiter if there is one.
+  void release() {
+    if (_waiters.isNotEmpty) {
+      _waiters.removeAt(0).complete();
+    } else {
+      _held--;
+    }
   }
 }

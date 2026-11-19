@@ -18,6 +18,7 @@ class ContentRow extends StatelessWidget {
     required this.itemCount,
     required this.itemBuilder,
     this.itemWidth = 124,
+    this.itemWidthForIndex,
     this.itemHeight = 210,
     this.onSeeAll,
   });
@@ -27,6 +28,7 @@ class ContentRow extends StatelessWidget {
   final int itemCount;
   final Widget Function(BuildContext context, int index) itemBuilder;
   final double itemWidth;
+  final double Function(int index)? itemWidthForIndex;
   final double itemHeight;
   final VoidCallback? onSeeAll;
 
@@ -61,9 +63,16 @@ class ContentRow extends StatelessWidget {
                   end: Platform.isWindows ? 20 : 12,
                 ),
                 child: SizedBox(
+                  // Upstream per-index widths; Windows scales them by the
+                  // same desktop factor used for the uniform item width.
                   width: Platform.isWindows
-                      ? (itemHeight > itemWidth ? 166 : itemWidth * 1.2)
-                      : itemWidth,
+                      ? (itemHeight > itemWidth
+                            ? (itemWidthForIndex?.call(index) ?? itemWidth) *
+                                  166 /
+                                  itemWidth
+                            : (itemWidthForIndex?.call(index) ?? itemWidth) *
+                                  1.2)
+                      : itemWidthForIndex?.call(index) ?? itemWidth,
                   child: RepaintBoundary(
                     child: RevealItem(
                       index: index,

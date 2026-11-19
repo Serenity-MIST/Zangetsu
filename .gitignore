@@ -86,3 +86,11 @@ supabase/.temp/
 
 # Locally staged, hash-pinned portable media engine (not source code).
 /windows/engines/
+
+# Discord's downloaded native SDK (install locally; not public source).
+/android/discord-sdk
+
+/ios/discord-sdk
+
+# Machine-local dependency overrides.
+/pubspec_overrides.yaml

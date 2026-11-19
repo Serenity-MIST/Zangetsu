@@ -2,15 +2,26 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:hive/hive.dart';
 
 import '../../core/app_mode.dart';
+import 'package:flutter_svg/flutter_svg.dart';
+
+import '../../core/desktop/desktop_context_menu.dart';
+import '../../core/desktop/desktop_dialogs.dart' show showDesktopConfirm;
+import '../../core/desktop/desktop_window.dart';
 import '../../core/di/injector.dart';
+import '../../core/profiles/profile_pin_store.dart';
 import '../../core/models/media_item.dart';
+import '../../core/ui/desktop_docked_panel.dart' show desktopPanelsEnabled;
 import '../../core/profiles/viewer_profile.dart';
 import '../../core/profiles/viewer_profile_avatar.dart';
+import '../../core/profiles/profile_lock_store.dart';
+import '../../core/profiles/synced_profile_lock_store.dart';
 import '../../core/profiles/profile_picker_artwork.dart';
 import '../../core/app_config.dart';
 import '../auth/auth_cubit.dart';
@@ -24,9 +35,11 @@ import '../../core/tv/tv_list_focusable.dart';
 import '../../l10n/l10n.dart';
 import '../home/cubit/home_cubit.dart';
 import '../auth/auth_screens.dart' show ProfileAccountSection;
+import 'profile_unlock.dart';
 import 'viewer_profile_editor_screen.dart';
 
 const Object kViewerProfileHeroTag = 'viewer-profile-selector';
+
 
 String _pickerBackdropUrl(String url) {
   final uri = Uri.tryParse(url);
@@ -74,6 +87,16 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
   ProfilePickerArtwork? _pickerArtwork;
   Timer? _artworkRotation;
 
+  // Windows picker (acct-7): one avatar key per profile so the number keys
+  // can play the same press animation as a click, and whether the number
+  // key handler was added (removed again in dispose).
+  final Map<String, GlobalKey<_ProfileAvatarTapTargetState>> _desktopAvatarKeys =
+      {};
+  bool _desktopKeysAdded = false;
+
+  /// Windows "Who's watching" layout and keys; phone and TV keep theirs.
+  bool get _desktopPicker => widget.selectionOnly && desktopPanelsEnabled;
+
   ViewerProfileStore get _profiles => sl<ViewerProfileStore>();
 
   /// The signed-in account's photo, for the default profile's face. Absent
@@ -117,6 +140,10 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
       parent: _pickerEntrance,
       curve: const Interval(0.7, 1, curve: Curves.easeOutCubic),
     );
+    if (_desktopPicker) {
+      _desktopKeysAdded = true;
+      HardwareKeyboard.instance.addHandler(_onDesktopPickerKey);
+    }
     if (widget.selectionOnly) {
       if (Hive.isBoxOpen(ViewerProfileStore.boxName)) {
         final artwork = _pickerArtwork = ProfilePickerArtwork(
@@ -174,8 +201,84 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
             ),
           );
 
+  /// Windows picker: keys 1-9 (top row or numpad) choose the profile in that
+  /// position, like clicking it. Ignored while typing, with Ctrl/Alt held,
+  /// in the profile manager, or when another route covers the picker.
+  bool _onDesktopPickerKey(KeyEvent event) {
+    if (event is! KeyDownEvent || !mounted || _managingProfiles) return false;
+    final keyboard = HardwareKeyboard.instance;
+    if (keyboard.isControlPressed ||
+        keyboard.isAltPressed ||
+        keyboard.isMetaPressed) {
+      return false;
+    }
+    if (!(ModalRoute.of(context)?.isCurrent ?? true)) return false;
+    if (DesktopWindow.focusInTextField()) return false;
+    final index = desktopPickerDigitIndex(event.logicalKey);
+    final profiles = _profiles.profiles;
+    if (index == null || index >= profiles.length) return false;
+    _activateDesktopProfile(profiles[index]);
+    return true;
+  }
+
+  /// Chooses [profile] with the same press animation as a click.
+  void _activateDesktopProfile(ViewerProfile profile) {
+    final avatar = _desktopAvatarKeys[profile.id]?.currentState;
+    if (avatar == null) {
+      unawaited(_switchTo(profile));
+    } else {
+      unawaited(avatar.runSelection());
+    }
+  }
+
+  /// Right-click / Menu-key menu on a picker profile (acct-7 Option B).
+  /// The PIN row says Set or Change depending on the saved lock status.
+  Future<void> _openDesktopProfileMenu(
+    ViewerProfile profile, {
+    Offset? position,
+    BuildContext? anchor,
+  }) async {
+    final locks = sl.isRegistered<ProfileLockStore>()
+        ? sl<ProfileLockStore>()
+        : null;
+    final hasPin = await profileHasPin(profile.id, locks);
+    if (!mounted) return;
+    await showDesktopContextMenu<void>(
+      context,
+      position: position,
+      anchor: position == null ? anchor : null,
+      items: [
+        DesktopMenuItem(
+          label: context.l10n.editProfile,
+          icon: Icons.edit_outlined,
+          onTap: () => unawaited(_edit(profile)),
+        ),
+        if (locks != null)
+          DesktopMenuItem(
+            label: hasPin
+                ? context.l10n.changePinEllipsis
+                : context.l10n.setPinEllipsis,
+            icon: hasPin ? Icons.lock_reset_rounded : Icons.lock_outline_rounded,
+            onTap: () => unawaited(manageProfileLock(context, profile)),
+          ),
+        if (!profile.isDefault) ...[
+          const DesktopMenuItem.divider(),
+          DesktopMenuItem(
+            label: context.l10n.deleteProfile,
+            icon: Icons.delete_outline_rounded,
+            destructive: true,
+            onTap: () => unawaited(_delete(profile)),
+          ),
+        ],
+      ],
+    );
+  }
+
   @override
   void dispose() {
+    if (_desktopKeysAdded) {
+      HardwareKeyboard.instance.removeHandler(_onDesktopPickerKey);
+    }
     _artworkRotation?.cancel();
     _enableSelectionHero.dispose();
     _pickerEntrance.dispose();
@@ -187,20 +290,46 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
     // closes the picker after a selection, so a second tap is always a
     // double-tap, never a new choice.
     if (_selecting) return;
-    _selecting = true;
-    final switching = _profiles.switchTo(profile.id);
-    if (!mounted) return;
-    final onSelected = widget.onSelected;
-    if (onSelected != null) {
-      _enableSelectionHero.value = true;
-      onSelected();
+    final owner = _profiles.ownerKey;
+    // A locked profile asks for its PIN first, including when it is the one
+    // already active (launch picker). Cancel or a wrong PIN stays on the picker.
+    if (!await ensureProfileAccess(context, profile)) return;
+    if (!mounted ||
+        _selecting ||
+        _profiles.ownerKey != owner ||
+        !_profiles.profiles.any((p) => p.id == profile.id)) {
+      return;
     }
-    await switching;
-    if (!mounted || onSelected != null) return;
-    Navigator.of(context).pop();
+    final locks = sl.isRegistered<ProfileLockStore>()
+        ? sl<ProfileLockStore>()
+        : null;
+    if (_profiles.activeId != profile.id) locks?.approveSwitch(profile.id);
+    _selecting = true;
+    try {
+      await _profiles.switchTo(profile.id);
+      if (_profiles.ownerKey != owner || _profiles.activeId != profile.id) {
+        _selecting = false;
+        return;
+      }
+      final onSelected = widget.onSelected;
+      if (mounted && onSelected != null) {
+        _enableSelectionHero.value = true;
+        onSelected();
+      }
+      if (mounted && onSelected == null) Navigator.of(context).pop();
+    } catch (_) {
+      _selecting = false;
+      rethrow;
+    } finally {
+      locks?.consumeSwitchApproval(profile.id);
+    }
   }
 
   Future<void> _edit([ViewerProfile? profile, int initialAvatar = 0]) async {
+    if (profile != null && !await ensureProfileAccess(context, profile)) {
+      return;
+    }
+    if (!mounted) return;
     await openViewerProfileEditor(
       context,
       _profiles,
@@ -209,28 +338,94 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
     );
   }
 
+  /// Turning the launch picker off opens straight into the active profile —
+  /// even a locked one. The locks stay set for switching inside the app, so
+  /// confirm the trade-off explicitly instead of silently dropping launch
+  /// protection the user may have set up for kids.
+  Future<void> _toggleAskOnLaunch() async {
+    if (!_profiles.askOnLaunch) {
+      await _profiles.setAskOnLaunch(true);
+      return;
+    }
+    // Windows uses the same synced lock as the phone, which is not asked at
+    // launch with the picker off, so it confirms exactly like the phone.
+    const title = "Turn off Who's watching?";
+    const message =
+        'The app will open straight into the active profile — no PIN at launch. '
+        'Profile PINs stay on for switching profiles inside the app.';
+    // Windows: graphite confirm (Enter turns off, Esc cancels); the phone
+    // keeps its plain AlertDialog below unchanged.
+    final confirmed = desktopPanelsEnabled
+        ? await showDesktopConfirm(
+            context,
+            title: title,
+            message: message,
+            confirmLabel: 'Turn off',
+            cancelLabel: 'Cancel',
+          )
+        : await showDialog<bool>(
+            context: context,
+            builder: (context) => AlertDialog(
+              title: const Text(title),
+              content: const Text(message),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('Cancel'),
+                ),
+                TextButton(
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const Text('Turn off'),
+                ),
+              ],
+            ),
+          );
+    if (!mounted || confirmed != true) return;
+    await _profiles.setAskOnLaunch(false);
+  }
+
   Future<void> _delete(ViewerProfile profile) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Delete profile?'),
-        content: Text(
-          'Delete ${profile.name} and its saved lists and progress from this account?',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true) return;
+    // A lock that doesn't cover deletion is decoration: removing the profile
+    // wipes the PIN with it.
+    if (!await ensureProfileAccess(context, profile)) return;
+    if (!mounted) return;
+    final message =
+        'Delete ${profile.name} and its saved lists and progress from this account?';
+    // Windows: graphite confirm with a red Delete button (Enter deletes, Esc
+    // cancels); the phone keeps its plain AlertDialog below unchanged.
+    final confirmed = desktopPanelsEnabled
+        ? await showDesktopConfirm(
+            context,
+            title: 'Delete profile?',
+            message: message,
+            confirmLabel: 'Delete',
+            cancelLabel: 'Cancel',
+            destructive: true,
+          )
+        : await showDialog<bool>(
+            context: context,
+            builder: (context) => AlertDialog(
+              title: const Text('Delete profile?'),
+              content: Text(message),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('Cancel'),
+                ),
+                TextButton(
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const Text('Delete'),
+                ),
+              ],
+            ),
+          );
+    // The PIN was already checked above (before the dialog), so a second
+    // prompt here would only ask twice.
+    if (confirmed != true || !mounted) return;
     final deleted = await _profiles.delete(profile.id);
+    if (deleted && sl.isRegistered<ProfilePinStore>()) {
+      await sl<ProfilePinStore>().forget(profile.id);
+    }
     if (!deleted && mounted) {
       ScaffoldMessenger.of(
         context,
@@ -242,25 +437,36 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
     if (_recoveryPromptShown || _profiles.recoverableProfiles.isEmpty) return;
     _recoveryPromptShown = true;
     final profile = _profiles.recoverableProfiles.first;
-    final restore = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text('${profile.name} is on this device only'),
-        content: const Text(
-          'This profile is missing from cloud sync. It may have been created offline or deleted on another device. Restore it only if you want it on all your devices. Its local data is safe either way.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Later'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Restore to cloud'),
-          ),
-        ],
-      ),
-    );
+    final title = '${profile.name} is on this device only';
+    const message =
+        'This profile is missing from cloud sync. It may have been created offline or deleted on another device. Restore it only if you want it on all your devices. Its local data is safe either way.';
+    // Windows: graphite confirm (Enter restores, Esc means Later); the phone
+    // keeps its plain AlertDialog below unchanged.
+    final restore = desktopPanelsEnabled
+        ? await showDesktopConfirm(
+            context,
+            title: title,
+            message: message,
+            confirmLabel: 'Restore to cloud',
+            cancelLabel: 'Later',
+          )
+        : await showDialog<bool>(
+            context: context,
+            builder: (context) => AlertDialog(
+              title: Text(title),
+              content: const Text(message),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('Later'),
+                ),
+                TextButton(
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const Text('Restore to cloud'),
+                ),
+              ],
+            ),
+          );
     if (!mounted || restore != true) return;
     if (!await _profiles.restoreRecoverable(profile.id) && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -350,12 +556,13 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
                 SettingsTile(
                   icon: Icons.login_rounded,
                   title: 'Ask who is watching on launch',
-                  subtitle: 'Choose a profile each time the app opens',
+                  subtitle:
+                      'Off opens straight into the active profile, even if it has a PIN.',
                   trailing: Switch.adaptive(
                     value: _profiles.askOnLaunch,
-                    onChanged: _profiles.setAskOnLaunch,
+                    onChanged: (_) => _toggleAskOnLaunch(),
                   ),
-                  onTap: () => _profiles.setAskOnLaunch(!_profiles.askOnLaunch),
+                  onTap: _toggleAskOnLaunch,
                 ),
               ],
             ),
@@ -624,7 +831,11 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
                             );
                           }
                           return Column(
-                            mainAxisAlignment: MainAxisAlignment.end,
+                            // Windows centres the picker in the window; the
+                            // phone keeps it low in the thumb zone.
+                            mainAxisAlignment: _desktopPicker
+                                ? MainAxisAlignment.center
+                                : MainAxisAlignment.end,
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               title,
@@ -1006,6 +1217,10 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
     final profiles = _profiles.profiles;
     final hasAddTile = profiles.length < ViewerProfileStore.maxProfiles;
     final count = profiles.length + (hasAddTile ? 1 : 0);
+    // Windows starts keyboard focus on the profile used last time, so Enter
+    // reopens it straight away; elsewhere the first tile (TV) as before.
+    final activeIndex = profiles.indexWhere((p) => p.id == _profiles.activeId);
+    final desktopFocusIndex = activeIndex < 0 ? 0 : activeIndex;
     return SizedBox(
       width: gridWidth.toDouble(),
       child: GridView.count(
@@ -1013,7 +1228,8 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
         crossAxisCount: columns,
         crossAxisSpacing: 4,
         mainAxisSpacing: 16,
-        mainAxisExtent: diameter + 48,
+        // Windows tiles add a focus ring around the avatar and name.
+        mainAxisExtent: diameter + (_desktopPicker ? 60 : 48),
         shrinkWrap: true,
         physics: const NeverScrollableScrollPhysics(),
         children: [
@@ -1025,7 +1241,8 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
                 profile: profiles[i],
                 diameter: diameter,
                 isTv: isTv,
-                autofocus: i == 0,
+                autofocus: _desktopPicker ? i == desktopFocusIndex : i == 0,
+                position: i,
               ),
             ),
           if (hasAddTile)
@@ -1055,10 +1272,18 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
     required double diameter,
     required bool isTv,
     required bool autofocus,
+    int position = 0,
   }) {
     final selected = _profiles.activeId == profile.id;
     final fill = viewerProfileAvatarColor(profile.avatar);
-    final avatarKey = GlobalKey<_ProfileAvatarTapTargetState>();
+    final desktop = _desktopPicker && !isTv;
+    // Windows keeps one key per profile so number keys reach the avatar.
+    final avatarKey = desktop
+        ? _desktopAvatarKeys.putIfAbsent(
+            profile.id,
+            GlobalKey<_ProfileAvatarTapTargetState>.new,
+          )
+        : GlobalKey<_ProfileAvatarTapTargetState>();
     final photo = profilePhotoForFace(
       profile: profile,
       accountPhotoUrl: _accountPhoto(),
@@ -1080,6 +1305,9 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
               ),
             ),
             onTap: () => _switchTo(profile),
+            // On Windows the whole tile takes focus (with its own ring), so
+            // the avatar's ink is not a second Tab stop.
+            focusable: !desktop,
             child: ProfileAvatarFace(
               profile: profile,
               photoUrl: photo,
@@ -1138,6 +1366,34 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
         builder: content,
       );
     }
+    if (desktop) {
+      // Windows (acct-7): focusable tile with a ring, Enter/Space opens,
+      // arrows move, right-click / Menu key opens Edit / PIN / Delete, and a
+      // tooltip names the profile, its kind, its lock and its number key.
+      return _ProfileLockStatus(
+        profileId: profile.id,
+        builder: (locked) => _DesktopPickerTile(
+          key: ValueKey('desktop-picker-tile-${profile.id}'),
+          autofocus: autofocus,
+          semanticLabel: context.l10n.selectProfileNamed(profile.name),
+          tooltip: [
+            profile.name,
+            if (profile.isKids) context.l10n.kidsProfile,
+            if (locked) context.l10n.pinProtected,
+            if (position < 9) context.l10n.pressNToChoose(position + 1),
+          ].join('\n'),
+          onActivate: () => _activateDesktopProfile(profile),
+          onMenu: (position, anchor) => unawaited(
+            _openDesktopProfileMenu(
+              profile,
+              position: position,
+              anchor: anchor,
+            ),
+          ),
+          builder: content,
+        ),
+      );
+    }
     return content(false);
   }
 
@@ -1194,6 +1450,22 @@ class _ViewerProfilesScreenState extends State<ViewerProfilesScreen>
         semanticLabel: semanticLabel,
         onTap: onTap,
         builder: content,
+      );
+    }
+    if (_desktopPicker) {
+      // Windows: the Add tile joins the arrow-key grid with the same ring.
+      return _DesktopPickerTile(
+        key: ValueKey('desktop-picker-tile-action-$title'),
+        autofocus: autofocus,
+        semanticLabel: semanticLabel,
+        tooltip: semanticLabel,
+        onActivate: onTap,
+        builder: (focused) => InkWell(
+          customBorder: const CircleBorder(),
+          canRequestFocus: false,
+          onTap: onTap,
+          child: content(focused),
+        ),
       );
     }
     return InkWell(
@@ -1277,6 +1549,7 @@ class _ProfileAvatarTapTarget extends StatefulWidget {
     required this.shape,
     required this.onTap,
     required this.child,
+    this.focusable = true,
   });
 
   final String profileId;
@@ -1285,6 +1558,9 @@ class _ProfileAvatarTapTarget extends StatefulWidget {
   final ShapeBorder shape;
   final Future<void> Function() onTap;
   final Widget child;
+
+  /// False on the Windows picker, where the surrounding tile owns focus.
+  final bool focusable;
 
   @override
   State<_ProfileAvatarTapTarget> createState() =>
@@ -1351,7 +1627,24 @@ class _ProfileAvatarTapTargetState extends State<_ProfileAvatarTapTarget>
   @override
   Widget build(BuildContext context) => SizedBox.square(
     dimension: widget.diameter,
-    child: Listener(
+    child: Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Positioned.fill(child: _avatar()),
+        // Small lock on profiles that ask for a PIN. Ignores pointer input so
+        // the whole avatar stays one tap target.
+        Positioned(
+          right: -2,
+          bottom: -2,
+          child: IgnorePointer(
+            child: ProfileLockBadge(profileId: widget.profileId),
+          ),
+        ),
+      ],
+    ),
+  );
+
+  Widget _avatar() => Listener(
       onPointerDown: (_) {
         if (!_activating) {
           _releaseAnimation = null;
@@ -1398,6 +1691,7 @@ class _ProfileAvatarTapTargetState extends State<_ProfileAvatarTapTarget>
               radius: widget.diameter / 2,
               splashColor: AppColors.textPrimary.withValues(alpha: 0.28),
               highlightColor: AppColors.textPrimary.withValues(alpha: 0.10),
+              canRequestFocus: widget.focusable,
               onTap: runSelection,
               child: SizedBox.square(
                 dimension: widget.diameter,
@@ -1407,6 +1701,252 @@ class _ProfileAvatarTapTargetState extends State<_ProfileAvatarTapTarget>
           ),
         ),
       ),
-    ),
-  );
+    );
+}
+
+/// Windows: small lock shown on a profile that has a PIN — the synced account
+/// lock as this PC last saw it, or an old PC-only PIN not yet moved. Pops in
+/// and out as locks change. Draws nothing elsewhere (phone/TV keep upstream's
+/// picker) or when no lock store is registered (tests).
+class ProfileLockBadge extends StatelessWidget {
+  const ProfileLockBadge({super.key, required this.profileId});
+  final String profileId;
+
+  @override
+  Widget build(BuildContext context) {
+    if (defaultTargetPlatform != TargetPlatform.windows) {
+      return const SizedBox.shrink();
+    }
+    final legacy = sl.isRegistered<ProfilePinStore>()
+        ? sl<ProfilePinStore>()
+        : null;
+    final locks = sl.isRegistered<ProfileLockStore>()
+        ? sl<ProfileLockStore>()
+        : null;
+    final synced = locks is SyncedProfileLockStore ? locks : null;
+    if (legacy == null && synced == null) return const SizedBox.shrink();
+    return ListenableBuilder(
+      listenable: Listenable.merge([
+        ?legacy,
+        ?synced?.statusChanges,
+      ]),
+      builder: (_, _) => FutureBuilder<bool?>(
+        // Saved status only: no network request per avatar.
+        future: synced?.cachedLocked(profileId),
+        builder: (_, cached) => _badge(
+          (legacy?.isLocked(profileId) ?? false) || cached.data == true,
+        ),
+      ),
+    );
+  }
+
+  Widget _badge(bool locked) => AnimatedScale(
+        scale: locked ? 1 : 0,
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOutBack,
+        child: Container(
+          key: ValueKey('profile-lock-$profileId'),
+          width: 22,
+          height: 22,
+          decoration: BoxDecoration(
+            color: const Color(0xFF1A1A23),
+            shape: BoxShape.circle,
+            border: Border.all(color: const Color(0xFF3C2D3A)),
+          ),
+          child: Center(
+            child: SvgPicture.asset(
+              'assets/icons/lucide/lock.svg',
+              width: 11,
+              height: 11,
+              colorFilter: const ColorFilter.mode(
+                Color(0xFFE3C6EA),
+                BlendMode.srcIn,
+              ),
+            ),
+          ),
+        ),
+      );
+}
+
+/// Windows picker (acct-7): position (0-based) chosen by a number key, from
+/// the top row or the numpad, 1-9. Null for any other key.
+@visibleForTesting
+int? desktopPickerDigitIndex(LogicalKeyboardKey key) {
+  const top = [
+    LogicalKeyboardKey.digit1,
+    LogicalKeyboardKey.digit2,
+    LogicalKeyboardKey.digit3,
+    LogicalKeyboardKey.digit4,
+    LogicalKeyboardKey.digit5,
+    LogicalKeyboardKey.digit6,
+    LogicalKeyboardKey.digit7,
+    LogicalKeyboardKey.digit8,
+    LogicalKeyboardKey.digit9,
+  ];
+  const pad = [
+    LogicalKeyboardKey.numpad1,
+    LogicalKeyboardKey.numpad2,
+    LogicalKeyboardKey.numpad3,
+    LogicalKeyboardKey.numpad4,
+    LogicalKeyboardKey.numpad5,
+    LogicalKeyboardKey.numpad6,
+    LogicalKeyboardKey.numpad7,
+    LogicalKeyboardKey.numpad8,
+    LogicalKeyboardKey.numpad9,
+  ];
+  final index = top.indexOf(key);
+  if (index >= 0) return index;
+  final padIndex = pad.indexOf(key);
+  return padIndex >= 0 ? padIndex : null;
+}
+
+/// Rebuilds with whether [profileId] has a PIN as this PC last saw it (the
+/// synced lock's saved status, or an old PC-only PIN). No network request,
+/// same source as [ProfileLockBadge]. Used for the Windows picker tooltip.
+class _ProfileLockStatus extends StatelessWidget {
+  const _ProfileLockStatus({required this.profileId, required this.builder});
+
+  final String profileId;
+  final Widget Function(bool locked) builder;
+
+  @override
+  Widget build(BuildContext context) {
+    final legacy = sl.isRegistered<ProfilePinStore>()
+        ? sl<ProfilePinStore>()
+        : null;
+    final locks = sl.isRegistered<ProfileLockStore>()
+        ? sl<ProfileLockStore>()
+        : null;
+    final synced = locks is SyncedProfileLockStore ? locks : null;
+    if (legacy == null && synced == null) return builder(false);
+    return ListenableBuilder(
+      listenable: Listenable.merge([?legacy, ?synced?.statusChanges]),
+      builder: (_, _) => FutureBuilder<bool?>(
+        future: synced?.cachedLocked(profileId),
+        builder: (_, cached) => builder(
+          (legacy?.isLocked(profileId) ?? false) || cached.data == true,
+        ),
+      ),
+    );
+  }
+}
+
+/// One focusable tile of the Windows "Who's watching" grid (acct-7).
+///
+/// Owns keyboard focus for the tile (the avatar's own ink is not a Tab stop)
+/// and draws an accent ring while focused. Enter / Space activate it, the
+/// arrow keys move focus to the neighbouring tile, and right-click, the Menu
+/// key or Shift+F10 open [onMenu]. A tooltip shows [tooltip] on hover.
+class _DesktopPickerTile extends StatefulWidget {
+  const _DesktopPickerTile({
+    super.key,
+    required this.builder,
+    required this.onActivate,
+    required this.tooltip,
+    required this.semanticLabel,
+    this.onMenu,
+    this.autofocus = false,
+  });
+
+  /// Builds the tile; `focused` lets it brighten the name like TV does.
+  final Widget Function(bool focused) builder;
+  final VoidCallback onActivate;
+  final String tooltip;
+  final String semanticLabel;
+
+  /// Opens the profile menu at a global [position] (right-click) or below
+  /// the tile ([anchor], keyboard).
+  final void Function(Offset? position, BuildContext anchor)? onMenu;
+  final bool autofocus;
+
+  @override
+  State<_DesktopPickerTile> createState() => _DesktopPickerTileState();
+}
+
+class _DesktopPickerTileState extends State<_DesktopPickerTile> {
+  late final FocusNode _focus = FocusNode(debugLabel: 'desktop-picker-tile');
+  bool _focused = false;
+
+  @override
+  void dispose() {
+    _focus.dispose();
+    super.dispose();
+  }
+
+  KeyEventResult _onKey(FocusNode node, KeyEvent event) {
+    if (event is KeyUpEvent) return KeyEventResult.ignored;
+    final key = event.logicalKey;
+    if (event is KeyDownEvent &&
+        (key == LogicalKeyboardKey.enter ||
+            key == LogicalKeyboardKey.numpadEnter ||
+            key == LogicalKeyboardKey.space)) {
+      widget.onActivate();
+      return KeyEventResult.handled;
+    }
+    final direction = switch (key) {
+      LogicalKeyboardKey.arrowLeft => TraversalDirection.left,
+      LogicalKeyboardKey.arrowRight => TraversalDirection.right,
+      LogicalKeyboardKey.arrowUp => TraversalDirection.up,
+      LogicalKeyboardKey.arrowDown => TraversalDirection.down,
+      _ => null,
+    };
+    if (direction != null) {
+      node.focusInDirection(direction);
+      // Handled even at the edge, so the arrow never leaves the grid.
+      return KeyEventResult.handled;
+    }
+    final menu = widget.onMenu;
+    if (menu != null &&
+        event is KeyDownEvent &&
+        (key == LogicalKeyboardKey.contextMenu ||
+            (key == LogicalKeyboardKey.f10 &&
+                HardwareKeyboard.instance.isShiftPressed))) {
+      menu(null, context);
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final menu = widget.onMenu;
+    return Semantics(
+      button: true,
+      label: widget.semanticLabel,
+      child: Focus(
+        focusNode: _focus,
+        autofocus: widget.autofocus,
+        onKeyEvent: _onKey,
+        onFocusChange: (focused) => setState(() => _focused = focused),
+        child: Tooltip(
+          message: widget.tooltip,
+          waitDuration: const Duration(milliseconds: 500),
+          // A click also moves keyboard focus here, so arrows continue from
+          // the tile the mouse used. A Listener (not a tap recogniser) so it
+          // never competes with the avatar's own tap.
+          child: Listener(
+            onPointerDown: (_) => _focus.requestFocus(),
+            child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onSecondaryTapUp: menu == null
+                ? null
+                : (details) => menu(details.globalPosition, context),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 140),
+              padding: const EdgeInsets.all(2),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(18),
+                border: Border.all(
+                  color: _focused ? AppColors.accent : Colors.transparent,
+                  width: 2,
+                ),
+              ),
+              child: widget.builder(_focused),
+            ),
+          ),
+          ),
+        ),
+      ),
+    );
+  }
 }

@@ -1,25 +1,32 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import '../desktop/extension_runtime.dart';
+import '../desktop/extension_boot_failures.dart';
+import '../desktop/desktop_prefs.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
 import 'package:watch_app/core/hive/source_icon_store.dart';
 import 'package:watch_app/core/lnreader/novel_cloudflare.dart';
 
 import 'package:dio/dio.dart';
-import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, debugPrint, defaultTargetPlatform, kDebugMode;
 import 'package:flutter/services.dart' show MethodChannel, rootBundle;
 import 'package:get_it/get_it.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:supabase_flutter/supabase_flutter.dart' show PostgrestClient;
+import 'package:zangetsu_source_bridge/zangetsu_source_bridge.dart';
 
 import '../announce/announcement.dart';
 import '../backup/backup_cloud.dart';
 import '../logging/log_report_service.dart';
+import '../mangayomi/mangayomi_manager.dart';
 import '../announce/announcement_service.dart';
 import '../cache/app_image_cache.dart';
 import '../platform/apple_tv.dart';
 import '../platform/app_paths.dart';
 import '../playback/category_store.dart';
+import '../playback/list_idle_runner.dart';
 import '../playback/list_status_store.dart';
 import '../playback/my_list.dart';
 import '../playback/playback_prefs.dart';
@@ -27,17 +34,25 @@ import '../playback/pinned_sources.dart';
 import '../playback/search_history.dart';
 import '../playback/search_prefs.dart';
 import '../ui/home_rows_prefs.dart';
+import '../tracker/tracker_switch_prefs.dart';
 import '../ui/streaming_prefs.dart';
 import '../ui/nav_prefs.dart';
 import '../playback/search_source_prefs.dart';
 import '../playback/source_health_store.dart';
+import '../../features/player/mpv_player_pool.dart';
 import '../schedule/airing_service.dart';
 import '../schedule/coming_soon_service.dart';
 import '../privacy/incognito_mode.dart';
+import '../boot_network.dart';
+import '../profiles/profile_pin_store.dart';
 import '../profiles/viewer_profile.dart';
+import '../profiles/profile_lock_store.dart';
+import '../profiles/profile_lock_remote.dart';
+import '../profiles/synced_profile_lock_store.dart';
 import '../profiles/profile_avatar_uploader.dart';
 import '../search/title_suggestion_service.dart';
 import '../ui/animation_prefs.dart';
+import '../ui/detail_prefs.dart';
 import '../playback/skip_service.dart';
 import '../playback/resume_store.dart';
 import '../reading/read_history.dart';
@@ -56,6 +71,11 @@ import '../provider/provider_repo_registry.dart';
 import '../repository/catalogue_repository.dart';
 import '../repository/provider_settings_repository.dart';
 import '../repository/source_domain_overrides.dart';
+import '../stremio/stremio_manager.dart';
+import '../stremio/stremio_backup.dart';
+import '../stremio/stremio_remote.dart';
+import '../stremio/stremio_sync.dart';
+import '../stremio/stremio_provider.dart';
 import '../repository/source_repository.dart';
 import '../state/active_source_cubit.dart';
 import '../locale/locale_controller.dart';
@@ -88,7 +108,6 @@ import '../tracker/tracker_binding_store.dart';
 import '../tracker/tracker_hub.dart';
 import '../tracker/relay/tracker_relay.dart';
 import '../app_mode.dart';
-import '../appwrite/appwrite_service.dart';
 import '../backup/backup_service.dart';
 import '../backup/sources_backup.dart';
 import '../backup/library_backup.dart';
@@ -116,16 +135,16 @@ import '../mihon/mihon_manager.dart';
 import '../mihon/mihon_provider.dart';
 import '../mihon/mihon_repo.dart';
 import '../../features/auth/auth_cubit.dart';
-import '../../features/auth/migration_bridge.dart';
 import '../../features/auth/tv_pairing_service.dart';
 import '../../features/home/cubit/home_cache.dart';
 import '../../features/home/cubit/home_cubit.dart';
+import '../../features/home/lists_hub_data.dart';
+import '../../features/home/lists_hub_models.dart';
 import '../../features/watch_together/watch_room_service.dart';
 import '../../features/watch_together/watch_together_controller.dart';
 import '../cast/cast_controller.dart';
 import '../cast/cast_proxy.dart';
 import '../supabase/supabase_service.dart';
-import 'package:supabase_flutter/supabase_flutter.dart' show OtpType;
 
 final GetIt sl = GetIt.instance;
 
@@ -221,7 +240,10 @@ void applySimklConventions(RequestOptions options) {
   options.headers['User-Agent'] = '$kAppName/$kAppVersion';
 }
 
-Future<void> initDependencies({void Function(String)? onProgress}) async {
+Future<void> initDependencies({
+  void Function(String)? onProgress,
+  bool Function()? isOffline,
+}) async {
   onProgress?.call('detecting device');
   // Detect device class first so every subsequent registration can gate on it.
   // Wrapped in try/catch: no native handler (tests, iOS, web) → phone behavior.
@@ -249,9 +271,6 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
   await openBoxSafely(AuthCubit.cacheBoxName);
   await ProviderDownloader.init();
 
-  // Appwrite first (no network on construct) — kept for mintJwt (the
-  // legacy-session-migration path in MigrationBridge/AuthCubit).
-  sl.registerSingleton<AppwriteService>(AppwriteService());
   // Supabase is already Supabase.initialize()d in main.dart; this is just the
   // thin client wrapper the stores/services depend on.
   sl.registerSingleton<SupabaseService>(SupabaseService());
@@ -292,6 +311,8 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
         accessToken: cloudAccessToken,
       ),
       currentUserId: currentUserId,
+      onProfileDataDeleted: (owner, id) =>
+          sl<ProfileLockStore>().forgetDeletedProfile(owner, id),
       deleteAvatar: (url) async {
         final token =
             sl<SupabaseService>().client.auth.currentSession?.accessToken;
@@ -300,45 +321,42 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
       },
     ),
   );
-  String currentProfileId() => sl<ViewerProfileStore>().activeId;
+  // Windows: PINs set by older PC-only builds (hashes in the OS credential
+  // store). NOT the profile lock any more: the synced ProfileLockStore below
+  // is the one lock on every platform. Kept only so an old PIN is verified
+  // once and moved into the synced lock (profile_unlock.dart), and honoured
+  // offline until it can be moved. Refreshed when profiles or account change.
+  if (Platform.isWindows) {
+    final pinStore = ProfilePinStore(
+      storage: SecurePinStorage(),
+      owner: () => currentUserId() ?? 'local',
+    );
+    sl.registerSingleton<ProfilePinStore>(pinStore);
+    Future<void> reloadPins() => pinStore.load(
+      sl<ViewerProfileStore>().profiles.map((profile) => profile.id),
+    );
+    sl<ViewerProfileStore>().revision.addListener(
+      () => unawaited(reloadPins()),
+    );
+    unawaited(reloadPins());
+  }
 
-  // Client half of the invisible Appwrite→Supabase account migration. Wired
-  // with real closures here (not in migration_bridge.dart) so the bridge
-  // itself stays Supabase-type-free and unit-testable.
-  sl.registerSingleton<MigrationBridge>(
-    MigrationBridge(
-      invoke: (name, body) async {
-        final r = await sl<SupabaseService>().client.functions.invoke(
-          name,
-          body: body,
-        );
-        return (r.data as Map).cast<String, dynamic>();
-      },
-      signInPassword: (email, pw) async {
-        try {
-          await sl<SupabaseService>().client.auth.signInWithPassword(
-            email: email,
-            password: pw,
-          );
-          return sl<SupabaseService>().client.auth.currentUser != null;
-        } catch (_) {
-          return false;
+  sl.registerSingleton<ProfileLockStore>(
+    SyncedProfileLockStore(
+      remote: PostgrestProfileLockRemote(vpsClient, cloudAccessToken),
+      currentUserId: currentUserId,
+      isOffline: isOffline,
+      onGrantsChanged: (grants) {
+        if (grants.isEmpty) {
+          vpsClient.headers.remove('x-profile-grants');
+        } else {
+          vpsClient.headers['x-profile-grants'] = jsonEncode(grants);
         }
       },
-      verifyOtp: (email, token) async {
-        try {
-          await sl<SupabaseService>().client.auth.verifyOTP(
-            email: email,
-            token: token,
-            type: OtpType.email,
-          );
-          return sl<SupabaseService>().client.auth.currentUser != null;
-        } catch (_) {
-          return false;
-        }
-      },
+      isolateGuestData: () => sl<ViewerProfileStore>().isolateGuestData(),
     ),
   );
+  String currentProfileId() => sl<ViewerProfileStore>().dataProfileId;
 
   await ResumeStore.init();
   sl.registerSingleton<ResumeStore>(
@@ -389,6 +407,9 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
   sl.registerSingleton<ListStatusStore>(
     ListStatusStore(currentProfileId: currentProfileId),
   );
+  // R5: boxes for auto Paused/Dropped (settings + per-title idle clocks).
+  // The runner itself is a plain singleton started from main after boot.
+  await ListIdleRunner.init();
   // User-made categories for My List. Its own box, beside the status store and
   // for the same reason: a cloud pull clears the list box, and a category must
   // not go with it.
@@ -437,6 +458,10 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
   await HomeCache.init();
   await PlaybackPrefs.init();
   sl.registerSingleton<PlaybackPrefs>(PlaybackPrefs());
+  sl.registerLazySingleton<MpvPlayerPool>(
+    MpvPlayerPool.new,
+    dispose: (pool) => pool.clear(),
+  );
   await ReaderPrefs.init();
   sl.registerSingleton<ReaderPrefs>(ReaderPrefs());
   await ReaderOverrideStore.init();
@@ -449,6 +474,7 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
   await ZModePrefs.init();
   await GenreCatalog.init();
   await HomeRowsPrefs.init();
+  await TrackerSwitchPrefs.init();
   await StreamingPrefs.init();
   await DownloadPrefs.init();
   sl.registerSingleton<DownloadPrefs>(DownloadPrefs());
@@ -459,6 +485,7 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
   await SearchHistory.init();
   sl.registerSingleton<SearchHistory>(SearchHistory());
   await AnimationPrefs.init(); // list/grid reveal toggle (phone/iOS only)
+  await DetailPrefs.init(); // episode lists open reversed when enabled
   await IncognitoMode.init(); // privacy: pause history/tracking/RPC when on
   await PinnedSources.init(); // favourite sources pinned atop the source picker
   await SearchSourcePrefs.init();
@@ -472,10 +499,16 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
   final animeLangPrefs = AnimeLangPrefs();
   await animeLangPrefs.init();
   sl.registerSingleton<AnimeLangPrefs>(animeLangPrefs);
+  final mangayomiLangPrefs = MangayomiLangPrefs();
+  await mangayomiLangPrefs.init();
+  sl.registerSingleton<MangayomiLangPrefs>(mangayomiLangPrefs);
   await SearchPrefs.init();
   sl.registerSingleton<SearchPrefs>(SearchPrefs());
   await NavPrefs.init();
   sl.registerSingleton<NavPrefs>(NavPrefs());
+  // Windows desktop prefs (window, tray, start page, backups, auto-lock);
+  // also registers the keyboard shortcut catalogue and loads user remaps.
+  await DesktopPrefs.init();
   // Per-source reliability: orders search healthy-first, recoverably skips dead
   // sources, and backs the "Source health" test screen.
   await SourceHealthStore.init();
@@ -518,6 +551,19 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
         }
         applySimklConventions(options);
         handler.next(options);
+      },
+    ),
+  );
+  // A request that fails because the connection itself is gone asks the
+  // connectivity watcher to check right away, so the app switches to offline
+  // mode within seconds instead of waiting for its next scheduled check.
+  dio.interceptors.add(
+    InterceptorsWrapper(
+      onError: (error, handler) {
+        if (isNetworkFailure(error)) {
+          BootConnectivity.instance.suspectOffline();
+        }
+        handler.next(error);
       },
     ),
   );
@@ -571,9 +617,18 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
   // text when absent). Cached per title (in-memory + a persisted Hive box, so
   // the logo doesn't re-resolve / pop-in on later launches).
   await TitleLogoService.init();
-  sl.registerSingleton<TitleLogoService>(TitleLogoService(dio));
+  sl.registerSingleton<TitleLogoService>(
+    TitleLogoService(
+      dio,
+      addonLogoFor: (item) => sl.isRegistered<StremioProvider>()
+          ? sl<StremioProvider>().titleLogoFor(item)
+          : Future.value(null),
+    ),
+  );
 
-  // Accurate OP/ED skip times for anime (AniList → MAL id → AniSkip).
+  // Accurate OP/ED skip times for anime (AniList → MAL id → AniSkip), with
+  // answers saved on this device so skipping also works offline.
+  await SkipService.init();
   sl.registerSingleton<SkipService>(SkipService(dio));
 
   // AniList account sync (auto-scrobble watched episodes + list import). The
@@ -602,6 +657,13 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
       sl<MangaBakaService>(),
     ]),
   );
+  // Windows "Schedule and lists" page data: one shared instance whose Hive
+  // cache is already open on the page's first frame, so it renders instantly.
+  if (defaultTargetPlatform == TargetPlatform.windows) {
+    final listsHub = ListsHubDataImpl();
+    await listsHub.ensureLoaded();
+    sl.registerSingleton<ListsHubData>(listsHub);
+  }
   // Manual match corrections (the sync sheet's "Change match"): show → chosen
   // tracker entry id, persisted so a fixed match sticks.
   await TrackerBindingStore.init();
@@ -621,16 +683,8 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
   // boot; navigation is deferred until the root Navigator exists.
   sl.registerSingleton<OpenLinkService>(OpenLinkService());
 
-  // AuthCubit is global so any widget can gate on login. SupabaseService,
-  // AppwriteService (mintJwt for migration) and MigrationBridge are already
-  // registered above.
-  sl.registerSingleton<AuthCubit>(
-    AuthCubit(
-      sl<SupabaseService>(),
-      sl<AppwriteService>(),
-      sl<MigrationBridge>(),
-    ),
-  );
+  // AuthCubit is global so widgets can gate on login.
+  sl.registerSingleton<AuthCubit>(AuthCubit(sl<SupabaseService>()));
 
   final manager = ProviderManager(dio: dio);
   sl.registerSingleton<ProviderManager>(manager);
@@ -792,6 +846,18 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
     await openBoxSafely<String>('lnreader_repos');
   }
 
+  // Mangayomi is a separate, on-device runtime. Boot only reads its local
+  // repository/install metadata; extension code and both runtimes stay lazy
+  // until the user opens or calls an installed source.
+  final mangayomiManager = MangayomiManager(
+    MangayomiExtensionService(await writableAppSubdir('mangayomi')),
+    // Windows has no native cookie channel; hand Mangayomi the cookies and
+    // browser user agent saved by the desktop verification browser instead.
+    sessionHeaders: Platform.isWindows ? _desktopSessionHeaders : null,
+  );
+  await mangayomiManager.init();
+  sl.registerSingleton<MangayomiManager>(mangayomiManager);
+
   // --- Provider registry data layer ---------------------------------
   await ProviderReposRegistry.init();
   await ProviderRegistry.init();
@@ -816,9 +882,13 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
         aniyomi: AniyomiExtensionService(),
         mihon: MihonExtensionService(),
         lnreader: lnrService,
+        mangayomi: mangayomiManager,
       ),
       LibraryBackup(),
       SettingsBackup(),
+      stremio: () => sl<StremioBackup>(),
+      authorize: () => (sl<ProfileLockStore>() as SyncedProfileLockStore)
+          .requireBackupAccess(),
     ),
   );
 
@@ -915,8 +985,18 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
   // Guarded Aniyomi boot step — reload any previously installed extensions.
   // This runs on a microtask so it never blocks or slows app startup. Any
   // failure is caught and logged; it must never propagate to the caller.
-  Future.microtask(() async {
-    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable) return;
+  // Named so the Windows load-failure notice's Retry can run it again.
+  Future<void> bootAniyomi() async {
+    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable) {
+      // src-10 (Windows): engine files missing - list the installed Aniyomi
+      // extensions in the startup notice instead of dropping them silently.
+      await reportMissingExtensionEngine(
+        ecosystem: 'Aniyomi',
+        installedBoxName: AniyomiExtensionService.installedBoxName,
+        boot: bootAniyomi,
+      );
+      return;
+    }
     try {
       if (!Hive.isBoxOpen(AniyomiExtensionService.installedBoxName)) {
         await openBoxSafely<dynamic>(AniyomiExtensionService.installedBoxName);
@@ -961,8 +1041,12 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
       }
     } catch (e, st) {
       debugPrint('[aniyomi] boot step failed (non-fatal): $e\n$st');
+      // src-10 (Windows): surface the failure in the startup notice.
+      reportExtensionBootFailure('Aniyomi', e, bootAniyomi);
     }
-  });
+  }
+
+  Future.microtask(bootAniyomi);
 
   // Guarded Mihon boot step — the manga twin of the Aniyomi step above.
   // Same shape: its own microtask so it never blocks startup, and a try/catch
@@ -981,8 +1065,18 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
   //     so the check lives here, where it covers boot-reload, the source
   //     picker's listing, and every data call in one place: on iOS nothing is
   //     ever loaded, so no MihonProvider is ever constructed.
-  Future.microtask(() async {
-    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable) return;
+  // Named so the Windows load-failure notice's Retry can run it again.
+  Future<void> bootMihon() async {
+    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable) {
+      // src-10 (Windows): engine files missing - list the installed Mihon
+      // extensions in the startup notice instead of dropping them silently.
+      await reportMissingExtensionEngine(
+        ecosystem: 'Mihon',
+        installedBoxName: MihonExtensionService.installedBoxName,
+        boot: bootMihon,
+      );
+      return;
+    }
     try {
       if (!Hive.isBoxOpen(MihonExtensionService.installedBoxName)) {
         await openBoxSafely<dynamic>(MihonExtensionService.installedBoxName);
@@ -1046,8 +1140,12 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
       }
     } catch (e, st) {
       debugPrint('[mihon] boot step failed (non-fatal): $e\n$st');
+      // src-10 (Windows): surface the failure in the startup notice.
+      reportExtensionBootFailure('Mihon', e, bootMihon);
     }
-  });
+  }
+
+  Future.microtask(bootMihon);
 
   // Global cubit so any widget can read/write the active source id and
   // descendants can react via BlocBuilder/BlocListener. Persists the pick to a
@@ -1068,6 +1166,7 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
         ...manager.installedIds,
         ...csManager.all.map((p) => p.sourceId),
         ...lnrManager.installedSources.map((s) => s.id),
+        ...mangayomiManager.all.map((p) => p.sourceId),
       },
     ),
   );
@@ -1080,6 +1179,43 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
     await ContentModeCubit.create(sl<ActiveSourceCubit>()),
   );
 
+  // Configured addon URLs stay in secure storage on this device.
+  final stremioManager = StremioManager();
+  await stremioManager.init();
+  await stremioManager.ensureDefaultMetadata();
+  sl.registerSingleton<StremioManager>(stremioManager);
+  final stremioRemote = StremioRemote(
+    endpoint: endpoint,
+    accessToken: cloudAccessToken,
+    currentUserId: currentUserId,
+  );
+  sl.registerSingleton<StremioRemote>(
+    stremioRemote,
+    dispose: (remote) => remote.dispose(),
+  );
+  sl.registerSingleton<StremioBackup>(
+    StremioBackup(
+      manager: stremioManager,
+      remote: stremioRemote,
+      currentUserId: currentUserId,
+    ),
+  );
+  final stremioSync = StremioSync(
+    manager: stremioManager,
+    remote: stremioRemote,
+  );
+  sl.registerSingleton<StremioSync>(
+    stremioSync,
+    dispose: (sync) => sync.dispose(),
+  );
+  stremioSync.start(
+    currentUserId(),
+    sl<AuthCubit>().stream
+        .where((state) => state.status != AuthStatus.unknown)
+        .map((state) => state.isLoggedIn ? state.user?.id : null),
+  );
+  sl.registerSingleton<StremioProvider>(StremioProvider(stremioManager));
+
   sl.registerSingleton<SourceRepository>(
     SourceRepository(
       manager: manager,
@@ -1087,6 +1223,7 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
       aniManager: aniyomiManager,
       mihonManager: mihonManager,
       lnrManager: lnrManager,
+      mangayomiManager: mangayomiManager,
       activeSource: sl<ActiveSourceCubit>(),
       prefs: sl<PlaybackPrefs>(),
       // The language sets the sources screens already filter their lists by.
@@ -1208,4 +1345,23 @@ Future<void> initDependencies({void Function(String)? onProgress}) async {
       debugPrint('[cloudstream] deferred load failed (non-fatal): $e\n$st');
     }
   });
+}
+
+/// Windows session lookup for Mangayomi requests: the cookies and exact browser
+/// user agent saved by the desktop verification browser for [url]'s host
+/// (or a parent domain), so a site verified once keeps working. Returns no
+/// headers when nothing was saved, which lets the source ask for verification.
+Future<Map<String, String>> _desktopSessionHeaders(Uri url) async {
+  final saved = CfClearanceStore().restore();
+  final host = url.host;
+  final match = saved[host] ??
+      saved.entries
+          .where((e) => host.endsWith('.${e.key}'))
+          .map((e) => e.value)
+          .firstOrNull;
+  if (match == null) return const {};
+  return {
+    if (match.cookie.isNotEmpty) 'Cookie': match.cookie,
+    if (match.ua != null && match.ua!.isNotEmpty) 'User-Agent': match.ua!,
+  };
 }

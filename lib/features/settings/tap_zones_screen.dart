@@ -1,5 +1,8 @@
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/material.dart';
 
+import '../../core/desktop/desktop_dialogs.dart';
 import '../../core/di/injector.dart';
 import '../../core/reading/reader_prefs.dart';
 import '../../core/reading/tap_zones.dart';
@@ -47,7 +50,23 @@ class _TapZonesScreenState extends State<TapZonesScreen> {
     ];
   }
 
+  /// Windows (reader-7 C): the same zones drive "Click to turn pages".
+  bool get _desktop => defaultTargetPlatform == TargetPlatform.windows;
+
   Future<void> _assign(int index, TapZoneLayout layout) async {
+    // Windows: the app's graphite choice dialog instead of a bottom sheet.
+    if (_desktop) {
+      final picked = await showDesktopChoiceDialog<ReaderAction>(
+        context,
+        title: context.l10n.tapZones,
+        current: layout.zones[index].action,
+        options: [for (final a in _actions) (a, a.label)],
+      );
+      if (picked == null) return;
+      await _prefs.setTapZones(layout.withZoneAction(index, picked));
+      if (mounted) setState(() {});
+      return;
+    }
     final picked = await showModalBottomSheet<ReaderAction>(
       context: context,
       backgroundColor: AppColors.surface,
@@ -104,7 +123,7 @@ class _TapZonesScreenState extends State<TapZonesScreen> {
   Widget build(BuildContext context) {
     final layout = _prefs.tapZones(_layoutId);
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar(
         context.l10n.tapZones,
         actions: [
@@ -141,13 +160,22 @@ class _TapZonesScreenState extends State<TapZonesScreen> {
           SettingsSectionLabel(context.l10n.tapAZoneToChangeIt),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-            child: AspectRatio(
-              // Roughly a phone screen, so the map reads as the page you'd be
-              // looking at rather than an abstract grid.
-              aspectRatio: 0.62,
-              child: _ZoneMap(
-                layout: layout,
-                onTapZone: (i) => _assign(i, layout),
+            child: Center(
+              child: ConstrainedBox(
+                // Windows: a window-shaped map, kept to a readable size.
+                constraints: BoxConstraints(
+                  maxWidth: _desktop ? 560 : double.infinity,
+                ),
+                child: AspectRatio(
+                  // Roughly a phone screen (or a window on Windows), so the
+                  // map reads as the page you'd be looking at rather than an
+                  // abstract grid.
+                  aspectRatio: _desktop ? 1.4 : 0.62,
+                  child: _ZoneMap(
+                    layout: layout,
+                    onTapZone: (i) => _assign(i, layout),
+                  ),
+                ),
               ),
             ),
           ),
@@ -160,6 +188,15 @@ class _TapZonesScreenState extends State<TapZonesScreen> {
               style: AppText.caption,
             ),
           ),
+          // Windows: say when these zones apply to mouse clicks.
+          if (_desktop)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 8, 20, 0),
+              child: Text(
+                context.l10n.tapZonesWindowsNote,
+                style: AppText.caption,
+              ),
+            ),
         ],
       ),
     );

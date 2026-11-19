@@ -47,7 +47,7 @@ class _CreditLine extends StatelessWidget {
               ),
           ],
         ),
-        maxLines: Platform.isWindows ? 1 : 2,
+        maxLines: _windowsDesktopUi ? 1 : 2,
         overflow: TextOverflow.ellipsis,
       ),
     );
@@ -84,7 +84,7 @@ class _Description extends StatelessWidget {
           Text(
             text,
             style: AppText.body,
-            maxLines: Platform.isWindows ? 2 : 3,
+            maxLines: _windowsDesktopUi ? 2 : 3,
             overflow: TextOverflow.ellipsis,
           ),
           const SizedBox(height: 6),
@@ -125,7 +125,7 @@ class _IconAction extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final color = active ? AppColors.accent : AppColors.textPrimary;
-    if (Platform.isWindows) {
+    if (_windowsDesktopUi) {
       return Tooltip(
         message: tooltip,
         child: Material(
@@ -195,7 +195,7 @@ class _DetailActionRow extends StatelessWidget {
   final List<Widget> children;
 
   @override
-  Widget build(BuildContext context) => Platform.isWindows
+  Widget build(BuildContext context) => _windowsDesktopUi
       ? Wrap(spacing: 8, runSpacing: 8, children: children)
       : Row(
           mainAxisAlignment: MainAxisAlignment.spaceAround,
@@ -208,8 +208,9 @@ class _DetailActionRow extends StatelessWidget {
 // ─────────────────────────────────────────────────────────────────────────────
 
 class _TabBarDelegate extends SliverPersistentHeaderDelegate {
-  _TabBarDelegate(this.tabBar);
+  _TabBarDelegate(this.tabBar, {this.tint});
   final TabBar tabBar;
+  final ValueListenable<Color?>? tint;
 
   @override
   double get minExtent => tabBar.preferredSize.height;
@@ -223,10 +224,18 @@ class _TabBarDelegate extends SliverPersistentHeaderDelegate {
     bool overlapsContent,
   ) {
     // No divider line under the bar — just the left-aligned tabs (Sozo Read).
-    return Material(color: AppColors.bg, elevation: 0, child: tabBar);
+    final t = tint;
+    if (t == null) {
+      return Material(color: AppColors.bg, elevation: 0, child: tabBar);
+    }
+    return ValueListenableBuilder<Color?>(
+      valueListenable: t,
+      builder: (context, c, _) =>
+          Material(color: c ?? AppColors.bg, elevation: 0, child: tabBar),
+    );
   }
 
   @override
   bool shouldRebuild(covariant _TabBarDelegate oldDelegate) =>
-      tabBar != oldDelegate.tabBar;
+      tabBar != oldDelegate.tabBar || tint != oldDelegate.tint;
 }

@@ -13,6 +13,7 @@ import '../platform/app_paths.dart';
 import 'cloudstream_catalog.dart';
 import '../provider/cf_clearance_store.dart';
 import 'extension_runtime.dart';
+import 'extension_load_failures.dart';
 import 'desktop_storage.dart';
 import 'desktop_flaresolverr.dart';
 import 'desktop_cloudflare.dart';
@@ -178,6 +179,51 @@ class DesktopCloudStream {
     return _starting ??= _start().whenComplete(() => _starting = null);
   }
 
+  /// Ecosystem name used in the extension load-failure notice.
+  // Brand name, so it is not translated.
+  static const _noticeEcosystem = 'CloudStream';
+
+  /// Records a plugin that could not be restored (log + startup notice).
+  /// Only the production runtime reports; injected test runtimes stay quiet.
+  void _reportRestoreFailure(String id, Object error) {
+    if (engineFactory != null) return;
+    _registerRetry();
+    ExtensionLoadFailures.report(
+      ExtensionLoadFailure(
+        ecosystem: _noticeEcosystem,
+        name: id,
+        message: '$error',
+      ),
+    );
+  }
+
+  /// Registers the notice's Retry: start the engine if needed, then reload
+  /// each plugin still listed as failed. Re-registering just replaces it.
+  void _registerRetry() {
+    ExtensionLoadFailures.registerRetry(_noticeEcosystem, () async {
+      // Engine failure entry clears once the engine is up again.
+      ExtensionLoadFailures.clear(_noticeEcosystem, name: 'CloudStream engine');
+      final engine = await _ready();
+      final failed = {
+        for (final f in ExtensionLoadFailures.failures.value)
+          if (f.ecosystem == _noticeEcosystem) f.name,
+      };
+      for (final item in _installed) {
+        final id = '${item['id']}';
+        if (!failed.contains(id)) continue;
+        try {
+          await engine.loadPlugin(
+            item['path'] as String,
+            url: item['url'] as String,
+          );
+          ExtensionLoadFailures.clear(_noticeEcosystem, name: id);
+        } catch (error) {
+          _reportRestoreFailure(id, error);
+        }
+      }
+    });
+  }
+
   /// Starts the bundled runtime and restores plugins; individual restore
   /// failures are logged without preventing other installed providers loading.
   Future<Cs3Engine> _start() async {
@@ -209,13 +255,29 @@ class DesktopCloudStream {
             item['path'] as String,
             url: item['url'] as String,
           );
+          ExtensionLoadFailures.clear(_noticeEcosystem, name: '${item['id']}');
         } catch (error) {
-          debugPrint('[cloudstream] Could not restore ${item['id']}: $error');
+          // Logged and listed in the startup notice (with Retry) instead of
+          // only reaching debugPrint, so a missing plugin is explained.
+          _reportRestoreFailure('${item['id']}', error);
         }
       }
       _engine = engine;
       return engine;
-    } catch (_) {
+    } catch (error) {
+      // The engine itself did not start: every CloudStream source is gone,
+      // so list that in the startup notice too (production runtime only).
+      if (engineFactory == null) {
+        _registerRetry();
+        ExtensionLoadFailures.report(
+          ExtensionLoadFailure(
+            ecosystem: _noticeEcosystem,
+            // Fixed id (cleared by name); translated on show.
+            name: 'CloudStream engine',
+            message: '$error',
+          ),
+        );
+      }
       await engine.dispose();
       rethrow;
     }

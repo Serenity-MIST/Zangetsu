@@ -204,9 +204,11 @@ class _TvTrackerConnectScreenState extends State<TvTrackerConnectScreen> {
                         if (widget.trackerId != null &&
                             widget.trackerId != 'mangabaka')
                           _qrOption(
-                            data:
-                                'https://zangetsu.online/tv-connect/'
-                                '?code=$_code&nonce=$_nonce&tracker=${widget.trackerId}',
+                            data: PairLink.trackerWebLink(
+                              code: _code!,
+                              nonce: _nonce!,
+                              tracker: widget.trackerId!,
+                            ),
                             title: context.l10n.noApp,
                             subtitle:
                                 'Scan to log in with\n$_label in your browser',

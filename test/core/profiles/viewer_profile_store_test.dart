@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/profiles/viewer_profile.dart';
+import 'package:watch_app/core/profiles/profile_scope.dart';
+import 'package:watch_app/core/playback/resume_store.dart';
 import 'package:watch_app/core/theme/app_colors.dart';
 import 'package:watch_app/core/theme/theme_controller.dart';
 
@@ -32,6 +34,108 @@ void main() {
     await Hive.deleteFromDisk();
     if (await directory.exists()) await directory.delete(recursive: true);
   });
+
+  test(
+    'logout separates guest data while preserving the account cache',
+    () async {
+      String? owner = 'account-a';
+      final profiles = ViewerProfileStore(currentUserId: () => owner);
+      await profiles.loadForUser();
+      expect(profiles.dataProfileId, kDefaultProfileId);
+      final history = await Hive.openBox('watch_history');
+      await history.put('private-title', {'title': 'Private account title'});
+      owner = null;
+      await profiles.loadForUser();
+      expect(profiles.dataProfileId, isNot(kDefaultProfileId));
+      expect(profileOwnsKey('private-title', profiles.dataProfileId), isFalse);
+      final guestKey = profileScopedKey(profiles.dataProfileId, 'guest-title');
+      await history.put(guestKey, {'title': 'Guest title'});
+      final restarted = ViewerProfileStore(currentUserId: () => owner);
+      await restarted.loadForUser();
+      expect(profileOwnsKey(guestKey, restarted.dataProfileId), isTrue);
+      owner = 'account-a';
+      await restarted.loadForUser();
+      expect(restarted.dataProfileId, kDefaultProfileId);
+      expect(history.get('private-title')['title'], 'Private account title');
+      expect(profileOwnsKey(guestKey, restarted.dataProfileId), isFalse);
+    },
+  );
+
+  test(
+    'a device that never signed in retains its existing guest history',
+    () async {
+      expect(store.dataProfileId, kDefaultProfileId);
+      expect(
+        profileOwnsKey('existing-guest-title', store.dataProfileId),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'older account caches are hidden from guest mode without moving rows',
+    () async {
+      await Hive.box(ViewerProfileStore.boxName).put('profiles:old-account', [
+        const ViewerProfile(id: 'default', name: 'Private account').toJson(),
+      ]);
+      expect(store.dataProfileId, isNot(kDefaultProfileId));
+      expect(profileOwnsKey('private-title', store.dataProfileId), isFalse);
+    },
+  );
+
+  test(
+    'guest playback positions stay separate from the signed-in profile',
+    () async {
+      String? owner = 'account-a';
+      final profiles = ViewerProfileStore(currentUserId: () => owner);
+      await profiles.loadForUser();
+      await ResumeStore.init();
+      final resume = ResumeStore(
+        currentProfileId: () => profiles.dataProfileId,
+      );
+      await resume.save(
+        'source',
+        'show',
+        'ep',
+        const Duration(seconds: 90),
+        const Duration(minutes: 24),
+      );
+      owner = null;
+      await profiles.loadForUser();
+      expect(resume.get('source', 'show', 'ep'), isNull);
+      await resume.save(
+        'source',
+        'show',
+        'ep',
+        const Duration(seconds: 45),
+        const Duration(minutes: 24),
+      );
+      owner = 'account-a';
+      await profiles.loadForUser();
+      expect(resume.get('source', 'show', 'ep')!.position.inSeconds, 90);
+      owner = null;
+      await profiles.loadForUser();
+      expect(resume.get('source', 'show', 'ep')!.position.inSeconds, 45);
+    },
+  );
+
+  test(
+    'profile deletion retires lock metadata only after local cleanup',
+    () async {
+      final retired = <String>[];
+      final profiles = ViewerProfileStore(
+        onProfileDataDeleted: (owner, id) async {
+          retired.add('$owner:$id');
+        },
+      );
+      await profiles.loadForUser();
+      final profile = (await profiles.create('Private'))!;
+      expect(await profiles.delete(profile.id), isTrue);
+      expect(retired, ['local:${profile.id}']);
+      expect(await profiles.delete(kDefaultProfileId), isFalse);
+      expect(retired, hasLength(1));
+    },
+  );
 
   test('keeps Home and caps the total at four profiles', () async {
     expect(ViewerProfileStore.maxProfiles, 4);
@@ -76,6 +180,30 @@ void main() {
       expect(cloudStore.activeProfile.name, 'Tamananna');
     },
   );
+
+  test('skips the cloud merge when boot found the network offline, then merges '
+      'on a normal load', () async {
+    final remote = _MemoryProfileRemote()
+      ..rows['cloud-only'] = const ViewerProfile(
+        id: 'cloud-only',
+        name: 'Cloud only',
+      );
+    final cloudStore = ViewerProfileStore(
+      remote: remote,
+      currentUserId: () => 'test-user',
+    );
+
+    await cloudStore.loadForUser(attemptRemote: false);
+
+    // Local-only: the splash must not wait on the cloud call.
+    expect(cloudStore.profiles.map((p) => p.id), [kDefaultProfileId]);
+    expect(cloudStore.isLoadedForCurrentUser, isTrue);
+
+    // The reconnect path calls it again without the flag and picks up the
+    // cloud copy.
+    await cloudStore.loadForUser();
+    expect(cloudStore.profiles.map((p) => p.id), contains('cloud-only'));
+  });
 
   test(
     'keeps a previously saved fifth profile when loading old data',
@@ -728,6 +856,45 @@ void main() {
     final hive = ViewerProfile.fromJson({'id': 'x', 'name': 'X'});
     expect(hive.photoUrl, isNull);
   });
+
+  test(
+    'local startup keeps the saved active profile when cloud hangs',
+    () async {
+      final box = Hive.box(ViewerProfileStore.boxName);
+      await box.put('profiles:startup-user', [
+        const ViewerProfile(id: kDefaultProfileId, name: 'Main').toJson(),
+        const ViewerProfile(id: 'saved-profile', name: 'Saved').toJson(),
+      ]);
+      await box.put('active:startup-user', 'saved-profile');
+      final cached = ViewerProfileStore(
+        remote: _HangingProfileRemote(),
+        currentUserId: () => 'startup-user',
+      );
+
+      await cached.loadForUser(attemptRemote: false);
+
+      expect(cached.isLoadedForCurrentUser, isTrue);
+      expect(cached.activeId, 'saved-profile');
+      expect(cached.activeProfile.name, 'Saved');
+      expect(cached.profiles, hasLength(2));
+    },
+  );
+
+  test(
+    'attemptRemote false applies local profiles without waiting on the network',
+    () async {
+      String? owner = 'account-offline';
+      final offline = ViewerProfileStore(
+        remote: _HangingProfileRemote(),
+        currentUserId: () => owner,
+      );
+      final sw = Stopwatch()..start();
+      await offline.loadForUser(displayName: 'Account', attemptRemote: false);
+      expect(sw.elapsed, lessThan(const Duration(seconds: 5)));
+      expect(offline.isLoadedForCurrentUser, isTrue);
+      expect(offline.activeProfile.name, 'Account');
+    },
+  );
 }
 
 class _BlockingDeleteProfileRemote implements ViewerProfileRemote {
@@ -805,6 +972,20 @@ class _FailingDeleteProfileRemote implements ViewerProfileRemote {
 
   @override
   Future<void> upsert(String userId, ViewerProfile profile) async {}
+}
+
+class _HangingProfileRemote implements ViewerProfileRemote {
+  @override
+  Future<List<Map<String, dynamic>>> listFor(String userId) =>
+      Completer<List<Map<String, dynamic>>>().future;
+
+  @override
+  Future<void> delete(String userId, String profileId) =>
+      Completer<void>().future;
+
+  @override
+  Future<void> upsert(String userId, ViewerProfile profile) =>
+      Completer<void>().future;
 }
 
 class _AccountSwitchProfileRemote implements ViewerProfileRemote {

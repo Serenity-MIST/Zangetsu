@@ -8,6 +8,7 @@ import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/ui/desktop_settings_surface.dart';
 import '../../l10n/l10n.dart';
+import '../settings/desktop_settings_slider.dart';
 
 /// Translation appearance state shared by the mobile sheet and a separately
 /// composed desktop editor; both retain the same preference ownership.
@@ -303,27 +304,38 @@ class _MangaTranslationAppearanceSheetState
                 color: _backgroundColor,
                 textColor: false,
               ),
-              _desktopSlider(
-                key: const ValueKey('manga-translation-appearance-size'),
+              // The shared Windows settings slider row (icon, value + default
+              // in the subtitle, compact slider on the right). The preview
+              // card above already shows the live size/opacity while dragging.
+              DesktopSettingsSlider(
+                sliderKey: const ValueKey('manga-translation-appearance-size'),
+                icon: Icons.format_size_rounded,
                 title: l10n.fontSize,
                 value: _fontSize,
                 min: 8,
                 max: 32,
                 divisions: 24,
-                display: '${_fontSize.round()} px',
+                format: (v) => '${v.round()}',
+                unit: (_) => 'px',
+                defaultValue: ReaderPrefs.defaultMangaTranslationFontSize,
                 onChanged: (v) => setState(() => _fontSize = v),
-                onEnd: widget.prefs.setMangaTranslationFontSize,
+                onChangeEnd: widget.prefs.setMangaTranslationFontSize,
               ),
-              _desktopSlider(
-                key: const ValueKey('manga-translation-appearance-opacity'),
+              DesktopSettingsSlider(
+                sliderKey: const ValueKey(
+                  'manga-translation-appearance-opacity',
+                ),
+                icon: Icons.opacity_rounded,
                 title: l10n.mangaTranslationBackgroundOpacity,
                 value: _backgroundOpacity,
                 min: 0,
                 max: 1,
                 divisions: 20,
-                display: '${(_backgroundOpacity * 100).round()}%',
+                format: (v) => '${(v * 100).round()}',
+                unit: (_) => '%',
+                defaultValue: ReaderPrefs.defaultMangaTranslationBackgroundOpacity,
                 onChanged: (v) => setState(() => _backgroundOpacity = v),
-                onEnd: widget.prefs.setMangaTranslationBackgroundOpacity,
+                onChangeEnd: widget.prefs.setMangaTranslationBackgroundOpacity,
               ),
             ],
           ),
@@ -362,41 +374,6 @@ class _MangaTranslationAppearanceSheetState
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: AppColors.hairline),
       ),
-    ),
-  );
-
-  /// The preview follows dragging; persistence retains the original release
-  /// callback so a pointer movement does not produce a disk write per frame.
-  Widget _desktopSlider({
-    required Key key,
-    required String title,
-    required double value,
-    required double min,
-    required double max,
-    required int divisions,
-    required String display,
-    required ValueChanged<double> onChanged,
-    required ValueChanged<double> onEnd,
-  }) => Padding(
-    padding: const EdgeInsets.fromLTRB(22, 18, 22, 12),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(title, style: AppText.body),
-        const SizedBox(height: 4),
-        Text(display, style: AppText.caption),
-        Slider(
-          key: key,
-          value: value.clamp(min, max),
-          min: min,
-          max: max,
-          divisions: divisions,
-          label: display,
-          semanticFormatterCallback: (_) => display,
-          onChanged: onChanged,
-          onChangeEnd: onEnd,
-        ),
-      ],
     ),
   );
 

@@ -1,5 +1,7 @@
 // ignore_for_file: invalid_use_of_protected_member
 
+import 'dart:io';
+
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
@@ -7,13 +9,19 @@ import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
+import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
+import 'package:watch_app/core/ui/nav_prefs.dart';
+import 'package:watch_app/features/home/home_catalogue_prefs.dart';
+import 'package:watch_app/features/schedule/schedule_screen.dart';
+import 'package:watch_app/features/home/search_screen.dart';
+import 'package:watch_app/features/shell/mode_bar.dart';
 import 'package:watch_app/core/ui/dock_visibility.dart';
 import 'package:watch_app/core/ui/frosted_surface.dart';
-import 'package:watch_app/core/appwrite/appwrite_service.dart';
 import 'package:watch_app/core/anilist/anilist_service.dart';
 import 'package:watch_app/core/announce/announcement.dart';
 import 'package:watch_app/core/announce/announcement_service.dart';
 import 'package:watch_app/core/app_mode.dart';
+import 'package:watch_app/core/desktop/desktop_settings_opener.dart';
 import 'package:watch_app/core/di/injector.dart';
 import 'package:watch_app/core/download/download_manager.dart';
 import 'package:watch_app/core/download/download_prefs.dart';
@@ -52,28 +60,11 @@ import 'package:watch_app/core/download/chapter_download_store.dart';
 import 'package:watch_app/core/zmode/metadata_repository.dart';
 import 'package:watch_app/core/zmode/zmode_prefs.dart';
 import 'package:watch_app/features/auth/auth_cubit.dart';
-import 'package:watch_app/features/auth/migration_bridge.dart';
 import 'package:watch_app/features/home/cubit/home_cubit.dart';
 import 'package:watch_app/features/home/home_screen.dart';
 import 'package:watch_app/features/shell/root_shell.dart';
 import 'package:watch_app/features/shell/root_shell_tv.dart';
-
-/// The gradient one of Home's cards is painting behind its label.
-List<Color> _cardFill(WidgetTester tester, String key) {
-  final box = tester.widget<DecoratedBox>(
-    find.descendant(
-      of: find.byKey(ValueKey(key)),
-      matching: find.byType(DecoratedBox),
-    ),
-  );
-  return ((box.decoration as BoxDecoration).gradient! as LinearGradient).colors;
-}
-
-MigrationBridge _fakeBridge() => MigrationBridge(
-  invoke: (_, __) async => const {'ok': false},
-  signInPassword: (_, __) async => false,
-  verifyOtp: (_, __) async => false,
-);
+import 'package:watch_app/features/settings/settings_screen.dart';
 
 // ── Minimal fakes (same shape as root_shell_tv_test.dart's harness) ────────
 
@@ -113,7 +104,6 @@ class _FakeMyListStore implements MyListStore {
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
@@ -127,15 +117,19 @@ class _FakeMyListStore implements MyListStore {
 }
 
 class _FakeSearchHistory implements SearchHistory {
+  _FakeSearchHistory([this.queries = const []]);
+  List<String> queries;
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
-  List<String> recent() => const [];
+  List<String> recent() => queries;
+
+  @override
+  Future<void> clear() async => queries = [];
 }
 
 class _FakeSearchPrefs extends ChangeNotifier implements SearchPrefs {
@@ -147,7 +141,6 @@ class _FakeSearchPrefs extends ChangeNotifier implements SearchPrefs {
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
@@ -181,7 +174,6 @@ class _FakeSearchSourcePrefs extends ChangeNotifier
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
@@ -196,7 +188,6 @@ class _FakeProviderRegistry implements ProviderRegistry {
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
@@ -220,7 +211,6 @@ class _FakeAniListService extends ChangeNotifier implements AniListService {
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
@@ -241,7 +231,6 @@ class _FakeMalService extends ChangeNotifier implements MalService {
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
@@ -262,7 +251,6 @@ class _FakeSimklService extends ChangeNotifier implements SimklService {
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
@@ -350,7 +338,7 @@ void main() {
     TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(
           const MethodChannel('plugins.flutter.io/path_provider'),
-          (call) async => '/tmp',
+          (call) async => Directory.systemTemp.path,
         );
 
     await sl.reset();
@@ -358,7 +346,8 @@ void main() {
     // Home's launch sequence shows a one-time community sheet backed by the
     // 'app_flags' Hive box. Init Hive + mark it seen so that path no-ops
     // (mirrors production, where Hive is initialized before runApp).
-    Hive.init('/tmp/zangetsu_nav_test_hive');
+    Hive.init('${Directory.systemTemp.path}/zangetsu_nav_test_hive');
+    await ViewerProfileStore.init();
     final flags = await Hive.openBox('app_flags');
     await flags.put('communitySheetSeen', true);
     await Hive.openBox(ThemeController.boxName);
@@ -372,7 +361,7 @@ void main() {
     final dio = Dio();
     final fakeRepo = _FakeSourceRepository();
     activeSource = ActiveSourceCubit();
-    authCubit = AuthCubit(SupabaseService(), AppwriteService(), _fakeBridge());
+    authCubit = AuthCubit(SupabaseService());
     // This suite reuses a fixed on-disk Hive dir (not a fresh temp dir) across
     // runs, so a mode persisted by an earlier run would otherwise leak in here
     // and start tests in the wrong mode.
@@ -453,6 +442,95 @@ void main() {
     matching: find.text(label),
   );
 
+  for (final style in NavBarStyle.values) {
+    testWidgets('Stremio hides only the mode dock (${style.name})', (
+      tester,
+    ) async {
+      sl.registerSingleton<AppMode>(const AppMode(isTv: false));
+      final nav = NavPrefs();
+      sl.registerSingleton<NavPrefs>(nav);
+      await tester.runAsync(() async {
+        await Hive.openBox(HomeCataloguePrefs.boxName);
+        await HomeCataloguePrefs.setCatalogue(
+          ContentMode.anime,
+          HomeCatalogueKind.metadata,
+        );
+        await NavPrefs.init();
+        await nav.setStyle(style);
+        await nav.setKeepDockExpanded(false);
+        await ZModePrefs.setEnabled(true);
+      });
+      await tester.pumpWidget(wrap(const RootShell()));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 5));
+      final modes = style == NavBarStyle.liquid
+          ? find.byType(GlassMenu)
+          : find.byType(ModeFab);
+      final navigation = style == NavBarStyle.liquid
+          ? find.byType(GlassTabBar)
+          : find.byKey(const ValueKey('dockPill'));
+      expect(modes, findsOneWidget);
+      expect(navigation, findsOneWidget);
+      final expandedWidth = tester.getSize(navigation).width;
+      double? collapsedWidth;
+      if (style == NavBarStyle.liquid) {
+        addTearDown(DockScrollCollapse.reset);
+        dockCollapsedByScroll.value = true;
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 500));
+        collapsedWidth = tester.getSize(navigation).width;
+        DockScrollCollapse.reset();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 500));
+      }
+
+      await tester.runAsync(
+        () => HomeCataloguePrefs.setCatalogue(
+          ContentMode.anime,
+          HomeCatalogueKind.stremio,
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 5));
+      expect(modes, findsNothing);
+      expect(navigation, findsOneWidget);
+      if (style == NavBarStyle.liquid) {
+        expect(tester.getSize(navigation).width, closeTo(expandedWidth, 1));
+        dockCollapsedByScroll.value = true;
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 500));
+        expect(tester.getSize(navigation).width, closeTo(collapsedWidth!, 1));
+        DockScrollCollapse.reset();
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 500));
+      }
+
+      await tester.runAsync(() => contentMode.setMode(ContentMode.manga));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 5));
+      expect(modes, findsOneWidget);
+      expect(navigation, findsOneWidget);
+
+      await tester.runAsync(() => contentMode.setMode(ContentMode.anime));
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 5));
+      expect(modes, findsNothing);
+
+      await tester.runAsync(
+        () => HomeCataloguePrefs.setCatalogue(
+          ContentMode.anime,
+          HomeCatalogueKind.metadata,
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 5));
+      expect(modes, findsOneWidget);
+      expect(navigation, findsOneWidget);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump(const Duration(seconds: 5));
+    });
+  }
+
   // Schedule left the dock for the card row on Home, beside the Manga/Novel
   // mode cards — two doors to one screen was the point of removing it — and
   // Sources took the slot it left, moved down from the Home header.
@@ -485,6 +563,31 @@ void main() {
     expect(find.byTooltip('Profile menu'), findsOneWidget);
     expect(find.text('About'), findsNothing);
   }, variant: TargetPlatformVariant.only(TargetPlatform.android));
+
+  testWidgets('double-tapping the phone Profile tab opens Settings', (
+    tester,
+  ) async {
+    sl.registerSingleton<AppMode>(const AppMode(isTv: false));
+    await tester.pumpWidget(wrap(const RootShell()));
+    await tester.pump(const Duration(milliseconds: 250));
+
+    expect(find.byType(SettingsScreen), findsNothing);
+
+    await tester.tap(dockLabel('Profile'));
+    await tester.pump();
+    expect(find.byType(ViewerProfileHomeScreen), findsOneWidget);
+    expect(
+      tester.state<NavigatorState>(find.byType(Navigator)).canPop(),
+      isFalse,
+    );
+    await tester.tap(dockLabel('Profile'));
+    await tester.pump(const Duration(milliseconds: 500));
+
+    final settings = tester.element(
+      find.byType(SettingsScreen, skipOffstage: false),
+    );
+    expect(ModalRoute.of(settings)?.isCurrent, isTrue);
+  });
 
   testWidgets('profile launch gate hides the entire phone shell', (
     tester,
@@ -687,37 +790,86 @@ void main() {
     expect(find.text('Schedule'), findsOneWidget);
   }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
-  // Home's mode-cards row carries the Schedule card alongside the Manga/Novel
-  // switcher cards. Since Schedule left the dock this is the ONLY way in, so
-  // this test is now load-bearing rather than a second opinion. Anime mode
-  // only — Schedule has nothing to say in a reading mode.
-  // Schedule now lives behind the hub card rather than a card of its own, so
-  // the guarantee got stronger: it is reachable from every mode instead of
-  // vanishing in Manga and Novel the way the old Schedule card did.
-  testWidgets("Home's hub card shows in every mode", (tester) async {
+  // Liquid navigation keeps animating, so advance transitions without waiting for idle.
+  Future<void> pumpHomeAnimations(WidgetTester tester) async {
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 2));
+  }
+
+  testWidgets('Search fits a short screen with the keyboard open', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(320, 600);
+    tester.view.devicePixelRatio = 1;
+    tester.view.viewInsets = const FakeViewPadding(bottom: 280);
+    addTearDown(tester.view.reset);
     sl.registerSingleton<AppMode>(const AppMode(isTv: false));
-    await tester.pumpWidget(wrap(const RootShell()));
-    await tester.pumpAndSettle();
+    await tester.pumpWidget(wrap(const SearchScreen(showBack: false)));
+    await pumpHomeAnimations(tester);
+    expect(tester.takeException(), isNull);
+  });
 
-    expect(find.byKey(const ValueKey('home_lists_hub_card')), findsOneWidget);
+  testWidgets('Schedule sits below recents and keeps search history', (
+    tester,
+  ) async {
+    sl.registerSingleton<AppMode>(const AppMode(isTv: false));
+    await sl.unregister<SearchHistory>();
+    final history = _FakeSearchHistory(['Naruto', 'Bleach']);
+    sl.registerSingleton<SearchHistory>(history);
+    await tester.pumpWidget(wrap(const SearchScreen(showBack: false)));
+    await pumpHomeAnimations(tester);
+    final schedule = find.byKey(const ValueKey('search_schedule_action'));
+    final scaffoldWidth = tester.getSize(find.byType(Scaffold).first).width;
+    expect(tester.getRect(schedule).width, closeTo(scaffoldWidth - 32, 1));
+    expect(
+      tester.getTopLeft(schedule).dy,
+      greaterThan(tester.getBottomLeft(find.text('Naruto')).dy),
+    );
+    final divider = find.byKey(const ValueKey('recent_search_divider'));
+    expect(divider, findsOneWidget);
+    expect(
+      tester.getTopLeft(schedule).dy,
+      greaterThan(tester.getBottomLeft(divider).dy),
+    );
+    await tester.tap(schedule);
+    await pumpHomeAnimations(tester);
+    expect(find.byType(ScheduleScreen), findsOneWidget);
+    Navigator.of(tester.element(find.byType(ScheduleScreen))).pop();
+    await pumpHomeAnimations(tester);
+    expect(history.recent(), ['Naruto', 'Bleach']);
+    await tester.tap(find.text('Clear'));
+    await pumpHomeAnimations(tester);
+    expect(
+      find.byKey(const ValueKey('search_schedule_action')),
+      findsOneWidget,
+    );
+    expect(history.recent(), isEmpty);
+  });
 
-    for (final m in ContentMode.values) {
-      await tester.runAsync(() => contentMode.setMode(m));
-      await tester.pumpAndSettle();
-      expect(
-        find.byKey(const ValueKey('home_lists_hub_card')),
-        findsOneWidget,
-        reason: 'Schedule has no other entry point in $m',
-      );
-    }
+  testWidgets('Schedule stays below the search field without recents', (
+    tester,
+  ) async {
+    sl.registerSingleton<AppMode>(const AppMode(isTv: false));
+    await tester.pumpWidget(wrap(const SearchScreen(showBack: false)));
+    await pumpHomeAnimations(tester);
+    final schedule = find.byKey(const ValueKey('search_schedule_action'));
+    expect(schedule, findsOneWidget);
+    expect(
+      tester.getTopLeft(schedule).dy,
+      greaterThan(tester.getBottomLeft(find.byType(TextField).first).dy),
+    );
   }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
-  // The row used to be hidden entirely under Z Mode (`if (!ZModePrefs.enabled)`),
-  // which was survivable while Schedule also had a dock tab. It doesn't, so the
-  // card has to be there in BOTH modes or Schedule has no entry point at all.
-  // The hub label is a phrase, not a word, which is why it gets twice the width
-  // of a switcher. On the narrowest phone we support that is still three cards
-  // sharing one row, so pin the case that would ellipsise or overflow it.
+  testWidgets('Home has no Schedule card or header button', (tester) async {
+    sl.registerSingleton<AppMode>(const AppMode(isTv: false));
+    await tester.pumpWidget(wrap(const RootShell()));
+    await pumpHomeAnimations(tester);
+    expect(find.byKey(const ValueKey('home_schedule_card')), findsNothing);
+    expect(find.byKey(const ValueKey('home_lists_hub_card')), findsNothing);
+    expect(find.byTooltip('Schedule'), findsNothing);
+  });
+
+  // The remaining mode/genre cards still fit narrow screens.
   testWidgets('the card row survives a narrow phone', (tester) async {
     tester.view.physicalSize = const Size(320 * 3, 640 * 3);
     tester.view.devicePixelRatio = 3;
@@ -725,16 +877,15 @@ void main() {
 
     sl.registerSingleton<AppMode>(const AppMode(isTv: false));
     await tester.pumpWidget(wrap(const RootShell()));
-    await tester.pumpAndSettle();
+    await pumpHomeAnimations(tester);
 
-    expect(find.byKey(const ValueKey('home_lists_hub_card')), findsOneWidget);
+    expect(find.byKey(const ValueKey('home_schedule_card')), findsNothing);
     expect(tester.takeException(), isNull);
   }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   // The row above only ever holds one card, because no MetadataRepository is
   // registered so Genres is hidden. Two cards splitting 320dp is the case
-  // that actually squeezes: "Schedule & lists" has to survive half a narrow
-  // phone next to Genres.
+  // that squeezes Schedule beside Genres.
   testWidgets('both cards fit side by side on a narrow phone', (tester) async {
     tester.view.physicalSize = const Size(320 * 3, 640 * 3);
     tester.view.devicePixelRatio = 3;
@@ -743,10 +894,10 @@ void main() {
     sl.registerSingleton<AppMode>(const AppMode(isTv: false));
     sl.registerSingleton<MetadataRepository>(_FiltersRepo());
     await tester.pumpWidget(wrap(const RootShell()));
-    await tester.pumpAndSettle();
+    await pumpHomeAnimations(tester);
 
-    expect(find.byKey(const ValueKey('home_lists_hub_card')), findsOneWidget);
-    expect(find.byKey(const ValueKey('home_genres_card')), findsOneWidget);
+    expect(find.byKey(const ValueKey('home_schedule_card')), findsNothing);
+    expect(find.byKey(const ValueKey('home_genres_card')), findsNothing);
     // An overflow paints an exception rather than throwing, so this is what
     // catches the row getting too tight.
     expect(tester.takeException(), isNull);
@@ -756,19 +907,15 @@ void main() {
   // tinted rather than the old surface2 -> surface grey, and that the two
   // cards do not land on the same tint (the "one wide slab" the accent was
   // added to avoid in the first place).
-  testWidgets('with no art at all the cards are tinted, and differ', (
+  testWidgets('Genres shortcut is disabled even when filtering is supported', (
     tester,
   ) async {
     sl.registerSingleton<AppMode>(const AppMode(isTv: false));
     sl.registerSingleton<MetadataRepository>(_FiltersRepo());
     await tester.pumpWidget(wrap(const RootShell()));
-    await tester.pumpAndSettle();
+    await pumpHomeAnimations(tester);
 
-    final hub = _cardFill(tester, 'home_lists_hub_card');
-    final genres = _cardFill(tester, 'home_genres_card');
-
-    expect(hub, isNot([AppColors.surface2, AppColors.surface]));
-    expect(hub, isNot(genres));
+    expect(find.byKey(const ValueKey('home_genres_card')), findsNothing);
   }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   testWidgets('no Genres card when the catalogue cannot filter', (
@@ -777,24 +924,26 @@ void main() {
     sl.registerSingleton<AppMode>(const AppMode(isTv: false));
     sl.registerSingleton<MetadataRepository>(_FiltersRepo(supports: false));
     await tester.pumpWidget(wrap(const RootShell()));
-    await tester.pumpAndSettle();
+    await pumpHomeAnimations(tester);
 
-    expect(find.byKey(const ValueKey('home_lists_hub_card')), findsOneWidget);
+    expect(find.byKey(const ValueKey('home_schedule_card')), findsNothing);
     expect(find.byKey(const ValueKey('home_genres_card')), findsNothing);
   }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
-  testWidgets('Home keeps the hub card with Z Mode on', (tester) async {
+  testWidgets('Home keeps Schedule out of the card row in Z Mode', (
+    tester,
+  ) async {
     sl.registerSingleton<AppMode>(const AppMode(isTv: false));
     await tester.pumpWidget(wrap(const RootShell()));
-    await tester.pumpAndSettle();
-    expect(find.byKey(const ValueKey('home_lists_hub_card')), findsOneWidget);
+    await pumpHomeAnimations(tester);
+    expect(find.byKey(const ValueKey('home_schedule_card')), findsNothing);
 
     await tester.runAsync(() => ZModePrefs.setEnabled(true));
-    await tester.pumpAndSettle();
-    expect(find.byKey(const ValueKey('home_lists_hub_card')), findsOneWidget);
+    await pumpHomeAnimations(tester);
+    expect(find.byKey(const ValueKey('home_schedule_card')), findsNothing);
 
     await tester.runAsync(() => ZModePrefs.setEnabled(false));
-    await tester.pumpAndSettle();
+    await pumpHomeAnimations(tester);
   }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   // Task 11 added a full-width "Search" bar to Home while Z Mode was on
@@ -822,6 +971,61 @@ void main() {
     // header's icon-only action has a tooltip (not rendered as Text) instead.
     expect(find.text('Search'), findsNothing);
   }, variant: TargetPlatformVariant.only(TargetPlatform.android));
+
+  // Windows: Settings opens as a full page pushed over the whole shell, so
+  // the left rail and top bar are covered (not an in-frame page beside the
+  // rail). Opening it twice keeps one copy, and Back returns to the tab the
+  // user was on (Home).
+  testWidgets('Windows Settings covers the rail and Back returns to Home', (
+    tester,
+  ) async {
+    sl.registerSingleton<AppMode>(const AppMode(isTv: false));
+    // SettingsScreen reads the dock prefs.
+    sl.registerSingleton<NavPrefs>(NavPrefs());
+    await tester.runAsync(NavPrefs.init);
+    await tester.pumpWidget(wrap(const RootShell()));
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+
+    // The shell installed its opener (the Profile button and Ctrl+, use it).
+    expect(find.byType(SettingsScreen), findsNothing);
+    final shell = tester.element(find.byType(RootShell));
+    expect(ModalRoute.of(shell)!.isCurrent, isTrue);
+
+    expect(DesktopSettingsOpener.open(), isTrue);
+    // A second request while it is open must not stack another copy.
+    DesktopSettingsOpener.open();
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+
+    // One Settings, on its own route above the shell route: the rail and
+    // top bar (part of the shell route) are covered.
+    expect(find.byType(SettingsScreen), findsOneWidget);
+    final settings = tester.element(find.byType(SettingsScreen));
+    expect(ModalRoute.of(settings)!.isCurrent, isTrue);
+    expect(ModalRoute.of(settings), isNot(ModalRoute.of(shell)));
+    expect(ModalRoute.of(shell)!.isCurrent, isFalse);
+
+    // Back (Esc / Alt+Left / mouse Back all pop the root navigator).
+    await Navigator.of(shell).maybePop();
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+
+    expect(find.byType(SettingsScreen), findsNothing);
+    expect(ModalRoute.of(shell)!.isCurrent, isTrue);
+    expect(find.byType(HomeScreen), findsOneWidget);
+
+    // It can be opened again after closing.
+    expect(DesktopSettingsOpener.open(), isTrue);
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.byType(SettingsScreen), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 5));
+    // Unmounting the shell removes its opener.
+    expect(DesktopSettingsOpener.handler, isNull);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
 }
 
 /// Home reads only [MetadataRepository.supportsFilters] to decide whether the
@@ -835,7 +1039,6 @@ class _FiltersRepo implements MetadataRepository {
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 }
 

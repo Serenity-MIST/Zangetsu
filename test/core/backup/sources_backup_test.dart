@@ -4,11 +4,14 @@ import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:watch_app/core/aniyomi/aniyomi_extension_service.dart';
 import 'package:watch_app/core/aniyomi/aniyomi_provider.dart';
 import 'package:watch_app/core/aniyomi/aniyomi_repo.dart';
 import 'package:watch_app/core/backup/sources_backup.dart';
 import 'package:watch_app/core/lnreader/lnreader_extension_service.dart';
+import 'package:watch_app/core/mangayomi/mangayomi_manager.dart';
 import 'package:watch_app/core/mihon/mihon_extension_service.dart';
 import 'package:watch_app/core/mihon/mihon_manager.dart';
 import 'package:watch_app/core/mihon/mihon_provider.dart';
@@ -16,6 +19,7 @@ import 'package:watch_app/core/provider/provider_manager.dart'
     show AniyomiManager;
 import 'package:watch_app/core/provider/provider_registry.dart';
 import 'package:watch_app/core/provider/provider_repo_registry.dart';
+import 'package:zangetsu_source_bridge/zangetsu_source_bridge.dart';
 
 // ── Stubs ──────────────────────────────────────────────────────────────────────
 
@@ -179,6 +183,61 @@ void main() {
 
     final settings = data['settings'] as Map;
     expect(settings.containsKey('repoUrl::src1'), isTrue);
+  });
+
+  test('Mangayomi backup restores selected sources from saved repositories',
+      () async {
+    const repoUrl = 'https://repo.example.com/index.json';
+    const codeUrl = 'https://cdn.example.com/source.dart';
+    final manifest = {
+      'id': 17,
+      'name': 'Test Manga',
+      'baseUrl': 'https://manga.example.com',
+      'sourceCodeUrl': codeUrl,
+      'version': '1.0.0',
+      'itemType': 0,
+      'sourceCodeLanguage': 0,
+      'lang': 'en',
+    };
+    final source = MangayomiSource.fromManifest(manifest, Uri.parse(repoUrl));
+    final client = MockClient((request) async {
+      if (request.url.toString() == repoUrl) {
+        return http.Response(jsonEncode([manifest]), 200);
+      }
+      if (request.url.toString() == codeUrl) {
+        return http.Response('void main() {}', 200);
+      }
+      return http.Response('', 404);
+    });
+    final original = MangayomiManager(MangayomiExtensionService(
+      Directory('${dir.path}/mangayomi_original'),
+      client: client,
+    ));
+    await original.init();
+    final sources = await original.addRepository(Uri.parse(repoUrl));
+    await original.install(sources.single);
+    final snapshot = SourcesBackup(
+      _StubRepos([]), _StubProviderRegistry([]), null, mangayomi: original,
+    ).build();
+    expect(snapshot['mangayomiRepoUrls'], [repoUrl]);
+    expect(snapshot['mangayomiSourceKeys'], [source.key]);
+    expect(snapshot, isNot(contains('mangayomiCode')));
+
+    final restored = MangayomiManager(MangayomiExtensionService(
+      Directory('${dir.path}/mangayomi_restored'),
+      client: client,
+    ));
+    await restored.init();
+    final failures = await SourcesBackup(
+      _StubRepos([]), _StubProviderRegistry([]), null, mangayomi: restored,
+    ).merge(snapshot);
+
+    expect(failures, isEmpty);
+    expect(restored.repositories.map((url) => url.toString()), [repoUrl]);
+    expect(restored.installed.map((item) => item.source.key), [source.key]);
+    original.dispose();
+    restored.dispose();
+    client.close();
   });
 
   // ── (b) merge does NOT call fetchAndCache for already-present repos ─────────

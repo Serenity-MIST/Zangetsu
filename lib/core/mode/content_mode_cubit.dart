@@ -48,25 +48,23 @@ class ContentModeCubit extends Cubit<ContentMode> {
     return sl<SourceRepository>().loadedSources.any((s) => s.id == id);
   }
 
-  /// Which mode a source id belongs to, by id prefix — no manager lookup, so
-  /// it's cheap and can't throw when the registry isn't up yet: `lnr:` = novel,
-  /// `mihon:` = manga, everything else (JS / CloudStream / Aniyomi) = anime.
-  /// Matches the prefix rules in [sourceTypeOf].
+  /// Which mode a source id belongs to — no manager lookup, so it's cheap and
+  /// can't throw when the registry isn't up yet. JS sources consult the
+  /// provider registry's declared type (Windows branch); everything else uses
+  /// the shared ID rules, where Mangayomi's key encodes its declared type.
   static bool _sourceInMode(String id, ContentMode m) {
     if (sl.isRegistered<ProviderRegistry>() && id.startsWith('js:')) {
       final type = sl<ProviderRegistry>().typeOf(id);
-      if (type != null)
+      if (type != null) {
         return switch (m) {
           ContentMode.manga => type == 'manga',
           ContentMode.novel => type == 'novel',
           ContentMode.anime => type != 'manga' && type != 'novel',
         };
+      }
     }
-    return switch (m) {
-      ContentMode.novel => id.startsWith('lnr:'),
-      ContentMode.manga => id.startsWith('mihon:'),
-      ContentMode.anime => !id.startsWith('lnr:') && !id.startsWith('mihon:'),
-    };
+    // Glue: fall back to upstream's shared ID check (lnr:/mihon:/mg: rules).
+    return sourceIdMatchesContentMode(id, m);
   }
 
   /// No valid remembered source for [m] — don't leave a source from another

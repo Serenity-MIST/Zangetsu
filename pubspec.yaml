@@ -16,7 +16,7 @@ publish_to: "none" # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 2.3.3+19603
+version: 2.3.6+23639
 
 environment:
   sdk: ^3.11.5
@@ -38,6 +38,7 @@ dependencies:
   flutter:
     sdk: flutter
   cue: ^0.4.0
+  liquid_glass_widgets: ^1.15.0
   flutter_localizations:
     sdk: flutter
   intl: any
@@ -76,6 +77,7 @@ dependencies:
   sqflite_tvos:
     path: third_party/sqflite_tvos
   # Transitive via flutter_widget_from_html (etc.); needs a tvOS implementation.
+  video_player: ^2.14.0
   video_player_tvos: ^0.0.1
   wakelock_plus_tvos: ^0.0.1
   firebase_core_tvos: ^0.0.2
@@ -138,7 +140,6 @@ dependencies:
   # that media_kit plays natively — no iframe, no YouTube chrome (Netflix-style).
   youtube_explode_dart: ^3.1.0
   wakelock_plus: ^1.5.2
-  appwrite: ^26.1.0
   image_picker: ^1.2.2
   # Swipe-for-brightness gesture in the player (left half of the surface).
   screen_brightness: ^2.1.4
@@ -156,11 +157,10 @@ dependencies:
   flutter_background_service: ^5.1.0
   # Local notifications for "new episode" alerts on subscribed shows.
   flutter_local_notifications: ^17.2.4
-  # Discord Rich Presence: Gateway WebSocket + secure token storage + a WebView
-  # for the Discord login (user-token capture).
+  # Discord Rich Presence: gateway WebSocket + secure storage for the
+  # retired user-token path (OAuth tokens live in Hive, like trackers).
   web_socket_channel: ^3.0.1
   flutter_secure_storage: ^10.3.1
-  webview_flutter: ^4.10.0
   # Capture the OAuth redirect (zangetsu://anilist-auth) back into the app for
   # AniList account linking.
   app_links: ^6.3.2
@@ -181,9 +181,13 @@ dependencies:
   firebase_messaging: ^16.4.3
   fluttertoast: ^10.0.0
   dynamic_color: ^2.1.0
+  local_auth: ^3.0.2
+  http: ^1.6.0
+  shared_preferences: ^2.5.5
 dev_dependencies:
   # The settings inventory parses controls and callback wiring from Dart ASTs.
   analyzer: ^10.0.1
+  video_player_platform_interface: ^6.9.0
   # Test-only: gives the EPUB tests a REAL XML parse, which catches what a
   # hand-rolled tag-balance check cannot (an unescaped '&', a bad attribute)
   # — exactly what a strict e-reader rejects the whole file over.
@@ -197,12 +201,7 @@ dev_dependencies:
   json_serializable: ^6.9.0
   flutter_launcher_icons: ^0.14.1
 
-# ── media_kit → Predidit performance fork (feat/mediakit-fork) ───────────────
-# Same media_kit Dart API (no code changes), but a newer native mpv 0.41 +
-# out-of-tree ffmpeg patches that play the malformed HLS/DASH streams scraped
-# sources serve — the reason AnymeX/Kazumi/Dartotsu run this fork. It's a
-# monorepo, so every package points at its subdir path. Pinned to AnymeX's
-# proven commit. To revert: delete this whole block and `flutter pub get`.
+# Keep the player runtime and native libraries on the same fork revision.
 dependency_overrides:
   # D4rt continuation fixes preserve awaited source expressions and cleanup.
   d4rt:
@@ -296,6 +295,8 @@ flutter:
   generate: true
   uses-material-design: true
   assets:
+    - assets/licenses/adaptive_palette.txt
+    - assets/licenses/discord_social_sdk.txt
     - assets/icons/lucide/
     # Shared with Android's native network security configuration.
     - android/app/src/main/res/raw/trusted_roots.pem
@@ -329,6 +330,7 @@ flutter:
     - assets/icon/providers/mal.png
     - assets/icon/providers/tmdb.png
     - assets/icon/providers/simkl.png
+    - assets/icon/providers/stremio.png
 
   fonts:
     - family: Inter

@@ -97,7 +97,7 @@ class _PosterCardSettingsScreenState extends State<PosterCardSettingsScreen> {
   Widget build(BuildContext context) {
     final wide = prefs.posterCardLayout == PosterCardLayout.wide;
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar('Poster cards'),
       body: DesktopSettingsScope.contains(context)
           ? _desktopBody(wide)
@@ -120,6 +120,7 @@ class _PosterCardSettingsScreenState extends State<PosterCardSettingsScreen> {
                             .toDouble();
                     final height = posterCellHeight(
                       width,
+                      textScaler: MediaQuery.textScalerOf(context),
                       wide: wide,
                       titleInside: posterTitleInside(context, wide: wide),
                     );
@@ -268,7 +269,7 @@ class _PosterCardSettingsScreenState extends State<PosterCardSettingsScreen> {
                     ),
                     _switch(
                       Icons.title_rounded,
-                      'Title artwork',
+                      'Title logo on cards',
                       'Use the real logo when available; otherwise show text',
                       prefs.posterTitleStyle == PosterTitleStyle.artwork,
                       (enabled) => prefs.setPosterTitleStyle(
@@ -364,7 +365,7 @@ class _PosterCardSettingsScreenState extends State<PosterCardSettingsScreen> {
             ),
             _switch(
               Icons.title_rounded,
-              'Title artwork',
+              'Title logo on cards',
               'Use the real logo when available; otherwise show text',
               prefs.posterTitleStyle == PosterTitleStyle.artwork,
               (value) => prefs.setPosterTitleStyle(
@@ -549,6 +550,7 @@ class _PosterCardSettingsScreenState extends State<PosterCardSettingsScreen> {
                     : _previewItem;
                 final height = posterCellHeight(
                   width,
+                  textScaler: MediaQuery.textScalerOf(context),
                   wide: wide,
                   titleInside: posterTitleInside(context, wide: wide),
                 );

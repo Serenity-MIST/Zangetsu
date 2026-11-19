@@ -1,10 +1,25 @@
 import 'desktop_sidebar_pages.dart';
+import 'desktop_sync_indicator.dart';
+import '../../core/desktop/desktop_focus_repair.dart';
+import '../../core/desktop/desktop_history_opener.dart';
+import '../../core/desktop/desktop_media_selector.dart';
+import '../../core/desktop/desktop_settings_opener.dart';
+import '../../core/desktop/desktop_shortcuts.dart';
+import '../../core/desktop/desktop_window.dart';
+import '../../core/notify/new_episode_inbox.dart';
+// dl-11: the notification-click hook for the Downloads page.
+import '../../core/notify/notification_router.dart'
+    show openDownloadsFromNotification;
+import '../../core/ui/global_messenger.dart';
+import '../settings/keyboard_shortcuts_screen.dart'
+    show showKeyboardShortcutsHelp;
 import '../home/lists_hub_screen.dart';
 import '../home/genres_screen.dart';
 import '../settings/streaming_services_screen.dart';
 import '../notify/subscriptions_screen.dart';
 import 'dart:async';
 import 'desktop_shell_workspace.dart';
+import '../../core/theme/theme_controller.dart';
 import 'dart:math' as math;
 
 import 'package:cached_network_image/cached_network_image.dart';
@@ -15,8 +30,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:fluttertoast/fluttertoast.dart';
+import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
 import '../search/browse_sources_screen.dart';
+import '../home/home_catalogue_prefs.dart';
 import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
 import '../../core/playback/my_list.dart';
@@ -25,10 +42,12 @@ import '../../core/playback/watch_history.dart';
 import '../../core/profiles/viewer_profile.dart';
 import '../../core/profiles/viewer_profile_avatar.dart';
 import '../../core/profiles/profile_shell_scope.dart';
+import '../../core/profiles/profile_lock_store.dart';
 import '../../core/reading/read_history.dart';
 import '../../core/mode/content_mode.dart';
 import '../../core/mode/content_mode_cubit.dart';
 import '../../core/theme/app_colors.dart';
+import '../../core/ui/liquid_nav_glass.dart';
 import '../../core/zmode/zmode_prefs.dart';
 import '../../l10n/ui_strings.dart';
 import '../../l10n/l10n.dart';
@@ -36,6 +55,7 @@ import '../../core/ui/nav_prefs.dart';
 import '../../core/ui/frosted_surface.dart';
 import '../downloads/downloads_screen.dart';
 import '../history/history_screen.dart';
+import '../profiles/profile_unlock.dart';
 import '../profiles/viewer_profiles_screen.dart';
 import '../profiles/viewer_profile_home_screen.dart';
 import '../auth/auth_cubit.dart';
@@ -54,17 +74,56 @@ import 'root_shell_tv.dart';
 ///
 /// [searchFocusSignal] is bumped each time the Search rail item is
 /// (re)selected on TV so the embedded search screen can auto-focus its
-/// field. Phone has no Search dock tab any more — Search moved to a Home
-/// header icon — so [RootShell] always passes null here.
+/// field. [RootShell] always passes null — a tapped Search dock tab just
+/// shows its page, and the Home header icon pushes a fresh one.
+///
+/// [searchFixedSourceId] pins the Search page to one source catalogue. TV
+/// leaves it null; the phone dock passes [dockSearchFixedSourceId].
 List<Widget> buildShellPages(
   ValueNotifier<int>? searchFocusSignal, {
   bool homeIsActive = true,
+  String? searchFixedSourceId,
 }) => [
   HomeScreen(isTabActive: homeIsActive),
-  SearchScreen(showBack: false, focusSignal: searchFocusSignal),
+  SearchScreen(
+    showBack: false,
+    focusSignal: searchFocusSignal,
+    fixedSourceId: searchFixedSourceId,
+  ),
   const MyListScreen(),
   const SettingsScreen(),
 ];
+
+/// What the phone dock's Search tab searches: the source catalogue Home is
+/// showing in the given mode (e.g. AniKoto), or null for metadata search —
+/// the same `fixedSourceId` the Home header icon passes.
+///
+/// Pure read of [HomeCataloguePrefs] so the mapping is unit-testable (pass
+/// [mode] explicitly); the shell passes nothing and the current cubit mode
+/// applies. The caller re-reads it on every rebuild (each tab switch), and
+/// [SearchScreen] recreates its bloc on scope change, so the tab follows
+/// catalogue picks with no extra plumbing.
+String? dockSearchFixedSourceId([ContentMode? mode]) {
+  if (!HomeCataloguePrefs.catalogueShown) return null;
+  final m =
+      mode ??
+      (sl.isRegistered<ContentModeCubit>()
+          ? sl<ContentModeCubit>().state
+          : null);
+  if (m == null) return HomeCataloguePrefs.sourceId;
+  return HomeCataloguePrefs.sourceIdFor(m);
+}
+
+/// Whether the shell keeps Home mounted even while another dock tab or an
+/// in-frame page (History, Settings, ...) is showing. True on Windows when
+/// Home is one of the dock tabs: Home publishes the catalogue choices of the
+/// shell pill's catalogue picker and clears them when disposed, so it must
+/// stay mounted for the picker to show on every screen. Phones (false) keep
+/// mounting Home only when it is visited. Pure, so the rule is unit-testable.
+bool desktopKeepsHomeMounted({
+  required bool windowsUi,
+  required List<DockTab> tabs,
+}) => windowsUi && tabs.contains(DockTab.home);
 
 /// App-level navigation shell — a reorderable dock (3-5 tabs, [NavPrefs])
 /// via a custom floating capsule (frosted, hovering over the content; no
@@ -87,6 +146,7 @@ class _RootShellState extends State<RootShell>
   /// Starts wherever the user chose to land; [NavPrefs.startTab] falls back to
   /// the leftmost tab, so an untouched install still opens on Home.
   late DockTab _tab = _navPrefs.startTab;
+
   /// Extra Windows destinations do not alter the shared mobile dock schema.
   String? _desktopPage;
 
@@ -94,6 +154,155 @@ class _RootShellState extends State<RootShell>
     if (_desktopPage == page) return;
     _lastBackPress = null;
     setState(() => _desktopPage = page);
+    _repairFocusAfterSwitch();
+  }
+
+  /// R1: after a tab / page switch the hidden page's focus is dropped and
+  /// the new page's autofocus does not fire again, so give the keys to the
+  /// newly shown page once it is laid out (Windows UI only).
+  void _repairFocusAfterSwitch() {
+    if (!_windowsUi) return;
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => DesktopFocusRepair.run(),
+    );
+  }
+
+  /// Windows UI (not TV). Gated on [defaultTargetPlatform] so widget tests
+  /// can switch it on and phones never see it.
+  bool get _windowsUi => defaultTargetPlatform == TargetPlatform.windows;
+
+  /// True while the full-page Settings route opened by
+  /// [_openDesktopSettings] is on the navigator, so a second click or
+  /// Ctrl+, never stacks another Settings page on top of it.
+  bool _settingsRouteOpen = false;
+
+  /// acct-3: brings the shell back on screen and opens Profile, where the
+  /// user signs in. Called from the title-bar sync icon.
+  void _openProfileForSignIn() {
+    if (!mounted) return;
+    final route = ModalRoute.of(context);
+    // Close pages pushed over the shell so Profile is actually visible.
+    if (route != null && !route.isCurrent) {
+      Navigator.of(context).popUntil((r) => r == route);
+    }
+    _onTabSelected(DockTab.profile);
+  }
+
+  // The Windows rail is always the compact icon rail now, so the saved
+  // DesktopPrefs.sidebarExpanded choice is no longer read here.
+
+  /// Opens Settings as a full page pushed over the whole shell, so it covers
+  /// the left rail and the top bar (the title bar stays: it sits above the
+  /// navigator). Back (its button, Esc, Alt+Left, mouse Back) pops the page
+  /// and shows exactly the tab / page underneath, e.g. Home.
+  ///
+  /// Installed as [DesktopSettingsOpener.handler] so the Profile page's
+  /// Settings button and Ctrl+, both open it the same way (Settings is not
+  /// on the rail).
+  void _openDesktopSettings() {
+    if (!mounted || _settingsRouteOpen) return;
+    _settingsRouteOpen = true;
+    _lastBackPress = null;
+    unawaited(
+      Navigator.of(context)
+          .push<void>(
+            MaterialPageRoute<void>(
+              // showBackButton: Settings' Back pops this route instead of
+              // asking the shell to swap an in-frame page.
+              builder: (_) => const SettingsScreen(showBackButton: true),
+            ),
+          )
+          .whenComplete(() {
+            // The page closed: allow opening it again, and give the keys
+            // back to the page that is showing again (R1).
+            _settingsRouteOpen = false;
+            if (mounted) _repairFocusAfterSwitch();
+          }),
+    );
+  }
+
+  /// Opens the in-frame History page (Ctrl+H, and the Profile page button
+  /// through [DesktopHistoryOpener.handler]); History left the rail.
+  void _openDesktopHistory() => _selectDesktopPage('history');
+
+  /// shell-7: the top-bar search box, focused by Ctrl+F and '/'.
+  final FocusNode _desktopSearchFocus = FocusNode(
+    debugLabel: 'desktop-shell-search',
+  );
+  final TextEditingController _desktopSearchCtrl = TextEditingController();
+
+  /// shell-9: query of the in-frame search page, and a counter so
+  /// submitting the same text again runs a fresh search.
+  String? _desktopSearchQuery;
+  int _desktopSearchSerial = 0;
+
+  /// shell-9: top-bar search opens results in the frame, like Schedule.
+  void _openDesktopSearch(String query) {
+    final q = query.trim();
+    if (q.isEmpty) return;
+    setState(() {
+      _desktopSearchQuery = q;
+      _desktopSearchSerial++;
+    });
+    _selectDesktopPage('search');
+  }
+
+  /// True while this shell's route is the one on screen, so app shortcuts
+  /// never act behind a pushed page, dialog or the player.
+  bool get _shellOnTop => mounted && (ModalRoute.of(context)?.isCurrent ?? true);
+
+  /// Rail destinations in rail order, for Ctrl+1..N (shell-7): the primary
+  /// tabs, then the extra shortcuts (Streaming, Schedule, Genres, Downloads).
+  List<VoidCallback> _desktopSections() => [
+    for (final entry in desktopRailTabs) () => _onTabSelected(entry.$1),
+    for (final shortcut in _desktopShortcuts()) shortcut.onTap,
+  ];
+
+  /// shell-7: focuses the top-bar search and selects its text.
+  void _focusDesktopSearch() {
+    _desktopSearchFocus.requestFocus();
+    _desktopSearchCtrl.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: _desktopSearchCtrl.text.length,
+    );
+  }
+
+  /// shell-7: app-scope keyboard actions handed to DesktopWindow. Pages
+  /// with their own Ctrl+F / Ctrl+number handlers sit deeper in the focus
+  /// tree and win; these only run while the shell is the page on screen.
+  Map<String, VoidCallback> _desktopAppActions() {
+    void onShell(VoidCallback action) {
+      if (_shellOnTop) action();
+    }
+
+    return {
+      'app.search': () => onShell(_focusDesktopSearch),
+      for (var i = 1; i <= 9; i++)
+        'app.section$i': () => onShell(() {
+          final sections = _desktopSections();
+          if (i <= sections.length) sections[i - 1]();
+        }),
+      for (var i = 1; i <= modeChoices.length && i <= 4; i++)
+        'app.mode$i': () => onShell(
+          () => unawaited(DesktopMediaSelector.select(modeChoices[i - 1])),
+        ),
+      'app.settings': () => onShell(_openDesktopSettings),
+      // Ctrl+H: History opens in the frame now that it left the rail.
+      'app.history': () => onShell(_openDesktopHistory),
+      // acct-11: 'app.lockProfile' (Ctrl+L) is deliberately not bound here.
+      // DesktopProfileRelock handles and consumes it through a
+      // HardwareKeyboard handler; menus call DesktopProfileRelock.lockNow().
+      // The help overlay works over any page.
+      'app.help': () {
+        final overlayContext = rootNavigatorKey.currentContext ?? context;
+        unawaited(
+          showKeyboardShortcutsHelp(
+            overlayContext,
+            scope: DesktopShortcutScope.app,
+          ),
+        );
+      },
+    };
   }
 
   /// Whether the floating mode bar (Anime / Movie/TV / Manga / Novel) is
@@ -117,6 +326,7 @@ class _RootShellState extends State<RootShell>
   /// Double-back-to-exit: timestamp of the last root Back press. A second Back
   /// within 2s exits the app; the first just shows the "press back again" toast.
   DateTime? _lastBackPress;
+  DateTime? _lastProfileTap;
 
   /// Tab-switch entrance: the visible page swaps immediately and the INCOMING
   /// tab fades + slides up into place (200ms, ease-out). We never fade the old
@@ -137,6 +347,18 @@ class _RootShellState extends State<RootShell>
     _switch = CurvedAnimation(parent: _switchCtrl, curve: Curves.easeOutCubic);
     _navPrefs.addListener(_onTabsChanged);
     ZModePrefs.revision.addListener(_onZMode);
+    if (_windowsUi && !(sl.isRegistered<AppMode>() && sl<AppMode>().isTv)) {
+      // shell-7: app-wide shortcuts.
+      DesktopWindow.setAppActions(_desktopAppActions());
+      // Profile page buttons: Settings opens as a full page over the shell,
+      // History in the frame.
+      DesktopSettingsOpener.handler = _openDesktopSettings;
+      DesktopHistoryOpener.handler = _openDesktopHistory;
+      // acct-3: the title-bar sync icon opens Profile when sign-in is needed.
+      DesktopSyncIndicator.signInHandler = _openProfileForSignIn;
+      // dl-11: a click on a download batch notification opens Downloads.
+      openDownloadsFromNotification = _openDownloadsFromNotification;
+    }
     if (sl.isRegistered<ViewerProfileStore>()) {
       sl<ViewerProfileStore>().active.addListener(_onProfileChanged);
       sl<ViewerProfileStore>().contextRevision.addListener(
@@ -222,7 +444,9 @@ class _RootShellState extends State<RootShell>
   /// that Schedule lives on Home instead (see `_scheduleCard` there), so this
   /// is just the user's order.
   List<DockTab> _visibleTabs() =>
-      (defaultTargetPlatform == TargetPlatform.windows) ? DockTab.values : _navPrefs.tabs;
+      (defaultTargetPlatform == TargetPlatform.windows)
+      ? DockTab.values
+      : _navPrefs.tabs;
 
   @override
   void dispose() {
@@ -235,13 +459,64 @@ class _RootShellState extends State<RootShell>
       );
     }
     _switchCtrl.dispose();
+    // Only remove the Windows hooks this shell installed.
+    // The Settings opener doubles as the "this shell installed the Windows
+    // hooks" marker, so the app actions are cleared with it.
+    if (DesktopSettingsOpener.handler == _openDesktopSettings) {
+      DesktopSettingsOpener.handler = null;
+      DesktopWindow.setAppActions(null);
+    }
+    if (DesktopHistoryOpener.handler == _openDesktopHistory) {
+      DesktopHistoryOpener.handler = null;
+    }
+    if (DesktopSyncIndicator.signInHandler == _openProfileForSignIn) {
+      DesktopSyncIndicator.signInHandler = null;
+    }
+    if (openDownloadsFromNotification == _openDownloadsFromNotification) {
+      openDownloadsFromNotification = null;
+    }
+    _desktopSearchFocus.dispose();
+    _desktopSearchCtrl.dispose();
     super.dispose();
   }
 
+  /// Windows (dl-11): a download notification was clicked. Close whatever is
+  /// pushed over the shell (detail pages, dialogs) and show the Downloads tab.
+  void _openDownloadsFromNotification() {
+    if (!mounted) return;
+    rootNavigatorKey.currentState?.popUntil((route) => route.isFirst);
+    _onTabSelected(DockTab.downloads);
+  }
+
   void _onTabSelected(DockTab tab) {
-    if (tab == _tab && _desktopPage == null) return; // Re-tapping the current tab: no transition.
+    // Upstream's double-tap-Profile-for-Settings shortcut is phone-only:
+    // Windows opens Settings from the Profile page and Ctrl+, instead.
+    if (tab == DockTab.profile &&
+        defaultTargetPlatform != TargetPlatform.windows) {
+      final now = DateTime.now();
+      final lastTap = _lastProfileTap;
+      _lastProfileTap = now;
+      if (lastTap != null &&
+          now.difference(lastTap) < const Duration(milliseconds: 350)) {
+        _lastProfileTap = null;
+        Navigator.of(context).push<void>(
+          MaterialPageRoute<void>(
+            builder: (_) => const SettingsScreen(showBackButton: true),
+          ),
+        );
+        return;
+      }
+    } else {
+      _lastProfileTap = null;
+    }
+    // Re-tapping the current tab: no transition (unless leaving a desktop page).
+    if (tab == _tab && _desktopPage == null) return;
     DockScrollCollapse.reset();
-    setState(() { _tab = tab; _desktopPage = null; });
+    setState(() {
+      _tab = tab;
+      _desktopPage = null;
+    });
+    _repairFocusAfterSwitch();
     _switchCtrl.forward(from: 0);
     if (tab == DockTab.myList && sl.isRegistered<MyListStore>()) {
       unawaited(sl<MyListStore>().pullFromCloud());
@@ -257,9 +532,16 @@ class _RootShellState extends State<RootShell>
     // Both PopScopes share this route, so Flutter fires ours too; bail so we
     // don't flash the exit toast over a normal in-tab back-out.
     // Extra desktop pages own Back before any retained hidden tab's interceptor.
-    if ((defaultTargetPlatform == TargetPlatform.windows) && _desktopPage != null) {
+    if (_windowsUi) {
       _lastBackPress = null;
-      setState(() => _desktopPage = null);
+      // Settings is a route pushed over the shell, so its Back pops that
+      // route and never reaches here.
+      if (_desktopPage != null) {
+        setState(() => _desktopPage = null);
+        return;
+      }
+      // shell-1 / shell-6: on a PC, Esc and Back never quit the app, so
+      // the root never reaches the "press back again to exit" toast.
       return;
     }
     if (shellBackIntercepted.value) return;
@@ -295,77 +577,147 @@ class _RootShellState extends State<RootShell>
   final Map<DockTab, Widget> _mountedPages = {};
   String? _mountedProfileId;
 
+  /// Theme revision the retained pages were built under (upstream remounts
+  /// tabs when theme colours change, since scaffolds read AppColors once).
+  int? _mountedThemeRevision;
+
+  /// Profile id whose data the tabs show (upstream's data profile scope).
+  String get _pageProfileId => sl.isRegistered<ViewerProfileStore>()
+      ? sl<ViewerProfileStore>().dataProfileId
+      : 'default';
+
   /// Constructs a destination on its first visit; the shell retains that page
   /// afterward so tab switches preserve navigation and avoid repeated startup.
+  ///
+  /// Search is an opt-in dock tab that searches what Home is showing (source
+  /// catalogue or metadata) — [dockSearchFixedSourceId].
   Widget _createPage(DockTab tab) => switch (tab) {
-    DockTab.home => buildShellPages(null)[0],
-    DockTab.search => const SearchScreen(showBack: false),
-    DockTab.myList => buildShellPages(null)[2],
+    DockTab.home => HomeScreen(
+      isTabActive: _tab == DockTab.home && _desktopPage == null,
+    ),
+    DockTab.search => SearchScreen(
+      showBack: false,
+      fixedSourceId: dockSearchFixedSourceId(),
+    ),
+    DockTab.myList => const MyListScreen(),
     DockTab.profile => const ViewerProfileHomeScreen(),
+    // Both normally get pushed with a back button; as tabs they own the
+    // whole screen, so their own back affordance is suppressed.
     DockTab.downloads => const DownloadsScreen(showBack: false),
     DockTab.history => const HistoryScreen(showBack: false),
     DockTab.sources => const BrowseSourcesScreen(),
   };
-  List<Widget> _pagesFor(List<DockTab> tabs) {
-    final profileId = sl.isRegistered<ViewerProfileStore>()
-        ? sl<ViewerProfileStore>().activeId
-        : 'default';
+
+  /// One page per visible tab, in the same order the dock draws them, so the
+  /// [IndexedStack] index is just the tab's position in that list.
+  List<Widget> _pagesFor(List<DockTab> tabs, String profileId) {
+    final themeRevision = ThemeController.revision.value;
     // Retain lazy tabs within a profile, but discard their cached state when
     // changing viewers so one profile never sees another profile's library.
-    if (_mountedProfileId != profileId) {
+    // A theme revision also remounts them (merged from upstream).
+    if (_mountedProfileId != profileId ||
+        _mountedThemeRevision != themeRevision) {
       _mountedPages.clear();
-      _desktopPage = null;
+      if (_mountedProfileId != profileId) _desktopPage = null;
       _mountedProfileId = profileId;
+      _mountedThemeRevision = themeRevision;
     }
     _mountedPages.putIfAbsent(_tab, () => _createPage(_tab));
-    if (_mountedPages.containsKey(DockTab.home)) {
-      _mountedPages[DockTab.home] = HomeScreen(
-        isTabActive: _tab == DockTab.home && _desktopPage == null,
+    // Windows: Home is the only page that publishes the catalogue choices
+    // for the shell pill's catalogue picker ("AniList ▾"), and it clears them
+    // when it is disposed. Lazy mounting (and the remount after a theme or
+    // profile change) left Home unmounted whenever another tab was current,
+    // so the picker vanished on History, Settings and other pages. Keeping
+    // Home mounted (hidden, tickers muted, isTabActive false) makes the
+    // picker show on every screen that shows the pill. Phones keep lazy Home.
+    if (desktopKeepsHomeMounted(windowsUi: _windowsUi, tabs: tabs)) {
+      _mountedPages.putIfAbsent(
+        DockTab.home,
+        () => _createPage(DockTab.home),
       );
     }
+    if (_mountedPages.containsKey(DockTab.home)) {
+      _mountedPages[DockTab.home] = _createPage(DockTab.home);
+    }
+    // Re-read on every rebuild so the Search tab follows catalogue picks.
+    if (_mountedPages.containsKey(DockTab.search)) {
+      _mountedPages[DockTab.search] = _createPage(DockTab.search);
+    }
     return [
-      for (final tab in tabs)
-        TickerMode(
-          key: ValueKey('$profileId:${tab.name}'),
-          enabled: tab == _tab,
-          child: _mountedPages[tab] ?? const SizedBox.shrink(),
-        ),
+      for (final tab in tabs) _tabPage(tab, profileId, themeRevision),
     ];
+  }
+
+  /// One retained dock page for [_pagesFor]: tickers run only on the
+  /// current tab. On Windows the page is also wrapped in
+  /// [TooltipVisibility] so a tooltip label that was fading out when the tab
+  /// changed is removed at once instead of freezing on screen (its fade
+  /// animation stops when the page's tickers are muted). Phones keep the
+  /// plain [TickerMode] tree.
+  Widget _tabPage(DockTab tab, String profileId, int themeRevision) {
+    final key = ValueKey('$profileId:${tab.name}:$themeRevision');
+    final page = _mountedPages[tab] ?? const SizedBox.shrink();
+    if (!_windowsUi) {
+      return TickerMode(key: key, enabled: tab == _tab, child: page);
+    }
+    return TooltipVisibility(
+      key: key,
+      visible: tab == _tab,
+      child: TickerMode(enabled: tab == _tab, child: page),
+    );
   }
 
   /// Desktop rail retains lazy profile-local pages; search uses the real
   /// search route so its provider filters and query behavior remain intact.
+  /// Extra Windows rail destinations below the primary tabs, in rail order.
+  List<({String id, String label, String icon, VoidCallback onTap})>
+  _desktopShortcuts() => [
+    if (!sl<ContentModeCubit>().state.isReading)
+      (
+        id: 'streaming',
+        label: context.l10n.streamingServices,
+        icon: 'circle-play',
+        onTap: () => _selectDesktopPage('streaming'),
+      ),
+    (
+      id: 'schedule',
+      label: 'Schedule & lists',
+      icon: 'calendar-days',
+      onTap: () => _selectDesktopPage('schedule'),
+    ),
+    (
+      id: 'genres',
+      label: 'Genres',
+      icon: 'tags',
+      onTap: () => _selectDesktopPage('genres'),
+    ),
+    (
+      id: 'downloads',
+      label: 'Downloads',
+      icon: 'download',
+      onTap: () => _onTabSelected(DockTab.downloads),
+    ),
+  ];
+
   Widget _buildDesktopWorkspace() {
     final tabs = _visibleTabs();
     final profile = sl.isRegistered<ViewerProfileStore>()
         ? sl<ViewerProfileStore>().activeProfile
         : null;
-    final pages = _pagesFor(tabs);
     return DesktopShellWorkspace(
       active: _tab,
       activeShortcut: _desktopPage,
       onSelected: _onTabSelected,
-      onNotifications: () => Navigator.of(context).push(MaterialPageRoute<void>(
-          builder: (_) => const SubscriptionsScreen())),
-      shortcuts: [
-        if (!sl<ContentModeCubit>().state.isReading)
-          (id: 'streaming', label: context.l10n.streamingServices, icon: 'circle-play',
-            onTap: () => _selectDesktopPage('streaming')),
-        (id: 'schedule', label: 'Schedule & lists', icon: 'calendar-days',
-          onTap: () => _selectDesktopPage('schedule')),
-        (id: 'genres', label: 'Genres', icon: 'tags',
-          onTap: () => _selectDesktopPage('genres')),
-        (id: 'downloads', label: 'Downloads', icon: 'download',
-          onTap: () => _onTabSelected(DockTab.downloads)),
-      ],
-      onSearch: (query) {
-        if (query.trim().isEmpty) return;
-        Navigator.of(context).push(
-          MaterialPageRoute<void>(
-            builder: (_) => SearchScreen(initialQuery: query.trim()),
-          ),
-        );
-      },
+      // shell-9: Notifications open in the frame like Schedule, and the
+      // bell shows the unread new-episode count.
+      onNotifications: () => _selectDesktopPage('notifications'),
+      unreadNotifications: NewEpisodeInbox.unread,
+      // shell-7: Ctrl+F and '/' focus this box.
+      searchFocusNode: _desktopSearchFocus,
+      searchController: _desktopSearchCtrl,
+      shortcuts: _desktopShortcuts(),
+      // shell-9: results open in the frame instead of a full-window page.
+      onSearch: _openDesktopSearch,
       profile: profile == null
           ? SvgPicture.asset(
               'assets/icons/lucide/user-round.svg',
@@ -387,17 +739,36 @@ class _RootShellState extends State<RootShell>
                 ),
               ),
             ),
-      child: DesktopSidebarPages(key: ValueKey('desktop-pages:${profile?.id ?? 'default'}'),
+      child: DesktopSidebarPages(
+        key: ValueKey('desktop-pages:${profile?.id ?? 'default'}'),
         selected: _desktopPage,
         builders: {
           'streaming': (_) => const StreamingServicesScreen(),
           'schedule': (_) => const ListsHubScreen(),
           'genres': (_) => const GenresScreen(),
+          // shell-9: top-bar search results, rebuilt for every submit.
+          'search': (_) => SearchScreen(
+            key: ValueKey('desktop-search:$_desktopSearchSerial'),
+            showBack: false,
+            initialQuery: _desktopSearchQuery,
+          ),
+          'notifications': (_) => const SubscriptionsScreen(),
+          // Settings is not an in-frame page: it opens as a full page over
+          // the rail (see _openDesktopSettings).
+          // History in the frame (Ctrl+H / Profile page); Esc returns to
+          // the tab underneath.
+          'history': (_) => const HistoryScreen(showBack: false),
         },
-        fallback: IndexedStack(
-          index: tabs.indexOf(_tab).clamp(0, tabs.length - 1),
-          children: pages,
-        )),
+        // Rebuilds on theme revisions like the phone body, so retained
+        // desktop tabs pick up new colours too.
+        fallback: ValueListenableBuilder<int>(
+          valueListenable: ThemeController.revision,
+          builder: (context, _, _) => IndexedStack(
+            index: tabs.indexOf(_tab).clamp(0, tabs.length - 1),
+            children: _pagesFor(tabs, _pageProfileId),
+          ),
+        ),
+      ),
     );
   }
 
@@ -409,6 +780,14 @@ class _RootShellState extends State<RootShell>
     }
     if (deferContent) {
       return ColoredBox(color: AppColors.bg, child: const SizedBox.expand());
+    }
+    // Windows lets the user choose a Start page other than Home, and Home is
+    // only built when visited, so launch checks (update dialog, daily
+    // extension auto-update) start here once the shell is unlocked and shown.
+    // AppLaunchChecks runs once per process, so Home mounting later is a no-op.
+    if (defaultTargetPlatform == TargetPlatform.windows &&
+        !AppLaunchChecks.started) {
+      AppLaunchChecks.runOnce(this);
     }
     return PopScope(
       // Intercept Back at the app root: first press toasts, second exits.
@@ -425,7 +804,9 @@ class _RootShellState extends State<RootShell>
           // more — the dock is the same in every mode now that Schedule is
           // not in it.
           setState(() {
-            if (mode.isReading && _desktopPage == 'streaming') _desktopPage = null;
+            if (mode.isReading && _desktopPage == 'streaming') {
+              _desktopPage = null;
+            }
           });
         },
         child: Scaffold(
@@ -433,6 +814,8 @@ class _RootShellState extends State<RootShell>
           // Content runs under the floating dock (screens keep their own bottom
           // padding so the last row scrolls clear of it).
           extendBody: true,
+          // Windows uses its sidebar workspace; phones keep upstream's dock
+          // body and navigation (dock or liquid glass).
           body: (defaultTargetPlatform == TargetPlatform.windows)
               ? _buildDesktopWorkspace()
               : deferContent
@@ -469,11 +852,17 @@ class _RootShellState extends State<RootShell>
                               // RepaintBoundary → the page is a single cached layer the transition
                               // just composites (opacity + translate), so no repaint per frame.
                               child: RepaintBoundary(
-                                child: IndexedStack(
-                                  // indexOf can be -1 for one frame if the mode flipped before
-                                  // the listener ran; clamp rather than throw.
-                                  index: active < 0 ? 0 : active,
-                                  children: _pagesFor(visible),
+                                child: ValueListenableBuilder<int>(
+                                  valueListenable: ThemeController.revision,
+                                  builder: (context, _, _) => IndexedStack(
+                                    // indexOf can be -1 for one frame if the mode flipped before
+                                    // the listener ran; clamp rather than throw.
+                                    index: active < 0 ? 0 : active,
+                                    children: _pagesFor(
+                                      visible,
+                                      _pageProfileId,
+                                    ),
+                                  ),
                                 ),
                               ),
                             );
@@ -485,16 +874,24 @@ class _RootShellState extends State<RootShell>
                 ),
           bottomNavigationBar: (defaultTargetPlatform == TargetPlatform.windows)
               ? null
-              : ValueListenableBuilder<bool>(
-                  valueListenable: dockHiddenBySection,
-                  builder: (context, sectionOpen, _) {
+              : ListenableBuilder(
+                  listenable: Listenable.merge([
+                    dockHiddenBySection,
+                    HomeCataloguePrefs.revision,
+                  ]),
+                  builder: (context, _) {
                     // Slide the dock away only when a Settings section is open AND the
                     // Profile tab is showing — every other tab keeps its dock.
-                    final hide = sectionOpen && _tab == DockTab.profile;
+                    final hide =
+                        dockHiddenBySection.value && _tab == DockTab.profile;
+                    final modesEnabled =
+                        ZModePrefs.enabled &&
+                        !(HomeCataloguePrefs.stremioSelected &&
+                            sl<ContentModeCubit>().state == ContentMode.anime);
                     return Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        if (ZModePrefs.enabled)
+                        if (modesEnabled && _navPrefs.style == NavBarStyle.dock)
                           Padding(
                             padding: const EdgeInsets.only(bottom: 8),
                             child: BlocBuilder<ContentModeCubit, ContentMode>(
@@ -506,7 +903,9 @@ class _RootShellState extends State<RootShell>
                                   setState(() => _modeBarOpen = false);
                                   await ZModePrefs.setStreamKind(k);
                                   await sl<ContentModeCubit>().setMode(m);
-                                  sl<HomeCubit>().load(reset: true);
+                                  if (m != ContentMode.anime) {
+                                    sl<HomeCubit>().load(reset: true);
+                                  }
                                 },
                               ),
                             ),
@@ -517,7 +916,6 @@ class _RootShellState extends State<RootShell>
                         // MediaQuery bottom padding whether or not it is on screen.
                         // Sliding alone left an open Settings section reserving a
                         // dock's worth of space for a dock that wasn't there.
-
                         TweenAnimationBuilder<double>(
                           tween: Tween<double>(begin: 1, end: hide ? 0 : 1),
                           duration: const Duration(milliseconds: 240),
@@ -549,13 +947,16 @@ class _RootShellState extends State<RootShell>
                                   0.12,
                                   curve: Curves.easeOutCubic,
                                 ),
-                          builder: (context, factor, child) => ClipRect(
-                            child: Align(
+                          builder: (context, factor, child) {
+                            final aligned = Align(
                               alignment: Alignment.topCenter,
                               heightFactor: factor,
                               child: child,
-                            ),
-                          ),
+                            );
+                            return factor < 1
+                                ? ClipRect(child: aligned)
+                                : aligned;
+                          },
                           child: AnimatedSlide(
                             offset: hide ? const Offset(0, 1.6) : Offset.zero,
                             duration: const Duration(milliseconds: 240),
@@ -568,36 +969,59 @@ class _RootShellState extends State<RootShell>
                               // builds every tab — is never rebuilt by this.
                               child: ValueListenableBuilder<bool>(
                                 valueListenable: dockCollapsedByScroll,
-                                builder: (context, collapsed, child) =>
-                                    _FloatingDock(
-                                      collapsed:
-                                          defaultTargetPlatform ==
-                                              TargetPlatform.windows
-                                          ? false
-                                          : collapsed && !_keepDockExpanded,
-                                      tabs: _visibleTabs(),
+                                builder: (context, collapsed, child) {
+                                  final tabs = _visibleTabs();
+                                  if (_navPrefs.style == NavBarStyle.liquid) {
+                                    return _LiquidNavDock(
+                                      tabs: tabs,
                                       active: _tab,
+                                      collapsed:
+                                          collapsed && !_keepDockExpanded,
+                                      glassTint: _navPrefs.glassTint,
+                                      glassVisibility:
+                                          _navPrefs.glassVisibility,
+                                      glassQuality: _navPrefs.glassQuality,
+                                      glassBlurEnabled:
+                                          _navPrefs.glassBlurEnabled,
                                       onSelected: _onTabSelected,
-                                      centre: ZModePrefs.enabled
-                                          ? BlocBuilder<
-                                              ContentModeCubit,
-                                              ContentMode
-                                            >(
-                                              bloc: sl<ContentModeCubit>(),
-                                              builder: (_, mode) => ModeFab(
-                                                open: _modeBarOpen,
-                                                icon: iconForMode(
-                                                  mode,
-                                                  ZModePrefs.streamKind,
-                                                ),
-                                                onTap: () => setState(
-                                                  () => _modeBarOpen =
-                                                      !_modeBarOpen,
-                                                ),
+                                      modesEnabled: modesEnabled,
+                                      onModeSelected: (mode, kind) async {
+                                        await ZModePrefs.setStreamKind(kind);
+                                        await sl<ContentModeCubit>().setMode(
+                                          mode,
+                                        );
+                                        if (mode != ContentMode.anime) {
+                                          sl<HomeCubit>().load(reset: true);
+                                        }
+                                      },
+                                    );
+                                  }
+                                  return _FloatingDock(
+                                    collapsed: collapsed && !_keepDockExpanded,
+                                    tabs: tabs,
+                                    active: _tab,
+                                    onSelected: _onTabSelected,
+                                    centre: modesEnabled
+                                        ? BlocBuilder<
+                                            ContentModeCubit,
+                                            ContentMode
+                                          >(
+                                            bloc: sl<ContentModeCubit>(),
+                                            builder: (_, mode) => ModeFab(
+                                              open: _modeBarOpen,
+                                              icon: iconForMode(
+                                                mode,
+                                                ZModePrefs.streamKind,
                                               ),
-                                            )
-                                          : null,
-                                    ),
+                                              onTap: () => setState(
+                                                () => _modeBarOpen =
+                                                    !_modeBarOpen,
+                                              ),
+                                            ),
+                                          )
+                                        : null,
+                                  );
+                                },
                               ),
                             ),
                           ),
@@ -610,6 +1034,280 @@ class _RootShellState extends State<RootShell>
       ),
     );
   }
+}
+
+/// Liquid-glass navigation tabs with a Cue mode menu on the right.
+class _LiquidNavDock extends StatelessWidget {
+  const _LiquidNavDock({
+    required this.tabs,
+    required this.active,
+    required this.collapsed,
+    required this.glassTint,
+    required this.glassVisibility,
+    required this.glassQuality,
+    required this.glassBlurEnabled,
+    required this.onSelected,
+    required this.modesEnabled,
+    required this.onModeSelected,
+  });
+
+  final List<DockTab> tabs;
+  final DockTab active;
+  final bool collapsed;
+  final double glassTint;
+  final double glassVisibility;
+  final GlassQuality glassQuality;
+  final bool glassBlurEnabled;
+  final ValueChanged<DockTab> onSelected;
+  final bool modesEnabled;
+  final void Function(ContentMode, StreamKind) onModeSelected;
+
+  Widget _icon(DockTab tab, {bool selected = false}) {
+    final color = selected ? AppColors.accent : AppColors.textPrimary;
+    if (tab == DockTab.profile) {
+      final profile = sl.isRegistered<ViewerProfileStore>()
+          ? sl<ViewerProfileStore>().activeProfile
+          : null;
+      if (profile != null) {
+        // Hero landing spot for the profile-picker avatar flight — the old
+        // dock has the same tag, so the flight works on both navbars. Only
+        // one of icon/activeIcon is ever mounted, so the tag stays unique.
+        return Hero(
+          tag: viewerProfileHeroTag(profile.id),
+          child: ClipOval(
+            child: ProfileAvatarFace(
+              profile: profile,
+              photoUrl: profilePhotoForFace(
+                profile: profile,
+                accountPhotoUrl: sl.isRegistered<AuthCubit>()
+                    ? sl<AuthCubit>().state.avatarUrl
+                    : null,
+              ),
+              iconSize: 18,
+              photoDiameter: 26,
+            ),
+          ),
+        );
+      }
+      return Icon(Icons.person_outline_rounded, color: color);
+    }
+    final glyph = dockGlyphFor(tab);
+    if (glyph != null) {
+      return DockIcon(glyph, color: color, filled: selected, size: 23);
+    }
+    final icons = _iconFor(tab)!;
+    return Icon(selected ? icons.$2 : icons.$1, color: color);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomInset = MediaQuery.paddingOf(context).bottom;
+    final glass = liquidNavGlassSettings(
+      glassTint,
+      extraBlur: glassBlurEnabled,
+      glassVisibility: glassVisibility,
+    );
+    final menuGlass =
+        liquidNavGlassSettings(glassTint, extraBlur: glassBlurEnabled).copyWith(
+          glassColor: AppColors.settingsCard.withValues(alpha: 0.84),
+          blur: 8,
+        );
+    final glassTabs = [
+      for (final tab in tabs)
+        GlassTab(
+          icon: tab == DockTab.profile
+              // The package tab bar has no per-tab long-press, so the
+              // gesture lives inside our own icon widget: the inner tap
+              // forwards selection unchanged, the inner long-press wins
+              // the arena and opens the switcher without selecting.
+              ? GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => onSelected(tab),
+                  onLongPress: () => unawaited(openProfileSwitcher(context)),
+                  child: _icon(tab),
+                )
+              : _icon(tab),
+          activeIcon: tab == DockTab.profile
+              ? GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => onSelected(tab),
+                  onLongPress: () => unawaited(openProfileSwitcher(context)),
+                  child: _icon(tab, selected: true),
+                )
+              : _icon(tab, selected: true),
+          label: tab.localizedLabel(context),
+          semanticLabel: tab.localizedLabel(context),
+        ),
+    ];
+    return ConstrainedBox(
+      constraints: BoxConstraints(minHeight: 96 + bottomInset),
+      child: Align(
+        alignment: Alignment.bottomCenter,
+        child: Padding(
+          padding: EdgeInsets.only(
+            left: 12,
+            right: 12,
+            bottom: bottomInset + 12,
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: _LiquidGlassTabBar(
+                  tabs: glassTabs,
+                  selectedIndex: tabs.indexOf(active).clamp(0, tabs.length - 1),
+                  collapsed: collapsed,
+                  modesEnabled: modesEnabled,
+                  quality: glassQuality,
+                  settings: glass,
+                  onTabSelected: (index) => onSelected(tabs[index]),
+                ),
+              ),
+              if (modesEnabled) ...[
+                const SizedBox(width: 8),
+                SizedBox(
+                  width: 56,
+                  height: 56,
+                  child: GlassMenu(
+                    menuAlignment: GlassMenuAlignment.bottomRight,
+                    autoAdjustToScreen: true,
+                    menuPadding: const EdgeInsets.all(12),
+                    menuWidth: 224,
+                    menuBorderRadius: 28,
+                    itemBorderRadius: 20,
+                    quality: glassQuality,
+                    settings: menuGlass,
+                    selectionColor: AppColors.accent.withValues(alpha: 0.14),
+                    enableInteractionGlow: false,
+                    semanticLabel: 'Change content mode',
+                    triggerBuilder: (context, toggleMenu) => GlassButton(
+                      icon: const Icon(Icons.menu_rounded),
+                      label: 'Change content mode',
+                      onTap: toggleMenu,
+                      width: 56,
+                      height: 56,
+                      quality: glassQuality,
+                      settings: glass,
+                      isStationary: true,
+                    ),
+                    items: [
+                      for (final choice in modeChoices)
+                        if (ZModePrefs.enabled ||
+                            choice.mode != ContentMode.anime ||
+                            choice.kind == StreamKind.anime)
+                          GlassMenuItem(
+                            title: choice.label(context),
+                            icon: Icon(choice.icon),
+                            trailing:
+                                choice.mode == sl<ContentModeCubit>().state &&
+                                    (choice.mode != ContentMode.anime ||
+                                        choice.kind == ZModePrefs.streamKind)
+                                ? Icon(
+                                    Icons.check_rounded,
+                                    color: AppColors.accent,
+                                  )
+                                : null,
+                            isSelected:
+                                choice.mode == sl<ContentModeCubit>().state &&
+                                (choice.mode != ContentMode.anime ||
+                                    choice.kind == ZModePrefs.streamKind),
+                            iconColor: AppColors.textPrimary,
+                            titleStyle: const TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w500,
+                            ),
+                            height: 48,
+                            onTap: () =>
+                                onModeSelected(choice.mode, choice.kind),
+                          ),
+                    ],
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _LiquidGlassTabBar extends StatelessWidget {
+  const _LiquidGlassTabBar({
+    required this.tabs,
+    required this.selectedIndex,
+    required this.collapsed,
+    required this.modesEnabled,
+    required this.quality,
+    required this.settings,
+    required this.onTabSelected,
+  });
+
+  final List<GlassTab> tabs;
+  final int selectedIndex;
+  final bool collapsed;
+  final bool modesEnabled;
+  final GlassQuality quality;
+  final LiquidGlassSettings settings;
+  final ValueChanged<int> onTabSelected;
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      final compactWidth = math.min(
+        constraints.maxWidth,
+        tabs.length * 52.0 + 8,
+      );
+      // Keep the missing mode button's 56px plus 8px gap out of the open bar.
+      final expandedWidth = modesEnabled
+          ? constraints.maxWidth
+          : math.max(compactWidth, constraints.maxWidth - 64);
+      return TweenAnimationBuilder<double>(
+        tween: Tween(end: collapsed ? 1 : 0),
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOutCubic,
+        builder: (context, progress, _) {
+          return Align(
+            alignment: modesEnabled ? Alignment.centerRight : Alignment.center,
+            child: SizedBox(
+              width: expandedWidth + (compactWidth - expandedWidth) * progress,
+              child: GlassTabBar.bottom(
+                tabs: tabs,
+                selectedIndex: selectedIndex,
+                onTabSelected: onTabSelected,
+                horizontalPadding: 4,
+                verticalPadding: 12 - 8 * progress,
+                barHeight: 60 - 10 * progress,
+                barBorderRadius: 30,
+                tabPadding: const EdgeInsets.symmetric(horizontal: 2),
+                iconSize: 22,
+                labelFontSize: math.max(0.01, 10 * (1 - progress)),
+                iconLabelSpacing: 4 * (1 - progress),
+                quality: quality,
+                backgroundQuality: progress == 0 || progress == 1
+                    ? quality
+                    : GlassQuality.minimal,
+                settings: settings,
+                indicatorColor: AppColors.accent.withValues(alpha: 0.14),
+                selectedIconColor: AppColors.accent,
+                unselectedIconColor: AppColors.textPrimary,
+                selectedLabelColor: AppColors.textPrimary.withValues(
+                  alpha: 1 - progress,
+                ),
+                unselectedLabelColor: AppColors.textSecondary.withValues(
+                  alpha: 1 - progress,
+                ),
+                indicatorExpansion: const EdgeInsets.symmetric(
+                  horizontal: 8,
+                  vertical: 8,
+                ),
+                magnification: 1.08,
+              ),
+            ),
+          );
+        },
+      );
+    },
+  );
 }
 
 /// The frosted floating capsule: blurred surface, hairline border, five
@@ -947,6 +1645,67 @@ class _DockItem extends StatelessWidget {
   }
 }
 
+/// Profile switcher sheet, shared by both docks: the old floating dock's
+/// profile item and the liquid dock's profile tab both long-press into this.
+Future<void> openProfileSwitcher(BuildContext context) async {
+  if (!sl.isRegistered<ViewerProfileStore>()) return;
+  final profiles = sl<ViewerProfileStore>();
+  if (profiles.profiles.length < 2) return;
+
+  final addProfile = await showModalBottomSheet<bool>(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    showDragHandle: true,
+    backgroundColor: AppColors.surface,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+    ),
+    builder: (sheetContext) => _ProfileSwitcherSheet(
+      profiles: profiles,
+      onSelected: (profile) {
+        Navigator.of(sheetContext).pop();
+        unawaited(_switchProfile(context, profiles, profile));
+      },
+      onAddProfile: () => Navigator.of(sheetContext).pop(true),
+    ),
+  );
+  if (addProfile == true && context.mounted) {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(builder: (_) => const ViewerProfilesScreen()),
+    );
+  }
+}
+
+Future<void> _switchProfile(
+  BuildContext context,
+  ViewerProfileStore profiles,
+  ViewerProfile profile,
+) async {
+  try {
+    if (!context.mounted) return;
+    final owner = profiles.ownerKey;
+    if (!await ensureProfileAccess(context, profile)) return;
+    if (!context.mounted || profiles.ownerKey != owner) return;
+    if (!profiles.profiles.any((p) => p.id == profile.id)) return;
+    final locks = sl.isRegistered<ProfileLockStore>()
+        ? sl<ProfileLockStore>()
+        : null;
+    if (profiles.activeId != profile.id) locks?.approveSwitch(profile.id);
+    try {
+      await profiles.switchTo(profile.id);
+    } finally {
+      locks?.consumeSwitchApproval(profile.id);
+    }
+  } catch (_) {
+    if (context.mounted) {
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        const SnackBar(content: Text("Couldn't switch profile. Try again.")),
+      );
+    }
+  }
+}
+
 /// The Profile tab — the user's avatar when signed in (accent ring while
 /// active), a plain person glyph otherwise. Opens the same Settings screen
 /// the gear used to.
@@ -963,52 +1722,6 @@ class _ProfileDockItem extends StatelessWidget {
   final bool selected;
   final VoidCallback onTap;
 
-  Future<void> _openProfileSwitcher(BuildContext context) async {
-    if (!sl.isRegistered<ViewerProfileStore>()) return;
-    final profiles = sl<ViewerProfileStore>();
-    if (profiles.profiles.length < 2) return;
-
-    final addProfile = await showModalBottomSheet<bool>(
-      context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
-      showDragHandle: true,
-      backgroundColor: AppColors.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
-      ),
-      builder: (sheetContext) => _ProfileSwitcherSheet(
-        profiles: profiles,
-        onSelected: (profile) {
-          Navigator.of(sheetContext).pop();
-          unawaited(_switchProfile(context, profiles, profile));
-        },
-        onAddProfile: () => Navigator.of(sheetContext).pop(true),
-      ),
-    );
-    if (addProfile == true && context.mounted) {
-      await Navigator.of(context).push<void>(
-        MaterialPageRoute<void>(builder: (_) => const ViewerProfilesScreen()),
-      );
-    }
-  }
-
-  Future<void> _switchProfile(
-    BuildContext context,
-    ViewerProfileStore profiles,
-    ViewerProfile profile,
-  ) async {
-    try {
-      await profiles.switchTo(profile.id);
-    } catch (_) {
-      if (context.mounted) {
-        ScaffoldMessenger.maybeOf(context)?.showSnackBar(
-          const SnackBar(content: Text("Couldn't switch profile. Try again.")),
-        );
-      }
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     final color = selected ? AppColors.accent : AppColors.textSecondary;
@@ -1023,10 +1736,10 @@ class _ProfileDockItem extends StatelessWidget {
         selected: selected,
         container: true,
         hint: 'Long-press to switch profiles',
-        onLongPress: () => unawaited(_openProfileSwitcher(context)),
+        onLongPress: () => unawaited(openProfileSwitcher(context)),
         child: InkWell(
           onTap: onTap,
-          onLongPress: () => unawaited(_openProfileSwitcher(context)),
+          onLongPress: () => unawaited(openProfileSwitcher(context)),
           borderRadius: BorderRadius.circular(18),
           child: ConstrainedBox(
             constraints: const BoxConstraints(minHeight: _FloatingDock._tapMin),

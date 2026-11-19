@@ -74,7 +74,7 @@ void main() {
     await store.add(_sub(ZmodeIds.sourceId, url));
     final repo = _Router({'${ZmodeIds.sourceId}|$url': 3});
 
-    await SubscriptionChecker(repo, store).checkAll();
+    await SubscriptionChecker(repo, store, deliver: _told).checkAll();
 
     expect(repo.asked, ['${ZmodeIds.sourceId}|$url'],
         reason: 'this is the call that used to throw and be swallowed');
@@ -87,7 +87,7 @@ void main() {
     await store.add(_sub('ani:1', url));
     final repo = _Router({'ani:1|$url': 5});
 
-    await SubscriptionChecker(repo, store).checkAll();
+    await SubscriptionChecker(repo, store, deliver: _told).checkAll();
 
     expect(store.all().single.lastCount, 5);
   });
@@ -97,7 +97,7 @@ void main() {
     await store.add(_sub('cs:Some', url));
     final repo = _Router({'cs:Some|$url': 9});
 
-    await SubscriptionChecker(repo, store).checkAll();
+    await SubscriptionChecker(repo, store, deliver: _told).checkAll();
 
     expect(repo.asked, isEmpty, reason: 'double alerts otherwise');
     expect(store.all().single.lastCount, 1);
@@ -108,7 +108,7 @@ void main() {
     await store.add(_sub('ani:ok', 'https://ok.test/1'));
     final repo = _Router({'ani:ok|https://ok.test/1': 4});
 
-    await SubscriptionChecker(repo, store).checkAll();
+    await SubscriptionChecker(repo, store, deliver: _told).checkAll();
 
     final ok = store.all().firstWhere((s) => s.sourceId == 'ani:ok');
     expect(ok.lastCount, 4);
@@ -119,8 +119,12 @@ void main() {
     await store.add(_sub(ZmodeIds.sourceId, url, lastCount: 7));
     final repo = _Router({'${ZmodeIds.sourceId}|$url': 7});
 
-    await SubscriptionChecker(repo, store).checkAll();
+    await SubscriptionChecker(repo, store, deliver: _told).checkAll();
 
     expect(store.all().single.lastCount, 7);
   });
 }
+
+/// Stands in for a delivered alert: these tests are about routing, and the
+/// checker only records a new count once the user was told (track-6).
+Future<bool> _told(Subscription sub, int count) async => true;

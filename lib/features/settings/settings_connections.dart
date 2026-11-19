@@ -24,38 +24,49 @@ class _ConnectionsScreenState extends State<ConnectionsScreen> {
       sl<SimklService>(),
       sl<MangaBakaService>(),
     ];
+    // Windows settings workspace: cap the list width like the tracker pages.
+    final desktop = DesktopSettingsScope.contains(context);
+    final list = ListView(
+      padding: const EdgeInsets.only(top: 8, bottom: 24),
+      children: [
+        SettingsCard(
+          children: [
+            for (final t in trackers)
+              SettingsTile(
+                icon: Icons.sync_alt_rounded,
+                title: t.displayName,
+                subtitle: t.isConnected
+                    ? (t.viewerName ?? context.l10n.connected)
+                    : context.l10n.syncProgressAsYouWatch,
+                onTap: () async {
+                  await Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => TrackerSettingsScreen(tracker: t),
+                    ),
+                  );
+                  if (mounted) setState(() {});
+                },
+              ),
+          ],
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(24, 8, 24, 0),
+          child: Text(context.l10n.connectionsBlurb, style: AppText.caption),
+        ),
+      ],
+    );
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar(context.l10n.connections),
-      body: ListView(
-        padding: const EdgeInsets.only(top: 8, bottom: 24),
-        children: [
-          SettingsCard(
-            children: [
-              for (final t in trackers)
-                SettingsTile(
-                  icon: Icons.sync_alt_rounded,
-                  title: t.displayName,
-                  subtitle: t.isConnected
-                      ? (t.viewerName ?? context.l10n.connected)
-                      : context.l10n.syncProgressAsYouWatch,
-                  onTap: () async {
-                    await Navigator.of(context).push(
-                      MaterialPageRoute<void>(
-                        builder: (_) => TrackerSettingsScreen(tracker: t),
-                      ),
-                    );
-                    if (mounted) setState(() {});
-                  },
-                ),
-            ],
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(24, 8, 24, 0),
-            child: Text(context.l10n.connectionsBlurb, style: AppText.caption),
-          ),
-        ],
-      ),
+      body: desktop
+          ? Align(
+              alignment: Alignment.topCenter,
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 720),
+                child: list,
+              ),
+            )
+          : list,
     );
   }
 }

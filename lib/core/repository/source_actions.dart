@@ -9,8 +9,11 @@ import '../models/source_pref.dart';
 import '../aniyomi/aniyomi_extension_service.dart';
 import '../di/injector.dart';
 import '../mihon/mihon_extension_service.dart';
+import '../mangayomi/mangayomi_cloudflare.dart';
+import '../mangayomi/mangayomi_manager.dart';
 import '../provider/cloudstream_provider.dart';
 import '../zmode/zmode_ids.dart';
+import '../../l10n/l10n.dart';
 import 'source_repository.dart';
 import '../../features/sources/source_settings_screen.dart';
 
@@ -19,14 +22,27 @@ import '../../features/sources/source_settings_screen.dart';
 /// their existing shared cookie manager and JavaScript uses ProviderManager.
 /// Returns false for a dismissed browser; callers retry only after completion.
 Future<bool> verifySourceChallenge(String id, String url) async {
-  if (Platform.isWindows && id.startsWith('cs:')) {
+  // Windows verifies CloudStream and Mangayomi sites in the desktop browser;
+  // its saved session feeds both runtimes (see _desktopSessionHeaders).
+  if (Platform.isWindows && (id.startsWith('cs:') || id.startsWith('mg:'))) {
+    // solve() shares one window per host, so a verification already open for
+    // this site (e.g. from an Aniyomi/Mihon request) is joined, not stacked.
     final session = await DesktopCloudflare.solve(url);
     return session?['verified'] == true;
+  } else if (id.startsWith('mg:')) {
+    // Mangayomi has its own solver (iOS native, Mihon's elsewhere).
+    await MangayomiCloudflare.solve(url);
+    return true;
   } else if (!['ani:', 'mihon:', 'cs:', 'lnr:'].any(id.startsWith)) {
     return sl<ProviderManager>().solveCloudflareForHost(
       Uri.parse(url).host,
       url,
     );
+  } else if (Platform.isWindows) {
+    // Windows: the strict call reports a closed window as false and rethrows
+    // a browser that could not start, so the caller never retries blindly
+    // into the same Cloudflare error.
+    return MihonExtensionService.verifyCloudflare(url);
   } else {
     try {
       await MihonExtensionService.solveCloudflare(url);
@@ -35,6 +51,38 @@ Future<bool> verifySourceChallenge(String id, String url) async {
       if (error.code == 'CANCELLED') return false;
       rethrow;
     }
+  }
+}
+
+/// Button flavour of [verifySourceChallenge] for Windows source screens.
+///
+/// Returns true only when the site was verified, so the caller can retry the
+/// failed load right away. A closed window returns false quietly; any other
+/// failure (for example the verification browser not starting) is shown as
+/// a snack bar on [context]'s messenger and returns false, instead of
+/// escaping as an unhandled error or retrying into the same challenge.
+Future<bool> verifySourceChallengeWithFeedback(
+  BuildContext context,
+  String id,
+  String url,
+) async {
+  // Captured before the await: the context may be gone afterwards.
+  final messenger = ScaffoldMessenger.maybeOf(context);
+  final l10n = context.l10n;
+  void say(String message) => messenger
+    ?..hideCurrentSnackBar()
+    ..showSnackBar(
+      SnackBar(content: Text(message), duration: const Duration(seconds: 6)),
+    );
+  try {
+    return await verifySourceChallenge(id, url);
+  } on PlatformException catch (error) {
+    if (error.code == 'CANCELLED') return false;
+    say(l10n.verificationFailedError(error.message ?? error.code));
+    return false;
+  } catch (error) {
+    say(l10n.verificationFailedError('$error'));
+    return false;
   }
 }
 
@@ -60,6 +108,13 @@ Future<bool> hasSourceSettings(String id) {
         : MihonExtensionService().hasSourceSettings(raw);
   }
   if (id.startsWith('cs:')) return csPluginHasSettings(id.substring(3));
+  if (id.startsWith('mg:') && sl.isRegistered<MangayomiManager>()) {
+    return sl<MangayomiManager>()
+        .sourcePreferences(id)
+        .then((prefs) => prefs.isNotEmpty)
+        .timeout(const Duration(seconds: 3))
+        .catchError((_) => false);
+  }
   return Future.value(false);
 }
 
@@ -101,6 +156,22 @@ Future<void> openSourceSettings(
       MaterialPageRoute<void>(
         builder: (_) =>
             SourceSettingsScreen(sourceId: id, repoUrl: '', displayName: name),
+      ),
+    );
+  }
+  if (id.startsWith('mg:') &&
+      sl.isRegistered<MangayomiManager>() &&
+      context.mounted) {
+    final manager = sl<MangayomiManager>();
+    final prefs = await manager.sourcePreferences(id);
+    if (prefs.isEmpty || !context.mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SourcePrefsScreen(
+          title: name,
+          prefs: prefs,
+          write: (key, value) => manager.setSourcePreference(id, key, value),
+        ),
       ),
     );
   }

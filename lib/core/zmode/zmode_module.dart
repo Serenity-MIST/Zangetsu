@@ -1,4 +1,5 @@
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:get_it/get_it.dart';
 
 import '../di/injector.dart';
@@ -166,32 +167,34 @@ List<({String id, String name})> candidatesForKind(
   // offerable here. The two lists had already drifted — the home switcher
   // showed Aniyomi sources this picker did not.
   final all = repo.pickableSources;
-  return switch (kind) {
-    ZKind.manga => [
-      for (final s in all)
-        if (s.id.startsWith('mihon:') ||
-            _safeSourceType(s.id) == ProviderType.manga)
-          s,
-    ],
-    ZKind.novel => [
-      for (final s in all)
-        if (s.id.startsWith('lnr:') ||
-            _safeSourceType(s.id) == ProviderType.novel)
-          s,
-    ],
-    // Anime and movie/TV share one streaming pool. Which of the two a title
-    // is has already been decided by the metadata catalogue; the source only
-    // has to be able to play it, and plenty carry both. Kind affinity is NOT
-    // applied here — this list also feeds the per-title picker, where the user
-    // is choosing by hand. The sweep gets it in [sweepOrder].
-    _ => [
-      for (final s in all)
-        if (!s.id.startsWith('mihon:') &&
-            !s.id.startsWith('lnr:') &&
-            _safeSourceType(s.id) != ProviderType.manga &&
-            _safeSourceType(s.id) != ProviderType.novel)
-          s,
-    ],
+  final mode = switch (kind) {
+    ZKind.manga => ContentMode.manga,
+    ZKind.novel => ContentMode.novel,
+    _ => ContentMode.anime,
+  };
+  // Anime and movie/TV share one streaming pool. Which of the two a title
+  // is has already been decided by the metadata catalogue; the source only
+  // has to be able to play it, and plenty carry both. Kind affinity is NOT
+  // applied here — this list also feeds the per-title picker, where the user
+  // is choosing by hand. The sweep gets it in [sweepOrder].
+  return [
+    for (final s in all)
+      if (_inKindPool(s.id, mode)) s,
+  ];
+}
+
+/// Upstream's prefix/Mangayomi rule, widened so JS sources whose manifest
+/// declares manga/novel join that pool (and leave the streaming pool).
+bool _inKindPool(String id, ContentMode mode) {
+  final byPrefix = sourceIdMatchesContentMode(id, mode);
+  // Mangayomi keys carry their own declared type; the prefix rule is final.
+  if (id.startsWith('mg:')) return byPrefix;
+  final type = _safeSourceType(id);
+  return switch (mode) {
+    ContentMode.manga => byPrefix || type == ProviderType.manga,
+    ContentMode.novel => byPrefix || type == ProviderType.novel,
+    ContentMode.anime =>
+      byPrefix && type != ProviderType.manga && type != ProviderType.novel,
   };
 }
 
@@ -262,19 +265,11 @@ List<({String id, String name})> byKindAffinity(
 /// their composition by hand and testing that instead.
 List<({String id, String name})> orderedCandidates(ZKind kind) {
   final prefs = sl<SourceOrderPrefs>();
-  // Switched-off sources are dropped HERE and nowhere else: this is the
-  // sweep's list. `candidatesForKind` stays whole, so the per-title picker
-  // still offers every installed source — turning one off means "stop
-  // trying it automatically", not "hide it from me".
-  // No exclude set any more. Switching a source off was the only way to keep
-  // it out of the sweep before there was a limit; now the limit and the order
-  // do that job, and a source below the cut is simply not tried. Keeping a
-  // second, invisible way to disable a source — with the UI for it gone —
-  // would leave anyone who had used it with sources silently off and no way
-  // to find them.
-  //
-  // `SourceOrderPrefs.excluded` still exists and still holds whatever was
-  // saved; nothing reads it, so it is inert rather than lost.
+  // This list stays whole — the per-title picker and pin lookups need every
+  // installed source. Sources switched off for Auto Resolve are dropped later,
+  // in [automaticCandidates] / [sweepCandidates]: turning one off means "stop
+  // trying it automatically", not "hide it from me". (That switch is only
+  // shown, and only honoured, on Windows — see [excludedForSweep].)
   return sweepOrder(
     candidatesForKind(sl<SourceRepository>(), kind),
     kind,
@@ -316,8 +311,37 @@ List<({String id, String name})> automaticKindPool(
       .toList();
 }
 
+/// Whether the per-source "Use in Auto Resolve" switch is honoured. Only the
+/// Windows Source Priority page shows that switch; elsewhere there is no way
+/// to see or undo a switched-off source, so any off-list left by an older
+/// build stays inert there (phone and TV keep sweeping every source).
+bool get autoResolveExclusionsEnabled =>
+    defaultTargetPlatform == TargetPlatform.windows;
+
+/// The sources Auto Resolve must skip for [kind]: the ones switched off on
+/// Source Priority. The preferred source is never skipped — choosing it as
+/// preferred is an explicit request to try it, which wins over "don't search
+/// it automatically".
+Set<String> excludedForSweep(ZKind kind) {
+  if (!autoResolveExclusionsEnabled || !sl.isRegistered<SourceOrderPrefs>()) {
+    return const {};
+  }
+  final off = sl<SourceOrderPrefs>().excluded(kind);
+  if (off.isEmpty) return off;
+  final preferred = sl.isRegistered<ZSourcePrefs>()
+      ? sl<ZSourcePrefs>().get(kind)
+      : null;
+  return {...off}..remove(preferred);
+}
+
 /// Shares content eligibility between detail matching and playback fallbacks.
-List<({String id, String name})> automaticCandidates(ZKind kind) {
+/// Switched-off sources are dropped here, so the playback sweep skips them
+/// too; a source pinned to a title is put back by the resolver itself.
+List<({String id, String name})> automaticCandidates(ZKind kind) =>
+    activeSources(_automaticPool(kind), excluded: excludedForSweep(kind));
+
+/// [automaticCandidates] before switched-off sources are removed.
+List<({String id, String name})> _automaticPool(ZKind kind) {
   var eligible = orderedCandidates(kind);
   try {
     final buckets = categorizedSources();
@@ -333,10 +357,23 @@ List<({String id, String name})> automaticCandidates(ZKind kind) {
   return eligible;
 }
 
-/// Uncapped, ranked Auto Resolve candidates for the Source Priority screen.
-/// Applying the configured cap later keeps this order identical to playback.
-List<({String id, String name})> sweepCandidates(ZKind kind) {
-  final narrowed = languageNarrowedCandidates(automaticCandidates(kind), {
+/// Uncapped, ranked Auto Resolve candidates, minus the sources switched off
+/// for Auto Resolve. Applying the configured cap later keeps this order
+/// identical to playback.
+///
+/// Built FROM [priorityCandidates] (not ranked separately) so the Source
+/// Priority screen, which lists every row including switched-off ones, marks
+/// exactly the rows this sweep walks.
+List<({String id, String name})> sweepCandidates(ZKind kind) => activeSources(
+  priorityCandidates(kind),
+  excluded: excludedForSweep(kind),
+);
+
+/// Every source the Source Priority screen lists for [kind], in sweep order,
+/// INCLUDING the ones switched off for Auto Resolve (so their switch can be
+/// turned back on). [sweepCandidates] is this list with those removed.
+List<({String id, String name})> priorityCandidates(ZKind kind) {
+  final narrowed = languageNarrowedCandidates(_automaticPool(kind), {
     for (final s in sl<SourceRepository>().loadedSources) s.id,
   });
   // Rank first, then put the sources the user placed by hand back on top.

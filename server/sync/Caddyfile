@@ -1,7 +1,41 @@
 sync.zangetsu.online {
-	@syncRoutes path /history /profile_history /mylist /profile_mylist /list_categories /profile_list_categories /mylist_categories /profile_mylist_categories /mylist_sync_clock /mylist_sync_tombstones /reading_history /profile_reading_history /viewer_profiles /backups
+	@authRouting path /auth-routing/v1.json
+	handle @authRouting {
+		root * /opt/zangetsu-sync/public
+		header Cache-Control "no-store"
+		file_server
+	}
+	@stremioRoutes path /stremio/v1/configuration /stremio/v1/seal /stremio/v1/open
+	handle @stremioRoutes {
+		request_body {
+			max_size 2MB
+		}
+		reverse_proxy 127.0.0.1:3111
+	}
+	@klipyRoutes path /klipy/v1/gifs/search /klipy/v1/gifs/items /klipy/v1/gifs/share/*
+	handle @klipyRoutes {
+		reverse_proxy 127.0.0.1:3110
+	}
+	@syncRoutes path /history /profile_history /mylist /profile_mylist /list_categories /profile_list_categories /mylist_categories /profile_mylist_categories /mylist_sync_clock /mylist_sync_tombstones /reading_history /profile_reading_history /viewer_profiles /backups /rpc/profile_lock
 	handle @syncRoutes {
 		reverse_proxy 127.0.0.1:3000
+	}
+	handle {
+		respond "Not found" 404
+	}
+}
+
+sb.zangetsu.online {
+	@admin path /auth/v1/admin /auth/v1/admin/*
+	handle @admin {
+		respond "Not found" 404
+	}
+	@api path /auth/v1/* /rest/v1/* /storage/v1/* /functions/v1/pair-tv
+	handle @api {
+		@privateResponses path /auth/v1/* /rest/v1/* /functions/v1/pair-tv
+		header @privateResponses Cache-Control no-store
+		header X-Content-Type-Options nosniff
+		reverse_proxy 127.0.0.1:18080
 	}
 	handle {
 		respond "Not found" 404

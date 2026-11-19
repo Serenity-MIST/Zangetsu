@@ -25,6 +25,20 @@ if (hasReleaseKeystore) {
     keystoreProperties.load(FileInputStream(keystorePropertiesFile))
 }
 
+// Set ZANGETSU_NO_DISCORD=1 (CI nightly) when the proprietary Discord SDK is
+// absent: the AAR require becomes a warning, the JNI lib is skipped, and a
+// no-op DiscordPresenceBridge (src/noDiscord) keeps MainActivity compiling.
+// Dart already treats the missing channel as "presence unavailable", so the
+// nightly behaves like a build with Discord disabled.
+val noDiscord =
+    System.getenv("ZANGETSU_NO_DISCORD") == "1" || project.hasProperty("noDiscord")
+
+// CI nightly identity: separate package + launcher name so the nightly
+// installs ALONGSIDE the release build instead of showing up as an "update"
+// that overwrites it for release users.
+val isNightly =
+    System.getenv("ZANGETSU_NIGHTLY") == "1" || project.hasProperty("nightly")
+
 android {
     namespace = "com.spyou.watch_app"
     compileSdk = flutter.compileSdkVersion
@@ -51,6 +65,24 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        resValue("string", "app_name", if (isNightly) "Zangetsu Nightly" else "Zangetsu")
+        if (noDiscord) {
+            externalNativeBuild {
+                cmake {
+                    // Tells our CMakeLists to skip the SDK's find_package +
+                    // JNI lib (the bridge below degrades via reflection).
+                    arguments += "-DNO_DISCORD=ON"
+                }
+            }
+        }
+    }
+
+    buildFeatures { prefab = true }
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     // Drop x86/x86_64 (emulator-only) native libs from every output — including
@@ -117,6 +149,8 @@ android {
                 signingConfigs.getByName("debugWithReleaseKey")
             else
                 signingConfigs.getByName("debug")
+            // Nightly ((isNightly)): own package so it never overwrites release.
+            if (isNightly) applicationIdSuffix = ".nightly"
             if (providers.gradleProperty("vpsSyncTestBuild").orNull == "true") {
                 applicationIdSuffix = ".vpstest"
             }
@@ -184,6 +218,15 @@ configurations.configureEach {
 // Bundles the CloudStream runtime so .cs3 plugins can be DexClassLoaded against
 // it. GPL-3.0 — see docs/cloudstream-integration-spec.md §7.
 dependencies {
+    val discordSdk = rootProject.file("discord-sdk/discord_partner_sdk.aar")
+    if (noDiscord) {
+        logger.warn("ZANGETSU_NO_DISCORD: skipping proprietary Discord SDK.")
+    } else {
+        require(discordSdk.exists()) {
+            "Discord SDK missing: run python3 tool/setup_discord_sdk.py /path/to/DiscordSocialSdk-1.10.19337.zip"
+        }
+        implementation(files(discordSdk))
+    }
     implementation("com.github.recloudstream.cloudstream:library:v4.8.0")
     // Jackson is already on the RUNTIME classpath (CloudStream library transitive
     // dep). compileOnly lets our clean-room DataStore reference JsonMapper for the
@@ -219,12 +262,22 @@ dependencies {
     // Only the dedicated CloudStreamSettingsActivity uses these themes; the
     // Flutter UI keeps its own theme, so this doesn't affect the main app.
     implementation("androidx.appcompat:appcompat:1.7.0")
+    // Precompiled extension settings can host Compose without changing our UI.
+    runtimeOnly(platform("androidx.compose:compose-bom:2026.03.00"))
+    runtimeOnly("androidx.compose.material3:material3")
+    runtimeOnly("androidx.compose.ui:ui")
+    runtimeOnly("androidx.activity:activity-compose:1.10.1")
     // Cloudflare Turnstile parity with Mihon: setUserAgent() uses WebSettingsCompat
     // to set Sec-CH-UA client-hint metadata matching the spoofed UA, so the hints
     // don't contradict it and flag the WebView as a bot.
     implementation("androidx.webkit:webkit:1.11.0")
     implementation("com.google.android.material:material:1.12.0")
     // SAF DocumentFile — used to check if a content:// download still exists.
+    // RoundedPolygon/Morph from Material 3 Expressive shapes, used by the native
+    // phone player's loading indicator. Tiny (no Compose runtime) and already in
+    // the dependency graph; declared explicitly so the compile classpath can't
+    // lose it when an unrelated transitive dep changes.
+    implementation("androidx.graphics:graphics-shapes:1.0.1")
     implementation("androidx.documentfile:documentfile:1.0.1")
     // RecyclerView 1.3.2 (transitive default is 1.1.0, which lacks
     // ViewHolder.getBindingAdapterPosition() — added in 1.2.0). Newer CS plugin
@@ -320,6 +373,7 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-dash:1.7.1")
     implementation("androidx.media3:media3-exoplayer-smoothstreaming:1.7.1")
     implementation("androidx.media3:media3-ui:1.7.1")
+    implementation("androidx.media3:media3-database:1.7.1")
     // Prebuilt FFmpeg software AUDIO decoders (Dolby AC3/E-AC3, DTS) — the exact
     // artifact CloudStream uses, straight off Maven Central (native .so bundled,
     // no source build). Version pairs with media3 1.7.1; nextlib 0.9.0 predates

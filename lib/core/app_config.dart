@@ -42,7 +42,7 @@ const String kLogIntakeUrl = 'https://zangetsu-logs.log-intake.workers.dev';
 /// Public R2 manifest for the rotating profile-picker backdrops. The manifest
 /// contains up to three image filenames stored beside it in this bucket.
 const String kProfilePickerArtworkManifestUrl =
-    'https://pub-a8b67f6edb404cb1b7545e19bc2b5b94.r2.dev/profile-picker/manifest.json';
+    'https://avatars.zangetsu.online/profile-picker/manifest.json';
 
 /// Developer announcements feed (a plain JSON file in the public app repo).
 /// The app READS this on launch to show in-app announcements — never writes.
@@ -56,12 +56,5 @@ const String kAnnouncementsUrl =
 /// gracefully disabled (the Trailer button simply never appears for them).
 const String kTmdbApiKey = String.fromEnvironment(
   'TMDB_API_KEY',
-  defaultValue: '',
-);
-
-/// Public KLIPY API key used by profile GIF search. Supply with
-/// `--dart-define=KLIPY_API_KEY=...`; the picker explains when it is unset.
-const String kKlipyApiKey = String.fromEnvironment(
-  'KLIPY_API_KEY',
   defaultValue: '',
 );

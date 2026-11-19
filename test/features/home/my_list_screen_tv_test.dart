@@ -10,9 +10,11 @@ import 'package:watch_app/core/models/provider_info.dart';
 import 'package:watch_app/core/models/watch_status.dart';
 import 'package:watch_app/core/playback/list_status_store.dart';
 import 'package:watch_app/core/playback/my_list.dart';
+import 'package:watch_app/core/stremio/stremio_library_badge.dart';
 import 'package:watch_app/core/tracker/tracker.dart';
 import 'package:watch_app/core/tracker/tracker_hub.dart';
 import 'package:watch_app/core/tv/tv_focusable.dart';
+import 'package:watch_app/core/ui/tracker_badge.dart';
 import 'package:watch_app/features/home/cubit/my_list_cubit.dart';
 import 'package:watch_app/features/home/cubit/tracker_list_cubit.dart';
 import 'package:watch_app/features/home/my_list_screen_tv.dart';
@@ -187,6 +189,30 @@ void main() {
     await sl.reset();
   });
 
+  testWidgets('only saved Stremio titles show the source icon', (tester) async {
+    await _registerHub([]);
+    final cubit = _makeCubit([
+      item1,
+      const MediaItem(
+        id: 'movie:tt123',
+        title: 'Stremio movie',
+        url: 'stremio://ref',
+        type: ProviderType.movie,
+        sourceId: 'stremio',
+      ),
+    ]);
+    final tracker = TrackerListCubit();
+    addTearDown(cubit.close);
+    addTearDown(tracker.close);
+
+    await tester.pumpWidget(_pumpTree(myList: cubit, trackerList: tracker));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(StremioLibraryBadge), findsOneWidget);
+    expect(find.text(item1.title), findsOneWidget);
+    expect(find.text('Stremio movie'), findsOneWidget);
+  });
+
   testWidgets(
     'MyListScreenTv renders poster cards and first card has autofocus',
     (tester) async {
@@ -275,6 +301,23 @@ void main() {
       expect(find.text('Attack on Titan'), findsNothing);
     },
   );
+
+  testWidgets('private tracker entries show a lock badge', (tester) async {
+    final anilist = _FakeTracker(name: 'AniList', connected: true);
+    await _registerHub([anilist]);
+    final cubit = _makeCubit([]);
+    final tlCubit = _SeededTrackerListCubit()
+      ..seed(TrackerListState(
+        source: TrackerSource(anilist),
+        status: TrackerListStatus.ready,
+        entries: [const MyListEntry(trackerItem, WatchStatus.planning, isPrivate: true)],
+      ));
+    addTearDown(cubit.close);
+    addTearDown(tlCubit.close);
+    await tester.pumpWidget(_pumpTree(myList: cubit, trackerList: tlCubit));
+    await tester.pumpAndSettle();
+    expect(find.byType(PrivateTrackerBadge), findsOneWidget);
+  });
 
   testWidgets('Shuffle on a tracker list opens its title details', (
     tester,

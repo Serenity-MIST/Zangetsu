@@ -14,7 +14,7 @@ abstract class AppText {
   static String fontFamily = defaultFontFamily;
 
   /// What a fresh install uses.
-  static const String defaultFontFamily = 'Nunito';
+  static const String defaultFontFamily = 'System';
 
   /// Platform CJK fonts. None of the UI families carry CJK glyphs; missing
   /// characters fall through to these (iOS Hiragino/PingFang, Android Noto).
@@ -29,7 +29,10 @@ abstract class AppText {
     'sans-serif',
   ];
 
-  static String get _f => fontFamily;
+  /// Null when the System font is picked ([AppFontPrefs.systemFamily]) —
+  /// no family means the platform default. Kept as a literal (not an import)
+  /// because app_font_prefs already imports this file.
+  static String? get _f => fontFamily == 'System' ? null : fontFamily;
   static const _fb = fontFamilyFallback;
 
   static TextStyle get largeTitle => TextStyle(
@@ -61,8 +64,10 @@ abstract class AppText {
 
   /// Compact app-bar title for settings-family screens — matches the settings
   /// section header so drilling deeper keeps one header size.
-  static final barTitle =
-      headline.copyWith(fontSize: 18, fontWeight: FontWeight.w700);
+  static final barTitle = headline.copyWith(
+    fontSize: 18,
+    fontWeight: FontWeight.w700,
+  );
   static TextStyle get body => TextStyle(
     fontFamily: _f,
     fontFamilyFallback: _fb,

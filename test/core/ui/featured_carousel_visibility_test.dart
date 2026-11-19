@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:watch_app/core/models/media_item.dart';
@@ -164,4 +166,53 @@ void main() {
     expect(find.text('Show new-source-second'), findsOneWidget);
     expect(find.text('Show old-source-second'), findsNothing);
   });
+
+  for (final style in HeroTransition.values) {
+    testWidgets('late colours cannot replace the visible tint (${style.name})', (
+      tester,
+    ) async {
+      final first = Completer<Color?>();
+      final second = Completer<Color?>();
+      final colors = <Color?>[];
+      MediaItem art(String id) => MediaItem(
+        id: id,
+        title: 'Show $id',
+        cover: 'https://example.test/$id.jpg',
+        url: 'https://example.test/$id',
+        type: ProviderType.anime,
+        sourceId: 'test',
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: FeaturedCarousel(
+              items: [art('first'), art('second')],
+              inList: (_) => false,
+              onPlay: (_) {},
+              onInfo: (_) {},
+              onToggleList: (_) {},
+              style: style,
+              onArtColor: colors.add,
+              paletteLoader: (url, _) =>
+                  url.contains('first') ? first.future : second.future,
+            ),
+          ),
+        ),
+      );
+
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pumpAndSettle();
+      second.complete(Colors.blue);
+      await tester.pump();
+      expect(colors.last, Colors.blue);
+
+      first.complete(Colors.red);
+      await tester.pump();
+      expect(colors.last, Colors.blue);
+      await tester.pumpWidget(const SizedBox.shrink());
+      // The hero's separate decorative palette lookup has a 15-second timeout.
+      await tester.pump(const Duration(seconds: 30));
+    });
+  }
 }

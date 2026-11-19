@@ -7,8 +7,12 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 
+import 'package:flutter/services.dart';
+
+import '../../core/desktop/desktop_multi_select.dart';
 import '../../core/di/injector.dart';
 import '../../core/mode/content_mode_cubit.dart';
+import '../../core/ui/desktop_docked_panel.dart' show DesktopPanelColors;
 import '../../core/models/home_section.dart';
 import '../../core/models/media_item.dart';
 import '../../core/models/provider_info.dart';
@@ -85,6 +89,27 @@ Map<String, GenreArt> genreArtFrom(List<HomeSection> sections, {ZKind? kind}) {
 MetaFilters genreFilters(String genre) =>
     MetaFilters(genres: [genre], adult: genre == kAdultGenre);
 
+/// The Search filters for several genres picked together on Windows
+/// (search-10): every genre at once, with the same adult rule as
+/// [genreFilters] (on only when the adult genre itself is picked).
+MetaFilters multiGenreFilters(List<String> genres) => MetaFilters(
+  genres: List.unmodifiable(genres),
+  adult: genres.contains(kAdultGenre),
+);
+
+/// Whether the current catalogue can filter by genre; says why not when it
+/// can't. Guards `sl` too, since the repository is not registered in every
+/// shell (and the provider can change while the Genres page is open).
+bool _genreFiltersAvailable(BuildContext context, ZKind kind) {
+  if (sl.isRegistered<MetadataRepository>() &&
+      sl<MetadataRepository>().supportsFilters) {
+    return true;
+  }
+  final needed = (kind == ZKind.movie || kind == ZKind.tv) ? 'TMDB' : 'AniList';
+  showAppToast(context, context.l10n.filtersNeedProvider(needed));
+  return false;
+}
+
 /// A stable colour for [genre] when there is no cover to show.
 ///
 /// Hashed from the name rather than random, so a genre keeps the same tile
@@ -139,11 +164,53 @@ class _GenresScreenState extends State<GenresScreen> {
     final kind = _currentKind;
     if (!mounted || kind == _kind) return;
     _artRequest++;
+    // A new catalogue has its own genre list; picks from the old one go.
+    _selection.clear();
     setState(() { _kind = kind; _adultArt = null; });
     if (_adultAllowed) unawaited(_loadAdultArt());
   }
 
+  /// Windows multi-select (search-10): genres picked with Ctrl/Shift-click,
+  /// browsed together from the selection bar.
+  final DesktopSelection<String> _selection = DesktopSelection<String>();
+
+  /// Genres in on-screen order, for Shift ranges and Ctrl+A.
+  List<String> _ordered = const [];
+
+  bool get _windows => defaultTargetPlatform == TargetPlatform.windows;
+
+  void _selectionChanged() {
+    if (mounted) setState(() {});
+  }
+
+  /// A Ctrl/Shift-click on a tile: Shift selects the range from the last
+  /// clicked genre, Ctrl toggles one.
+  void _onSelectClick(String genre, {required bool ctrl, required bool shift}) {
+    _selection.handleClick(genre, _ordered, ctrl: ctrl, shift: shift);
+  }
+
+  /// The selected genres, in grid order (stable, regardless of click order).
+  List<String> get _selectedGenres => [
+    for (final g in _ordered)
+      if (_selection.isSelected(g)) g,
+  ];
+
+  /// "Browse N genres": Search opened on every selected genre at once.
+  void _browseSelected() {
+    final genres = _selectedGenres;
+    if (genres.isEmpty) return;
+    if (!_genreFiltersAvailable(context, _kind)) return;
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SearchScreen(initialFilters: multiGenreFilters(genres)),
+      ),
+    );
+  }
+
   @override void dispose() {
+    _selection
+      ..removeListener(_selectionChanged)
+      ..dispose();
     _artRequest++;
     unawaited(_modeSubscription.cancel());
     unawaited(_homeSubscription?.cancel());
@@ -169,6 +236,7 @@ class _GenresScreenState extends State<GenresScreen> {
   @override
   void initState() {
     super.initState();
+    _selection.addListener(_selectionChanged);
     _kind = _currentKind;
     _modeSubscription = sl<ContentModeCubit>().stream.listen((_) => _catalogueChanged());
     ZModePrefs.revision.addListener(_catalogueChanged);
@@ -235,12 +303,23 @@ class _GenresScreenState extends State<GenresScreen> {
     // this cannot leak results on its own.
     final genres = GenreCatalog.genresFor(kind, adult: _adultAllowed);
     final art = {..._artByGenre(kind), kAdultGenre: ?_adultArt};
-    return Scaffold(
+    _ordered = genres;
+    final windows = _windows;
+    final selectedCount = windows ? _selectedGenres.length : 0;
+    final scaffold = Scaffold(
       backgroundColor: AppColors.bg,
       appBar: AppBar(
         backgroundColor: AppColors.bg,
         title: Text(context.l10n.genres, style: AppText.barTitle),
       ),
+      // search-10 (Windows): the selection bar, only while genres are picked.
+      bottomNavigationBar: selectedCount == 0
+          ? null
+          : _GenreSelectionBar(
+              genres: _selectedGenres,
+              onClear: _selection.clear,
+              onBrowse: _browseSelected,
+            ),
       body: GridView.builder(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 40),
         itemCount: genres.length,
@@ -260,19 +339,110 @@ class _GenresScreenState extends State<GenresScreen> {
               ),
         itemBuilder: (_, i) {
           final g = genres[i];
-          return _GenreTile(genre: g, kind: kind, art: art[g]);
+          return _GenreTile(
+            genre: g,
+            kind: kind,
+            art: art[g],
+            selected: windows && _selection.isSelected(g),
+            onSelectClick: windows ? _onSelectClick : null,
+          );
         },
+      ),
+    );
+    // Windows keys for the selection: Esc clears it (before Esc goes back),
+    // Ctrl+A picks every genre, Enter browses the picked ones. Off Windows
+    // this returns the scaffold untouched.
+    return DesktopSelectionShortcuts<String>(
+      selection: _selection,
+      orderedKeys: () => _ordered,
+      onActivate: _browseSelected,
+      autofocus: true,
+      child: scaffold,
+    );
+  }
+}
+
+/// search-10 (Windows): bottom bar listing the picked genres, with Clear and
+/// the "Browse N genres" button. Graphite like the other desktop panels.
+class _GenreSelectionBar extends StatelessWidget {
+  const _GenreSelectionBar({
+    required this.genres,
+    required this.onClear,
+    required this.onBrowse,
+  });
+
+  final List<String> genres;
+  final VoidCallback onClear;
+  final VoidCallback onBrowse;
+
+  @override
+  Widget build(BuildContext context) {
+    final n = genres.length;
+    return Container(
+      key: const ValueKey('genre-selection-bar'),
+      padding: const EdgeInsets.fromLTRB(20, 10, 16, 10),
+      decoration: BoxDecoration(
+        color: DesktopPanelColors.surface,
+        border: Border(top: BorderSide(color: DesktopPanelColors.edge)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                genres.join(', '),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: AppText.body.copyWith(color: AppColors.textSecondary),
+              ),
+            ),
+            const SizedBox(width: 12),
+            TextButton(
+              key: const ValueKey('genre-selection-clear'),
+              onPressed: onClear,
+              child: Text(context.l10n.clear),
+            ),
+            const SizedBox(width: 8),
+            FilledButton.icon(
+              key: const ValueKey('genre-selection-browse'),
+              onPressed: onBrowse,
+              style: FilledButton.styleFrom(
+                backgroundColor: AppColors.accent,
+                foregroundColor: Colors.white,
+              ),
+              icon: const Icon(Icons.travel_explore_rounded, size: 18),
+              label: Text(
+                context.l10n.browseNGenres(n),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
 }
 
 class _GenreTile extends StatelessWidget {
-  const _GenreTile({required this.genre, required this.kind, this.art});
+  const _GenreTile({
+    required this.genre,
+    required this.kind,
+    this.art,
+    this.selected = false,
+    this.onSelectClick,
+  });
 
   final String genre;
   final ZKind kind;
   final GenreArt? art;
+
+  /// Windows multi-select (search-10): this tile is in the selection bar.
+  final bool selected;
+
+  /// Windows multi-select: called for a Ctrl/Shift-click instead of opening.
+  /// Null (phone/TV) keeps the single-genre tap exactly as before.
+  final void Function(String genre, {required bool ctrl, required bool shift})?
+  onSelectClick;
 
   /// Open Search on this genre.
   ///
@@ -283,13 +453,20 @@ class _GenreTile extends StatelessWidget {
   /// same unfiltered list and Simkl ignores its own `genre`, so without this
   /// the tap would look like it worked and quietly show the wrong titles.
   void _open(BuildContext context) {
-    if (!sl<MetadataRepository>().supportsFilters) {
-      final needed = (kind == ZKind.movie || kind == ZKind.tv)
-          ? 'TMDB'
-          : 'AniList';
-      showAppToast(context, context.l10n.filtersNeedProvider(needed));
-      return;
+    // search-10 (Windows): Ctrl/Shift-click adds this genre to the selection
+    // bar instead of opening it. A plain click still opens one genre.
+    final onSelectClick = this.onSelectClick;
+    if (onSelectClick != null &&
+        defaultTargetPlatform == TargetPlatform.windows) {
+      final keyboard = HardwareKeyboard.instance;
+      final ctrl = keyboard.isControlPressed || keyboard.isMetaPressed;
+      final shift = keyboard.isShiftPressed;
+      if (ctrl || shift) {
+        onSelectClick(genre, ctrl: ctrl, shift: shift);
+        return;
+      }
     }
+    if (!_genreFiltersAvailable(context, kind)) return;
     Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => SearchScreen(initialFilters: genreFilters(genre)),
@@ -357,6 +534,37 @@ class _GenreTile extends StatelessWidget {
           ),
           // Above the artwork so the whole tile is the target, and so the
           // ripple is not clipped away by the image.
+          // Windows multi-select marker: accent outline + tick (search-10).
+          if (selected) ...[
+            IgnorePointer(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: AppColors.accent, width: 2.5),
+                ),
+              ),
+            ),
+            Positioned(
+              top: 6,
+              right: 6,
+              child: IgnorePointer(
+                child: Container(
+                  key: ValueKey('genre_selected_$genre'),
+                  width: 20,
+                  height: 20,
+                  decoration: BoxDecoration(
+                    color: AppColors.accent,
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(
+                    Icons.check_rounded,
+                    size: 14,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+            ),
+          ],
           Material(
             color: Colors.transparent,
             child: InkWell(onTap: () => _open(context)),

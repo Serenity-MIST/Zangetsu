@@ -1,4 +1,5 @@
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../app_mode.dart';
@@ -7,6 +8,7 @@ import '../models/media_detail.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text.dart';
 import '../tv/tv_focusable.dart';
+import 'desktop_settings_surface.dart' show GraphiteSettingsColors;
 
 /// Netflix-style "more info" card shown on long-press of any row item.
 ///
@@ -34,6 +36,33 @@ Future<void> showMediaInfoSheet(
   double? progress,
   VoidCallback? onRemoveFromContinue,
 }) {
+  // Windows: a centred graphite dialog (Esc / click outside closes it) instead
+  // of a phone bottom sheet. Same content and actions.
+  if (defaultTargetPlatform == TargetPlatform.windows) {
+    return showDialog<void>(
+      context: context,
+      barrierColor: Colors.black.withValues(alpha: 0.6),
+      builder: (_) => _MediaInfoSheet(
+        desktop: true,
+        title: title,
+        englishTitle: englishTitle,
+        cover: cover,
+        headers: headers,
+        typeLabel: typeLabel,
+        subCount: subCount,
+        dubCount: dubCount,
+        detail: detail,
+        inMyList: inMyList,
+        onPlay: onPlay,
+        onOpenDetail: onOpenDetail,
+        onToggleMyList: onToggleMyList,
+        playLabel: playLabel,
+        progressLabel: progressLabel,
+        progress: progress,
+        onRemoveFromContinue: onRemoveFromContinue,
+      ),
+    );
+  }
   return showModalBottomSheet<void>(
     context: context,
     backgroundColor: Colors.transparent,
@@ -60,6 +89,10 @@ Future<void> showMediaInfoSheet(
   );
 }
 
+/// Graphite dialog surface on Windows (matches the desktop settings dialogs).
+// A getter (set-9) so it follows Pure black and custom backgrounds.
+Color get _kDesktopSurface => GraphiteSettingsColors.dialog;
+
 class _MediaInfoSheet extends StatefulWidget {
   const _MediaInfoSheet({
     required this.title,
@@ -78,8 +111,11 @@ class _MediaInfoSheet extends StatefulWidget {
     this.progressLabel,
     this.progress,
     this.onRemoveFromContinue,
+    this.desktop = false,
   });
 
+  /// Windows dialog presentation (no grab handle, close button, button row).
+  final bool desktop;
   final String title;
   final String? englishTitle;
   final String? cover;
@@ -118,6 +154,29 @@ class _MediaInfoSheetState extends State<_MediaInfoSheet> {
   @override
   Widget build(BuildContext context) {
     final h = MediaQuery.of(context).size.height;
+    if (widget.desktop) {
+      // Windows: bounded centred card in the graphite settings-dialog style.
+      return Dialog(
+        backgroundColor: _kDesktopSurface,
+        insetPadding: const EdgeInsets.all(32),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(20),
+          side: BorderSide(color: GraphiteSettingsColors.dialogEdge),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxWidth: 580, maxHeight: h * 0.86),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _hero(),
+              Flexible(child: _body()),
+              _desktopActions(),
+            ],
+          ),
+        ),
+      );
+    }
     return Padding(
       // Tiny side inset so the rounded corners read as a floating card.
       padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
@@ -146,8 +205,10 @@ class _MediaInfoSheetState extends State<_MediaInfoSheet> {
 
   // ── JioHotstar-style cinematic hero: full-bleed cover + gradient + title ───
   Widget _hero() {
+    // The gradient melts into whichever surface hosts the card.
+    final fade = widget.desktop ? _kDesktopSurface : const Color(0xFF16161C);
     return SizedBox(
-      height: 220,
+      height: widget.desktop ? 260 : 220,
       child: Stack(
         fit: StackFit.expand,
         children: [
@@ -165,17 +226,41 @@ class _MediaInfoSheetState extends State<_MediaInfoSheet> {
 
           // Cinematic gradient — clear at top, melts to the sheet surface so the
           // image flows seamlessly into the content.
-          const DecoratedBox(
+          DecoratedBox(
             decoration: BoxDecoration(
               gradient: LinearGradient(
                 begin: Alignment.topCenter,
                 end: Alignment.bottomCenter,
-                colors: [Color(0x33000000), Color(0x00000000), Color(0xCC16161C), Color(0xFF16161C)],
-                stops: [0.0, 0.4, 0.82, 1.0],
+                colors: [
+                  const Color(0x33000000),
+                  const Color(0x00000000),
+                  fade.withValues(alpha: 0.8),
+                  fade,
+                ],
+                stops: const [0.0, 0.4, 0.82, 1.0],
               ),
             ),
           ),
 
+          // Windows: a close button over the art instead of a grab handle.
+          if (widget.desktop)
+            Align(
+              alignment: AlignmentDirectional.topEnd,
+              child: Padding(
+                padding: const EdgeInsets.all(10),
+                child: IconButton(
+                  key: const ValueKey('media-info-close'),
+                  tooltip: MaterialLocalizations.of(context).closeButtonTooltip,
+                  onPressed: () => Navigator.of(context).pop(),
+                  icon: const Icon(Icons.close_rounded, size: 20),
+                  color: Colors.white,
+                  style: IconButton.styleFrom(
+                    backgroundColor: Colors.black.withValues(alpha: 0.45),
+                  ),
+                ),
+              ),
+            )
+          else
           // Grab handle over the art.
           Align(
             alignment: Alignment.topCenter,
@@ -308,7 +393,8 @@ class _MediaInfoSheetState extends State<_MediaInfoSheet> {
                   Text(
                     (desc != null && desc.isNotEmpty) ? desc : 'No description available.',
                     style: AppText.body.copyWith(height: 1.4),
-                    maxLines: 3,
+                    // The wider desktop card has room for more synopsis.
+                    maxLines: widget.desktop ? 6 : 3,
                     overflow: TextOverflow.ellipsis,
                   ),
                   if (d != null && d.studios.isNotEmpty) ...[
@@ -428,6 +514,135 @@ class _MediaInfoSheetState extends State<_MediaInfoSheet> {
               ],
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  /// Windows action row: Play (default focus, so Enter plays) beside labelled
+  /// My List / Details / Remove buttons — the same actions as the phone chips.
+  Widget _desktopActions() {
+    void closeThen(VoidCallback action) {
+      Navigator.pop(context);
+      action();
+    }
+
+    final shape = RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(12),
+    );
+    Widget secondary({
+      required Key key,
+      required Widget icon,
+      required String label,
+      required VoidCallback? onPressed,
+      bool highlighted = false,
+    }) {
+      final color = highlighted ? AppColors.accent : AppColors.textPrimary;
+      return OutlinedButton.icon(
+        key: key,
+        onPressed: onPressed,
+        icon: icon,
+        label: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis),
+        style: OutlinedButton.styleFrom(
+          minimumSize: const Size(0, 44),
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          foregroundColor: color,
+          backgroundColor: highlighted
+              ? AppColors.accentSoft
+              : const Color(0xFF232429),
+          side: BorderSide(
+            color: highlighted
+                ? AppColors.accent.withValues(alpha: 0.5)
+                : const Color(0xFF36373E),
+          ),
+          shape: shape,
+          textStyle: AppText.button.copyWith(fontSize: 14),
+        ),
+      );
+    }
+
+    final play = FilledButton.icon(
+      key: const ValueKey('media-info-play'),
+      autofocus: true,
+      onPressed: () => closeThen(widget.onPlay),
+      icon: const Icon(Icons.play_arrow_rounded, size: 22),
+      label: Text(
+        widget.playLabel ?? 'Play',
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      style: FilledButton.styleFrom(
+        minimumSize: const Size(0, 44),
+        backgroundColor: Colors.white,
+        foregroundColor: AppColors.bg,
+        shape: shape,
+        textStyle: AppText.button.copyWith(fontSize: 15),
+      ),
+    );
+    final secondaries = <Widget>[
+      secondary(
+        key: const ValueKey('media-info-my-list'),
+        icon: _togglingList
+            ? SizedBox.square(
+                dimension: 16,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: AppColors.accent,
+                ),
+              )
+            : Icon(_inList ? Icons.check_rounded : Icons.add_rounded, size: 18),
+        label: 'My List',
+        highlighted: _inList,
+        onPressed: _toggleList,
+      ),
+      secondary(
+        key: const ValueKey('media-info-details'),
+        icon: const Icon(Icons.info_outline_rounded, size: 18),
+        label: 'Details',
+        onPressed: () => closeThen(widget.onOpenDetail),
+      ),
+      if (widget.onRemoveFromContinue != null)
+        secondary(
+          key: const ValueKey('media-info-remove'),
+          icon: const Icon(Icons.delete_outline_rounded, size: 18),
+          label: 'Remove',
+          highlighted: true,
+          onPressed: () => closeThen(widget.onRemoveFromContinue!),
+        ),
+    ];
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 10, 20, 20),
+      child: FocusTraversalGroup(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            // Normal window: one row, Play takes the spare width.
+            if (constraints.maxWidth >= 500) {
+              return Row(
+                children: [
+                  Expanded(child: play),
+                  for (final s in secondaries) ...[const SizedBox(width: 8), s],
+                ],
+              );
+            }
+            // Very narrow window: Play on its own line, the rest share a row.
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                play,
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    for (var i = 0; i < secondaries.length; i++) ...[
+                      if (i > 0) const SizedBox(width: 8),
+                      Expanded(child: secondaries[i]),
+                    ],
+                  ],
+                ),
+              ],
+            );
+          },
         ),
       ),
     );

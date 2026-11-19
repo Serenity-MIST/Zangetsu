@@ -63,8 +63,14 @@ class _AppFaceScreenState extends State<AppFaceScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: AppColors.bg,
-      appBar: settingsAppBar('Icon, splash & banner'),
+      backgroundColor: settingsPageBackground(context),
+      // Windows (desktop settings) shows only the splash picker, so the page
+      // is named for it, matching the "Splash screen" row that opens it.
+      appBar: settingsAppBar(
+        DesktopSettingsScope.contains(context)
+            ? 'Splash screen'
+            : 'Icon, splash & banner',
+      ),
       body: DesktopSettingsScope.contains(context)
           ? _desktopBody()
           : ListView(
@@ -99,8 +105,9 @@ class _AppFaceScreenState extends State<AppFaceScreen>
     );
   }
 
-  /// Desktop identity settings use grouped controls and a single live preview,
-  /// with no phone-sized carousel or Android launcher action on Windows.
+  /// Desktop body: the splash picker only. Windows has no launcher-icon
+  /// switch, and its Home always draws its own hero, so the icon note and the
+  /// Home banner picker (which changed nothing there) are not shown.
   Widget _desktopBody() {
     final splash = GraphiteSettingsPanel(
       margin: EdgeInsets.zero,
@@ -112,13 +119,20 @@ class _AppFaceScreenState extends State<AppFaceScreen>
             children: [
               Text(context.l10n.splashStyle, style: AppText.headline),
               const SizedBox(height: 8),
-              Text(context.l10n.splashStyleBlurb, style: AppText.caption),
+              Text(
+                '${context.l10n.splashStyleBlurb} Your choice plays the next '
+                'time Zangetsu starts.',
+                style: AppText.caption,
+              ),
               const SizedBox(height: 16),
               Container(
                 width: double.infinity,
                 height: 150,
                 decoration: BoxDecoration(
-                  color: const Color(0xFF101114),
+                  // The real splash paints the app background, so the preview
+                  // does too (custom background and pure black included).
+                  color: AppColors.bg,
+                  border: Border.all(color: AppColors.hairline),
                   borderRadius: BorderRadius.circular(16),
                 ),
                 child: AnimatedBuilder(
@@ -175,128 +189,18 @@ class _AppFaceScreenState extends State<AppFaceScreen>
           ),
       ],
     );
-    final banner = GraphiteSettingsPanel(
-      margin: EdgeInsets.zero,
-      children: [
-        Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('Home banner', style: AppText.headline),
-              const SizedBox(height: 8),
-              Text(
-                'How the featured title shows on Home.',
-                style: AppText.caption,
-              ),
-            ],
-          ),
-        ),
-        for (final option in BannerStyle.options)
-          Semantics(
-            checked: BannerStyle.current.value == option.id,
-            inMutuallyExclusiveGroup: true,
-            child: GraphiteSettingsControl(
-              key: ValueKey('desktop-banner-${option.id}'),
-              icon: Icons.panorama_outlined,
-              leading: _desktopBannerThumb(option.id),
-              title: option.label,
-              subtitle: option.blurb,
-              trailing: BannerStyle.current.value == option.id
-                  ? Icon(Icons.check_circle_rounded, color: AppColors.accent)
-                  : null,
-              onTap: () async {
-                await BannerStyle.select(option.id);
-                if (mounted) setState(() {});
-              },
-            ),
-          ),
-      ],
-    );
+    // One panel, capped so the preview stays a sensible size at 1920 wide.
     return SingleChildScrollView(
       padding: const EdgeInsets.all(22),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          GraphiteSettingsPanel(
-            margin: EdgeInsets.zero,
-            children: [
-              GraphiteSettingsControl(
-                icon: Icons.desktop_windows_outlined,
-                title: 'Windows app icon',
-                subtitle:
-                    'Windows uses the icon bundled with this desktop build. Launcher icon switching is available on Android.',
-              ),
-            ],
-          ),
-          const SizedBox(height: 20),
-          LayoutBuilder(
-            builder: (context, constraints) => constraints.maxWidth >= 1000
-                ? Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Expanded(child: splash),
-                      const SizedBox(width: 20),
-                      Expanded(child: banner),
-                    ],
-                  )
-                : Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [splash, const SizedBox(height: 20), banner],
-                  ),
-          ),
-        ],
+      child: Align(
+        alignment: AlignmentDirectional.topStart,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 760),
+          child: splash,
+        ),
       ),
     );
   }
-
-  /// Compact diagrams distinguish banner geometry without fetching artwork or
-  /// introducing a second independently running Home carousel in settings.
-  Widget _desktopBannerThumb(String id) => Container(
-    width: 64,
-    height: 44,
-    padding: EdgeInsets.all(id == BannerStyle.edgeId ? 0 : 5),
-    decoration: BoxDecoration(
-      color: const Color(0xFF0E0F12),
-      borderRadius: BorderRadius.circular(8),
-    ),
-    clipBehavior: Clip.antiAlias,
-    child: id == BannerStyle.panelsId
-        ? Row(
-            children: [
-              for (var i = 0; i < 3; i++)
-                Expanded(
-                  child: Container(
-                    margin: const EdgeInsets.all(1),
-                    decoration: BoxDecoration(
-                      color: AppColors.accent.withValues(alpha: 0.2 + i * 0.15),
-                      borderRadius: BorderRadius.circular(3),
-                    ),
-                  ),
-                ),
-            ],
-          )
-        : Container(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                colors: [
-                  AppColors.accent.withValues(alpha: 0.5),
-                  const Color(0xFF292A31),
-                ],
-              ),
-              borderRadius: BorderRadius.circular(
-                id == BannerStyle.edgeId ? 0 : 5,
-              ),
-            ),
-            alignment: Alignment.bottomLeft,
-            padding: const EdgeInsets.all(5),
-            child: const Icon(
-              Icons.play_arrow_rounded,
-              size: 14,
-              color: Colors.white,
-            ),
-          ),
-  );
 
   /// Section description under a [SettingsSectionLabel], indented to match it.
   Widget _blurb(String text) => Padding(

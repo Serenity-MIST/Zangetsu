@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 
 import '../../core/di/injector.dart';
+import '../../core/stremio/stremio_manager.dart';
 import '../../core/mode/content_mode.dart';
 import '../../core/mode/content_mode_cubit.dart';
 import '../../core/models/home_section.dart';
@@ -15,7 +16,8 @@ import '../../core/ui/poster_card.dart';
 import '../../core/ui/row_skeleton.dart';
 import '../detail/detail_screen.dart';
 import '../search/browse_source_screen.dart' show canonicalTargetFor;
-import '../sources/providers_hub_screen.dart';
+import '../sources/sources_screen.dart' show SourcesScreen;
+import '../sources/stremio_sources_screen.dart';
 import 'cubit/home_rows_composer.dart' show providerRowSections;
 import 'see_all_screen.dart';
 
@@ -94,6 +96,7 @@ class SourceCatalogueHomeContentState
   bool _failed = false;
   bool _openingItem = false;
   int _generation = 0;
+  StremioManager? _stremioManager;
 
   ContentMode _modeFor(SourceCatalogueHomeContent widget) =>
       widget.mode ??
@@ -104,6 +107,9 @@ class SourceCatalogueHomeContentState
   @override
   void initState() {
     super.initState();
+    if (sl.isRegistered<StremioManager>()) {
+      _stremioManager = sl<StremioManager>()..addListener(_onStremioChanged);
+    }
     widget.controller?._attach(_controllerOwner, refresh);
     _mode = _modeFor(widget);
     _sources = _sourcesForMode();
@@ -139,6 +145,13 @@ class SourceCatalogueHomeContentState
     _notifySections(const []);
   }
 
+  void _onStremioChanged() {
+    if (!mounted || _sourceId != 'stremio') return;
+    _sources = _sourcesForMode();
+    _load(reset: true);
+    _notifySections(const []);
+  }
+
   void _notifySections(List<HomeSection> sections) {
     final generation = _generation;
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -165,6 +178,7 @@ class SourceCatalogueHomeContentState
   }
 
   String? _chooseSourceId([String? preferred]) {
+    if (widget.initialSourceId == 'stremio') return 'stremio';
     if (_sources.any((source) => source.id == preferred)) return preferred;
     final activeId = sl.isRegistered<ActiveSourceCubit>()
         ? sl<ActiveSourceCubit>().state
@@ -182,18 +196,25 @@ class SourceCatalogueHomeContentState
       .loadedSources
       .where((source) {
         final id = source.id;
-        return switch (_mode) {
-          ContentMode.anime =>
-            !id.startsWith('mihon:') && !id.startsWith('lnr:'),
-          ContentMode.manga => id.startsWith('mihon:'),
-          ContentMode.novel => id.startsWith('lnr:'),
-        };
+        // Stremio has its own catalogue toggle; never select it as a fallback.
+        if (widget.initialSourceId == 'stremio') return id == 'stremio';
+        if (id == 'stremio') return false;
+        return sourceIdMatchesContentMode(id, _mode);
       })
       .toList(growable: false);
 
   Future<void> _load({bool reset = false}) async {
     final sourceId = _sourceId;
     if (sourceId == null) return;
+    if (sourceId == 'stremio' && !_sources.any((s) => s.id == sourceId)) {
+      _generation++;
+      setState(() {
+        _loading = false;
+        _failed = false;
+        _sections = const [];
+      });
+      return;
+    }
     final generation = ++_generation;
     setState(() {
       _loading = true;
@@ -256,6 +277,7 @@ class SourceCatalogueHomeContentState
   @override
   void dispose() {
     widget.controller?._detach(_controllerOwner);
+    _stremioManager?.removeListener(_onStremioChanged);
     super.dispose();
   }
 
@@ -265,7 +287,9 @@ class SourceCatalogueHomeContentState
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        if (_sources.isEmpty)
+        if (_sources.isEmpty && _sourceId == 'stremio')
+          _stremioEmptyState()
+        else if (_sources.isEmpty)
           _emptyState(
             icon: Icons.extension_off_rounded,
             title: 'No sources available',
@@ -309,6 +333,7 @@ class SourceCatalogueHomeContentState
       );
     }
     if (!_loading && sections.isEmpty) {
+      if (_sourceId == 'stremio') return _stremioEmptyState();
       return Column(
         key: ValueKey('source-catalogue-empty:$_sourceId'),
         children: [
@@ -333,6 +358,28 @@ class SourceCatalogueHomeContentState
           widget.sectionBuilder?.call(section) ?? _sectionRow(section),
         if (_loading) _shimmerRow(),
       ],
+    );
+  }
+
+  Widget _stremioEmptyState() {
+    final installed = _stremioManager?.installations.isNotEmpty ?? false;
+    final enabled = _stremioManager?.enabled.isNotEmpty ?? false;
+    return _emptyState(
+      icon: Icons.extension_outlined,
+      title: !installed
+          ? 'No addons added'
+          : !enabled
+          ? 'No addons enabled'
+          : 'No catalogues to show',
+      message: !installed
+          ? 'Add a Stremio catalogue addon to start browsing.'
+          : !enabled
+          ? 'Enable a catalogue addon to browse Stremio here.'
+          : 'Check your enabled catalogue addons and connection.',
+      action: () => Navigator.of(context).push(
+        MaterialPageRoute<void>(builder: (_) => const StremioSourcesScreen()),
+      ),
+      actionLabel: installed ? 'Manage addons' : 'Add addons',
     );
   }
 
@@ -449,7 +496,11 @@ class SourceCatalogueHomeContentState
     ),
   );
 
-  void _openSources() => Navigator.of(
-    context,
-  ).push(MaterialPageRoute<void>(builder: (_) => const ProvidersHubScreen()));
+  void _openSources() => Navigator.of(context).push(
+    MaterialPageRoute<void>(
+      // Same screen as Settings > Providers: on Windows (not TV) the
+      // two-pane Sources manager with Back; elsewhere the Providers hub.
+      builder: (_) => const SourcesScreen(),
+    ),
+  );
 }

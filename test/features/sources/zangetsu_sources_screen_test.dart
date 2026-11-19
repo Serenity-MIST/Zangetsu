@@ -14,6 +14,7 @@ import 'package:watch_app/core/provider/provider_registry.dart';
 import 'package:watch_app/core/provider/provider_repo_registry.dart';
 import 'package:watch_app/core/tv/tv_focusable.dart';
 import 'package:watch_app/features/sources/zangetsu_sources_screen.dart';
+import 'package:watch_app/features/sources/sources_desktop_kit.dart';
 
 // ── Fakes (mirrors test/provider/provider_registry_test.dart) ────────────────
 
@@ -204,7 +205,10 @@ void main() {
       expect(find.byType(FloatingActionButton), findsNothing);
       // The toolbar starts with the search-field gutter rather than centering
       // its intrinsic width within the settings content pane.
-      expect(tester.getTopLeft(find.byType(TabBar)).dx, closeTo(22, 1));
+      expect(
+        tester.getTopLeft(find.byKey(DesktopSourcesToolbar.tabsKey)).dx,
+        closeTo(22, 1),
+      );
       expect(
         find.byKey(const ValueKey('desktop-add-zangetsu-repo')),
         findsOneWidget,
@@ -262,7 +266,9 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(
-        DefaultTabController.of(tester.element(find.byType(TabBar))).index,
+        DefaultTabController.of(
+          tester.element(find.byKey(DesktopSourcesToolbar.tabsKey)),
+        ).index,
         1,
       );
       expect(tester.takeException(), isNull);

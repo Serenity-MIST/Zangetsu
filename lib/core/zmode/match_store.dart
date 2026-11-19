@@ -178,7 +178,10 @@ class MatchStore {
   ///
   /// One pass over the title's own keys, same cheap prefix scan as
   /// [pinnedFor].
-  SourceMatch? bestFor(ZCanonical c, {bool Function(String sourceId)? available}) {
+  SourceMatch? bestFor(
+    ZCanonical c, {
+    bool Function(String sourceId)? available,
+  }) {
     final prefix = '${c.key}@';
     final last = lastPlayed(c);
     SourceMatch? played;
@@ -199,6 +202,87 @@ class MatchStore {
   Future<void> forget(ZCanonical c, String sourceId) =>
       _box.delete(_key(c, sourceId));
 
+  /// Every raw match entry of one title (all sources), keyed by box key.
+  /// Taken before a "Wrong title?" pick so its Undo can put the title back
+  /// exactly as it was: [pin] demotes the previous choice, and a plain
+  /// re-pin could not tell a demoted guess from one that never existed.
+  Map<String, Map> snapshot(ZCanonical c) {
+    final prefix = '${c.key}@';
+    return {
+      for (final k in _box.keys)
+        if (k is String && k.startsWith(prefix))
+          if (_box.get(k) case final Map m) k: Map.of(m),
+    };
+  }
+
+  /// Puts a title's entries back to a [snapshot]: entries added since are
+  /// deleted and every saved entry is written back unchanged (pinned flag
+  /// included). Other titles are not touched.
+  Future<void> restore(ZCanonical c, Map<String, Map> saved) async {
+    final prefix = '${c.key}@';
+    for (final k in _box.keys.toList()) {
+      if (k is String && k.startsWith(prefix) && !saved.containsKey(k)) {
+        await _box.delete(k);
+      }
+    }
+    for (final e in saved.entries) {
+      await _box.put(e.key, e.value);
+    }
+  }
+
+  static const String _labelPrefix = 'label:';
+
+  /// The metadata title's own name, remembered when the user fixes a match by
+  /// hand so the Manual matches page can say WHICH title a pin belongs to
+  /// (the match itself only knows the source's show name). Separate prefix,
+  /// so it never collides with match keys or the `last:` entries.
+  Future<void> rememberTitle(ZCanonical c, String title) async {
+    if (title.trim().isEmpty) return;
+    await _box.put('$_labelPrefix${c.key}', {'title': title.trim()});
+  }
+
+  /// The name stored by [rememberTitle], or null for pins made before it.
+  String? titleFor(ZCanonical c) {
+    final v = _box.get('$_labelPrefix${c.key}')?['title'];
+    return v is String && v.isNotEmpty ? v : null;
+  }
+
+  /// Every hand-made (pinned) match in the store, for the Manual matches
+  /// page. One title has at most one pin (see [pin]), so this is one row per
+  /// fixed title. Pins left on uninstalled sources are included: the page is
+  /// where the user tidies those up.
+  List<({ZCanonical canonical, SourceMatch match})> pinnedMatches() {
+    final out = <({ZCanonical canonical, SourceMatch match})>[];
+    for (final k in _box.keys) {
+      if (k is! String) continue;
+      final c = canonicalFromKey(k);
+      if (c == null) continue;
+      final m = _repairMatch(c, SourceMatch.fromMap(_box.get(k)));
+      if (m != null && m.pinned) out.add((canonical: c, match: m));
+    }
+    return out;
+  }
+
+  /// Reads the title back out of a match key (`'<kind>:<id>@<sourceId>'`).
+  /// Null for the `last:` / `label:` entries and anything malformed.
+  static ZCanonical? canonicalFromKey(String key) {
+    final at = key.indexOf('@');
+    if (at <= 0) return null;
+    final head = key.substring(0, at);
+    final colon = head.indexOf(':');
+    if (colon <= 0) return null;
+    final kind = ZKind.values
+        .where((k) => k.name == head.substring(0, colon))
+        .firstOrNull;
+    final id = head.substring(colon + 1);
+    if (kind == null || id.isEmpty) return null;
+    return ZCanonical(kind, id);
+  }
+
+  /// Fires whenever the box changes, so the Manual matches page can refresh
+  /// after an Undo or a reset made elsewhere.
+  Stream<BoxEvent> watch() => _box.watch();
+
   static const String _lastPrefix = 'last:';
 
   String _lastKey(ZCanonical c) => '$_lastPrefix${c.key}';
@@ -208,6 +292,8 @@ class MatchStore {
     final v = _box.get(_lastKey(c))?['sourceId'];
     return v is String && v.isNotEmpty ? v : null;
   }
+
+  Future<void> clearLastPlayed(ZCanonical c) => _box.delete(_lastKey(c));
 
   /// Remember which source served this title on the last successful play.
   Future<void> rememberLastPlayed(ZCanonical c, String sourceId) => _box.put(

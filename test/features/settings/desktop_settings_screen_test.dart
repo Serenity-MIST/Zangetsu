@@ -5,15 +5,18 @@ import 'package:watch_app/core/ui/desktop_settings_surface.dart';
 import 'package:watch_app/core/ui/streaming_prefs.dart';
 import 'package:watch_app/core/profiles/viewer_profile.dart';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:watch_app/core/desktop/desktop_storage.dart';
+import 'package:watch_app/core/desktop/desktop_prefs.dart';
+import 'package:watch_app/features/settings/download_location_screen.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:get_it/get_it.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/anilist/anilist_service.dart';
 import 'package:watch_app/core/app_mode.dart';
-import 'package:watch_app/core/appwrite/appwrite_service.dart';
 import 'package:watch_app/core/download/download_prefs.dart';
 import 'package:watch_app/core/playback/playback_prefs.dart';
 import 'package:watch_app/core/playback/search_prefs.dart';
@@ -29,16 +32,8 @@ import 'package:watch_app/core/tracker/simkl_service.dart';
 import 'package:watch_app/core/tracker/mangabaka_service.dart';
 import 'package:watch_app/features/auth/auth_screens.dart';
 import 'package:watch_app/features/auth/auth_cubit.dart';
-import 'package:watch_app/features/auth/migration_bridge.dart';
 import 'package:watch_app/features/settings/settings_screen.dart';
-import 'package:watch_app/features/settings/desktop_settings_category_grid.dart';
 import 'package:watch_app/l10n/app_localizations.dart';
-
-MigrationBridge _fakeBridge() => MigrationBridge(
-  invoke: (_, _) async => const {'ok': false},
-  signInPassword: (_, _) async => false,
-  verifyOtp: (_, _) async => false,
-);
 
 // ── Minimal stubs (mirrors settings_screen_tv_test.dart / AppMode wiring) ────
 
@@ -174,9 +169,15 @@ void main() {
       ..registerSingleton<TorrentPrefs>(TorrentPrefs())
       ..registerSingleton<ReaderPrefs>(ReaderPrefs());
     activeCubit = ActiveSourceCubit();
+    // The workspace gate reads the target platform now (not the host OS), so
+    // these desktop-workspace tests opt in explicitly.
+    SettingsScreen.debugDesktopWorkspaceOverride = true;
   });
 
   tearDown(() async {
+    SettingsScreen.debugDesktopWorkspaceOverride = null;
+    debugDefaultTargetPlatformOverride = null;
+    DesktopStorage.downloadsRoot = null;
     await activeCubit.close();
     await GetIt.instance.reset();
     await Hive.deleteFromDisk();
@@ -192,11 +193,7 @@ void main() {
     await tester.binding.setSurfaceSize(const Size(1000, 2200));
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
-    final authCubit = AuthCubit(
-      SupabaseService(),
-      AppwriteService(),
-      _fakeBridge(),
-    );
+    final authCubit = AuthCubit(SupabaseService());
     addTearDown(authCubit.close);
     GetIt.instance.registerSingleton<AuthCubit>(authCubit);
 
@@ -237,7 +234,6 @@ void main() {
   ) async {
     await pumpSettings(tester);
     expect(find.byType(DesktopSettingsWorkspace), findsOneWidget);
-    expect(find.byType(DesktopSettingsCategoryGrid), findsNothing);
     expect(find.text('Settings appearance'), findsNothing);
 
     // The new cards retain real existing routes rather than placeholder pages.
@@ -304,7 +300,10 @@ void main() {
     expect(find.text('Providers'), findsNothing);
     expect(find.text('Storage'), findsNothing);
     expect(find.text('Backup & Restore'), findsOneWidget);
-    expect(find.text('Manage profiles'), findsOneWidget);
+    // The Account page's profile strip switches profiles (the card above
+    // opens the manager), so there is no duplicate Manage button.
+    expect(find.text('Switch profile'), findsOneWidget);
+    expect(find.text('Manage profiles'), findsNothing);
   });
 
   testWidgets('tapping a category drills into its settings', (tester) async {
@@ -349,6 +348,8 @@ void main() {
   testWidgets('desktop playback exposes working control-bar customization', (
     tester,
   ) async {
+    // The Windows Player section (control bar editor) is a Windows target row.
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
     await pumpSettings(tester);
     await tester.tap(find.text('Playback'));
     await tester.pumpAndSettle();
@@ -362,6 +363,7 @@ void main() {
     expect(find.text('Reset'), findsOneWidget);
     expect(find.text('Default player'), findsNothing);
     expect(tester.takeException(), isNull);
+    debugDefaultTargetPlatformOverride = null;
   });
 
   testWidgets('connection summary includes all four trackers', (tester) async {
@@ -576,6 +578,19 @@ void main() {
       expect(find.byType(Dialog), findsOneWidget);
       expect(find.byType(BottomSheet), findsNothing);
       if (label == 'App font') {
+        // The new System option leads the list, so the downloadable fonts sit
+        // below the dialog's fold: scroll the dialog list to reach them.
+        expect(find.text("Your system's default font"), findsOneWidget);
+        await tester.scrollUntilVisible(
+          find.text('Rubik'),
+          120,
+          scrollable: find
+              .descendant(
+                of: find.byType(Dialog),
+                matching: find.byType(Scrollable),
+              )
+              .first,
+        );
         expect(find.text('Downloads on first use'), findsWidgets);
       } else {
         for (final description in [
@@ -642,6 +657,48 @@ void main() {
     expect(prefs.myListStyle, 'new');
   });
 
+  // Windows: Downloads has a Download location row, and the search leaves
+  // pointed at it (LeafParent.downloadLocation) appear and open that page.
+  testWidgets('Windows Download location row and its search leaves', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    DesktopStorage.downloadsRoot = '${hiveDir.path}\\Downloads\\Zangetsu';
+    await pumpSettings(tester);
+
+    await tester.tap(find.byKey(const ValueKey('desktop-nav-downloads')));
+    await tester.pumpAndSettle();
+    expect(find.text('Download location'), findsOneWidget);
+    await tester.tap(find.text('Download location'));
+    await tester.pumpAndSettle();
+    expect(find.byType(DownloadLocationScreen), findsOneWidget);
+    await tester.tap(find.byTooltip('Back').last);
+    await tester.pumpAndSettle();
+    expect(find.byType(DownloadLocationScreen), findsNothing);
+
+    for (final leaf in const [
+      'Choose folder…',
+      'Reset to default',
+      'Open in File Explorer',
+    ]) {
+      await tester.enterText(find.byType(TextField), leaf);
+      await tester.pumpAndSettle();
+      // The query also sits in the search field; match the result row only.
+      final hit = find.byWidgetPredicate(
+        (w) => w is Text && w.data == leaf,
+      );
+      expect(hit, findsOneWidget, reason: leaf);
+      await tester.tap(hit);
+      await tester.pumpAndSettle();
+      expect(find.byType(DownloadLocationScreen), findsOneWidget, reason: leaf);
+      await tester.tap(find.byTooltip('Back').last);
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), '');
+      await tester.pumpAndSettle();
+    }
+    debugDefaultTargetPlatformOverride = null;
+  });
+
   testWidgets('search cuts across every section (flat filtered list)', (
     tester,
   ) async {
@@ -655,5 +712,73 @@ void main() {
     // …and non-matching tiles/categories are filtered out.
     expect(find.text('Providers'), findsNothing);
     expect(find.byKey(const ValueKey('desktop-nav-sources')), findsOneWidget);
+  });
+
+  // set-1: a one-page section (Playback) shows that page as the section, so
+  // one Back leaves Settings instead of landing on a one-row list.
+  testWidgets('one-page sections show their page with nothing underneath', (
+    tester,
+  ) async {
+    await pumpSettings(tester, routed: true);
+    await tester.tap(find.byKey(const ValueKey('desktop-nav-playback')));
+    await tester.pumpAndSettle();
+    expect(find.byType(PlaybackSettingsScreen), findsOneWidget);
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(find.byType(SettingsScreen), findsNothing);
+    expect(find.text('Open player settings'), findsOneWidget);
+  });
+
+  // set-8 C: Settings reopens on the section used last, not always Account.
+  testWidgets('reopens on the last settings section', (tester) async {
+    // Real Hive file IO runs outside the fake-async test zone. The box is
+    // closed again before the widgets run: a write started inside the fake
+    // zone (a sidebar tap saves the section) never completes there, and
+    // tearDown would wait on it forever. Closed box -> the getter falls back.
+    await tester.runAsync(() async {
+      await Hive.openBox(DesktopPrefs.boxName);
+      await DesktopPrefs.setLastSettingsSection('sources');
+    });
+    await pumpSettings(tester);
+    // Opens on Sources, not Account.
+    expect(find.text('Providers'), findsOneWidget);
+    expect(find.text('Backup & Restore'), findsNothing);
+    await tester.runAsync(() => Hive.box(DesktopPrefs.boxName).close());
+  });
+
+  // set-3 + set-2: Ctrl+F focuses the sidebar search from a page, words
+  // match in any order, and a leaf result focuses its own row.
+  testWidgets('Ctrl+F searches and a leaf result focuses its row', (
+    tester,
+  ) async {
+    await pumpSettings(tester);
+    await tester.tap(find.byKey(const ValueKey('desktop-nav-sources')));
+    await tester.pumpAndSettle();
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+    await tester.pumpAndSettle();
+    final search = find.byType(TextField).first;
+    expect(tester.widget<TextField>(search).focusNode?.hasFocus, isTrue);
+    await tester.enterText(search, 'episode next autoplay');
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Autoplay next episode'));
+    // Route transition, seeking and the flash.
+    for (var i = 0; i < 40; i++) {
+      await tester.pump(const Duration(milliseconds: 50));
+    }
+    await tester.pumpAndSettle();
+    expect(find.byType(PlaybackSettingsScreen), findsOneWidget);
+    final row = find.widgetWithText(
+      GraphiteSettingsControl,
+      'Autoplay next episode',
+    );
+    expect(row, findsOneWidget);
+    final focused = FocusManager.instance.primaryFocus?.context;
+    expect(focused, isNotNull);
+    expect(
+      find.descendant(of: row, matching: find.byWidget(focused!.widget)),
+      findsOneWidget,
+    );
   });
 }

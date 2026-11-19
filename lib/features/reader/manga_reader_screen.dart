@@ -1,13 +1,13 @@
+import '../../core/playback/list_auto_status.dart';
 import '../../core/desktop/extension_runtime.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter/foundation.dart'
-    show defaultTargetPlatform, TargetPlatform;
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -15,6 +15,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../core/reading/reader_image_budget.dart';
 import '../../core/reading/crop_borders.dart';
 import '../../core/reading/reader_page_queue.dart';
+import '../../core/reading/reader_page_image.dart';
 import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:visibility_detector/visibility_detector.dart';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
@@ -22,7 +23,16 @@ import 'package:gal/gal.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../../core/di/injector.dart';
+// Windows reader additions: graphite context menus, image clipboard,
+// reader keys and the chapter downloader for the chapter panel.
+import '../../core/desktop/desktop_context_menu.dart';
+import '../../core/desktop/desktop_image_clipboard.dart';
+import '../../core/desktop/desktop_shortcuts.dart';
+import '../../core/download/chapter_download_store.dart';
+import '../../core/download/chapter_downloader.dart';
+import '../../core/mode/content_mode.dart';
 import '../../core/error/exceptions.dart';
+import '../../core/mangayomi/mangayomi_cloudflare.dart';
 import '../../core/models/episode.dart';
 import '../../core/reading/chapter_nav.dart';
 import '../../core/reading/manga_translation/manga_page_translation_models.dart';
@@ -51,7 +61,9 @@ import '../../core/theme/app_text.dart';
 import '../../core/tracker/tracker.dart';
 import '../../core/tracker/tracker_hub.dart';
 import 'reader_chrome.dart';
+import 'desktop_chapter_list_panel.dart';
 import 'desktop_reader_input.dart';
+import 'desktop_page_scroller.dart';
 import 'reader_auto_scroll.dart';
 import 'reader_auto_scroll_ui.dart';
 import 'reader_comfort.dart';
@@ -119,11 +131,6 @@ class MangaReaderScreen extends StatefulWidget {
   State<MangaReaderScreen> createState() => _MangaReaderScreenState();
 }
 
-/// How long a page takes to fade in once its image lands. Short on purpose:
-/// this plays while someone is still scrolling, and the package's 500ms
-/// default is long enough to look like the page is struggling.
-const Duration _kPageFade = Duration(milliseconds: 220);
-
 class _MangaReaderScreenState extends State<MangaReaderScreen>
     with ReaderComfortMixin<MangaReaderScreen>, TickerProviderStateMixin {
   /// Hands-free scrolling — webtoon only; paged modes step whole pages and
@@ -159,6 +166,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   String? _error;
   String? _cloudflareUrl;
   int _pageRetry = 0;
+  bool _solvingCloudflare = false;
 
   /// Every page currently in the strip — which, once you read past the end of
   /// a chapter, spans MORE THAN ONE chapter. [_slots] says which.
@@ -206,6 +214,11 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   final ValueNotifier<int> _pageIndexVN = ValueNotifier<int>(0);
   int get _pageIndex => _pageIndexVN.value;
   set _pageIndex(int value) => _pageIndexVN.value = value;
+
+  /// Bumped on every scroll frame (both modes — PageView scrolls too) so the
+  /// page pill can show *while* scrolling, not just when the page flips.
+  /// Nobody rebuilds on this except the pill itself.
+  final ValueNotifier<int> _scrollTickVN = ValueNotifier<int>(0);
 
   late final MangaPageTranslationService _translationService =
       widget.translationService ?? MangaPageTranslationService();
@@ -257,6 +270,14 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   bool _pagedZoomed = false;
 
   bool get _lockPagedScroll => _pagedPinchActive || _pagedZoomed;
+
+  /// Windows: scroll views of the paged items whose fit overflows the window,
+  /// by PageView item index, so keys can scroll the page on screen.
+  final Map<int, DesktopPageScrollerState> _desktopScrollers = {};
+
+  /// Windows: the last page step went backwards, so the page arriving opens
+  /// at its bottom and reading upwards carries on where it left off.
+  bool _desktopArrivedBackward = false;
 
   // Webtoon (vertical) pinch-zoom. The strip stays a lazy ListView for
   // one-finger scrolling; a two-finger pinch drives this scale/offset which a
@@ -360,6 +381,10 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       c.dispose();
     }
     _pageIndexVN.dispose();
+    _scrollTickVN.dispose();
+    // Windows zoom badge (reader-5) and its hide timer.
+    _zoomBadgeTimer?.cancel();
+    _zoomBadge.dispose();
     super.dispose();
   }
 
@@ -471,8 +496,13 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     } on CloudflareRequiredException catch (error) {
       if (!mounted) return;
       setState(() {
-        _cloudflareUrl = error.url;
-        _error = 'Complete source verification to load this chapter.';
+        // Mangayomi gets upstream's dedicated Cloudflare panel everywhere;
+        // Windows also offers verification for every other source.
+        final mangayomi = widget.sourceId.startsWith('mg:');
+        if (mangayomi || _desktopReader) _cloudflareUrl = error.url;
+        _error = !mangayomi && _desktopReader
+            ? 'Complete source verification to load this chapter.'
+            : kChapterLoadFailedMessage;
         _loading = false;
       });
     } catch (_) {
@@ -542,8 +572,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// strip as sideways slices, which is unreadable. Deliberately off the build
   /// path: [_effectiveDirection] runs on every build and only reads the result.
   ///
-  /// The provider is built the way [_pagedItem]/[_verticalItem] build theirs
-  /// (CachedNetworkImage wraps its provider in a ResizeImage), so this reads
+  /// The provider is the same bounded one the page widgets use, so this reads
   /// the page the reader is already decoding instead of fetching a second,
   /// full-size copy. A page that never resolves leaves the flag null and the
   /// reader keeps whatever direction was asked for.
@@ -590,12 +619,30 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// it picks up an orientation/window change for free.
   int _decodeWidth(BuildContext context) {
     final mq = MediaQuery.of(context);
+    // Windows double-page spreads use the whole window (reader-8), so each
+    // page gets half of it; single pages stay capped at the paged column.
+    final desktopWidth = _desktopReader && _activeSpreads() != null
+        ? mq.size.width / 2
+        : math.min(mq.size.width, _kDesktopPagedMaxWidth);
     return readerDecodeWidth(
-      ((Platform.isWindows ? math.min(mq.size.width, 1040) : mq.size.width) *
+      ((Platform.isWindows ? desktopWidth : mq.size.width) *
               mq.devicePixelRatio)
           .round(),
     );
   }
+
+  /// Width cap of the Windows paged column (single pages).
+  static const double _kDesktopPagedMaxWidth = 1040;
+
+  /// Width cap of the Windows long strip for this series: the per-series
+  /// 'Page width' (reader-5) or the default. The strip, its decode width and
+  /// its reserved page heights all read this, so they stay in step.
+  double get _desktopStripMaxWidth => sl.isRegistered<ReaderOverrideStore>()
+      ? sl<ReaderOverrideStore>().effectivePageWidth(
+          widget.sourceId,
+          widget.showId,
+        )
+      : ReaderOverrideStore.defaultPageWidth;
 
   /// Decode width for a page in the WEBTOON strip — see [webtoonZoomHeadroom].
   ///
@@ -606,8 +653,11 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// gesture for the same frames.
   int _webtoonDecodeWidth(BuildContext context) {
     final mq = MediaQuery.of(context);
+    // Same cap as the strip itself (per-series page width on Windows).
     final device =
-        ((Platform.isWindows ? math.min(mq.size.width, 1040) : mq.size.width) *
+        ((Platform.isWindows
+                    ? math.min(mq.size.width, _desktopStripMaxWidth)
+                    : mq.size.width) *
                 mq.devicePixelRatio)
             .round();
     return readerDecodeWidth(
@@ -624,11 +674,14 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     final width = _effectiveDirection(sl<ReaderPrefs>()) == 'vertical'
         ? _webtoonDecodeWidth(context)
         : _decodeWidth(context);
-    final window = preloadWindow(
-      index,
-      pages.length,
-      count: sl<ReaderPrefs>().preloadCount,
-    );
+    final window = [
+      if (index >= 0 && index < pages.length) index,
+      ...preloadWindow(
+        index,
+        pages.length,
+        count: sl<ReaderPrefs>().preloadCount,
+      ),
+    ];
 
     // Through the queue, one at a time, nearest first — NOT all at once.
     //
@@ -644,11 +697,12 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     _pageQueue.keepOnly(keep);
     for (final i in window) {
       final p = pages[i];
+      // add starts the worker synchronously, so its task must already exist.
+      _queueTasks[p.url] = () => _fetchPageBytes(p, i, width);
       _pageQueue.add(
         p.url,
         i == index ? PagePriority.current : PagePriority.adjacent,
       );
-      _queueTasks[p.url] = () => _fetchPageBytes(p, i, width);
     }
     _warmNextChapter(index, pages.length);
     // Within a couple of pages of the strip's end — pull the next chapter on.
@@ -752,10 +806,8 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// Deliberately NOT precacheImage. A page decodes to width x height x 4 —
   /// around 28MB at our decode width — so precaching even a few pushed the
   /// already-decoded ones straight back out of the image cache and the reader
-  /// paid to decode them again on the way past. This is the same call
-  /// CachedNetworkImage makes for maxWidthDiskCache, so the file lands under
-  /// the key the visible page resolves to; only the page being looked at ends
-  /// up decoded in memory.
+  /// paid to decode them again on the way past. Cache the original bytes;
+  /// resizing on disk can squash tall images before the tile decoder sees them.
   Future<void> _fetchPageBytes(PageImage p, int index, int width) async {
     // A tile crop needs a real file on disk, which most pages do not start
     // with — resolve one here, off the same preload pass that measures the
@@ -763,7 +815,6 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     if (!_pageFile.containsKey(p.url)) {
       final f = await _pageFiles.fileFor(p.url, p.headers);
       if (f != null && mounted) {
-        _pageFile[p.url] = f.path;
         // Read the TRUE pixel size here rather than leaving it to the measure
         // paths below, because neither can supply it for every page kind: a
         // page the native side draws never reaches [_measureFromFile], and
@@ -771,7 +822,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
         // the size the file really is. Getting that wrong means a tile crop
         // addressed in the wrong space — and a page cropped wrong is a visibly
         // broken page, not a slow one.
-        await _recordPixelSize(f, p.url);
+        await _recordPageFile(f, p.url);
       }
     }
     // A page the NATIVE side draws must be measured from what the native side
@@ -790,13 +841,14 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       await _measureFromProvider(p, width);
       return;
     }
-    final stream = DefaultCacheManager().getImageFile(
+    final stream = DefaultCacheManager().getFileStream(
       p.url,
       headers: p.headers,
-      maxWidth: width,
     );
     await for (final r in stream) {
       if (r is FileInfo) {
+        if (!mounted) return;
+        await _recordPageFile(r.file, p.url);
         // Shape read off the file BEFORE the page is ever built — see
         // [_measureFromFile] for why that matters so much here.
         if (!_aspect.containsKey(p.url)) {
@@ -888,8 +940,8 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// [PageFileCache] resolved for it. Header-only on purpose: the point is to
   /// avoid decoding the page, so pulling the whole thing in to ask how big it
   /// is would defeat the feature it serves.
-  Future<void> _recordPixelSize(File file, String url) async {
-    if (_pixelSize.containsKey(url)) return;
+  Future<void> _recordPageFile(File file, String url) async {
+    if (_pageFile[url] == file.path && _pixelSize.containsKey(url)) return;
     ui.ImmutableBuffer? buffer;
     ui.ImageDescriptor? desc;
     try {
@@ -898,6 +950,8 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       final w = desc.width, h = desc.height;
       if (w <= 0 || h <= 0 || !mounted) return;
       _pixelSize[url] = Size(w.toDouble(), h.toDouble());
+      _pageFile[url] = file.path;
+      _flushAspects();
     } catch (_) {
       // Unreadable means no tiling for this page, which is the same as not
       // having a file at all — the plain path draws it.
@@ -968,6 +1022,9 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       if (!mounted) return;
       if (!_verticalController.hasClients) {
         setState(() {});
+        // Windows double-page: a page now known to be wide may regroup the
+        // spreads; keep the view on the page being read (reader-8).
+        _reanchorSpreadsIfChanged();
         return;
       }
       // Never while the finger is down or the fling is running. setState here
@@ -1594,11 +1651,71 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     final dir = _effectiveDirection(prefs);
     if (dir == 'vertical') return null;
     if (MediaQuery.orientationOf(context) != Orientation.landscape) return null;
-    // ponytail: wide-page detection deferred (needs the image decoded to read
-    // its aspect ratio) — every pair is two portrait pages. Upgrade path:
-    // resolve each page's decoded size via an ImageStream listener and pass
-    // the landscape (aspect > 1) indices here as `wide`.
-    return pairPages(pages.length, rtl: dir == 'rtl', wide: const {});
+    final rtl = dir == 'rtl';
+    // Phones keep the old pairing exactly.
+    if (!_desktopReader) return pairPages(pages.length, rtl: rtl);
+    // Windows (reader-8): a page measured wider than tall is already a full
+    // spread, so it stands alone instead of being squeezed beside a
+    // neighbour. Shapes come from the sizes the reader already measures.
+    final wide = <int>{
+      for (var i = 0; i < pages.length; i++)
+        if ((_aspect[pages[i].url] ?? 2) < _kWideSpreadAspect) i,
+    };
+    var spreads = pairPages(pages.length, rtl: rtl, wide: wide);
+    if (_shiftSpread) {
+      // 'Shift spread by one page': the first page that would be paired
+      // stands alone instead, so every later pair moves along by one.
+      final firstPair = spreads.indexWhere((s) => s.length == 2);
+      if (firstPair >= 0) {
+        final lowest = spreads[firstPair].reduce(math.min);
+        spreads = pairPages(pages.length, rtl: rtl, wide: {...wide, lowest});
+      }
+    }
+    return spreads;
+  }
+
+  /// Height/width below which a page counts as a two-page spread scan. A
+  /// print page is about 1.4; a scanned spread is about 0.7.
+  static const double _kWideSpreadAspect = 1.0;
+
+  /// This series' 'Shift spread by one page' setting (reader-8).
+  bool get _shiftSpread => sl.isRegistered<ReaderOverrideStore>()
+      ? sl<ReaderOverrideStore>().shiftSpread(widget.sourceId, widget.showId)
+      : false;
+
+  /// Flips the series' spread shift and keeps the reader on the same page.
+  Future<void> _toggleShiftSpread() async {
+    if (!sl.isRegistered<ReaderOverrideStore>()) return;
+    final on = !_shiftSpread;
+    await sl<ReaderOverrideStore>().setShiftSpread(
+      widget.sourceId,
+      widget.showId,
+      on,
+    );
+    if (!mounted) return;
+    setState(() {});
+    _syncControllersAfterDirectionChange();
+    _flashZoomBadge(
+      on
+          ? context.l10n.spreadsShifted
+          : context.l10n.spreadsNotShifted,
+    );
+  }
+
+  /// Spread grouping the PageView was last built with (Windows), so a page
+  /// measured wide later re-anchors the view instead of jumping a spread.
+  String? _lastSpreadLayout;
+
+  /// Windows: after new page shapes arrive, if the double-page grouping
+  /// changed, keep the PageView on the spread holding the current page.
+  void _reanchorSpreadsIfChanged() {
+    if (!_desktopReader) return;
+    final spreads = _activeSpreads();
+    final layout = spreads?.map((s) => s.join(',')).join('|');
+    if (layout == _lastSpreadLayout) return;
+    _lastSpreadLayout = layout;
+    if (spreads == null) return;
+    _syncControllersAfterDirectionChange();
   }
 
   /// The index of the spread that contains real page [page]. Falls back to 0
@@ -1806,6 +1923,21 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       ),
       flush: flush,
     );
+    // Windows: keeps My List in step with reading (Plan to read -> Reading,
+    // the last chapter of a finished series -> Completed). No-op elsewhere.
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      unawaited(
+        ListAutoStatus.instance.onReadProgress(
+          widget.showUrl,
+          ep.number,
+          finished: sl<ReadStore>().finished(
+            widget.sourceId,
+            widget.showId,
+            ep.id,
+          ),
+        ),
+      );
+    }
     if (sl<ReadStore>().finished(widget.sourceId, widget.showId, ep.id)) {
       _maybeScrobble(ep);
     }
@@ -1878,6 +2010,9 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       _wZooming = false;
       _pagedPinchActive = false;
       _pagedZoomed = false;
+      // Windows Ctrl zoom of Width/Smart pages starts over too (reader-5).
+      _overflowZoom = 1.0;
+      _pagedItemContexts.clear();
     });
     _load();
   }
@@ -2098,24 +2233,57 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   @override
   Widget build(BuildContext context) {
     final prefs = sl<ReaderPrefs>();
+    final pageTotal = _activeSpreads()?.length ?? _pages?.length ?? 0;
+    final direction = _effectiveDirection(prefs);
     return Scaffold(
       backgroundColor: readerBgColor(prefs.mangaBackground),
       body: _desktopReader
           ? DesktopReaderInput(
-              direction: _effectiveDirection(prefs),
+              key: _desktopInputKey,
+              direction: direction,
+              // The wheel moves the strip at once; keys glide (reader-3).
               onVerticalScroll: _desktopScroll,
+              onVerticalKeyScroll: _desktopKeyScroll,
               onPageStep: _desktopPage,
-              builder: (top, bottom) => _buildReaderStack(
-                prefs,
-                topVisible: top,
-                bottomVisible: bottom,
+              // reader-4: the reader.* keys (N/P, ] / [, C, S, A, Backspace,
+              // F/F11, M, '?') come from DesktopShortcuts in the input
+              // widget; bars, back and help use its defaults.
+              // F / F11 go through ReaderComfortMixin so the window is put
+              // back the way it was when the reader closes.
+              onToggleFullscreen: toggleReaderFullscreen,
+              onNextChapter: () => _goToChapter(_nextIndex),
+              onPreviousChapter: () => _goToChapter(_prevIndex),
+              onChapterList: _openChapterSheet,
+              onSettings: () => unawaited(_openSettingsSheet()),
+              onAutoScroll: () => _setAutoScroll(!_autoScroll.running.value),
+              // reader-5: Ctrl+= / Ctrl+- / Ctrl+0.
+              onZoomBy: _desktopZoomBy,
+              onZoomReset: _desktopZoomReset,
+              // reader-7: click the page to turn it (tap-zone layout).
+              onPageClick: _desktopPageClick,
+              // A double click zooms the page, so a single click waits out
+              // the double-click interval before it turns the page.
+              deferClicks: true,
+              builder: (top, bottom) => DesktopReaderKeyScope(
+                onKey: _desktopKey,
+                child: _buildReaderStack(
+                  prefs,
+                  pageTotal: pageTotal,
+                  topVisible: top,
+                  bottomVisible: bottom,
+                ),
               ),
             )
-          : _buildReaderStack(prefs),
+          : _buildReaderStack(prefs, pageTotal: pageTotal),
     );
   }
 
-  /// Scrolls through the same strip controller used to save reading progress.
+  /// Lets the reader reach the Windows input widget: its bar pinning (for
+  /// the middle click zone) and its box (to place zoom focal points).
+  final GlobalKey<DesktopReaderInputState> _desktopInputKey =
+      GlobalKey<DesktopReaderInputState>();
+
+  /// Wheel scrolling of the strip: immediate, like any scroll view.
   void _desktopScroll(double delta) {
     if (!_verticalController.hasClients) return;
     final position = _verticalController.position;
@@ -2127,39 +2295,436 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     );
   }
 
+  /// Keyboard and side-button scrolling of the strip: a short glide so the
+  /// eye can follow it (reader-3 B).
+  void _desktopKeyScroll(double delta) {
+    unawaited(desktopAnimatedScrollBy(_verticalController, delta));
+  }
+
   /// PageController handles both individual pages and landscape spreads.
+  ///
+  /// reader-6 A: 'next' on the end-of-chapter page opens the next chapter,
+  /// so reading by keyboard (or wheel, or click) never stalls there.
   void _desktopPage(bool forward) {
     if (!_pageController.hasClients || _loading) return;
+    if (forward && _onChapterEndPage) {
+      _goToChapter(_nextIndex);
+      return;
+    }
+    // Read by the arriving page's DesktopPageScroller as it is built.
+    _desktopArrivedBackward = !forward;
+    final Future<void> turn;
     if (forward) {
-      _pageController.nextPage(
+      turn = _pageController.nextPage(
         duration: const Duration(milliseconds: 140),
         curve: Curves.easeOut,
       );
     } else {
-      _pageController.previousPage(
+      turn = _pageController.previousPage(
         duration: const Duration(milliseconds: 140),
         curve: Curves.easeOut,
       );
     }
+    // Only the page this step arrives at may open at its bottom.
+    // Cleared after the frame that lays the arriving page out: a short turn
+    // can finish before that frame's layout, which would clear it too early.
+    unawaited(
+      turn.whenComplete(() {
+        WidgetsBinding.instance
+          ..addPostFrameCallback((_) => _desktopArrivedBackward = false)
+          ..scheduleFrame();
+      }),
+    );
+  }
+
+  /// True while the paged view shows the extra end-of-chapter page.
+  bool get _onChapterEndPage {
+    final pages = _pages;
+    if (pages == null || !_hasTransitionPage || !_pageController.hasClients) {
+      return false;
+    }
+    final count = _activeSpreads()?.length ?? pages.length;
+    final item = _pageController.page?.round() ?? 0;
+    return item >= count;
+  }
+
+  /// The scroll view of the paged item on screen, when its fit overflows.
+  DesktopPageScrollerState? get _currentDesktopScroller {
+    if (!_pageController.hasClients) return null;
+    final item = _pageController.page?.round();
+    return item == null ? null : _desktopScrollers[item];
+  }
+
+  /// Windows keys handled ahead of DesktopReaderInput: arrows, PageUp/PageDown,
+  /// Space and Home/End scroll inside a page taller than the window, and only
+  /// at its edge do PageUp/PageDown/Space turn the page. Keys ignored here
+  /// still reach DesktopReaderInput, so Left/Right paging is unchanged.
+  KeyEventResult _desktopKey(KeyEvent event) {
+    if (_loading || _pages == null) return KeyEventResult.ignored;
+    final key = event.logicalKey;
+    final shift = HardwareKeyboard.instance.isShiftPressed;
+    final vertical = _effectiveDirection(sl<ReaderPrefs>()) == 'vertical';
+    // reader-8: O shifts double-page spreads by one page (paged only).
+    if (!vertical && DesktopShortcuts.matches('reader.shiftSpread', event)) {
+      if (event is KeyDownEvent) unawaited(_toggleShiftSpread());
+      return KeyEventResult.handled;
+    }
+    // reader.firstPage / reader.lastPage (Home / End) when there is no tall
+    // page to scroll to its edge first.
+    final first = DesktopShortcuts.matches('reader.firstPage', event);
+    final last = DesktopShortcuts.matches('reader.lastPage', event);
+    if (vertical) {
+      if (first || last) {
+        if (event is KeyDownEvent) _desktopJumpToEdgePage(last: last);
+        return KeyEventResult.handled;
+      }
+      // The strip already scrolls on arrows/PageUp/PageDown; Space joins them.
+      if (key != LogicalKeyboardKey.space) return KeyEventResult.ignored;
+      final height = _verticalController.hasClients
+          ? _verticalController.position.viewportDimension
+          : MediaQuery.sizeOf(context).height;
+      _desktopKeyScroll((shift ? -0.85 : 0.85) * height);
+      return KeyEventResult.handled;
+    }
+    final scroller = _currentDesktopScroller;
+    if (key == LogicalKeyboardKey.arrowDown ||
+        key == LogicalKeyboardKey.arrowUp) {
+      // Arrows only scroll, so holding one never flips through pages.
+      if (scroller == null) return KeyEventResult.ignored;
+      scroller.scrollBy(
+        key == LogicalKeyboardKey.arrowDown
+            ? kDesktopArrowScrollStep
+            : -kDesktopArrowScrollStep,
+        animate: true,
+      );
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.pageDown ||
+        key == LogicalKeyboardKey.pageUp ||
+        key == LogicalKeyboardKey.space) {
+      final forward =
+          key == LogicalKeyboardKey.pageDown ||
+          (key == LogicalKeyboardKey.space && !shift);
+      final step = (scroller?.viewportHeight ?? 0) * 0.85;
+      if (scroller != null &&
+          scroller.scrollBy(forward ? step : -step, animate: true)) {
+        return KeyEventResult.handled;
+      }
+      if (key != LogicalKeyboardKey.space) return KeyEventResult.ignored;
+      _desktopPage(forward);
+      return KeyEventResult.handled;
+    }
+    if (first || last) {
+      final moved = scroller?.jumpToEdge(end: last) ?? false;
+      if (!moved && event is KeyDownEvent) _desktopJumpToEdgePage(last: last);
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  /// Home / End: the chapter's first or last page, saved like a slider seek.
+  void _desktopJumpToEdgePage({required bool last}) {
+    final pages = _pages;
+    if (pages == null || pages.isEmpty) return;
+    // Within the chapter being read, even when the strip holds the next one.
+    final slot = _slotAt(_pageIndex);
+    final start = _pageIndex - (slot?.pageInChapter ?? _pageIndex);
+    final count = slot?.chapterPages ?? pages.length;
+    final target = last ? start + count - 1 : start;
+    _seekToPage(target);
+    _commitSeek(target);
+  }
+
+  /// reader-7: a left click on the page, from DesktopReaderInput. Uses the
+  /// existing paged tap-zone layout (mirrored for right-to-left): the side
+  /// zones turn the page, the middle pins the bars. Only in paged reading,
+  /// and only while 'Click to turn pages' is on.
+  void _desktopPageClick(Offset local, Size size) {
+    if (!mounted || _loading || _pages == null) return;
+    if (size.width <= 0 || size.height <= 0) return;
+    final prefs = sl<ReaderPrefs>();
+    final mode = _effectiveDirection(prefs);
+    if (mode == 'vertical' || !prefs.clickToTurn) return;
+    final action = prefs
+        .tapZonesForMode(mode)
+        .actionAt(
+          Offset(
+            (local.dx / size.width).clamp(0.0, 1.0),
+            (local.dy / size.height).clamp(0.0, 1.0),
+          ),
+          rtl: mode == 'rtl',
+        );
+    switch (action) {
+      case ReaderAction.nextPage:
+        _desktopPage(true);
+      case ReaderAction.prevPage:
+        _desktopPage(false);
+      case ReaderAction.toggleMenu:
+        _desktopInputKey.currentState?.toggleBars();
+      default:
+        _runReaderAction(action);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Windows zoom (reader-5)
+  // ---------------------------------------------------------------------
+
+  /// Zoom step for one Ctrl+wheel notch.
+  static const double _kWheelZoomStep = 1.1;
+
+  /// Largest paged zoom.
+  static const double _kMaxPagedZoom = 5.0;
+
+  /// Paged zoom of the Width/Smart fits, which draw pages inside a
+  /// [DesktopPageScroller] instead of a zoom transform: pages are laid out
+  /// this much wider and the scroller pans them. Reset per chapter.
+  double _overflowZoom = 1.0;
+
+  /// The paged item's build context per page index, to find the box of the
+  /// page under the cursor for a zoom.
+  final Map<int, BuildContext> _pagedItemContexts = {};
+
+  /// Ctrl+= / Ctrl+- from DesktopReaderInput. [focal] is the mouse position
+  /// inside that widget; it becomes a global point for the page under it.
+  void _desktopZoomBy(double factor, Offset? focal) {
+    Offset? global;
+    final box = _desktopInputKey.currentContext?.findRenderObject();
+    if (focal != null && box is RenderBox && box.hasSize) {
+      global = box.localToGlobal(focal);
+    }
+    _zoomAt(factor, global);
+  }
+
+  /// Applies a zoom step around [global] (or the page centre): the strip's
+  /// page width in long-strip mode, the page itself in paged mode.
+  void _zoomAt(double factor, Offset? global) {
+    if (_loading || _pages == null) return;
+    if (_effectiveDirection(sl<ReaderPrefs>()) == 'vertical') {
+      _zoomStripBy(factor);
+    } else if (_desktopOverflow) {
+      _zoomOverflowBy(factor, global);
+    } else {
+      _zoomPagedBy(factor, global);
+    }
+  }
+
+  /// Ctrl+0: back to 100% (paged) or the default page width (long strip).
+  void _desktopZoomReset() {
+    if (_loading || _pages == null) return;
+    if (_effectiveDirection(sl<ReaderPrefs>()) == 'vertical') {
+      if (sl.isRegistered<ReaderOverrideStore>()) {
+        unawaited(
+          sl<ReaderOverrideStore>().setPageWidthOverride(
+            widget.sourceId,
+            widget.showId,
+            null,
+          ),
+        );
+      }
+      setState(() {});
+      _flashZoomBadge(
+        context.l10n.pageWidthPx(ReaderOverrideStore.defaultPageWidth.round()),
+      );
+      return;
+    }
+    _cancelDoubleTapZoom();
+    for (final c in _zoomControllers.values) {
+      c.value = Matrix4.identity();
+    }
+    setState(() {
+      _overflowZoom = 1.0;
+      _pagedZoomed = false;
+    });
+    _flashZoomBadge('100%');
+  }
+
+  /// Contain/Height fit: scales the page under the cursor with its own zoom
+  /// controller, keeping the point under the cursor still.
+  void _zoomPagedBy(double factor, Offset? global) {
+    if (!_pageController.hasClients) return;
+    final item = _pageController.page?.round() ?? 0;
+    final spreads = _activeSpreads();
+    final pages = _pages!;
+    final count = spreads?.length ?? pages.length;
+    if (item < 0 || item >= count) return;
+    final indices = spreads == null ? [item] : spreads[item];
+    // The page under the cursor; otherwise the first page of the spread.
+    var target = indices.first;
+    RenderBox? targetBox;
+    for (final i in indices) {
+      final ctx = _pagedItemContexts[i];
+      final box = ctx != null && ctx.mounted ? ctx.findRenderObject() : null;
+      if (box is! RenderBox || !box.hasSize) continue;
+      targetBox ??= box;
+      if (global != null && box.size.contains(box.globalToLocal(global))) {
+        target = i;
+        targetBox = box;
+        break;
+      }
+      if (i == target) targetBox = box;
+    }
+    final ctrl = _zoomControllers[target];
+    if (ctrl == null || targetBox == null) return;
+    var local = global == null
+        ? targetBox.size.center(Offset.zero)
+        : targetBox.globalToLocal(global);
+    if (!targetBox.size.contains(local)) {
+      local = targetBox.size.center(Offset.zero);
+    }
+    _applyPagedZoom(ctrl, targetBox.size, factor, local);
+  }
+
+  /// Scales [ctrl] by [factor] around [focal] (local to a page of size
+  /// [viewport]), clamped to 100%..500% and to the page's edges.
+  void _applyPagedZoom(
+    TransformationController ctrl,
+    Size viewport,
+    double factor,
+    Offset focal,
+  ) {
+    _cancelDoubleTapZoom(ctrl);
+    final scale = ctrl.value.getMaxScaleOnAxis();
+    final next = (scale * factor).clamp(1.0, _kMaxPagedZoom).toDouble();
+    if ((next - scale).abs() > 0.0001) {
+      final storage = ctrl.value.storage;
+      final translation = Offset(storage[12], storage[13]);
+      // The page point under the cursor stays under the cursor.
+      final scenePoint = (focal - translation) / scale;
+      final moved = _clampPagedTranslation(
+        focal - scenePoint * next,
+        viewport,
+        next,
+      );
+      ctrl.value = Matrix4.identity()
+        ..translateByDouble(moved.dx, moved.dy, 0, 1.0)
+        ..scaleByDouble(next, next, next, 1.0);
+      final zoomed = next > 1.01;
+      if (zoomed != _pagedZoomed) setState(() => _pagedZoomed = zoomed);
+    }
+    _flashZoomBadge('${(next * 100).round()}%');
+  }
+
+  /// Width/Smart fit: lays the page out wider and keeps the point under the
+  /// cursor in place by moving the page scroller with it.
+  void _zoomOverflowBy(double factor, Offset? global) {
+    if (_effectiveFit(sl<ReaderPrefs>()) == 'original') {
+      // Original draws pages at their own pixel size; nothing to scale.
+      _flashZoomBadge('100%');
+      return;
+    }
+    final next = (_overflowZoom * factor).clamp(1.0, 4.0).toDouble();
+    if ((next - _overflowZoom).abs() < 0.0001) {
+      _flashZoomBadge('${(next * 100).round()}%');
+      return;
+    }
+    final ratio = next / _overflowZoom;
+    final scroller = _currentDesktopScroller;
+    Offset? focal;
+    double? top;
+    double? left;
+    if (scroller != null && scroller.mounted) {
+      final box = scroller.context.findRenderObject();
+      if (box is RenderBox && box.hasSize) {
+        final local = global == null ? null : box.globalToLocal(global);
+        focal = local != null && box.size.contains(local)
+            ? local
+            : box.size.center(Offset.zero);
+        top = scroller.vertical.hasClients ? scroller.vertical.offset : 0;
+        left = scroller.sideways.hasClients ? scroller.sideways.offset : 0;
+      }
+    }
+    setState(() => _overflowZoom = next);
+    _flashZoomBadge('${(next * 100).round()}%');
+    if (scroller == null || focal == null) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!scroller.mounted) return;
+      void keep(ScrollController c, double old, double f) {
+        if (!c.hasClients) return;
+        final p = c.position;
+        c.jumpTo(
+          ((old + f) * ratio - f).clamp(p.minScrollExtent, p.maxScrollExtent),
+        );
+      }
+
+      keep(scroller.vertical, top!, focal!.dy);
+      keep(scroller.sideways, left!, focal.dx);
+    });
+  }
+
+  /// Long strip: Ctrl zoom changes this series' page width (the same value
+  /// as the 'Page width' slider), never past the window.
+  void _zoomStripBy(double factor) {
+    if (!sl.isRegistered<ReaderOverrideStore>()) return;
+    final window = MediaQuery.sizeOf(context).width;
+    final shown = math.min(_desktopStripMaxWidth, window);
+    var next = (shown * factor).clamp(
+      ReaderOverrideStore.minPageWidth,
+      ReaderOverrideStore.maxPageWidth,
+    );
+    if (factor > 1) next = math.max(shown, math.min(next, window));
+    unawaited(
+      sl<ReaderOverrideStore>().setPageWidthOverride(
+        widget.sourceId,
+        widget.showId,
+        next.toDouble(),
+      ),
+    );
+    setState(() {});
+    _flashZoomBadge(context.l10n.pageWidthPx(next.round()));
+  }
+
+  /// Ctrl+wheel over a page or the strip zooms (reader-5). Claims the wheel
+  /// event so nothing below or above also scrolls or turns the page.
+  /// Returns true when it took the event.
+  bool _ctrlWheelZoom(PointerSignalEvent event, void Function(double) zoom) {
+    if (!_desktopReader || event is! PointerScrollEvent) return false;
+    if (!HardwareKeyboard.instance.isControlPressed) return false;
+    final dy = event.scrollDelta.dy;
+    if (dy == 0) return false;
+    GestureBinding.instance.pointerSignalResolver.register(event, (_) {
+      zoom(dy < 0 ? _kWheelZoomStep : 1 / _kWheelZoomStep);
+    });
+    return true;
   }
 
   /// Keeps mobile chrome unchanged while desktop reveals each bar independently.
   Widget _buildReaderStack(
     ReaderPrefs prefs, {
+    required int pageTotal,
     bool? topVisible,
     bool? bottomVisible,
   }) => Stack(
     children: [
       Positioned.fill(
-        child: _desktopReader
-            ? Align(
-                alignment: Alignment.topCenter,
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 1040),
-                  child: _buildBody(prefs),
-                ),
-              )
-            : _buildBody(prefs),
+        child: NotificationListener<ScrollNotification>(
+          // ScrollUpdate covers drags, flings and programmatic moves
+          // in both modes. Bubbles up from the deep PageView/ListView
+          // — returning false so nothing else is affected.
+          onNotification: (n) {
+            if (n is ScrollUpdateNotification) _scrollTickVN.value++;
+            return false;
+          },
+          child: _desktopReader
+              // Catch-all for Ctrl+wheel (reader-5) outside the pages, e.g.
+              // the margins beside a capped strip or column. Pages register
+              // their own Ctrl+wheel first, so this only runs when none did.
+              ? Listener(
+                  behavior: HitTestBehavior.translucent,
+                  onPointerSignal: (e) =>
+                      _ctrlWheelZoom(e, (f) => _zoomAt(f, e.position)),
+                  child: Align(
+                    alignment: Alignment.topCenter,
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxWidth: _desktopBodyMaxWidth(prefs),
+                      ),
+                      child: _buildBody(prefs),
+                    ),
+                  ),
+                )
+              : _buildBody(prefs),
+        ),
       ),
       // Both bars stay in the tree at all times now (an AnimatedOpacity
       // fade instead of the old conditional if (_chromeVisible) build) so
@@ -2167,6 +2732,55 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       // why that doesn't let a hidden bar eat page taps.
       _buildTopBar(visible: topVisible),
       _buildBottomBar(visible: bottomVisible),
+      // Windows zoom level ('150%'), shown briefly after each zoom step.
+      if (_desktopReader)
+        Positioned.fill(
+          child: IgnorePointer(
+            child: Center(
+              child: ValueListenableBuilder<String?>(
+                valueListenable: _zoomBadge,
+                builder: (context, text, _) => AnimatedOpacity(
+                  duration: const Duration(milliseconds: 160),
+                  opacity: text == null ? 0 : 1,
+                  child: text == null
+                      ? const SizedBox.shrink()
+                      : ReaderPillSurface(
+                          key: const ValueKey('reader-zoom-badge'),
+                          radius: 14,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 9,
+                          ),
+                          child: Text(
+                            text,
+                            style: AppText.body.copyWith(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      // Mihon-style page pill ("08/26"): pops up on every page turn in
+      // both modes and fades 1.5s after the last one. Hidden while the
+      // chrome (which carries its own counter) is up.
+      if (prefs.showPageNumber)
+        _ScrollPagePill(
+          key: const ValueKey('reader-scroll-page-number'),
+          pageIndex: _pageIndexVN,
+          activity: _scrollTickVN,
+          total: pageTotal,
+          // Desktop: the hovered bottom bar sits where the pill does, and the
+          // top bar already shows the page, so the pill steps aside for it.
+          visible: !_chromeVisible && !(bottomVisible ?? false),
+          // Desktop counts within the chapter, like the title pill, so a
+          // double-page spread or an appended next chapter reads correctly.
+          labelFor: _desktopReader ? _desktopPillLabel : null,
+          persistent: _desktopReader,
+        ),
       if (!_desktopReader &&
           _showFloatingMangaTranslation &&
           _pages != null &&
@@ -2182,6 +2796,39 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
         ),
     ],
   );
+
+  /// Width cap of the Windows reader body: the long strip uses the series'
+  /// page width (reader-5), double-page spreads use the whole window
+  /// (reader-8), and single pages keep the paged column.
+  double _desktopBodyMaxWidth(ReaderPrefs prefs) {
+    if (_effectiveDirection(prefs) == 'vertical') return _desktopStripMaxWidth;
+    if (_activeSpreads() != null) return double.infinity;
+    return _kDesktopPagedMaxWidth;
+  }
+
+  /// Text of the Windows zoom badge, or null while it is hidden.
+  final ValueNotifier<String?> _zoomBadge = ValueNotifier<String?>(null);
+  Timer? _zoomBadgeTimer;
+
+  /// Shows [text] in the zoom badge for a moment (reader-5).
+  void _flashZoomBadge(String text) {
+    _zoomBadge.value = text;
+    _zoomBadgeTimer?.cancel();
+    _zoomBadgeTimer = Timer(const Duration(milliseconds: 900), () {
+      _zoomBadge.value = null;
+    });
+  }
+
+  /// Desktop page pill text: page within its chapter over that chapter's
+  /// page count, zero-padded the same way as the default pill.
+  String _desktopPillLabel(int index) {
+    final slot = _slotAt(index);
+    final count = slot?.chapterPages ?? (_pages?.length ?? 0);
+    final current = (slot?.pageInChapter ?? index) + 1;
+    final width = math.max(2, count.toString().length);
+    return '${current.toString().padLeft(width, '0')}'
+        '/${count.toString().padLeft(width, '0')}';
+  }
 
   /// Volume-key paging, driven by the native `dispatchKeyEvent` hook (see
   /// [VolumeKeys] for why it can't be done in Dart).
@@ -2234,6 +2881,23 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     if (i == null || i < 0 || i >= _chapters.length) return null;
     final t = _chapters[i].title.trim();
     return t.isNotEmpty ? t : 'Chapter ${chapterNumberLabel(_chapters, i)}';
+  }
+
+  /// Windows skip-button tooltip (reader-12): 'Chapter 42 - Title', or just
+  /// 'Chapter 42' when the source gives no title (or the title only repeats
+  /// the number). At either end it says there is no chapter that way.
+  String _skipTooltip(int? i, {required bool previous}) {
+    if (i == null || i < 0 || i >= _chapters.length) {
+      return previous
+          ? context.l10n.noPreviousChapter
+          : context.l10n.noNextChapter;
+    }
+    final number = context.l10n.chapterNumberTitle(chapterNumberLabel(_chapters, i));
+    final title = _chapters[i].title.trim();
+    if (title.isEmpty || title.toLowerCase() == number.toLowerCase()) {
+      return number;
+    }
+    return '$number - $title';
   }
 
   Widget _buildBody(ReaderPrefs prefs) {
@@ -2320,7 +2984,13 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     // Only wrap in ColorFiltered when a filter is actually chosen — 'none'
     // (the default) must leave this widget out of the tree entirely so the
     // default reading path is byte-for-byte what it was before this feature.
-    final colorFilter = readerColorFilter(prefs.colorFilter);
+    // A custom tint wins over the preset when both are set.
+    final colorFilter = prefs.customColorFilter
+        ? ColorFilter.mode(
+            Color(prefs.customFilterColor),
+            readerCustomBlendMode(prefs.customFilterBlend),
+          )
+        : readerColorFilter(prefs.colorFilter);
     if (colorFilter != null) {
       content = ColorFiltered(colorFilter: colorFilter, child: content);
     }
@@ -2355,6 +3025,8 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
           onPageChanged: _onPageChanged,
           itemBuilder: (context, index) => index >= pages.length
               ? _chapterEndPage()
+              : _desktopOverflow
+              ? _desktopPagedSlot(index, [index], pages)
               : _pagedItem(pages[index], index),
         ),
       );
@@ -2371,7 +3043,137 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
         onPageChanged: _onPageChanged,
         itemBuilder: (context, index) => index >= spreads.length
             ? _chapterEndPage()
+            : _desktopOverflow
+            ? _desktopPagedSlot(index, spreads[index], pages)
             : _spreadItem(spreads[index], pages),
+      ),
+    );
+  }
+
+  /// Windows with Width, Smart or Original fit: pages are laid out at their
+  /// real size inside a scroll view instead of being squeezed into the window.
+  bool get _desktopOverflow =>
+      _desktopReader && desktopFitOverflows(_effectiveFit(sl<ReaderPrefs>()));
+
+  /// One PageView item on Windows when the fit overflows the window: the page
+  /// (or a double-page spread, side by side) inside a [DesktopPageScroller],
+  /// centred while it is smaller than the window.
+  Widget _desktopPagedSlot(
+    int item,
+    List<int> pageIndices,
+    List<PageImage> pages,
+  ) {
+    final original = _effectiveFit(sl<ReaderPrefs>()) == 'original';
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final viewport = constraints.biggest;
+        // Width/Smart split the window between the spread's pages; Original
+        // draws every page at its own size.
+        final slotWidth = viewport.width / pageIndices.length;
+        // Ctrl zoom (reader-5) lays Width/Smart pages out wider; the
+        // scroller then pans them both ways.
+        final share = original ? null : slotWidth * _overflowZoom;
+        return DesktopPageScroller(
+          key: ValueKey('desktop-page-scroller-$item'),
+          horizontal: original || _overflowZoom > 1.001,
+          startAtEnd: _desktopArrivedBackward,
+          onAttach: (s) => _desktopScrollers[item] = s,
+          onDetach: (s) {
+            if (identical(_desktopScrollers[item], s)) {
+              _desktopScrollers.remove(item);
+            }
+          },
+          // Inside the scroll view, so Ctrl+wheel reaches this before the
+          // scroller or the reader can scroll or turn the page.
+          child: Listener(
+            // Opaque so Ctrl+wheel over the margin beside a narrow page
+            // zooms too, instead of falling through to the scroller.
+            behavior: HitTestBehavior.opaque,
+            onPointerSignal: (e) =>
+                _ctrlWheelZoom(e, (f) => _zoomOverflowBy(f, e.position)),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                minWidth: viewport.width,
+                minHeight: viewport.height,
+              ),
+              child: Center(
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    for (final i in pageIndices)
+                      _desktopOverflowPage(
+                        pages[i],
+                        i,
+                        share,
+                        viewport,
+                        slotWidth,
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// A page at fit-to-[width] (Width/Smart) or, when [width] is null, at its
+  /// own pixel size (Original). Loading and failed pages hold one window of
+  /// height so the scroll view has a real extent before the image arrives.
+  Widget _desktopOverflowPage(
+    PageImage page,
+    int index,
+    double? width,
+    Size viewport,
+    double slotWidth,
+  ) {
+    // Original asks for the source's full width (never upscaled by
+    // ResizeImage); the fitted modes decode for the window as usual.
+    final decode = width == null ? 4096 : _decodeWidth(context);
+    final crop = sl<ReaderPrefs>().cropBorders ? _crop[page.url] : null;
+    // A trimmed page is drawn wider so it is exactly [width] once cropped.
+    final drawWidth = width == null ? null : width / (crop?.w ?? 1.0);
+    final slot = Size(slotWidth, viewport.height);
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onSecondaryTapUp: (d) => _showPageActions(page, at: d.globalPosition),
+      child: _cropIfEnabled(
+        ReaderPageImage(
+          key: ValueKey('page-$index-$_pageRetry'),
+          pageUrl: page.url,
+          image: _pageProvider(page, decode),
+          width: drawWidth,
+          fit: width == null ? BoxFit.none : BoxFit.fitWidth,
+          onLoaded: () => _loaded.add(index),
+          placeholderBuilder: (context, progress) => SizedBox.fromSize(
+            key: ValueKey('desktop-page-placeholder-$index'),
+            size: slot,
+            child: _drawnLocally(page)
+                ? Center(
+                    child: _shimmerSlot(
+                      context,
+                      label: '${index + 1}',
+                      progress: progress,
+                    ),
+                  )
+                : ColoredBox(color: AppColors.surface2),
+          ),
+          errorBuilder: (_, error, _) => SizedBox.fromSize(
+            size: slot,
+            child: _drawnLocally(page)
+                ? _failedPage(page, index, decode, error)
+                : const Center(
+                    child: Icon(
+                      Icons.broken_image_outlined,
+                      color: Colors.white38,
+                      size: 48,
+                    ),
+                  ),
+          ),
+        ),
+        page.url,
       ),
     );
   }
@@ -2399,7 +3201,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     Size viewport,
     PointerDownEvent event,
   ) {
-    if (event.kind != PointerDeviceKind.touch) return;
+    if (!_tracksPagedDown(event)) return;
     _cancelDoubleTapZoom(controller);
 
     final viewportObject = _pagedViewportKey.currentContext?.findRenderObject();
@@ -2423,8 +3225,52 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     _tryBeginPagedPan();
   }
 
+  /// Touch drives paged pinch and pan. On Windows a mouse also pans a
+  /// double-click-zoomed page (one pointer, so it never pinches).
+  bool _tracksPagedPointer(PointerEvent event) =>
+      event.kind == PointerDeviceKind.touch ||
+      (_desktopReader && event.kind == PointerDeviceKind.mouse);
+
+  /// [_tracksPagedPointer] for a press: a mouse must use its primary button,
+  /// so a right-click for page actions never starts a pan.
+  bool _tracksPagedDown(PointerDownEvent event) =>
+      _tracksPagedPointer(event) &&
+      (event.kind != PointerDeviceKind.mouse ||
+          (event.buttons & kPrimaryMouseButton) != 0);
+
+  /// Windows wheel over a zoomed page: pans it (Shift pans sideways) and
+  /// claims the event, so the page only turns once the zoom reaches its edge.
+  void _desktopZoomWheel(
+    TransformationController ctrl,
+    Size viewport,
+    PointerSignalEvent event,
+  ) {
+    if (event is! PointerScrollEvent) return;
+    // Ctrl+wheel zooms around the cursor instead (reader-5).
+    if (_ctrlWheelZoom(
+      event,
+      (f) => _applyPagedZoom(ctrl, viewport, f, event.localPosition),
+    )) {
+      return;
+    }
+    final scale = ctrl.value.getMaxScaleOnAxis();
+    if (scale <= 1.01) return;
+    final storage = ctrl.value.storage;
+    final current = Offset(storage[12], storage[13]);
+    final delta = HardwareKeyboard.instance.isShiftPressed
+        ? Offset(event.scrollDelta.dy, 0)
+        : event.scrollDelta;
+    final next = _clampPagedTranslation(current - delta, viewport, scale);
+    if ((next - current).distance < 0.5) return;
+    GestureBinding.instance.pointerSignalResolver.register(event, (_) {
+      ctrl.value = Matrix4.identity()
+        ..translateByDouble(next.dx, next.dy, 0, 1.0)
+        ..scaleByDouble(scale, scale, scale, 1.0);
+    });
+  }
+
   void _onPagedPointerDown(PointerDownEvent event) {
-    if (event.kind != PointerDeviceKind.touch) return;
+    if (!_tracksPagedDown(event)) return;
     if (_pagedPointerPositions.isEmpty) _capturePagedGestureStart();
     _pagedPointerPositions[event.pointer] = event.localPosition;
     _tryBeginPagedPinch();
@@ -2432,7 +3278,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   }
 
   void _onPagedPointerMove(PointerMoveEvent event) {
-    if (event.kind != PointerDeviceKind.touch ||
+    if (!_tracksPagedPointer(event) ||
         !_pagedPointerPositions.containsKey(event.pointer)) {
       return;
     }
@@ -2447,7 +3293,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   }
 
   void _onPagedPointerEnd(PointerEvent event) {
-    if (event.kind != PointerDeviceKind.touch ||
+    if (!_tracksPagedPointer(event) ||
         !_pagedPointerPositions.containsKey(event.pointer)) {
       return;
     }
@@ -2715,14 +3561,22 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                 // arrangement in which a gap cannot happen.
                 SliverList.builder(
                   itemCount: _anchorIndex,
-                  itemBuilder: (context, i) =>
-                      _verticalStripItem(context, pages, _anchorIndex - 1 - i),
+                  itemBuilder: (context, i) => _verticalStripItem(
+                    context,
+                    pages,
+                    _anchorIndex - 1 - i,
+                    viewport.width,
+                  ),
                 ),
                 SliverList.builder(
                   key: _centerKey,
                   itemCount: pages.length - _anchorIndex,
-                  itemBuilder: (context, i) =>
-                      _verticalStripItem(context, pages, _anchorIndex + i),
+                  itemBuilder: (context, i) => _verticalStripItem(
+                    context,
+                    pages,
+                    _anchorIndex + i,
+                    viewport.width,
+                  ),
                 ),
               ],
             ),
@@ -2743,11 +3597,14 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     BuildContext context,
     List<PageImage> pages,
     int index,
+    // The strip's real laid-out width (reader-2): on Windows it is capped by
+    // the page width, so reserved heights must use it, not the window width.
+    double stripWidth,
   ) {
     // The transition card rides with the LAST page of each chapter — which,
     // in a strip that holds several chapters, happens more than once. Its
     // height is declared in [_extentOf] so nothing is clipped.
-    final page = _verticalItem(context, pages[index], index);
+    final page = _verticalItem(context, pages[index], index, stripWidth);
     final slot = _slotAt(index);
     final body = (slot?.isChapterEnd ?? false)
         ? Column(
@@ -2906,45 +3763,41 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     return RepaintBoundary(
       child: LayoutBuilder(
         builder: (context, constraints) {
+          // Lets Ctrl zoom find this page's box (reader-5).
+          if (_desktopReader) _pagedItemContexts[index] = context;
           final width = _decodeWidth(context);
           final viewport = constraints.biggest;
           final image = Center(
             child: _cropIfEnabled(
               _withPageTranslation(
-                _drawnLocally(page)
-                    ? Image(
-                        key: ValueKey('page-$index-$_pageRetry'),
-                        image: _pageProvider(page, width),
-                        fit: fit,
-                        // Same gap as the strip had: nothing at all while
-                        // the page decodes.
-                        frameBuilder: (context, child, frame, wasSync) {
-                          if (frame != null) _loaded.add(index);
-                          if (wasSync || frame != null) return child;
-                          return Center(
-                            child: _shimmerSlot(context, label: '${index + 1}'),
-                          );
-                        },
-                        errorBuilder: (_, error, _) =>
-                            _failedPage(page, index, width, error),
-                      )
-                    : CachedNetworkImage(
-                        imageUrl: page.url,
-                        httpHeaders: page.headers,
-                        memCacheWidth: width,
-                        maxWidthDiskCache: width,
-                        fit: fit,
-                        // Static, not an animated spinner — see ColoredBox usage in
-                        // poster_card.dart/continue_card.dart for the same convention.
-                        placeholder: (_, _) => SizedBox.expand(
+                ReaderPageImage(
+                  // _pageRetry re-keys the page so "Retry page" re-resolves it.
+                  key: ValueKey('page-$index-$_pageRetry'),
+                  pageUrl: page.url,
+                  image: _pageProvider(page, width),
+                  fit: fit,
+                  onLoaded: () => _loaded.add(index),
+                  placeholderBuilder: (context, progress) => _drawnLocally(page)
+                      ? Center(
+                          child: _shimmerSlot(
+                            context,
+                            label: '${index + 1}',
+                            progress: progress,
+                          ),
+                        )
+                      : SizedBox.expand(
                           child: ColoredBox(color: AppColors.surface2),
                         ),
-                        errorWidget: (_, _, _) => const Icon(
+                  // Local/native pages (incl. Windows extension pages) keep
+                  // our retry/verify affordance; network pages keep the icon.
+                  errorBuilder: (_, error, _) => _drawnLocally(page)
+                      ? _failedPage(page, index, width, error)
+                      : const Icon(
                           Icons.broken_image_outlined,
                           color: Colors.white38,
                           size: 48,
                         ),
-                      ),
+                ),
                 page: page,
                 index: index,
                 fit: fit,
@@ -2958,13 +3811,17 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
             onDoubleTapDown: (d) => _lastDoubleTapPos = d.localPosition,
             onDoubleTap: () => _toggleZoom(ctrl),
             onLongPress: _desktopReader ? null : () => _showPageActions(page),
-            onSecondaryTap: _desktopReader
-                ? () => _showPageActions(page)
+            onSecondaryTapUp: _desktopReader
+                ? (d) => _showPageActions(page, at: d.globalPosition)
                 : null,
             child: Listener(
               behavior: HitTestBehavior.opaque,
               onPointerDown: (event) =>
                   _onPagedItemPointerDown(ctrl, viewport, event),
+              // Windows: the wheel pans a double-click-zoomed page first.
+              onPointerSignal: _desktopReader
+                  ? (event) => _desktopZoomWheel(ctrl, viewport, event)
+                  : null,
               child: AnimatedBuilder(
                 animation: ctrl,
                 builder: (context, child) => ClipRect(
@@ -2998,19 +3855,27 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// were reading slid away under you, and `maxScrollExtent` moved so much
   /// that anything derived from it was noise. Reserving the real shape is what
   /// makes the list stop moving.
-  double _reservedHeight(BuildContext context, int index) {
+  double _reservedHeight(int index, double stripWidth) {
     final pages = _pages;
     final url = (pages != null && index >= 0 && index < pages.length)
         ? pages[index].url
         : null;
     return reservedPageHeight(
-      MediaQuery.sizeOf(context).width,
+      // The width the strip is actually laid out at (passed down from
+      // _buildVertical's LayoutBuilder), so a capped Windows strip reserves
+      // the height its pages will really take (reader-2).
+      stripWidth,
       measured: url == null ? null : _aspect[url],
       chapter: _chapterAspect,
     );
   }
 
-  Widget _verticalItem(BuildContext context, PageImage page, int index) {
+  Widget _verticalItem(
+    BuildContext context,
+    PageImage page,
+    int index,
+    double stripWidth,
+  ) {
     final fit = _verticalBoxFit(_effectiveFit(sl<ReaderPrefs>()));
     // See the comment on _pagedItem's RepaintBoundary — same reasoning here.
     return RepaintBoundary(
@@ -3018,15 +3883,24 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
         behavior: HitTestBehavior.opaque,
         onTapUp: (d) => _dispatchTap(d.globalPosition),
         onLongPress: _desktopReader ? null : () => _showPageActions(page),
-        onSecondaryTap: _desktopReader ? () => _showPageActions(page) : null,
-        child: _cropIfEnabled(
-          _withPageTranslation(
-            _verticalPageImage(context, page, index),
-            page: page,
-            index: index,
-            fit: fit,
+        onSecondaryTapUp: _desktopReader
+            ? (d) => _showPageActions(page, at: d.globalPosition)
+            : null,
+        // Windows: Ctrl+wheel over the strip changes its page width
+        // (reader-5); a plain wheel still scrolls.
+        child: Listener(
+          onPointerSignal: _desktopReader
+              ? (e) => _ctrlWheelZoom(e, _zoomStripBy)
+              : null,
+          child: _cropIfEnabled(
+            _withPageTranslation(
+              _verticalPageImage(context, page, index, stripWidth),
+              page: page,
+              index: index,
+              fit: fit,
+            ),
+            page.url,
           ),
-          page.url,
         ),
       ),
     );
@@ -3079,17 +3953,20 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// otherwise draws it whole, exactly as before. Every null check below is
   /// load-bearing — a page with no recorded file or no true pixel size takes
   /// the plain path, not a guessed one.
-  Widget _verticalPageImage(BuildContext context, PageImage page, int index) {
-    final aspect = _aspect[page.url];
+  Widget _verticalPageImage(
+    BuildContext context,
+    PageImage page,
+    int index,
+    double stripWidth,
+  ) {
     final pixels = _pixelSize[page.url];
     final file = _pageFile[page.url];
     final canTile =
-        aspect != null &&
         pixels != null &&
         file != null &&
         // Below about two screens there is nothing to win and the plain path
         // is simpler and faster.
-        (aspect * _webtoonDecodeWidth(context)) >
+        (pixels.height / pixels.width * _webtoonDecodeWidth(context)) >
             MediaQuery.sizeOf(context).height * 2;
 
     if (canTile) {
@@ -3098,86 +3975,37 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
         imageWidth: pixels.width.round(),
         imageHeight: pixels.height.round(),
         decoder: _tileDecoder,
-        fallbackBuilder: () => _plainPageImage(context, page, index),
+        fallbackBuilder: () =>
+            _plainPageImage(context, page, index, stripWidth),
       );
     }
-    return _plainPageImage(context, page, index);
+    return _plainPageImage(context, page, index, stripWidth);
   }
 
   /// The old, untiled page draw — used directly when tiling is off or not
   /// possible for this page, and as [TiledPageImage]'s fallback.
-  Widget _plainPageImage(BuildContext context, PageImage page, int index) {
+  Widget _plainPageImage(
+    BuildContext context,
+    PageImage page,
+    int index,
+    double stripWidth,
+  ) {
     final width = _webtoonDecodeWidth(context);
-    return _drawnLocally(page)
-        ? Image(
-            key: ValueKey('strip-$index-$_pageRetry'),
-            image: _pageProvider(page, width),
-            width: double.infinity,
-            fit: _verticalBoxFit(_effectiveFit(sl<ReaderPrefs>())),
-            // A downloaded/CBZ page needs no fetch — it is there.
-            // A local page decodes fast but not instantly, and it used
-            // to cut straight from placeholder to art. Same short fade
-            // the network path gets, so both read the same way.
-            // Until the first frame decodes this shows the SAME
-            // placeholder the network path shows.
-            //
-            // It used to fade in from opacity 0, which on this path
-            // means the page is simply invisible while it loads — no
-            // spinner, no page number, nothing. And this is not a rare
-            // path: a source that rewrites its image bytes serves every
-            // page through the native bridge (see [nativePageProvider]),
-            // which is most long manhwa. That is the "it just shows
-            // black" report — the progress ring was only ever on the
-            // branch those pages never take.
-            frameBuilder: (context, child, frame, wasSync) {
-              if (frame != null) _loaded.add(index);
-              if (wasSync) return child;
-              if (frame == null) return _pagePlaceholder(context, index);
-              return AnimatedOpacity(
-                opacity: 1,
-                duration: _kPageFade,
-                curve: Curves.easeOut,
-                child: child,
-              );
-            },
-            errorBuilder: (_, error, _) =>
-                _failedPage(page, index, width, error),
-          )
-        : CachedNetworkImage(
-            imageUrl: page.url,
-            httpHeaders: page.headers,
-            width: double.infinity,
-            memCacheWidth: width,
-            maxWidthDiskCache: width,
-            fit: _verticalBoxFit(_effectiveFit(sl<ReaderPrefs>())),
-            // The package default is 500ms, which is a long time to
-            // watch a page arrive while you are still scrolling. Short
-            // enough to feel immediate, long enough not to be a cut.
-            fadeInDuration: _kPageFade,
-            fadeOutDuration: _kPageFade,
-            // The placeholder is already on screen holding the page's
-            // space — fading it IN as well just delays it.
-            placeholderFadeInDuration: Duration.zero,
-            // The page is on screen for real from here. Scrolling PAST a
-            // placeholder is not reading it, and that distinction is what
-            // keeps a fast scroll from marking the chapter read.
-            imageBuilder: (context, imageProvider) {
-              _loaded.add(index);
-              return Image(
-                image: imageProvider,
-                width: double.infinity,
-                fit: _verticalBoxFit(_effectiveFit(sl<ReaderPrefs>())),
-              );
-            },
-            // A page that has not arrived reserves its real height
-            // (see [_reservedHeight]) so the list does not jump, and
-            // shows how far along the download actually is. A shimmer
-            // says "something is happening"; a percentage says whether
-            // it is nearly there or barely started, which on a slow
-            // source is the difference between waiting and giving up.
-            progressIndicatorBuilder: (_, _, progress) =>
-                _pagePlaceholder(context, index, progress.progress),
-            errorWidget: (_, _, _) => const SizedBox(
+    return ReaderPageImage(
+      // _pageRetry re-keys the page so "Retry page" re-resolves it.
+      key: ValueKey('strip-$index-$_pageRetry'),
+      pageUrl: page.url,
+      image: _pageProvider(page, width),
+      width: double.infinity,
+      fit: _verticalBoxFit(_effectiveFit(sl<ReaderPrefs>())),
+      onLoaded: () => _loaded.add(index),
+      placeholderBuilder: (context, progress) =>
+          _pagePlaceholder(context, index, stripWidth, progress),
+      // Local/native pages (incl. Windows extension pages) keep our retry and
+      // verification affordance; plain network pages keep upstream's icon.
+      errorBuilder: (_, error, _) => _drawnLocally(page)
+          ? _failedPage(page, index, width, error)
+          : const SizedBox(
               height: 200,
               child: Icon(
                 Icons.broken_image_outlined,
@@ -3185,7 +4013,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                 size: 48,
               ),
             ),
-          );
+    );
   }
 
   /// The strip, before there are any pages to put in it.
@@ -3271,9 +4099,14 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// A sweeping gradient rather than a pulsing block — a pulse dims the whole
   /// screen at once when several placeholders are visible, which is precisely
   /// the "broken app" look it was meant to avoid.
-  Widget _pagePlaceholder(BuildContext context, int index, [double? progress]) {
+  Widget _pagePlaceholder(
+    BuildContext context,
+    int index,
+    double stripWidth, [
+    double? progress,
+  ]) {
     return SizedBox(
-      height: _reservedHeight(context, index),
+      height: _reservedHeight(index, stripWidth),
       width: double.infinity,
       child: _shimmerSlot(
         context,
@@ -3530,7 +4363,58 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
           ),
         ),
       );
-  Widget _buildError() => _buildMessage(_error!);
+
+  Widget _buildError() {
+    final url = _cloudflareUrl;
+    // Only Mangayomi uses this panel; other (Windows) sources fall through to
+    // the shared message, which carries the desktop "Verify source" button.
+    if (url == null || !widget.sourceId.startsWith('mg:')) {
+      return _buildMessage(_error!);
+    }
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.shield_outlined,
+              size: 40,
+              color: AppColors.textTertiary,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'This Mangayomi chapter is protected by Cloudflare.',
+              style: AppText.body.copyWith(color: Colors.white),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: _solvingCloudflare
+                  ? null
+                  : () => unawaited(_solveMangayomiCloudflare(url)),
+              icon: _solvingCloudflare
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.shield_rounded),
+              label: Text(context.l10n.solveCloudflare),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _solveMangayomiCloudflare(String url) async {
+    setState(() => _solvingCloudflare = true);
+    await MangayomiCloudflare.solve(url);
+    if (!mounted) return;
+    setState(() => _solvingCloudflare = false);
+    await _load();
+  }
 
   /// Icon, message, and a Retry that re-runs [_load]. Shared by the failure
   /// and the empty-chapter cases — both leave the reader with nothing to show
@@ -3718,6 +4602,10 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                     Icons.skip_previous_rounded,
                     () => _goToChapter(_prevIndex),
                     enabled: hasPrev,
+                    // Windows (reader-12): names the chapter it opens.
+                    tooltip: _desktopReader
+                        ? _skipTooltip(_prevIndex, previous: true)
+                        : null,
                   ),
                   Expanded(
                     // A chapter with one page has nothing to scrub, so the
@@ -3746,10 +4634,21 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                                 max: (count - 1).toDouble(),
                                 divisions: count - 1,
                                 onChangeStart: (_) => _seeking = true,
-                                onChanged: (v) =>
-                                    _seekToPage(start + v.round()),
+                                onChanged: (v) {
+                                  _seekToPage(start + v.round());
+                                  // A change outside a drag (a keyboard step)
+                                  // gets no onChangeEnd, so it commits here:
+                                  // preload and progress save (reader-9).
+                                  // Windows only, so phones keep their exact
+                                  // drag-then-commit behaviour.
+                                  if (_desktopReader && !_seeking) {
+                                    _commitSeek(start + v.round());
+                                  }
+                                },
                                 onChangeEnd: (v) =>
                                     _commitSeek(start + v.round()),
+                                // Windows 'Page 12 / 30' label (reader-12).
+                                labelFor: (v) => context.l10n.pageNOfCount(v.round() + 1, count),
                               );
                             },
                           )
@@ -3759,6 +4658,9 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                     Icons.skip_next_rounded,
                     () => _goToChapter(_nextIndex),
                     enabled: hasNext,
+                    tooltip: _desktopReader
+                        ? _skipTooltip(_nextIndex, previous: false)
+                        : null,
                   ),
                 ],
               ),
@@ -3853,10 +4755,9 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
 
   void _openAutoScrollSheet() {
     final prefs = sl<ReaderPrefs>();
-    showModalBottomSheet<void>(
+    // Side panel on Windows, bottom sheet on phones.
+    showReaderPanel<void>(
       context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
       builder: (_) => ReaderAutoScrollSheet(
         desktop: _desktopReader,
         running: _autoScroll.running.value,
@@ -3892,11 +4793,16 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
       );
       return;
     }
+    // Windows (reader-10): searchable, keyboard-driven list with read and
+    // downloaded markers and a right-click menu, in the reader side panel.
+    if (_desktopReader) {
+      _openDesktopChapterList();
+      return;
+    }
     const rowHeight = 52.0;
-    showModalBottomSheet<void>(
+    // Side panel on Windows, bottom sheet on phones.
+    showReaderPanel<void>(
       context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
       // Not readerSheetBody: that wraps its children in a SingleChildScrollView,
       // and a lazy ListView inside one has no bounded height — it would try to
       // build all 100+ rows at once. Same grabber and title, own scrolling.
@@ -3907,17 +4813,19 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Center(
-                child: Container(
-                  margin: const EdgeInsets.fromLTRB(0, 8, 0, 4),
-                  width: 36,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: AppColors.textTertiary.withValues(alpha: 0.5),
-                    borderRadius: BorderRadius.circular(2),
+              if (_desktopReader) const SizedBox(height: 12),
+              if (!_desktopReader)
+                Center(
+                  child: Container(
+                    margin: const EdgeInsets.fromLTRB(0, 8, 0, 4),
+                    width: 36,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: AppColors.textTertiary.withValues(alpha: 0.5),
+                      borderRadius: BorderRadius.circular(2),
+                    ),
                   ),
                 ),
-              ),
               Padding(
                 padding: const EdgeInsets.fromLTRB(20, 4, 20, 2),
                 child: Text(context.l10n.chapters, style: AppText.headline),
@@ -3940,69 +4848,72 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                   constraints: BoxConstraints(
                     maxHeight: MediaQuery.sizeOf(context).height * 0.5,
                   ),
-                  child: ListView.builder(
-                    shrinkWrap: true,
-                    controller: ScrollController(
-                      // Centre-ish rather than pinned to the top edge, so the
-                      // chapters either side are visible too.
-                      initialScrollOffset: ((_index - 2) * rowHeight).clamp(
-                        0,
-                        double.infinity,
-                      ),
+                  // The controller is owned (and disposed) by the sheet
+                  // rather than created inline and leaked (reader-10).
+                  child: ReaderOwnedScrollController(
+                    // Centre-ish rather than pinned to the top edge, so the
+                    // chapters either side are visible too.
+                    initialScrollOffset: ((_index - 2) * rowHeight).clamp(
+                      0,
+                      double.infinity,
                     ),
-                    itemCount: _chapters.length,
-                    itemExtent: rowHeight,
-                    itemBuilder: (context, i) {
-                      final current = i == _index;
-                      return InkWell(
-                        onTap: () {
-                          Navigator.of(ctx).pop();
-                          if (i != _index) _goToChapter(i);
-                        },
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 18),
-                          child: Row(
-                            children: [
-                              SizedBox(
-                                width: 46,
-                                child: Text(
-                                  chapterNumberLabel(_chapters, i),
-                                  style: AppText.caption.copyWith(
-                                    color: current
-                                        ? AppColors.accent
-                                        : AppColors.textSecondary,
+                    builder: (context, controller) => ListView.builder(
+                      shrinkWrap: true,
+                      controller: controller,
+                      itemCount: _chapters.length,
+                      itemExtent: rowHeight,
+                      itemBuilder: (context, i) {
+                        final current = i == _index;
+                        return InkWell(
+                          onTap: () {
+                            Navigator.of(ctx).pop();
+                            if (i != _index) _goToChapter(i);
+                          },
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 18),
+                            child: Row(
+                              children: [
+                                SizedBox(
+                                  width: 46,
+                                  child: Text(
+                                    chapterNumberLabel(_chapters, i),
+                                    style: AppText.caption.copyWith(
+                                      color: current
+                                          ? AppColors.accent
+                                          : AppColors.textSecondary,
+                                    ),
                                   ),
                                 ),
-                              ),
-                              Expanded(
-                                child: Text(
-                                  _chapters[i].title.trim().isNotEmpty
-                                      ? _chapters[i].title
-                                      : 'Chapter '
-                                            '${chapterNumberLabel(_chapters, i)}',
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: AppText.body.copyWith(
-                                    color: current
-                                        ? AppColors.accent
-                                        : Colors.white,
-                                    fontWeight: current
-                                        ? FontWeight.w700
-                                        : FontWeight.w400,
+                                Expanded(
+                                  child: Text(
+                                    _chapters[i].title.trim().isNotEmpty
+                                        ? _chapters[i].title
+                                        : 'Chapter '
+                                              '${chapterNumberLabel(_chapters, i)}',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: AppText.body.copyWith(
+                                      color: current
+                                          ? AppColors.accent
+                                          : Colors.white,
+                                      fontWeight: current
+                                          ? FontWeight.w700
+                                          : FontWeight.w400,
+                                    ),
                                   ),
                                 ),
-                              ),
-                              if (current)
-                                Icon(
-                                  Icons.play_arrow_rounded,
-                                  size: 18,
-                                  color: AppColors.accent,
-                                ),
-                            ],
+                                if (current)
+                                  Icon(
+                                    Icons.play_arrow_rounded,
+                                    size: 18,
+                                    color: AppColors.accent,
+                                  ),
+                              ],
+                            ),
                           ),
-                        ),
-                      );
-                    },
+                        );
+                      },
+                    ),
                   ),
                 ),
               ),
@@ -4014,46 +4925,101 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     );
   }
 
+  /// Windows chapter panel (reader-10): opens [DesktopChapterListPanel] in
+  /// the reader side panel, wired to the same chapter jump, read store and
+  /// chapter downloader the rest of the app uses.
+  void _openDesktopChapterList() {
+    final readStore = sl.isRegistered<ReadStore>() ? sl<ReadStore>() : null;
+    final downloads = sl.isRegistered<ChapterDownloadStore>()
+        ? sl<ChapterDownloadStore>()
+        : null;
+    final downloader = sl.isRegistered<ChapterDownloader>()
+        ? sl<ChapterDownloader>()
+        : null;
+    showReaderPanel<void>(
+      context: context,
+      builder: (ctx) => DesktopChapterListPanel(
+        title: context.l10n.chapters,
+        subtitle: context.l10n.chapterXOfY(chapterNumberLabel(_chapters, _index), chapterCountLabel(_chapters)),
+        chapters: _chapters,
+        currentIndex: _index,
+        isRead: (i) =>
+            readStore?.finished(
+              widget.sourceId,
+              widget.showId,
+              _chapters[i].id,
+            ) ??
+            false,
+        isDownloaded: (i) =>
+            downloads?.isDownloaded(widget.sourceId, _chapters[i].url) ?? false,
+        // Refreshes the downloaded markers as a queued chapter finishes.
+        changes: downloads?.listenable(),
+        onOpen: (i) {
+          if (i != _index) _goToChapter(i);
+        },
+        onMarkReadUpTo: readStore == null
+            ? null
+            : (i) async {
+                // Chapters are ascending, so 'up to here' is 0..i.
+                for (var c = 0; c <= i; c++) {
+                  await readStore.setRead(
+                    widget.sourceId,
+                    widget.showId,
+                    _chapters[c].id,
+                    read: true,
+                  );
+                }
+                if (mounted) {
+                  setState(() {});
+                  _toast(context.l10n.markedReadUpToHere);
+                }
+              },
+        onDownload: downloader == null
+            ? null
+            : (i) async {
+                await downloader.enqueue(
+                  chapter: _chapters[i],
+                  sourceId: widget.sourceId,
+                  showId: widget.showId,
+                  showTitle: widget.showTitle,
+                  cover: widget.cover,
+                  mode: ContentMode.manga,
+                );
+                if (mounted) _toast(context.l10n.addedToDownloads);
+              },
+      ),
+    );
+  }
+
   /// True for a saved page — those come back from the repository as a file
   /// path, not a URL, and CachedNetworkImage can't load one.
   static bool _isLocal(String url) => !url.startsWith('http');
 
-  /// The image for a page: inside a saved `.cbz`, a loose saved file, or the
-  /// network. One place, so the two page builders and the webtoon probe can't
-  /// disagree about what they're loading.
-  /// Whether [_pageProvider] should draw this page rather than
-  /// CachedNetworkImage.
-  ///
-  /// True for a downloaded/CBZ page, and for one the bridge marked as needing
-  /// its source's own client — see [nativePageProvider]. Both end up as a
-  /// plain [Image], so the network widget keeps its cache for every ordinary
-  /// page.
+  /// Pages whose shape must be measured through their image provider.
   static bool _drawnLocally(PageImage page) =>
       _isLocal(page.url) ||
       CbzImage.tryParse(page.url) != null ||
       nativePageProvider(page.url, page.headers) != null;
 
+  /// Uses the same provider and proportional decode bounds for display and measurement.
   static ImageProvider _pageProvider(PageImage page, int width) {
     final cbz = CbzImage.tryParse(page.url);
-    if (cbz != null) return ResizeImage.resizeIfNeeded(width, null, cbz);
-    if (_isLocal(page.url)) {
-      return ResizeImage.resizeIfNeeded(width, null, FileImage(File(page.url)));
-    }
     // A source that serves its pages scrambled puts the descrambler on its own
     // OkHttp client, and fetching the url ourselves never touches that client —
     // the reader drew the raw scrambled bytes and the page looked torn into
     // squares. The bridge marks those pages, and the fix is the one covers have
     // used all along: go and get them natively instead.
     final native = nativePageProvider(page.url, page.headers);
-    if (native != null) return ResizeImage.resizeIfNeeded(width, null, native);
-    return ResizeImage.resizeIfNeeded(
-      width,
-      null,
-      CachedNetworkImageProvider(
-        page.url,
-        headers: page.headers,
-        maxWidth: width,
-      ),
+    final provider =
+        cbz ??
+        (_isLocal(page.url) ? FileImage(File(page.url)) : native) ??
+        CachedNetworkImageProvider(page.url, headers: page.headers);
+    // Bound both dimensions before GPU upload; width-only decoding squashes tall strips.
+    return ResizeImage(
+      provider,
+      width: width,
+      height: 8192,
+      policy: ResizeImagePolicy.fit,
     );
   }
 
@@ -4073,8 +5039,12 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   Future<void> _openReaderMenu() async {
     final chapter = _chapter;
     final pages = _pages;
+    // Page OCR has no Windows engine, so the entry would only end in an error.
     final canTranslatePage =
-        pages != null && pages.isNotEmpty && _pageIndex < pages.length;
+        !_desktopReader &&
+        pages != null &&
+        pages.isNotEmpty &&
+        _pageIndex < pages.length;
     final canBrowse = source_actions.canOpenInBrowser(
       widget.sourceId,
       chapter.url,
@@ -4198,10 +5168,9 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
 
   Future<void> _openSettingsSheet() async {
     var openTranslationSettings = false;
-    await showModalBottomSheet<void>(
+    // Bottom sheet on phones; a side panel on Windows (see showReaderPanel).
+    await showReaderPanel<void>(
       context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setSheetState) {
           final prefs = sl<ReaderPrefs>();
@@ -4267,46 +5236,49 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                       mainAxisSize: MainAxisSize.min,
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Center(
-                          child: Container(
-                            margin: const EdgeInsets.only(bottom: 4),
-                            width: 36,
-                            height: 4,
-                            decoration: BoxDecoration(
-                              color: AppColors.textTertiary.withValues(
-                                alpha: 0.5,
+                        // A drag handle means nothing on a desktop panel.
+                        if (!_desktopReader)
+                          Center(
+                            child: Container(
+                              margin: const EdgeInsets.only(bottom: 4),
+                              width: 36,
+                              height: 4,
+                              decoration: BoxDecoration(
+                                color: AppColors.textTertiary.withValues(
+                                  alpha: 0.5,
+                                ),
+                                borderRadius: BorderRadius.circular(2),
                               ),
-                              borderRadius: BorderRadius.circular(2),
                             ),
                           ),
-                        ),
-                        Text(
-                          context.l10n.readerSettings,
-                          style: AppText.headline,
-                        ),
-                        readerSheetSection(
-                          context.l10n.mangaTranslationSection,
-                        ),
-                        readerSheetGroup([
-                          KeyedSubtree(
-                            key: const ValueKey(
-                              'reader-settings-manga-translation',
-                            ),
-                            child: readerSheetRow(
-                              icon: Icons.translate_rounded,
-                              label: context.l10n.mangaTranslationSettings,
-                              trailing: const Icon(
-                                Icons.chevron_right_rounded,
-                                color: AppColors.textSecondary,
-                                size: 20,
-                              ),
-                              onTap: () {
-                                openTranslationSettings = true;
-                                Navigator.of(ctx).pop();
-                              },
-                            ),
+                        _readerPanelTitle(ctx, context.l10n.readerSettings),
+                        // Page OCR has no Windows engine; hidden there rather
+                        // than shown as a row that can only fail.
+                        if (!_desktopReader) ...[
+                          readerSheetSection(
+                            context.l10n.mangaTranslationSection,
                           ),
-                        ]),
+                          readerSheetGroup([
+                            KeyedSubtree(
+                              key: const ValueKey(
+                                'reader-settings-manga-translation',
+                              ),
+                              child: readerSheetRow(
+                                icon: Icons.translate_rounded,
+                                label: context.l10n.mangaTranslationSettings,
+                                trailing: const Icon(
+                                  Icons.chevron_right_rounded,
+                                  color: AppColors.textSecondary,
+                                  size: 20,
+                                ),
+                                onTap: () {
+                                  openTranslationSettings = true;
+                                  Navigator.of(ctx).pop();
+                                },
+                              ),
+                            ),
+                          ]),
+                        ],
                         readerSheetSection(context.l10n.statusReading),
                         readerSheetGroup([
                           readerSheetRow(
@@ -4344,6 +5316,17 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                         ]),
                         readerSheetSection(context.l10n.display),
                         readerSheetGroup([
+                          readerSheetRow(
+                            icon: Icons.format_list_numbered_rounded,
+                            label: context.l10n.showPageNumber,
+                            trailing: Switch(
+                              key: const ValueKey('reader-show-page-number'),
+                              value: prefs.showPageNumber,
+                              activeThumbColor: AppColors.accent,
+                              onChanged: (v) =>
+                                  apply(() => prefs.setShowPageNumber(v)),
+                            ),
+                          ),
                           readerSheetRow(
                             icon: Icons.fit_screen_outlined,
                             label: context.l10n.fit,
@@ -4383,6 +5366,62 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                             ),
                           ),
                           readerSheetRow(
+                            icon: Icons.palette_outlined,
+                            label: 'Custom color filter',
+                            trailing: Switch(
+                              value: prefs.customColorFilter,
+                              activeThumbColor: AppColors.accent,
+                              onChanged: (v) =>
+                                  apply(() => prefs.setCustomColorFilter(v)),
+                            ),
+                          ),
+                          if (prefs.customColorFilter) ...[
+                            for (final ch in const ['r', 'g', 'b', 'a'])
+                              readerSheetRow(
+                                icon: Icons.circle,
+                                label: _channelLabel(ch),
+                                trailing: _channelPill(
+                                  _channelValue(prefs.customFilterColor, ch),
+                                ),
+                                child: Slider(
+                                  value: _channelValue(
+                                    prefs.customFilterColor,
+                                    ch,
+                                  ).toDouble(),
+                                  min: 0,
+                                  max: 255,
+                                  divisions: 255,
+                                  activeColor: AppColors.accent,
+                                  onChanged: (v) => apply(
+                                    () => prefs.setCustomFilterColor(
+                                      _channelSet(
+                                        prefs.customFilterColor,
+                                        ch,
+                                        v.round().clamp(0, 255),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            readerSheetRow(
+                              icon: Icons.layers_outlined,
+                              label: 'Color filter blend mode',
+                              child: ReaderSegmentedControl(
+                                options: const [
+                                  (value: 'default', label: 'Default'),
+                                  (value: 'multiply', label: 'Multiply'),
+                                  (value: 'screen', label: 'Screen'),
+                                  (value: 'overlay', label: 'Overlay'),
+                                  (value: 'dodge', label: 'Dodge'),
+                                  (value: 'lighten', label: 'Lighten'),
+                                ],
+                                selected: prefs.customFilterBlend,
+                                onSelect: (v) =>
+                                    apply(() => prefs.setCustomFilterBlend(v)),
+                              ),
+                            ),
+                          ],
+                          readerSheetRow(
                             icon: Icons.auto_stories_outlined,
                             label: context.l10n.doublePageLandscape,
                             trailing: Switch(
@@ -4397,6 +5436,78 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
                               }),
                             ),
                           ),
+                          // Windows (reader-8): fixes spreads that pair the
+                          // wrong pages, per series; O does the same.
+                          if (_desktopReader &&
+                              overrides != null &&
+                              prefs.doublePageLandscape)
+                            readerSheetRow(
+                              icon: Icons.swap_horiz_rounded,
+                              label: context.l10n.shiftSpreadByOnePage,
+                              trailing: Switch(
+                                value: _shiftSpread,
+                                activeThumbColor: AppColors.accent,
+                                onChanged: (_) => apply(
+                                  () => unawaited(_toggleShiftSpread()),
+                                ),
+                              ),
+                            ),
+                          // Windows (reader-5): long-strip width for this
+                          // series, live while dragging.
+                          if (_desktopReader && overrides != null)
+                            readerSheetRow(
+                              icon: Icons.width_normal_rounded,
+                              label: context.l10n.pageWidthLongStrip,
+                              trailing:
+                                  overrides.pageWidthOverride(
+                                        widget.sourceId,
+                                        widget.showId,
+                                      ) ==
+                                      null
+                                  ? Text(
+                                      '${_desktopStripMaxWidth.round()} px',
+                                      style: AppText.caption.copyWith(
+                                        color: AppColors.textSecondary,
+                                      ),
+                                    )
+                                  : GestureDetector(
+                                      // Tapping the tag goes back to default.
+                                      onTap: () => apply(
+                                        () => unawaited(
+                                          overrides.setPageWidthOverride(
+                                            widget.sourceId,
+                                            widget.showId,
+                                            null,
+                                          ),
+                                        ),
+                                      ),
+                                      child: Tooltip(
+                                        message: context.l10n.resetToDefault,
+                                        child: readerOverrideTag(context),
+                                      ),
+                                    ),
+                              child: Slider(
+                                key: const ValueKey('reader-page-width-slider'),
+                                value: _desktopStripMaxWidth.clamp(
+                                  ReaderOverrideStore.minPageWidth,
+                                  ReaderOverrideStore.maxPageWidth,
+                                ),
+                                min: ReaderOverrideStore.minPageWidth,
+                                max: ReaderOverrideStore.maxPageWidth,
+                                divisions: 50,
+                                label: '${_desktopStripMaxWidth.round()} px',
+                                activeColor: AppColors.accent,
+                                onChanged: (v) => apply(
+                                  () => unawaited(
+                                    overrides.setPageWidthOverride(
+                                      widget.sourceId,
+                                      widget.showId,
+                                      v,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
                           readerSheetRow(
                             icon: Icons.crop_outlined,
                             label: context.l10n.cropBorders,
@@ -4528,6 +5639,25 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     }
   }
 
+  /// Sheet title. Phones keep the plain headline; the Windows side panel adds
+  /// a close button, since there is no sheet to swipe away.
+  Widget _readerPanelTitle(BuildContext sheetContext, String title) {
+    final text = Text(title, style: AppText.headline);
+    if (!_desktopReader) return text;
+    return Row(
+      children: [
+        Expanded(child: text),
+        IconButton(
+          key: const ValueKey('reader-panel-close'),
+          tooltip: MaterialLocalizations.of(sheetContext).closeButtonTooltip,
+          icon: const Icon(Icons.close_rounded, size: 20),
+          color: AppColors.textSecondary,
+          onPressed: () => Navigator.of(sheetContext).pop(),
+        ),
+      ],
+    );
+  }
+
   String _directionLabel(String d) => switch (d) {
     'rtl' => 'Right to left',
     'vertical' => context.l10n.vertical,
@@ -4555,6 +5685,40 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
     'sepia' => 'Sepia',
     _ => context.l10n.subtitleOutlineNone,
   };
+
+  /// Custom tint channel helpers (ARGB int like 0xFFFFBA55).
+  static String _channelLabel(String ch) => switch (ch) {
+    'r' => 'Red',
+    'g' => 'Green',
+    'b' => 'Blue',
+    _ => 'Alpha',
+  };
+
+  static int _channelValue(int color, String ch) => switch (ch) {
+    'r' => (color >> 16) & 0xFF,
+    'g' => (color >> 8) & 0xFF,
+    'b' => color & 0xFF,
+    _ => (color >> 24) & 0xFF,
+  };
+
+  static int _channelSet(int color, String ch, int v) => switch (ch) {
+    'r' => (color & 0xFF00FFFF) | ((v & 0xFF) << 16),
+    'g' => (color & 0xFFFF00FF) | ((v & 0xFF) << 8),
+    'b' => (color & 0xFFFFFF00) | (v & 0xFF),
+    _ => (color & 0x00FFFFFF) | ((v & 0xFF) << 24),
+  };
+
+  static Widget _channelPill(int value) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+    decoration: BoxDecoration(
+      color: AppColors.surface2,
+      borderRadius: BorderRadius.circular(12),
+    ),
+    child: Text(
+      '$value',
+      style: AppText.body.copyWith(fontWeight: FontWeight.w600),
+    ),
+  );
 
   /// Small tappable pill next to the Brightness row — jumps straight to the
   /// OS-managed brightness. Calls the exact same `setBrightness(-1.0)` +
@@ -4590,7 +5754,36 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// already populated (`DefaultCacheManager().getSingleFile`, with the
   /// page's own CF headers so a protected source resolves the same way the
   /// reader itself does) rather than issuing a second download.
-  Future<void> _showPageActions(PageImage page) async {
+  Future<void> _showPageActions(PageImage page, {Offset? at}) async {
+    // Windows right-click: the app's graphite context menu at the pointer,
+    // not a bottom sheet. Copy image is Windows only (reader-1).
+    if (_desktopReader && at != null) {
+      final picked = await showDesktopContextMenu<_PageAction>(
+        context,
+        position: at,
+        items: [
+          DesktopMenuItem(
+            label: context.l10n.copyImage,
+            icon: Icons.copy_rounded,
+            value: _PageAction.copy,
+          ),
+          DesktopMenuItem(
+            label: context.l10n.saveToPictures,
+            icon: Icons.download_rounded,
+            value: _PageAction.save,
+          ),
+          DesktopMenuItem(
+            label: context.l10n.share,
+            icon: Icons.ios_share_rounded,
+            value: _PageAction.share,
+          ),
+        ],
+      );
+      if (picked == _PageAction.copy) await _copyPage(page);
+      if (picked == _PageAction.save) await _savePage(page);
+      if (picked == _PageAction.share) await _sharePage(page);
+      return;
+    }
     final action = await showModalBottomSheet<_PageAction>(
       context: context,
       backgroundColor: Colors.transparent,
@@ -4633,6 +5826,9 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
         await _savePage(page);
       case _PageAction.share:
         await _sharePage(page);
+      // Only offered by the Windows menu above.
+      case _PageAction.copy:
+        await _copyPage(page);
     }
   }
 
@@ -4659,10 +5855,7 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
   /// permission on the older-Android/iOS path where it throws.
   Future<void> _savePage(PageImage page) async {
     try {
-      final file = await DefaultCacheManager().getSingleFile(
-        page.url,
-        headers: page.headers ?? const {},
-      );
+      final file = await _pageFileFor(page);
       final bytes = await file.readAsBytes();
       final name = 'Zangetsu_${DateTime.now().millisecondsSinceEpoch}';
       try {
@@ -4671,7 +5864,8 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
         await Gal.requestAccess();
         await Gal.putImageBytes(bytes, name: name);
       }
-      _toast('Saved to gallery');
+      // gal saves into the Pictures library on Windows.
+      _toast(_desktopReader ? 'Saved to Pictures' : 'Saved to gallery');
     } catch (_) {
       _toast('Save failed');
     }
@@ -4679,13 +5873,43 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
 
   Future<void> _sharePage(PageImage page) async {
     try {
-      final file = await DefaultCacheManager().getSingleFile(
-        page.url,
-        headers: page.headers ?? const {},
-      );
+      final file = await _pageFileFor(page);
       await SharePlus.instance.share(ShareParams(files: [XFile(file.path)]));
     } catch (_) {
       _toast('Share failed');
+    }
+  }
+
+  /// The page's real bytes on disk, for Save / Share / Copy (reader-1).
+  ///
+  /// Goes through [PageFileCache], the resolver the tiled renderer already
+  /// uses, so a downloaded page, a page inside a CBZ and a scrambled
+  /// (native-provider) page all give the image the reader shows. Only a plain
+  /// network page that is not in the disk cache yet falls back to fetching
+  /// it through the cache manager, as before. Throws when there is no file.
+  Future<File> _pageFileFor(PageImage page) async {
+    final file = await _pageFiles.fileFor(page.url, page.headers);
+    if (file != null) return file;
+    final plainNetwork =
+        page.url.startsWith('http') &&
+        CbzImage.tryParse(page.url) == null &&
+        nativePageProvider(page.url, page.headers) == null;
+    if (!plainNetwork) throw StateError('Page file unavailable');
+    return DefaultCacheManager().getSingleFile(
+      page.url,
+      headers: page.headers ?? const {},
+    );
+  }
+
+  /// Windows 'Copy image': puts the page on the clipboard as a bitmap.
+  Future<void> _copyPage(PageImage page) async {
+    try {
+      final bytes = await (await _pageFileFor(page)).readAsBytes();
+      final ok = await copyImageToClipboard(bytes);
+      if (!mounted) return;
+      _toast(ok ? context.l10n.imageCopied : context.l10n.copyFailed);
+    } catch (_) {
+      if (mounted) _toast(context.l10n.copyFailed);
     }
   }
 
@@ -4720,7 +5944,8 @@ class _MangaReaderScreenState extends State<MangaReaderScreen>
 }
 
 /// Save-or-share choice from [_MangaReaderScreenState._showPageActions].
-enum _PageAction { save, share }
+/// [copy] is the Windows-only 'Copy image' (reader-1).
+enum _PageAction { save, share, copy }
 
 /// Resolves `ReaderPrefs.fitMode` into the `BoxFit` used to render a paged
 /// page. `smart` needs a page's own decoded aspect ratio to pick between
@@ -5028,4 +6253,133 @@ enum _ReaderMenuAction {
   toggleRead,
   settings,
   translatePage,
+}
+
+/// Mihon-style page pill ("08/26"), floating bottom-centre. Appears on every
+/// page turn in both modes and fades 1.5s after the last one. Listens to the
+/// index notifier itself so page turns never rebuild the reader, and stays
+/// hidden while the chrome (which carries its own counter) is up.
+class _ScrollPagePill extends StatefulWidget {
+  const _ScrollPagePill({
+    super.key,
+    required this.pageIndex,
+    required this.activity,
+    required this.total,
+    required this.visible,
+    this.labelFor,
+    this.persistent = false,
+  });
+
+  /// Optional text for a page index; null keeps the default "index/total".
+  final String Function(int index)? labelFor;
+
+  /// Desktop: stays up instead of fading 1.5s after a turn. There is no tap
+  /// to summon the chrome there, so "Show page number" means always shown.
+  final bool persistent;
+
+  final ValueListenable<int> pageIndex;
+
+  /// Bumped every scroll frame — wakes the pill while scrolling.
+  final ValueListenable<int> activity;
+  final int total;
+  final bool visible;
+
+  @override
+  State<_ScrollPagePill> createState() => _ScrollPagePillState();
+}
+
+class _ScrollPagePillState extends State<_ScrollPagePill> {
+  bool _show = false;
+  Timer? _hideTimer;
+  int? _lastSeen;
+
+  @override
+  void initState() {
+    super.initState();
+    _lastSeen = widget.pageIndex.value;
+    widget.pageIndex.addListener(_onPage);
+    widget.activity.addListener(_poke);
+  }
+
+  @override
+  void didUpdateWidget(_ScrollPagePill oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.pageIndex, widget.pageIndex)) {
+      oldWidget.pageIndex.removeListener(_onPage);
+      widget.pageIndex.addListener(_onPage);
+    }
+    if (!identical(oldWidget.activity, widget.activity)) {
+      oldWidget.activity.removeListener(_poke);
+      widget.activity.addListener(_poke);
+    }
+  }
+
+  void _onPage() {
+    if (_lastSeen == widget.pageIndex.value) return;
+    _lastSeen = widget.pageIndex.value;
+    _poke();
+  }
+
+  /// Show (or keep shown) and restart the 1.5s fade-out timer.
+  void _poke() {
+    _hideTimer?.cancel();
+    if (mounted && !_show) setState(() => _show = true);
+    if (!mounted) return;
+    _hideTimer = Timer(const Duration(milliseconds: 1500), () {
+      if (mounted) setState(() => _show = false);
+    });
+  }
+
+  @override
+  void dispose() {
+    widget.pageIndex.removeListener(_onPage);
+    widget.activity.removeListener(_poke);
+    _hideTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final total = widget.total;
+    final show = (_show || widget.persistent) && widget.visible && total > 0;
+    return Positioned(
+      left: 0,
+      right: 0,
+      bottom: 36,
+      child: IgnorePointer(
+        child: AnimatedOpacity(
+          opacity: show ? 1.0 : 0.0,
+          duration: const Duration(milliseconds: 250),
+          child: Center(
+            child: ValueListenableBuilder<int>(
+              valueListenable: widget.pageIndex,
+              builder: (context, index, _) {
+                final width = math.max(2, total.toString().length);
+                final cur = (index + 1).toString().padLeft(width, '0');
+                final tot = total.toString().padLeft(width, '0');
+                return Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 5,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.6),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text(
+                    widget.labelFor?.call(index) ?? '$cur/$tot',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }

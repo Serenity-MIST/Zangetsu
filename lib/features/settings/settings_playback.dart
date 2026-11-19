@@ -19,6 +19,12 @@ class PlaybackSettingsScreen extends StatefulWidget {
 class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
   PlaybackPrefs get _prefs => sl<PlaybackPrefs>();
 
+  /// Windows desktop wording/layout for rows whose phone text describes a
+  /// phone (rotation, BACK key, touch slider). Target platform, so widget
+  /// tests can switch it on; phone and TV are unchanged.
+  bool get _windowsUi =>
+      defaultTargetPlatform == TargetPlatform.windows && !sl<AppMode>().isTv;
+
   int _cacheBytes = 0;
   bool _shadersReady = ShaderPresets.downloaded;
   bool _shaderDownloading = false;
@@ -30,7 +36,8 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
   @override
   void initState() {
     super.initState();
-    _loadCacheSize();
+    // Windows no longer shows the size here (it links to Storage instead).
+    if (!_windowsUi) _loadCacheSize();
     ShaderPresets.refreshDownloaded().then((v) {
       if (mounted) setState(() => _shadersReady = v);
     });
@@ -297,6 +304,13 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
     (30, '30s'),
   ];
 
+  // Same triple as the manga reader's Orientation row.
+  static const List<(String, String)> _orientationOptions = [
+    ('landscape', 'Landscape'),
+    ('portrait', 'Portrait'),
+    ('system', 'System'),
+  ];
+
   String _labelFor<T>(List<(T, String)> options, T value, String fallback) {
     for (final (v, label) in options) {
       if (v == value) return label;
@@ -467,11 +481,15 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
     if (mounted) setState(() {});
   }
 
+  /// Decoder choices: Windows names the D3D11 path mpv actually uses.
+  List<(String, String)> _decoderOptions(AppLocalizations l10n) =>
+      _windowsUi ? kWindowsDecoderOptions : videoDecoderOptions(l10n);
+
   Future<void> _pickDecoder() async {
     final l10n = context.l10n;
     final picked = await _pick<String>(
       title: l10n.videoDecoder,
-      options: videoDecoderOptions(l10n),
+      options: _decoderOptions(l10n),
       current: _prefs.videoDecoder,
     );
     if (picked == null) return;
@@ -524,15 +542,100 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
     if (mounted) setState(() {});
   }
 
+  Future<void> _pickOrientation() async {
+    final picked = _windowsUi
+        ? await _pickPlayerOpensIn()
+        : await _pick<String>(
+            title: context.l10n.orientationLock,
+            options: _orientationOptions,
+            current: _prefs.playerOrientation,
+          );
+    if (picked == null) return;
+    await _prefs.setPlayerOrientation(picked);
+    if (mounted) setState(() {});
+  }
+
+  /// Windows title for the orientation row: a PC never rotates, the stored
+  /// value only picks the layout the player opens in.
+  String get _playerOpensInTitle => context.l10n.playerOpensIn;
+
+  /// Windows: same stored values as the phone orientation lock. 'portrait'
+  /// opens the theater watch page, 'landscape' the full window (see
+  /// initialPresentation in player_screen.dart). A legacy 'system' save is
+  /// still offered while it is the current value, so it is never lost silently.
+  Future<String?> _pickPlayerOpensIn() {
+    final current = _prefs.playerOrientation;
+    final options = <(String, String)>[
+      ...kWindowsPlayerOpensInOptions,
+      if (current == 'system') ('system', windowsPlayerOpensInLabel('system')),
+    ];
+    if (!DesktopSettingsScope.contains(context)) {
+      return _pick<String>(
+        title: _playerOpensInTitle,
+        options: options,
+        current: current,
+      );
+    }
+    return showGraphiteSettingsChoice<String>(
+      context,
+      title: _playerOpensInTitle,
+      options: options,
+      current: current,
+      optionDescriptions: const {
+        'portrait':
+            'Theater page with the episode list beside the video. '
+            'Double-click the video for the full window.',
+        'landscape':
+            'The video fills the app window. Esc or the mouse Back '
+            'button drops to the watch page.',
+        'system': 'Watch page in a tall window, full window in a wide one.',
+      },
+    );
+  }
+
   Future<void> _pickCloseConfirmation() async {
     final l10n = context.l10n;
+    if (_windowsUi && DesktopSettingsScope.contains(context)) {
+      final picked = await showGraphiteSettingsChoice<String>(
+        context,
+        title: l10n.closeConfirmation,
+        description:
+            'From the full window, the first Esc or Back goes to the watch '
+            'page. This choice decides what closes the player from there.',
+        options: kWindowsCloseConfirmOptions,
+        current: _prefs.closeConfirmation,
+      );
+      if (picked == null) return;
+      await _prefs.setCloseConfirmation(picked);
+      if (mounted) setState(() {});
+      return;
+    }
     final picked = await _pick<String>(
       title: l10n.closeConfirmation,
-      options: closeConfirmPickerOptions(l10n),
+      options: _windowsUi
+          ? kWindowsCloseConfirmOptions
+          : closeConfirmPickerOptions(l10n),
       current: _prefs.closeConfirmation,
     );
     if (picked == null) return;
     await _prefs.setCloseConfirmation(picked);
+    if (mounted) setState(() {});
+  }
+
+  /// Chooses what happens when every online source fails or stalls and a
+  /// finished download of the same episode exists.
+  Future<void> _pickLocalDownloadFallback() async {
+    final picked = await _pick<String>(
+      title: context.l10n.playDownloadedCopyIfFails,
+      options: [
+        ('auto', context.l10n.switchAutomatically),
+        ('ask', context.l10n.askFirst),
+        ('off', context.l10n.off),
+      ],
+      current: _prefs.localDownloadFallback,
+    );
+    if (picked == null) return;
+    await _prefs.setLocalDownloadFallback(picked);
     if (mounted) setState(() {});
   }
 
@@ -641,11 +744,140 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
     );
   }
 
+  // R5 row titles. Hard-coded English (Windows-only rows); the search index
+  // uses the same strings so a search hit finds the row by its title.
+  static const listIdleToggleTitle = 'Auto-pause idle titles';
+  static const listIdlePauseTitle = 'Move to Paused after';
+  static const listIdleDropTitle = 'Move to Dropped after';
+
+  /// R5 (Windows): the auto Paused/Dropped toggle plus its two day sliders
+  /// (shown only while the toggle is on).
+  List<Widget> _listIdleRows() {
+    final idle = ListIdleRunner.instance;
+    return [
+      _toggleRow(
+        icon: Icons.snooze_rounded,
+        title: listIdleToggleTitle,
+        subtitle:
+            'Watching or Reading titles with no progress move to Paused, '
+            'then to Dropped. Trackers are updated too, with Undo.',
+        value: idle.enabled,
+        onChanged: (v) async {
+          await idle.setEnabled(v);
+          if (mounted) setState(() {});
+        },
+      ),
+      if (idle.enabled) ...[
+        _listIdleDaysRow(
+          key: 'list-idle-pause-days',
+          title: listIdlePauseTitle,
+          value: idle.pauseDays,
+          suffix: 'days without progress',
+          onSave: idle.setPauseDays,
+          defaultDays: ListIdleRule.defaultPauseDays,
+        ),
+        _listIdleDaysRow(
+          key: 'list-idle-drop-days',
+          title: listIdleDropTitle,
+          value: idle.dropDays,
+          suffix: 'more days in Paused',
+          onSave: idle.setDropDays,
+          defaultDays: ListIdleRule.defaultDropDays,
+        ),
+      ],
+    ];
+  }
+
+  /// One 7–30 day slider row. Holds the value locally while dragging and
+  /// saves on release (no Hive write per tick), like the MegaSkip slider.
+  Widget _listIdleDaysRow({
+    required String key,
+    required String title,
+    required int value,
+    required String suffix,
+    required Future<void> Function(int) onSave,
+    required int defaultDays,
+  }) {
+    // Windows settings: the shared slider row (value, unit and default in
+    // the subtitle). It holds the value while dragging and saves on release.
+    if (DesktopSettingsScope.contains(context)) {
+      return DesktopSettingsSlider(
+        key: ValueKey(key),
+        sliderKey: ValueKey('$key-slider'),
+        icon: Icons.schedule_rounded,
+        title: title,
+        value: value.toDouble(),
+        min: ListIdleRule.minDays.toDouble(),
+        max: ListIdleRule.maxDays.toDouble(),
+        divisions: ListIdleRule.maxDays - ListIdleRule.minDays,
+        format: (v) => '${v.round()}',
+        unit: (_) => suffix,
+        defaultValue: defaultDays.toDouble(),
+        onChangeEnd: (v) async {
+          await onSave(v.round());
+          if (mounted) setState(() {});
+        },
+      );
+    }
+    var val = value.toDouble();
+    return StatefulBuilder(
+      key: ValueKey(key),
+      builder: (context, setLocal) {
+        final slider = SizedBox(
+          width: 240,
+          child: Slider(
+            key: ValueKey('$key-slider'),
+            min: ListIdleRule.minDays.toDouble(),
+            max: ListIdleRule.maxDays.toDouble(),
+            divisions: ListIdleRule.maxDays - ListIdleRule.minDays,
+            value: val,
+            label: '${val.round()}',
+            activeColor: AppColors.accent,
+            onChanged: (v) => setLocal(() => val = v),
+            onChangeEnd: (v) async {
+              await onSave(v.round());
+              if (mounted) setState(() {});
+            },
+          ),
+        );
+        final subtitle = '${val.round()} $suffix';
+        return SettingsTile(
+          icon: Icons.schedule_rounded,
+          title: title,
+          subtitle: subtitle,
+          trailing: slider,
+        );
+      },
+    );
+  }
+
   /// MegaSkip jump-size slider (5–180s), shown under the MegaSkip toggle. Holds
   /// the value locally while dragging (smooth, no per-tick Hive writes) and
   /// persists on release.
   Widget _megaSkipDurationRow() {
     double val = _prefs.megaSkipSeconds.toDouble();
+    // Desktop settings: the shared slider row (drag, click or arrow keys),
+    // with the jump in seconds and the default in the subtitle.
+    if (DesktopSettingsScope.contains(context)) {
+      return DesktopSettingsSlider(
+        key: const ValueKey('megaskip-duration-desktop'),
+        sliderKey: const ValueKey('megaskip-duration-slider'),
+        icon: Icons.timer_outlined,
+        title: context.l10n.megaSkipDuration,
+        value: val,
+        min: PlaybackPrefs.megaSkipMin.toDouble(),
+        max: PlaybackPrefs.megaSkipMax.toDouble(),
+        divisions: PlaybackPrefs.megaSkipMax - PlaybackPrefs.megaSkipMin,
+        format: (v) => '${v.round()}',
+        unit: (v) => v.round() == 1 ? 'second' : 'seconds',
+        // 85 s is PlaybackPrefs.megaSkipSeconds' stored default.
+        defaultValue: 85,
+        onChangeEnd: (v) async {
+          await _prefs.setMegaSkipSeconds(v.round());
+          if (mounted) setState(() {});
+        },
+      );
+    }
     return StatefulBuilder(
       builder: (context, setLocal) => Padding(
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
@@ -720,7 +952,7 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar(context.l10n.playback),
       body: ListView(
         // TV focus chrome paints outside the row, so it must not be clipped.
@@ -771,9 +1003,9 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
                   icon: Icons.memory_outlined,
                   title: context.l10n.videoDecoder,
                   subtitle: _labelFor(
-                    videoDecoderOptions(context.l10n),
+                    _decoderOptions(context.l10n),
                     _prefs.videoDecoder,
-                    context.l10n.decoderHardwareRecommended,
+                    _decoderOptions(context.l10n).first.$2,
                   ),
                   onTap: _pickDecoder,
                 ),
@@ -782,7 +1014,7 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
               // can't swap its video output on a live player).
               // Windows fixes output to its embedded surface so renderer
               // changes cannot create an uncontrolled external mpv window.
-              if (!sl<AppMode>().isTv && !Platform.isWindows)
+              if (!sl<AppMode>().isTv && !_windowsUi)
                 SettingsTile(
                   icon: Icons.display_settings_outlined,
                   title: context.l10n.videoRenderer,
@@ -856,6 +1088,16 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
                             : context.l10n.externalApp),
                   onTap: _pickPlayer,
                 ),
+                _toggleRow(
+                  icon: Icons.swap_horiz_rounded,
+                  title: context.l10n.autoPlayerFallback,
+                  subtitle: context.l10n.autoPlayerFallbackDescription,
+                  value: _prefs.autoPlayerFallback,
+                  onChanged: (value) async {
+                    await _prefs.setAutoPlayerFallback(value);
+                    if (mounted) setState(() {});
+                  },
+                ),
                 SettingsTile(
                   icon: Icons.tune_rounded,
                   title: context.l10n.playerControls,
@@ -875,7 +1117,7 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
 
           // Desktop embeds its own player, but its bar arrangement remains
           // editable. Do not gate this destination with Android app handoff.
-          if (Platform.isWindows) ...[
+          if (_windowsUi) ...[
             SettingsSectionLabel(context.l10n.sectionPlayer),
             SettingsCard(
               children: [
@@ -940,15 +1182,29 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
                   if (mounted) setState(() {});
                 },
               ),
+              // R5 (Windows only): auto Paused/Dropped for idle titles.
+              if (_windowsUi) ..._listIdleRows(),
               SettingsTile(
                 icon: Icons.exit_to_app_outlined,
                 title: context.l10n.closeConfirmation,
-                subtitle: switch (_prefs.closeConfirmation) {
-                  'confirm' => context.l10n.closeConfirmationAsk,
-                  'direct' => context.l10n.closeConfirmationDirect,
-                  _ => context.l10n.closeConfirmationDoubleBack,
-                },
+                subtitle: _windowsUi
+                    ? windowsCloseConfirmLabel(_prefs.closeConfirmation)
+                    : switch (_prefs.closeConfirmation) {
+                        'confirm' => context.l10n.closeConfirmationAsk,
+                        'direct' => context.l10n.closeConfirmationDirect,
+                        _ => context.l10n.closeConfirmationDoubleBack,
+                      },
                 onTap: _pickCloseConfirmation,
+              ),
+              SettingsTile(
+                icon: Icons.download_done_rounded,
+                title: context.l10n.playDownloadedCopyIfFails,
+                subtitle: switch (_prefs.localDownloadFallback) {
+                  'ask' => context.l10n.askFirst,
+                  'off' => context.l10n.off,
+                  _ => context.l10n.switchAutomatically,
+                },
+                onTap: _pickLocalDownloadFallback,
               ),
               _toggleRow(
                 icon: Icons.skip_next_outlined,
@@ -1064,11 +1320,16 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
                   },
                 ),
               // Desktop shortcuts use this duration even without seek buttons.
-              if (_prefs.seekButtons || Platform.isWindows)
+              if (_prefs.seekButtons || _windowsUi)
                 SettingsTile(
                   icon: Icons.timer_outlined,
                   title: context.l10n.seekButtonDuration,
-                  subtitle: context.l10n.secondsShort(_prefs.tvSeekSeconds),
+                  // Windows: name the keys/buttons this step drives
+                  // (DesktopPlayerInput).
+                  subtitle: _windowsUi
+                      ? '${context.l10n.secondsShort(_prefs.tvSeekSeconds)}'
+                            ' · arrow keys, J / L and the mouse Forward button'
+                      : context.l10n.secondsShort(_prefs.tvSeekSeconds),
                   onTap: _pickSeekSecondsForTV,
                 ),
               _toggleRow(
@@ -1080,6 +1341,26 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
                   if (mounted) setState(() {});
                 },
               ),
+              // Orientation also controls the phone player's opening layout.
+              // Windows shows it as "Player opens in" (watch page / full
+              // window); the stored value is the same.
+              if (!sl<AppMode>().isTv)
+                SettingsTile(
+                  icon: _windowsUi
+                      ? Icons.picture_in_picture_outlined
+                      : Icons.screen_rotation,
+                  title: _windowsUi
+                      ? _playerOpensInTitle
+                      : context.l10n.orientationLock,
+                  subtitle: _windowsUi
+                      ? windowsPlayerOpensInLabel(_prefs.playerOrientation)
+                      : _labelFor(
+                          _orientationOptions,
+                          _prefs.playerOrientation,
+                          _prefs.playerOrientation,
+                        ),
+                  onTap: _pickOrientation,
+                ),
               if (sl<AppMode>().isTv && !isAppleTv)
                 _toggleRow(
                   icon: Icons.tv_outlined,
@@ -1152,7 +1433,7 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
           ),
 
           // Touch gestures have no desktop effect; Windows uses keyboard/mouse.
-          if (!sl<AppMode>().isTv && !Platform.isWindows) ...[
+          if (!sl<AppMode>().isTv && !_windowsUi) ...[
             SettingsSectionLabel(context.l10n.sectionGestures),
             SettingsCard(
               children: [
@@ -1224,14 +1505,46 @@ class _PlaybackSettingsScreenState extends State<PlaybackSettingsScreen> {
                 ),
                 onTap: _pickBufferLength,
               ),
-              SettingsTile(
-                icon: Icons.delete_outline_rounded,
-                title: context.l10n.clearImageVideoCache,
-                subtitle: MediaCache.formatBytes(_cacheBytes),
-                onTap: _clearCache,
-              ),
+              // Windows (set-6): caches are sized and cleared in one place,
+              // Storage, so this row links there instead of duplicating it.
+              if (_windowsUi)
+                SettingsTile(
+                  key: const ValueKey('playback-storage-link'),
+                  icon: Icons.storage_rounded,
+                  title: context.l10n.cacheAndStorage,
+                  subtitle: context.l10n.cacheAndStorageSubtitle,
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => const StorageSettingsScreen(),
+                    ),
+                  ),
+                )
+              else
+                SettingsTile(
+                  icon: Icons.delete_outline_rounded,
+                  title: context.l10n.clearImageVideoCache,
+                  subtitle: MediaCache.formatBytes(_cacheBytes),
+                  onTap: _clearCache,
+                ),
             ],
           ),
+
+          if (Platform.isAndroid && !sl<AppMode>().isTv)
+            SettingsCard(
+              margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+              children: [
+                SettingsTile(
+                  icon: Icons.storage_rounded,
+                  title: context.l10n.androidPlayerCache,
+                  subtitle: context.l10n.androidPlayerCacheSummary,
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => const NativePlayerCacheScreen(),
+                    ),
+                  ),
+                ),
+              ],
+            ),
 
           // ── Subtitles ───────────────────────────────────────────────────
           SettingsSectionLabel(context.l10n.subtitles),

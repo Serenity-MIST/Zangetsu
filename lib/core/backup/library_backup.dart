@@ -1,6 +1,8 @@
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/hive/hive_key.dart';
 
+import 'backup_boxes.dart';
+
 /// Backs up the user's library — My List, watch history, and manga/novel
 /// reading progress — and merges it back in on restore. Never deletes:
 /// My List and the reading boxes merge by union (existing entries win),
@@ -14,6 +16,30 @@ class LibraryBackup {
   static const _readHistoryBox = 'read_history';
   static const _readPositionsBox = 'read_positions';
   static const _listStatusBox = 'list_status';
+  // Added for file backups that fully bring a library back. All four hold
+  // things the user made, not caches:
+  // My List categories and which titles are in them (CategoryStore).
+  static const _categoriesBox = 'list_categories';
+  // Mid-episode resume points and hand-marked watched episodes (ResumeStore).
+  static const _resumeBox = 'resume_positions';
+  // Per-series reader direction / fit / page width (ReaderOverrideStore).
+  static const _readerOverridesBox = 'reader_overrides';
+  // Manual "this show = that tracker entry" fixes (TrackerBindingStore).
+  static const _trackerBindingsBox = 'tracker_bindings';
+
+  /// Every box a library restore can write to. The safety copy taken before
+  /// a restore snapshots these so 'Undo restore' can put them back.
+  static const List<String> boxNames = [
+    _myListBox,
+    _historyBox,
+    _readHistoryBox,
+    _readPositionsBox,
+    _listStatusBox,
+    _categoriesBox,
+    _resumeBox,
+    _readerOverridesBox,
+    _trackerBindingsBox,
+  ];
 
   Map<String, dynamic> build() => {
     'myList': _dump(_myListBox),
@@ -23,7 +49,20 @@ class LibraryBackup {
     'readHistory': _dumpKeyed(_readHistoryBox, asMap: true),
     'readPositions': _dumpKeyed(_readPositionsBox, asMap: true),
     'listStatus': _dumpKeyed(_listStatusBox, asMap: false),
+    'listCategories': _dumpPlain(_categoriesBox),
+    'resumePositions': _dumpKeyed(_resumeBox, asMap: true),
+    'readerOverrides': _dumpPlain(_readerOverridesBox),
+    'trackerBindings': _dumpPlain(_trackerBindingsBox),
   };
+
+  /// Dumps an untyped box as `{key: plain JSON value}`. Used by the boxes
+  /// whose values are lists or maps under an untyped `Box` (categories,
+  /// reader overrides, tracker bindings).
+  Map<String, dynamic> _dumpPlain(String box) {
+    final b = anyOpenBox(box);
+    if (b == null) return const {};
+    return {for (final k in b.keys) k.toString(): plainCopy(b.get(k))};
+  }
 
   List<Map<String, dynamic>> _dump(String box) {
     if (!Hive.isBoxOpen(box)) return const [];
@@ -101,6 +140,66 @@ class LibraryBackup {
     await _mergeKeyed(_readHistoryBox, data['readHistory'], asMap: true);
     await _mergeKeyed(_readPositionsBox, data['readPositions'], asMap: true);
     await _mergeKeyed(_listStatusBox, data['listStatus'], asMap: false);
+    await _mergeCategories(data['listCategories']);
+    // Resume points: union, the current device's point for an episode wins.
+    await _mergeKeyed(_resumeBox, data['resumePositions'], asMap: true);
+    await _mergeFieldMaps(_readerOverridesBox, data['readerOverrides']);
+    await _mergeFieldMaps(_trackerBindingsBox, data['trackerBindings']);
+  }
+
+  /// Merges My List categories. Category lists (keys ending in
+  /// `__categories__`) are unioned by category id, keeping the current name
+  /// and order for ids that exist on both sides. Assignment rows (a title's
+  /// list of category ids) are unioned too. Nothing is removed.
+  Future<void> _mergeCategories(Object? raw) async {
+    final box = anyOpenBox(_categoriesBox);
+    if (box == null || raw is! Map) return;
+    for (final e in raw.entries) {
+      final key = hiveKey(e.key.toString());
+      final incoming = e.value;
+      if (incoming is! List) continue;
+      final current = box.get(key);
+      if (key.endsWith('__categories__')) {
+        final rows = current is List ? [...current] : <dynamic>[];
+        final ids = {
+          for (final r in rows)
+            if (r is Map) r['id'],
+        };
+        for (final r in incoming) {
+          if (r is Map && r['id'] is String && !ids.contains(r['id'])) {
+            rows.add(Map<String, dynamic>.from(r));
+            ids.add(r['id']);
+          }
+        }
+        await box.put(key, rows);
+      } else {
+        final ids = <String>{
+          if (current is List) ...current.whereType<String>(),
+          ...incoming.whereType<String>(),
+        };
+        await box.put(key, ids.toList());
+      }
+    }
+  }
+
+  /// Merges an untyped box whose values are small field maps (reader
+  /// overrides `{mode, fit, ...}`, tracker bindings `{tracker: id}`). Missing
+  /// rows are added; for a row on both sides, only fields the current device
+  /// doesn't already have are filled in, so nothing the user set here changes.
+  Future<void> _mergeFieldMaps(String boxName, Object? raw) async {
+    final box = anyOpenBox(boxName);
+    if (box == null || raw is! Map) return;
+    for (final e in raw.entries) {
+      final value = e.value;
+      if (value is! Map) continue;
+      final key = hiveKey(e.key.toString());
+      final current = box.get(key);
+      final merged = <String, dynamic>{
+        ...Map<String, dynamic>.from(value),
+        if (current is Map) ...Map<String, dynamic>.from(current),
+      };
+      await box.put(key, merged);
+    }
   }
 
   Future<void> _mergeProfileRows(

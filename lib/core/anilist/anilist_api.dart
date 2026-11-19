@@ -7,6 +7,8 @@ import '../zmode/metadata_provider_prefs.dart';
 import 'anilist_title.dart';
 import '../models/person.dart';
 import '../tracker/tracker.dart' show MediaKind;
+// track-2: lets _gql report a lost login to the tracker sync outbox.
+import '../tracker/tracker_sync_queue.dart' show TrackerWriteScope;
 
 /// AniList's `type:` enum value for [kind].
 String _anilistType(MediaKind kind) =>
@@ -36,7 +38,7 @@ String mediaEntryQuery(MediaKind kind) {
   return 'query(\$id:Int){ Media(id:\$id){ ${_totalCountFields(kind)} '
       'title{ romaji english native } '
       'nextAiringEpisode{ episode airingAt } '
-      'mediaListEntry{ status score(format:POINT_10) progress } } }';
+      'mediaListEntry{ status score(format:POINT_10) progress private } } }';
 }
 
 /// Query text for [AniListApi.searchMedia]. [novelFormat] narrows a manga
@@ -58,10 +60,14 @@ String searchMediaQuery(MediaKind kind, {bool novelFormat = false}) {
 /// byte-identical to the pre-manga text apart from the totals/airing fields.
 String mediaListCollectionQuery(MediaKind kind) {
   final formatField = kind == MediaKind.manga ? ' format' : '';
-  final airingField = kind == MediaKind.manga ? '' : ' nextAiringEpisode{episode}';
+  // airingAt + status + endDate date the latest release, so the desktop
+  // "New from your list" row can tell a fresh episode from an old one.
+  final airingField = kind == MediaKind.manga
+      ? ''
+      : ' nextAiringEpisode{episode airingAt} status endDate{year month day}';
   return 'query(\$u:String){ MediaListCollection(userName:\$u, type:${_anilistType(kind)}){ '
       'lists { status entries { status progress score(format:POINT_10) '
-      'updatedAt customLists(asArray:true) '
+      'updatedAt private customLists(asArray:true) '
       'media { id idMal title { romaji english native }$formatField '
       '${_totalCountFields(kind)}$airingField coverImage { large } } } } } }';
 }
@@ -130,6 +136,15 @@ class AniListApi {
           validateStatus: (s) => s != null && s < 500,
         ),
       );
+      // track-2: a revoked or expired token answers 401/403. Tell the sync
+      // outbox so it shows "needs sign-in" instead of retrying it as a
+      // network failure. A no-op outside a watched tracker write. Only when a
+      // token was sent: an anonymous 403 is not a lost login.
+      final code = res.statusCode;
+      if ((code == 401 || code == 403) &&
+          headers.containsKey('Authorization')) {
+        TrackerWriteScope.reportStatus(code);
+      }
       final data = res.data;
       if (data is Map && data['data'] is Map) {
         return Map<String, dynamic>.from(data['data'] as Map);
@@ -714,7 +729,7 @@ class AniListApi {
     return Map<String, dynamic>.from(m);
   }
 
-  /// Write any subset of status/progress/score for [mediaId] in one mutation.
+  /// Write any subset of status/progress/score/privacy in one mutation.
   /// [scoreRaw] is 0–100 (AniList's internal scale, independent of the user's
   /// display format). Returns true on success.
   Future<bool> saveEntry({
@@ -722,6 +737,7 @@ class AniListApi {
     String? status,
     int? progress,
     int? scoreRaw,
+    bool? isPrivate,
   }) async {
     final varDefs = <String>['\$mediaId:Int'];
     final args = <String>['mediaId:\$mediaId'];
@@ -740,6 +756,11 @@ class AniListApi {
       varDefs.add('\$scoreRaw:Int');
       args.add('scoreRaw:\$scoreRaw');
       vars['scoreRaw'] = scoreRaw;
+    }
+    if (isPrivate != null) {
+      varDefs.add(r'$private:Boolean');
+      args.add(r'private:$private');
+      vars['private'] = isPrivate;
     }
     final d = await _gql(
       'mutation(${varDefs.join(',')}){'

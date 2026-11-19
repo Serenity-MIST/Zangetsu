@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
@@ -427,6 +428,62 @@ void main() {
     expect(saved, contains('section:Recently released'));
     // The switch the test just flipped reflects it in the UI too.
     expect(tester.widget<Switch>(switchOf('section:Trending')).value, isFalse);
+  });
+
+  testWidgets('phone keeps drag only: no up/down buttons', (tester) async {
+    sl.registerSingleton<TrackerHub>(TrackerHub([_FakeTracker('AniList')]));
+    await pumpEditor(tester);
+    expect(find.byKey(const ValueKey('home-row-up-local:continue')), findsNothing);
+    expect(find.byTooltip('Move down'), findsNothing);
+  });
+
+  testWidgets('Windows up/down buttons move a row, save it, and reset undoes it', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    try {
+      sl.registerSingleton<TrackerHub>(TrackerHub([_FakeTracker('AniList')]));
+      await pumpEditor(tester, desktop: true);
+
+      // First row cannot move up; last row cannot move down.
+      final up = find.byKey(const ValueKey('home-row-up-local:continue'));
+      expect(tester.widget<IconButton>(up).onPressed, isNull);
+      final down = find.byKey(const ValueKey('home-row-down-local:continue'));
+      expect(tester.widget<IconButton>(down).onPressed, isNotNull);
+
+      // Default order starts local:continue then the tracker continue row.
+      double y(String id) => tester.getTopLeft(find.byKey(ValueKey(id))).dy;
+      expect(y('local:continue'), lessThan(y('tracker:continue')));
+
+      await tester.tap(down);
+      await tester.pump();
+      await flushWrites(tester);
+
+      // Moved one place down, both on screen and in storage.
+      expect(y('local:continue'), greaterThan(y('tracker:continue')));
+      final saved = HomeRowsPrefs.savedFor(layoutKey)!;
+      expect(saved.indexOf('local:continue'), 1);
+      expect(tester.widget<IconButton>(up).onPressed, isNotNull);
+
+      // And back up again restores the original first slot.
+      await tester.tap(up);
+      await tester.pump();
+      await flushWrites(tester);
+      expect(HomeRowsPrefs.savedFor(layoutKey)!.indexOf('local:continue'), 0);
+
+      // Move it down again, then Reset drops the saved order entirely.
+      await tester.tap(down);
+      await tester.pump();
+      await flushWrites(tester);
+      await tester.tap(find.text('Reset'));
+      await tester.pumpAndSettle();
+      await flushWrites(tester);
+      expect(HomeRowsPrefs.savedFor(layoutKey), isNull);
+      expect(y('local:continue'), lessThan(y('tracker:continue')));
+      expect(tester.takeException(), isNull);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
   });
 
   testWidgets('reset clears the saved arrangement and restores defaults', (

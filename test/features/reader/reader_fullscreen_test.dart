@@ -109,7 +109,9 @@ void main() {
     uiModes.clear();
     state.applyReaderComfort();
     await settle();
-    expect(uiModes, ['SystemUiMode.edgeToEdge']);
+    // Windows (reader-4 C): with the setting off the reader leaves the
+    // window exactly as it was, so nothing is sent at all.
+    expect(uiModes, Platform.isWindows ? isEmpty : ['SystemUiMode.edgeToEdge']);
   });
 
   test('leaving the reader brings the bars back', () async {

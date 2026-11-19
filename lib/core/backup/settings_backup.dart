@@ -1,4 +1,4 @@
-import 'package:hive/hive.dart';
+import 'backup_boxes.dart';
 
 /// Codec that dumps and restores the plain preference Hive boxes.
 ///
@@ -15,8 +15,12 @@ import 'package:hive/hive.dart';
 ///                           written. Add only with per-key handling.
 ///   - `pinned_sources`, `subscriptions` — reference source ids the restoring
 ///                           device may not have installed
-///   - `zmode_matches`     — same reason: it is nothing but source ids
-///                           (which source plays each metadata title)
+///
+/// `zmode_matches` is handled on its own (see [matchesBox]): only the
+/// HAND-MADE matches ("Wrong title?" fixes and per-title source choices) are
+/// saved, never the automatic guesses. A pin for a source the restoring device
+/// lacks is harmless: the app ignores matches for sources that aren't
+/// installed and uses them again once the source is reinstalled.
 ///
 /// Every box here must be OPENED DURING BOOTSTRAP. [_boxFor] returns null for a
 /// closed box and [build] skips it silently, so a lazily-opened box would look
@@ -34,6 +38,7 @@ class SettingsBackup {
     'nav_prefs', // which tabs the bottom bar shows, and their order
     'search_view_prefs', // search layout (grid vs rows)
     'ui_prefs', // list sort / reveal animation
+    'tracker_switch_prefs', // last-selected list view
     'privacy_prefs', // incognito
     'novel_lang_prefs', // novel language filter
     'torrent_prefs', // torrent settings
@@ -47,7 +52,23 @@ class SettingsBackup {
     'streaming_prefs', // streaming-service region + pinned service rows
     'zmode_source_order', // Source Priority: which source Auto Resolve tries first
     'viewer_profiles', // per-account profile names and Kids-mode preference
+    // The source-language filters: the same kind of setting as
+    // novel_lang_prefs above (which languages a catalogue shows).
+    'manga_lang_prefs',
+    'aniyomi_lang_prefs',
+    'mangayomi_lang_prefs',
   ];
+
+  /// Per-title source matches. Only pinned (hand-made) entries and the title
+  /// names remembered for them are backed up; see the class comment.
+  static const String matchesBox = 'zmode_matches';
+
+  /// Prefix of the remembered title-name entries in [matchesBox].
+  static const String _matchLabelPrefix = 'label:';
+
+  /// Every box a settings restore can write to. The safety copy taken before
+  /// a restore snapshots these so 'Undo restore' can put them all back.
+  static const List<String> restoredBoxNames = [...boxNames, matchesBox];
 
   /// Returns a map of `{boxName: {key: value, ...}}` for every open box.
   /// Closed boxes are silently skipped.
@@ -60,7 +81,64 @@ class SettingsBackup {
         (box.toMap() as Map).map((k, v) => MapEntry(k.toString(), v)),
       );
     }
+    final matches = _buildPinnedMatches();
+    if (matches != null) out[matchesBox] = matches;
     return out;
+  }
+
+  /// The pinned matches plus the remembered names of those titles, or null
+  /// when the match box isn't open. Match keys are `'<kind>:<id>@<sourceId>'`.
+  Map<String, dynamic>? _buildPinnedMatches() {
+    final box = anyOpenBox(matchesBox);
+    if (box == null) return null;
+    final out = <String, dynamic>{};
+    final titles = <String>{};
+    for (final k in box.keys) {
+      if (k is! String) continue;
+      final v = box.get(k);
+      if (v is! Map || v['pinned'] != true) continue;
+      final at = k.indexOf('@');
+      if (at <= 0) continue; // not a match entry
+      out[k] = plainCopy(v);
+      titles.add(k.substring(0, at));
+    }
+    // The title name shown on the Manual matches page, for pinned titles only.
+    for (final t in titles) {
+      final label = box.get('$_matchLabelPrefix$t');
+      if (label is Map) out['$_matchLabelPrefix$t'] = plainCopy(label);
+    }
+    return out;
+  }
+
+  /// Puts backed-up pins back. A restored pin becomes the title's choice, so
+  /// any other pin on the same title is demoted to a plain guess first (one
+  /// title has one chosen source, as MatchStore.pin does). Remembered title
+  /// names are only added when missing.
+  Future<void> _mergePinnedMatches(Map raw) async {
+    final box = anyOpenBox(matchesBox);
+    if (box == null) return;
+    for (final e in raw.entries) {
+      final key = e.key.toString();
+      final value = e.value;
+      if (value is! Map) continue;
+      if (key.startsWith(_matchLabelPrefix)) {
+        if (!box.containsKey(key)) await box.put(key, Map.of(value));
+        continue;
+      }
+      final at = key.indexOf('@');
+      if (at <= 0 || value['pinned'] != true) continue;
+      final prefix = key.substring(0, at + 1);
+      for (final other in box.keys.toList()) {
+        if (other is! String || other == key || !other.startsWith(prefix)) {
+          continue;
+        }
+        final m = box.get(other);
+        if (m is Map && m['pinned'] == true) {
+          await box.put(other, {...m, 'pinned': false});
+        }
+      }
+      await box.put(key, Map.of(value));
+    }
   }
 
   /// Overwrites each box with the entries from [data].
@@ -70,6 +148,11 @@ class SettingsBackup {
     for (final entry in data.entries) {
       final kv = entry.value;
       if (kv is! Map) continue;
+      // Hand-made matches merge on their own (pins stay exclusive per title).
+      if (entry.key == matchesBox) {
+        await _mergePinnedMatches(kv);
+        continue;
+      }
       final box = _boxFor(entry.key);
       if (box == null) continue;
       // Per-key put (not putAll): a Box<Map> rejects a Map<String,dynamic> whose
@@ -87,22 +170,10 @@ class SettingsBackup {
   /// unexpected type) — a listed box that lands here saves NOTHING while still
   /// looking backed up, which is why every type in [boxNames] needs a case.
   dynamic _boxFor(String name) {
-    if (!Hive.isBoxOpen(name)) return null;
-    try {
-      return Hive.box<Map>(name);
-    } catch (_) {
-      /* not a Box<Map> */
-    }
-    try {
-      return Hive.box<String>(name);
-    } catch (_) {
-      /* not a Box<String> */
-    }
-    try {
-      return Hive.box(name);
-    } catch (_) {
-      /* not a Box<dynamic> either */
-    }
-    return null;
+    // The match box is only ever read and written through its pinned-only path.
+    if (name == matchesBox) return null;
+    // Shared lookup that also knows Box<List> (zmode_source_order), which the
+    // old Map/String/dynamic tries missed.
+    return anyOpenBox(name);
   }
 }

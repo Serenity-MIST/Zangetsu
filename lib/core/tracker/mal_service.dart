@@ -8,12 +8,14 @@ import 'package:flutter/foundation.dart';
 import 'package:hive/hive.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../desktop/desktop_oauth.dart';
 import '../environment.dart';
 import '../models/media_item.dart';
 import '../models/provider_info.dart';
 import '../models/watch_status.dart';
 import '../platform/apple_tv.dart';
 import 'tracker.dart';
+import 'tracker_sync_queue.dart' show TrackerWriteProblem, TrackerWriteScope;
 
 /// MAL's list-endpoint root for [kind] — `anime` or `manga` (novels are
 /// filed under manga on MAL; there's no separate novel list).
@@ -222,8 +224,28 @@ class MalService extends ChangeNotifier implements Tracker {
     return List.generate(len, (_) => chars[r.nextInt(chars.length)]).join();
   }
 
+  /// Safe, user-facing reason the last [connect] failed; null on success or
+  /// when there is nothing more specific than "cancelled".
+  String? lastConnectionError;
+
+  /// Abandons a sign-in that is still waiting for the browser redirect.
+  void cancelConnect() {
+    if (_pending == null) return;
+    lastConnectionError = 'Sign-in cancelled.';
+    _resolvePending(false);
+  }
+
   @override
   Future<bool> connect() async {
+    final active = _pending;
+    if (active != null) return active.future;
+    lastConnectionError = null;
+    // Windows: point zangetsu:// at this exe before the browser can redirect.
+    final callbackError = await DesktopOAuth.ensureBrowserCallback();
+    if (callbackError != null) {
+      lastConnectionError = callbackError;
+      return false;
+    }
     final verifier = _randomString(96); // plain: challenge == verifier
     final state = _randomString(16);
     await _box.put('codeVerifier', verifier);
@@ -235,17 +257,25 @@ class MalService extends ChangeNotifier implements Tracker {
       '&state=$state'
       '&redirect_uri=${Uri.encodeComponent(Environment.malRedirectUri)}',
     );
-    _pending = Completer<bool>();
+    final pending = Completer<bool>();
+    _pending = pending;
     final ok = await launchUrl(url, mode: LaunchMode.externalApplication);
     if (!ok) {
-      _pending = null;
+      if (identical(_pending, pending)) _pending = null;
+      lastConnectionError = 'The sign-in browser could not be opened.';
       return false;
     }
     try {
-      return await _pending!.future.timeout(const Duration(minutes: 3));
-    } catch (_) {
-      _pending = null;
+      // Hold the local future: a fast redirect may already have cleared
+      // _pending by the time launchUrl returns.
+      return await pending.future.timeout(const Duration(minutes: 3));
+    } on TimeoutException {
+      lastConnectionError = DesktopOAuth.noCallbackMessage(displayName);
       return false;
+    } catch (_) {
+      return false;
+    } finally {
+      if (identical(_pending, pending)) _pending = null;
     }
   }
 
@@ -341,7 +371,17 @@ class MalService extends ChangeNotifier implements Tracker {
       if (await _storeToken(res.data)) {
         return _box.get('accessToken') as String?;
       }
-    } catch (_) {}
+      // MAL answered but refused the refresh token: the login is dead. Tell
+      // the sync outbox (track-2) so it shows "needs sign-in" and keeps the
+      // write, instead of failing silently while still looking connected.
+      TrackerWriteScope.report(
+        TrackerWriteProblem.auth,
+        'Sign-in refresh refused (HTTP ${res.statusCode})',
+      );
+    } catch (e) {
+      // No answer (offline / timeout): retryable, not a dead login.
+      TrackerWriteScope.reportError(e);
+    }
     return null;
   }
 
@@ -402,6 +442,10 @@ class MalService extends ChangeNotifier implements Tracker {
           validateStatus: (s) => s != null && s < 500,
         ),
       );
+      // A refused lookup (expired login) is a sync failure, not "no match".
+      if (res.statusCode == 401 || res.statusCode == 403) {
+        TrackerWriteScope.reportStatus(res.statusCode);
+      }
       final list = (res.data is Map) ? (res.data['data'] as List?) : null;
       final node = (list != null && list.isNotEmpty)
           ? (list.first as Map)['node'] as Map?
@@ -416,7 +460,9 @@ class MalService extends ChangeNotifier implements Tracker {
       final total = (node?['num_episodes'] as num?)?.toInt();
       if (total != null && total > 0) await _cacheEps(id, total);
       return (id: id, total: total);
-    } catch (_) {
+    } catch (e) {
+      // Offline while matching the title: the write must be retried later.
+      TrackerWriteScope.reportError(e);
       return null;
     }
   }
@@ -479,6 +525,10 @@ class MalService extends ChangeNotifier implements Tracker {
           validateStatus: (s) => s != null && s < 500,
         ),
       );
+      // A refused lookup (expired login) is a sync failure, not "no match".
+      if (res.statusCode == 401 || res.statusCode == 403) {
+        TrackerWriteScope.reportStatus(res.statusCode);
+      }
       final list = (res.data is Map) ? (res.data['data'] as List?) : null;
       final node = (list != null && list.isNotEmpty)
           ? (list.first as Map)['node'] as Map?
@@ -493,7 +543,9 @@ class MalService extends ChangeNotifier implements Tracker {
       final total = (node?['num_chapters'] as num?)?.toInt();
       if (total != null && total > 0) await _cacheChapters(id, total);
       return (id: id, total: total);
-    } catch (_) {
+    } catch (e) {
+      // Offline while matching the title: the write must be retried later.
+      TrackerWriteScope.reportError(e);
       return null;
     }
   }
@@ -568,8 +620,16 @@ class MalService extends ChangeNotifier implements Tracker {
           validateStatus: (s) => s != null && s < 500,
         ),
       );
-      return res.statusCode != null && res.statusCode! < 300;
-    } catch (_) {
+      final ok = res.statusCode != null && res.statusCode! < 300;
+      // Tell the sync outbox (track-2) how it went; no-op outside a hub write.
+      if (ok) {
+        TrackerWriteScope.reportSent();
+      } else {
+        TrackerWriteScope.reportStatus(res.statusCode);
+      }
+      return ok;
+    } catch (e) {
+      TrackerWriteScope.reportError(e);
       return false;
     }
   }
@@ -666,13 +726,14 @@ class MalService extends ChangeNotifier implements Tracker {
     if (!isConnected) return;
     // A pinned id wins over title/malId resolution — same precedence as
     // fetchEntry, so a corrected match is deleted instead of the guess.
-    final id = int.tryParse(pinnedId ?? '') ??
+    final id =
+        int.tryParse(pinnedId ?? '') ??
         (await _resolveFor(kind, malId, title))?.id;
     if (id == null) return;
     final token = await _validToken();
     if (token == null) return;
     try {
-      await _dio.delete<dynamic>(
+      final res = await _dio.delete<dynamic>(
         '$_api/${malListStatusPath(kind, id)}',
         options: Options(
           headers: {'Authorization': 'Bearer $token'},
@@ -680,7 +741,16 @@ class MalService extends ChangeNotifier implements Tracker {
         ),
       );
       await _setScrobbled(id, kind, 0);
-    } catch (_) {}
+      // 404 = already gone, which is what a removal wants.
+      final code = res.statusCode;
+      if (code != null && (code < 300 || code == 404)) {
+        TrackerWriteScope.reportSent();
+      } else {
+        TrackerWriteScope.reportStatus(code);
+      }
+    } catch (e) {
+      TrackerWriteScope.reportError(e);
+    }
   }
 
   // ── Tracker reads ───────────────────────────────────────────────────────────
@@ -793,6 +863,7 @@ class MalService extends ChangeNotifier implements Tracker {
     WatchStatus? status,
     double? score,
     int? progress,
+    bool? isPrivate,
     MediaKind kind = MediaKind.anime,
   }) async {
     if (!isConnected) return;

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../app_mode.dart';
+import '../desktop/desktop_chrome_colors.dart';
 import '../di/injector.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text.dart';
@@ -89,7 +90,9 @@ class _ScopedSettingsAppBar extends StatelessWidget
       return fallback;
     }
     return AppBar(
-      backgroundColor: const Color(0xFF101114),
+      // Same frame colour as the settings workspace, so Pure black and the
+      // Background colour reach the page headers too.
+      backgroundColor: DesktopChrome.frame,
       surfaceTintColor: Colors.transparent,
       elevation: 0,
       scrolledUnderElevation: 0,
@@ -129,6 +132,15 @@ class _ScopedSettingsAppBar extends StatelessWidget
 }
 
 bool _isTvDevice() => sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
+
+/// Page background for a pushed settings screen. Inside the Windows settings
+/// workspace it is the same [DesktopChrome.frame] as the header and canvas,
+/// so page, header and sidebar read as one surface (and follow Pure black /
+/// Background colour together); phone and TV keep [AppColors.bg].
+Color settingsPageBackground(BuildContext context) =>
+    !_isTvDevice() && DesktopSettingsScope.contains(context)
+    ? DesktopChrome.frame
+    : AppColors.bg;
 
 /// One settings list row inside a [SettingsCard]: a rounded tinted icon tile +
 /// title with an optional description under it + trailing chevron / switch /

@@ -36,6 +36,11 @@ class Win32Window {
   // |Show| is called. Returns true if the window was created successfully.
   bool Create(const std::wstring& title, const Point& origin, const Size& size);
 
+  // Creates the window at |frame| (physical screen pixels, e.g. a restored
+  // placement). When |maximized| is true the first Show() maximises it, and
+  // |frame| becomes the size it restores to.
+  bool CreateAt(const std::wstring& title, const RECT& frame, bool maximized);
+
   // Show the current window. Returns true if the window was successfully shown.
   bool Show();
 
@@ -91,6 +96,9 @@ class Win32Window {
   static void UpdateTheme(HWND const window);
 
   bool quit_on_close_ = false;
+
+  // Set by CreateAt: the first Show() opens maximised.
+  bool start_maximized_ = false;
 
   // window handle for top level window.
   HWND window_handle_ = nullptr;

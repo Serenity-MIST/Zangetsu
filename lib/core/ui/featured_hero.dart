@@ -1,15 +1,17 @@
 import 'dart:math' as math;
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 
 import 'image_fade.dart';
 import 'mobile_hero_art.dart';
-import 'package:palette_generator/palette_generator.dart';
+import 'poster_palette.dart';
 
 import '../di/injector.dart';
 import 'native_cover_provider.dart';
 import '../metadata/title_logo_service.dart';
+import '../stremio/stremio_ref.dart';
 import '../models/media_item.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text.dart';
@@ -64,6 +66,7 @@ class FeaturedHero extends StatefulWidget {
     this.metaFuture,
     this.parallax = 0,
     this.kenBurns = false,
+    this.backgroundTint,
     this.wrapButton,
     this.reading = false,
   });
@@ -91,6 +94,11 @@ class FeaturedHero extends StatefulWidget {
   /// Slowly zoom the card artwork (Ken-Burns) — used in the cinematic mode.
   final bool kenBurns;
 
+  /// When set, painted as the hero's base background instead of flat
+  /// [AppColors.bg], so a screen-level tint layer shows through the hero's
+  /// own region too. Null → exactly today's behaviour.
+  final ValueListenable<Color?>? backgroundTint;
+
   /// Optional button decorator for TV D-pad focus.  When supplied, each hero
   /// action button (Play, My List, Info) is passed through this builder so TV
   /// callers can inject [TvFocusable] focus around the buttons without altering
@@ -107,16 +115,24 @@ class FeaturedHero extends StatefulWidget {
 }
 
 class _FeaturedHeroState extends State<FeaturedHero> {
-  // Cache extracted colours so swiping back doesn't recompute the palette.
-  static final Map<String, Color> _paletteCache = {};
   Color? _artColor;
   String? _logoUrl; // TMDB title logo (null → show the text title)
+
+  /// Current background tint from [widget.backgroundTint] (null → theme bg).
+  Color? _bgTint;
 
   @override
   void initState() {
     super.initState();
+    _bgTint = widget.backgroundTint?.value;
+    widget.backgroundTint?.addListener(_onBackgroundTint);
     _loadPalette();
     _loadLogo();
+  }
+
+  void _onBackgroundTint() {
+    if (!mounted) return;
+    setState(() => _bgTint = widget.backgroundTint?.value);
   }
 
   /// Tall phone artwork uses TMDB's portrait poster when available.
@@ -128,24 +144,47 @@ class _FeaturedHeroState extends State<FeaturedHero> {
     // Keyed on the ITEM, not on its artwork. Two different titles can share one
     // cover URL (same art, or both with no cover), and keying on the art left the
     // previous title's TMDB logo sitting on the new hero — the "old header".
-    if (!_sameItem(old.item, widget.item)) {
+    if (!_sameItem(old.item, widget.item) ||
+        (widget.item.sourceId == stremioSourceId &&
+            old.item.titleLogo != widget.item.titleLogo)) {
       _artColor = null;
       _logoUrl = null;
       _loadPalette();
       _loadLogo();
+    }
+    if (old.backgroundTint != widget.backgroundTint) {
+      old.backgroundTint?.removeListener(_onBackgroundTint);
+      _bgTint = widget.backgroundTint?.value;
+      widget.backgroundTint?.addListener(_onBackgroundTint);
     }
   }
 
   static bool _sameItem(MediaItem a, MediaItem b) =>
       a.sourceId == b.sourceId && a.id == b.id;
 
+  @override
+  void dispose() {
+    widget.backgroundTint?.removeListener(_onBackgroundTint);
+    super.dispose();
+  }
+
   /// Best-effort TMDB title-logo lookup; on a hit, swap the text title for the
   /// logo image. Stays as text until (and unless) a logo resolves.
-  Future<void> _loadLogo() async {
+  Future<void> _loadLogo({String? failedUrl}) async {
     if (!sl.isRegistered<TitleLogoService>()) return;
+    if (failedUrl != null && failedUrl != _logoUrl) return;
+    final item = widget.item;
     try {
-      final url = await sl<TitleLogoService>().logoFor(widget.item);
-      if (mounted && url != null && url.isNotEmpty) {
+      final service = sl<TitleLogoService>();
+      final url = failedUrl == null
+          ? await service.logoFor(item)
+          : await service.fallbackFor(item, failedUrl);
+      if (!mounted ||
+          !_sameItem(item, widget.item) ||
+          item.titleLogo != widget.item.titleLogo) {
+        return;
+      }
+      if (url != null || failedUrl != null) {
         setState(() => _logoUrl = url);
       }
     } catch (_) {}
@@ -154,35 +193,12 @@ class _FeaturedHeroState extends State<FeaturedHero> {
   Future<void> _loadPalette() async {
     final cover = _art(widget.item);
     if (cover == null || cover.isEmpty) return;
-    final cached = _paletteCache[cover];
-    if (cached != null) {
-      setState(() => _artColor = cached);
-      return;
-    }
-    try {
-      final pal = await PaletteGenerator.fromImageProvider(
-        // Decode a SMALL copy for the palette: the dominant colour is identical,
-        // but this avoids a full-resolution decode on the UI isolate every time
-        // the cinematic carousel rotates to a new cover (the 30s-of-lag cause).
-        ResizeImage(
-          nativeCoverProvider(cover, widget.item.coverHeaders),
-          width: 180,
-        ),
-        size: const Size(180, 270),
-        maximumColorCount: 8,
-      );
-      final c =
-          pal.vibrantColor?.color ??
-          pal.dominantColor?.color ??
-          pal.darkVibrantColor?.color ??
-          pal.mutedColor?.color;
-      if (c != null) {
-        _paletteCache[cover] = c;
-        if (mounted) setState(() => _artColor = c);
-      }
-    } catch (_) {
-      /* keep fallback */
-    }
+    final c = await extractDominantColor(cover, widget.item.coverHeaders);
+    // A slow decode can resolve after the carousel has moved on — only
+    // apply the colour if this cover is still the one on screen.
+    if (!mounted || _art(widget.item) != cover) return;
+    if (c == null) return;
+    setState(() => _artColor = c);
   }
 
   @override
@@ -193,6 +209,7 @@ class _FeaturedHeroState extends State<FeaturedHero> {
     final mq = MediaQuery.of(context);
     final memW = (mq.size.width * mq.devicePixelRatio).round();
     final tint = _artColor ?? AppColors.surface2;
+    final pageColor = _bgTint ?? AppColors.bg;
 
     final provider = hasCover
         ? nativeCoverProvider(cover, item.coverHeaders)
@@ -202,8 +219,14 @@ class _FeaturedHeroState extends State<FeaturedHero> {
       child: Stack(
         fit: StackFit.expand,
         children: [
-          // Plain page background.
-          ColoredBox(color: AppColors.bg),
+          // Page background — the caller's tint when one is supplied (adaptive
+          // colour), so the wash is continuous behind the hero too. Morphs on
+          // the same clock as the screen-level PosterTintLayer.
+          AnimatedContainer(
+            duration: adaptiveColourDuration,
+            curve: adaptiveColourCurve,
+            color: pageColor,
+          ),
 
           // Soft ambient glow of the art's own colour bleeding OUTSIDE the card.
           // RADIAL so it fades to the page colour on every side — it dies out
@@ -248,14 +271,15 @@ class _FeaturedHeroState extends State<FeaturedHero> {
               16,
               40,
             ),
-            child: _card(provider, tint, memW),
+            child: _card(provider, tint, memW, pageColor),
           ),
         ],
       ),
     );
   }
 
-  Widget _card(ImageProvider? provider, Color tint, int memW) {
+  Widget _card(ImageProvider? provider, Color tint, int memW, Color pageColor) {
+    final logoUrl = _logoUrl;
     return ClipRRect(
       borderRadius: BorderRadius.circular(28),
       child: Stack(
@@ -263,9 +287,10 @@ class _FeaturedHeroState extends State<FeaturedHero> {
         children: [
           if (provider != null)
             Image(
-              // Decode at the screen's actual size (not full source res) — same
-              // visible sharpness, a fraction of the memory + decode cost.
-              image: ResizeImage(provider, width: memW),
+              image: ResizeImage(
+                provider,
+                width: mobileHeroDecodeWidth(widget.item.sourceId, memW),
+              ),
               fit: BoxFit.cover,
               frameBuilder: imageFadeIn,
               // Crop from the top so the poster's own printed title block (and
@@ -298,8 +323,8 @@ class _FeaturedHeroState extends State<FeaturedHero> {
             ),
           ),
 
-          // Bottom fade to the EXACT page colour, so the card bottom melts into
-          // the page with no hard bottom edge/line.
+          // Bottom fade to the CURRENT page colour (tint or theme bg), so the
+          // card bottom melts into the page with no hard bottom edge/line.
           Positioned.fill(
             child: IgnorePointer(
               child: DecoratedBox(
@@ -308,11 +333,11 @@ class _FeaturedHeroState extends State<FeaturedHero> {
                     begin: Alignment.topCenter,
                     end: Alignment.bottomCenter,
                     colors: [
-                      Color(0x000B0B0F),
-                      Color(0xB30B0B0F),
-                      AppColors.bg,
+                      pageColor.withValues(alpha: 0),
+                      pageColor.withValues(alpha: 0.7),
+                      pageColor,
                     ],
-                    stops: [0.42, 0.72, 1.0],
+                    stops: const [0.42, 0.72, 1.0],
                   ),
                 ),
               ),
@@ -337,12 +362,16 @@ class _FeaturedHeroState extends State<FeaturedHero> {
                       ? ConstrainedBox(
                           constraints: const BoxConstraints(maxHeight: 96),
                           child: CachedNetworkImage(
-                            imageUrl: _logoUrl!,
+                            imageUrl: logoUrl!,
                             fit: BoxFit.contain,
                             memCacheWidth: memW,
                             fadeInDuration: const Duration(milliseconds: 250),
                             // If the logo image itself fails, fall back to text.
                             errorWidget: (_, _, _) => _titleText(),
+                            errorListener:
+                                widget.item.sourceId == stremioSourceId
+                                ? (_) => _loadLogo(failedUrl: logoUrl)
+                                : null,
                           ),
                         )
                       : _titleText(),

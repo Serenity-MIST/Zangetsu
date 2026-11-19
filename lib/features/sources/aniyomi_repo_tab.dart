@@ -1,8 +1,10 @@
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:get_it/get_it.dart';
 import 'package:hive/hive.dart';
 
 import '../../core/aniyomi/aniyomi_extension_service.dart';
+import '../../core/repository/source_actions.dart' as source_actions;
 import '../../core/ui/source_icon_tile.dart';
 import '../../core/aniyomi/aniyomi_provider.dart';
 import '../../core/aniyomi/aniyomi_repo.dart';
@@ -10,12 +12,13 @@ import '../../core/aniyomi/aniyomi_update.dart';
 import '../../core/di/injector.dart';
 import '../../core/i18n/source_languages.dart';
 import '../../core/prefs/source_lang_prefs.dart';
+import '../../core/provider/base_provider.dart';
 import '../../core/provider/provider_manager.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/ui/app_dialog.dart';
 import '../../core/ui/states.dart';
-import 'sources_search_field.dart';
+import 'sources_search_field.dart'; // also brings the Windows kit
 import '../../l10n/l10n.dart';
 
 /// Hive box name for persisted Aniyomi repo URLs.
@@ -62,25 +65,33 @@ class _AniyomiAddRepoDialogState extends State<AniyomiAddRepoDialog> {
       backgroundColor: AppColors.surface,
       title: Text(context.l10n.addAniyomiRepo, style: AppText.headline),
       content: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            TextField(
-              controller: _urlCtrl,
-              autofocus: false,
-              keyboardType: TextInputType.url,
-              cursorColor: AppColors.accent,
-              style: AppText.body.copyWith(color: AppColors.textPrimary),
-              onSubmitted: (_) => _submit(),
-              decoration: InputDecoration(
-                labelText: context.l10n.repoBaseUrl,
-                hintText: context.l10n.repoBaseUrlHint,
+        // Windows: clipboard pre-fill + drop a link / file (src-12 B).
+        child: DesktopAddRepoAssist(
+          controller: _urlCtrl,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              TextField(
+                controller: _urlCtrl,
+                // Windows: focus the field so Enter adds a pre-filled link.
+                autofocus: desktopPanelsEnabled,
+                keyboardType: TextInputType.url,
+                cursorColor: AppColors.accent,
+                style: AppText.body.copyWith(color: AppColors.textPrimary),
+                onSubmitted: (_) => _submit(),
+                decoration: InputDecoration(
+                  labelText: context.l10n.repoBaseUrl,
+                  hintText: context.l10n.repoBaseUrlHint,
+                ),
               ),
-            ),
-            const SizedBox(height: 10),
-            Text(context.l10n.pasteRepoBaseUrlAniyomi, style: AppText.caption),
-          ],
+              const SizedBox(height: 10),
+              Text(
+                context.l10n.pasteRepoBaseUrlAniyomi,
+                style: AppText.caption,
+              ),
+            ],
+          ),
         ),
       ),
       actions: [
@@ -148,8 +159,16 @@ class AniyomiRepoTab extends StatefulWidget {
 }
 
 /// Retains a refresh revision so pulling refresh really refetches each repo.
-class _AniyomiRepoTabState extends State<AniyomiRepoTab> {
+class _AniyomiRepoTabState extends State<AniyomiRepoTab>
+    with DesktopRefreshTicks<AniyomiRepoTab> {
   int _revision = 0;
+
+  /// F5 on Windows (src-13 A): same as pull-to-refresh, every repo refetches.
+  @override
+  void onDesktopRefresh() {
+    if (mounted) setState(() => _revision++);
+  }
+
   List<String> get repoUrls => widget.repoUrls;
   void Function(String) get onRemoveRepo => widget.onRemoveRepo;
   String get query => widget.query;
@@ -172,7 +191,10 @@ class _AniyomiRepoTabState extends State<AniyomiRepoTab> {
       backgroundColor: AppColors.surface,
       onRefresh: () async => setState(() => _revision++),
       child: ListView.builder(
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
+        // Windows has no floating button to leave room for (src-3 B).
+        padding: desktopPanelsEnabled
+            ? kDesktopSourcesListPadding
+            : const EdgeInsets.fromLTRB(16, 12, 16, 96),
         itemCount: repoUrls.length,
         itemBuilder: (_, i) => _AniyomiRepoSection(
           key: ValueKey('${repoUrls[i]}:$_revision'),
@@ -337,6 +359,8 @@ class _AniyomiRepoSectionState extends State<_AniyomiRepoSection> {
     final mgr = _manager;
     if (mgr == null) return;
     final messenger = ScaffoldMessenger.of(context);
+    // Read before the await: the section may be gone when it returns.
+    final l10n = context.l10n;
     setState(() => _checking = true);
     try {
       final list = await mgr.checkRepoUpdates(widget.url);
@@ -346,10 +370,10 @@ class _AniyomiRepoSectionState extends State<_AniyomiRepoSection> {
           SnackBar(
             content: Text(
               list.isEmpty
-                  ? context.l10n.alreadyUpToDate
+                  ? l10n.alreadyUpToDate
                   : list.length == 1
-                  ? context.l10n.oneUpdate
-                  : context.l10n.nUpdates(list.length),
+                  ? l10n.oneUpdate
+                  : l10n.nUpdates(list.length),
             ),
           ),
         );
@@ -365,12 +389,15 @@ class _AniyomiRepoSectionState extends State<_AniyomiRepoSection> {
   /// path calls [AniyomiExtensionService.installFromRepo], which never throws
   /// and instead returns an empty list on failure — that emptiness is what we
   /// key success off of.
+  ///
+  /// The default path now uses [AniyomiExtensionService.installFromRepoOrThrow]
+  /// so a failure carries its reason to the 'Update all' summary (src-5).
   Future<bool> _applyOne(AniyomiRepoEntry entry, AniyomiManager mgr) async {
     if (widget.installFn != null) {
       await widget.installFn!(entry);
       return true;
     }
-    final providers = await AniyomiExtensionService().installFromRepo(
+    final providers = await AniyomiExtensionService().installFromRepoOrThrow(
       entry,
       manager: mgr,
     );
@@ -383,35 +410,62 @@ class _AniyomiRepoSectionState extends State<_AniyomiRepoSection> {
   /// Only clears a package's pending update when its install actually
   /// succeeded — a failed download must keep reporting the source as
   /// outdated rather than silently clearing the badge.
-  Future<void> _updateAll() async {
+  ///
+  /// [only] limits the run to those updates (the Retry of the summary).
+  /// On Windows the run ends with 'Updated 3 of 5. 2 failed' and a Details
+  /// list with each reason and Retry (src-5 A); phone keeps its snackbar.
+  Future<void> _updateAll({List<AniyomiUpdate>? only}) async {
     final mgr = _manager;
-    if (mgr == null || _updating) return;
+    if (!mounted || mgr == null || _updating) return;
     final messenger = ScaffoldMessenger.of(context);
-    final updates = List<AniyomiUpdate>.from(mgr.updatesFor(widget.url));
+    final l10n = context.l10n;
+    final updates =
+        only ?? List<AniyomiUpdate>.from(mgr.updatesFor(widget.url));
     if (updates.isEmpty) return;
     setState(() => _updating = true);
     var done = 0;
+    final failed = <AniyomiUpdate>[];
+    final failures = <ExtensionUpdateFailure>[];
     try {
       for (final u in updates) {
         try {
           if (await _applyOne(u.entry, mgr)) {
             mgr.clearUpdatesForPkg(u.pkg);
             done++;
+          } else {
+            throw ExtensionInstallFailure.noSource(u.pkg);
           }
-        } catch (_) {}
+        } catch (e) {
+          // Keep the reason instead of dropping it (it used to be `catch (_)`).
+          final failure = ExtensionInstallFailure.from(e);
+          failed.add(u);
+          failures.add(
+            ExtensionUpdateFailure(
+              name: u.name,
+              reason: failure.reason,
+              details: failure.details,
+            ),
+          );
+        }
       }
     } finally {
       if (mounted) setState(() => _updating = false);
     }
-    messenger
-      ..clearSnackBars()
-      ..showSnackBar(
-        SnackBar(
-          content: Text(
-            context.l10n.updatedSourcesCount(done, done == 1 ? '' : 's'),
-          ),
-        ),
-      );
+    final successText = l10n.updatedSourcesCount(done, done == 1 ? '' : 's');
+    if (!desktopPanelsEnabled) {
+      messenger
+        ..clearSnackBars()
+        ..showSnackBar(SnackBar(content: Text(successText)));
+      return;
+    }
+    showUpdateAllSummary(
+      messenger,
+      total: updates.length,
+      done: done,
+      failures: failures,
+      successText: successText,
+      onRetry: () => _updateAll(only: failed),
+    );
   }
 
   @override
@@ -705,7 +759,67 @@ class _AniyomiExtensionRow extends StatefulWidget {
 class _AniyomiExtensionRowState extends State<_AniyomiExtensionRow> {
   bool _busy = false;
 
+  /// Windows: an install download is running (shows the progress bar).
+  bool _downloading = false;
+
+  /// Windows: download fraction, null until the size is known (src-2 B).
+  double? _progress;
+
+  /// Windows: lets the progress bar's Cancel stop the download.
+  CancelToken? _cancel;
+
   AniyomiRepoEntry get _entry => widget.entry;
+
+  /// Live manager (null in widget tests that don't register it).
+  AniyomiManager? get _manager => GetIt.instance.isRegistered<AniyomiManager>()
+      ? GetIt.instance.get<AniyomiManager>()
+      : null;
+
+  /// A newer version of this installed extension, if one was found.
+  AniyomiUpdate? get _update => _manager?.updateFor(_entry.pkg);
+
+  /// The installed source of this package, for its settings (Windows menu).
+  BaseProvider? get _installedSource {
+    for (final p in _manager?.all ?? const <BaseProvider>[]) {
+      if (p is AniyomiProvider && p.info.pkg == _entry.pkg) return p;
+    }
+    return null;
+  }
+
+  /// Download progress from Dio, throttled to whole percents.
+  void _onProgress(int received, int total) {
+    if (!mounted) return;
+    final next = installFraction(received, total);
+    final prev = _progress;
+    if (next != null && prev != null && (next - prev).abs() < .01 && next < 1) {
+      return;
+    }
+    setState(() => _progress = next);
+  }
+
+  /// Windows row actions: one list for the '...' menu and right-click
+  /// (src-6 B / src-13 B).
+  List<DesktopMenuItem<Object?>> _menuItems() {
+    final installed = widget.installed;
+    final update = installed ? _update : null;
+    final source = installed ? _installedSource : null;
+    return desktopSourceMenuItems(
+      context,
+      onInstall: !installed && !_busy ? _install : null,
+      onUpdate: update != null && !_busy ? _install : null,
+      updateLabel: update == null
+          ? null
+          : context.l10n.updateArrowVersion(update.availableVersion),
+      onSettings: source == null
+          ? null
+          : () => source_actions.openSourceSettings(
+              context,
+              source.sourceId,
+              source.displayName,
+            ),
+      onUninstall: installed && !_busy ? _uninstall : null,
+    );
+  }
 
   String get _meta {
     final parts = <String>[
@@ -724,22 +838,41 @@ class _AniyomiExtensionRowState extends State<_AniyomiExtensionRow> {
     // too, so a failed install said nothing at all instead of saying why.
     // The messenger is the app-level one, so it still shows the snackbar.
     final l10n = context.l10n;
-    setState(() => _busy = true);
+    // Windows shows the real reason, a progress bar and Cancel (src-2).
+    final desktop = desktopPanelsEnabled;
+    setState(() {
+      _busy = true;
+      _downloading = desktop;
+      _progress = null;
+      // Created up front so Cancel is live from the first frame.
+      _cancel = desktop && widget.installFn == null ? CancelToken() : null;
+    });
     try {
       if (widget.installFn != null) {
         await widget.installFn!(_entry);
       } else {
-        final mgr = GetIt.instance.isRegistered<AniyomiManager>()
-            ? GetIt.instance.get<AniyomiManager>()
-            : null;
-        final providers = await AniyomiExtensionService().installFromRepo(
-          _entry,
-          manager: mgr,
-        );
-        // installFromRepo never throws — it returns an empty list on failure.
-        // Treat "no source loaded" as a failure so we don't mislabel context.l10n.installed.
-        if (providers.isEmpty) {
-          throw Exception(l10n.noSourceLoaded);
+        final mgr = _manager;
+        if (desktop) {
+          final cancel = _cancel ??= CancelToken();
+          // Throws an ExtensionInstallFailure with the reason on failure.
+          await AniyomiExtensionService().installFromRepoOrThrow(
+            _entry,
+            manager: mgr,
+            onProgress: _onProgress,
+            cancelToken: cancel,
+          );
+          // An install from the menu's Update clears the pending update.
+          mgr?.clearUpdatesForPkg(_entry.pkg);
+        } else {
+          final providers = await AniyomiExtensionService().installFromRepo(
+            _entry,
+            manager: mgr,
+          );
+          // installFromRepo never throws — it returns an empty list on failure.
+          // Treat "no source loaded" as a failure so we don't mislabel context.l10n.installed.
+          if (providers.isEmpty) {
+            throw Exception(l10n.noSourceLoaded);
+          }
         }
       }
       widget.onInstalled();
@@ -749,11 +882,29 @@ class _AniyomiExtensionRowState extends State<_AniyomiExtensionRow> {
           SnackBar(content: Text(l10n.installedName(_entry.name))),
         );
     } catch (e) {
-      messenger
-        ..clearSnackBars()
-        ..showSnackBar(SnackBar(content: Text(l10n.installFailed('$e'))));
+      if (desktop) {
+        // The readable reason plus 'Copy details' (src-2 A).
+        final failure = ExtensionInstallFailure.from(e);
+        showExtensionInstallFailure(
+          messenger,
+          message: failure.cancelled
+              ? failure.reason
+              : l10n.installFailed(failure.reason),
+          failure: failure,
+        );
+      } else {
+        messenger
+          ..clearSnackBars()
+          ..showSnackBar(SnackBar(content: Text(l10n.installFailed('$e'))));
+      }
     } finally {
-      if (mounted) setState(() => _busy = false);
+      _cancel = null;
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _downloading = false;
+        });
+      }
     }
   }
 
@@ -768,6 +919,8 @@ class _AniyomiExtensionRowState extends State<_AniyomiExtensionRow> {
     if (ok != true) return;
     if (!mounted) return;
     final messenger = ScaffoldMessenger.of(context);
+    // Read before the await: the row may be gone when it returns.
+    final l10n = context.l10n;
     setState(() => _busy = true);
     try {
       if (widget.uninstallFn != null) {
@@ -779,14 +932,12 @@ class _AniyomiExtensionRowState extends State<_AniyomiExtensionRow> {
       messenger
         ..clearSnackBars()
         ..showSnackBar(
-          SnackBar(content: Text(context.l10n.uninstalledName(_entry.name))),
+          SnackBar(content: Text(l10n.uninstalledName(_entry.name))),
         );
     } catch (e) {
       messenger
         ..clearSnackBars()
-        ..showSnackBar(
-          SnackBar(content: Text(context.l10n.uninstallFailed('$e'))),
-        );
+        ..showSnackBar(SnackBar(content: Text(l10n.uninstallFailed('$e'))));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -806,87 +957,107 @@ class _AniyomiExtensionRowState extends State<_AniyomiExtensionRow> {
   @override
   Widget build(BuildContext context) {
     final installed = widget.installed;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 10, 12, 10),
-      child: Row(
-        children: [
-          // The index names the icon, so a browse row can show the real logo
-          // before anything is installed.
-          Padding(
-            padding: const EdgeInsetsDirectional.only(end: 12),
-            child: SourceIconTile(name: _entry.name, icon: _entry.iconUrl),
-          ),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Flexible(
-                      child: Text(
-                        _entry.name,
-                        style: AppText.headline.copyWith(fontSize: 15),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    if (_entry.nsfw) ...[
-                      const SizedBox(width: 8),
-                      _NsfwBadge(),
-                    ],
-                  ],
-                ),
-                const SizedBox(height: 2),
-                Text(_meta, style: AppText.caption),
-              ],
+    final desktop = desktopPanelsEnabled;
+    // Windows: hover highlight, a tooltip with the full name and the same
+    // actions on right-click as in the '...' menu (src-13 B).
+    return DesktopSourceRow(
+      items: _menuItems,
+      tooltip: '${_entry.name} · $_meta',
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 10, 12, 10),
+        child: Row(
+          children: [
+            // The index names the icon, so a browse row can show the real logo
+            // before anything is installed.
+            Padding(
+              padding: const EdgeInsetsDirectional.only(end: 12),
+              child: SourceIconTile(name: _entry.name, icon: _entry.iconUrl),
             ),
-          ),
-          const SizedBox(width: 8),
-          if (_busy)
-            SizedBox(
-              width: 96,
-              height: 36,
-              child: Center(
-                child: SizedBox(
-                  width: 20,
-                  height: 20,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    color: AppColors.accent,
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          _entry.name,
+                          style: AppText.headline.copyWith(fontSize: 15),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      if (_entry.nsfw) ...[
+                        const SizedBox(width: 8),
+                        _NsfwBadge(),
+                      ],
+                    ],
+                  ),
+                  const SizedBox(height: 2),
+                  Text(_meta, style: AppText.caption),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            if (desktop && _downloading)
+              // Determinate bar + Cancel instead of the spinner (src-2 B).
+              DesktopInstallProgress(
+                value: _progress,
+                onCancel: _cancel == null ? null : () => _cancel?.cancel(),
+              )
+            else if (_busy)
+              SizedBox(
+                width: 96,
+                height: 36,
+                child: Center(
+                  child: SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: AppColors.accent,
+                    ),
                   ),
                 ),
-              ),
-            )
-          else if (installed)
-            OutlinedButton(
-              onPressed: _uninstall,
-              style: OutlinedButton.styleFrom(
-                foregroundColor: AppColors.textSecondary,
-                side: BorderSide(
-                  color: AppColors.textSecondary.withValues(alpha: 0.4),
+              )
+            else if (installed && desktop)
+              // A status, not a button: clicking 'Installed' no longer
+              // uninstalls; the actions live in the '...' menu (src-6 B).
+              DesktopInstalledActions(
+                items: _menuItems,
+                updateAvailable: _update != null,
+              )
+            else if (installed)
+              OutlinedButton(
+                onPressed: _uninstall,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: AppColors.textSecondary,
+                  side: BorderSide(
+                    color: AppColors.textSecondary.withValues(alpha: 0.4),
+                  ),
+                  minimumSize: const Size(96, 36),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
                 ),
-                minimumSize: const Size(96, 36),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
+                child: Text(context.l10n.installed),
+              )
+            else
+              FilledButton(
+                onPressed: _install,
+                style: FilledButton.styleFrom(
+                  backgroundColor: AppColors.accent,
+                  foregroundColor: Colors.white,
+                  elevation: 0,
+                  minimumSize: const Size(96, 36),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
                 ),
+                child: Text(context.l10n.install),
               ),
-              child: Text(context.l10n.installed),
-            )
-          else
-            FilledButton(
-              onPressed: _install,
-              style: FilledButton.styleFrom(
-                backgroundColor: AppColors.accent,
-                foregroundColor: Colors.white,
-                elevation: 0,
-                minimumSize: const Size(96, 36),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-              ),
-              child: Text(context.l10n.install),
-            ),
-        ],
+          ],
+        ),
       ),
     );
   }

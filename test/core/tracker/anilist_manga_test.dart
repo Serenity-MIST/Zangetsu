@@ -24,7 +24,7 @@ const _entryAnimeGolden =
     r'query($id:Int){ Media(id:$id){ episodes '
     r'title{ romaji english native } '
     r'nextAiringEpisode{ episode airingAt } '
-    r'mediaListEntry{ status score(format:POINT_10) progress } } }';
+    r'mediaListEntry{ status score(format:POINT_10) progress private } } }';
 const _searchMediaAnimeGolden =
     r'query($q:String,$n:Int){ Page(perPage:$n){ media(search:$q,type:ANIME){ '
     r'id idMal episodes format seasonYear '
@@ -48,9 +48,10 @@ const _searchMediaAnimeGolden =
 const _listCollectionAnimeGolden =
     r'query($u:String){ MediaListCollection(userName:$u, type:ANIME){ '
     r'lists { status entries { status progress score(format:POINT_10) '
-    r'updatedAt customLists(asArray:true) '
+    r'updatedAt private customLists(asArray:true) '
     r'media { id idMal title { romaji english native } episodes '
-    r'nextAiringEpisode{episode} coverImage { large } } } } } }';
+    r'nextAiringEpisode{episode airingAt} status endDate{year month day} '
+    r'coverImage { large } } } } } }';
 
 /// A `MediaListCollection` response shaped exactly like AniList's — two lists
 /// (Watching / Planning), the `media` sub-object carrying idMal + titles +
@@ -148,7 +149,7 @@ void main() {
       expect(q, contains('nextAiringEpisode{ episode airingAt }'));
       expect(
         q,
-        contains('mediaListEntry{ status score(format:POINT_10) progress }'),
+        contains('mediaListEntry{ status score(format:POINT_10) progress private }'),
       );
     });
 

@@ -33,10 +33,17 @@ class TrackerListItem {
     this.score,
     this.tmdbIsTv = false,
     this.updatedAt,
+    this.isPrivate = false,
     this.customLists = const [],
     this.totalEpisodes,
     this.nextAiringEpisode,
+    this.latestReleaseAt,
   });
+
+  /// Roughly when the newest released episode came out: a week before the
+  /// next episode airs while a show is airing, or its end date once finished.
+  /// Null when the tracker did not say (only AniList fills it today).
+  final DateTime? latestReleaseAt;
 
   final MediaItem item;
   final WatchStatus status; // planning | watching | completed | paused | dropped
@@ -48,6 +55,8 @@ class TrackerListItem {
   /// both always leave this empty. Distinct from the app's local categories,
   /// which no tracker ever sees.
   final List<String> customLists;
+
+  final bool isPrivate;
 
   /// When this entry last changed on the tracker, for the "Last updated" sort.
   ///
@@ -81,6 +90,7 @@ class TrackerEntry {
   const TrackerEntry({
     required this.trackerName,
     this.onList = false,
+    this.isPrivate = false,
     this.title,
     this.status,
     this.score,
@@ -97,6 +107,8 @@ class TrackerEntry {
 
   /// Whether the title is on the user's list at all.
   final bool onList;
+
+  final bool isPrivate;
 
   /// What this tracker actually matched, so the sheet can show it and the user
   /// can tell a wrong auto-match from a right one. Null when the tracker can't
@@ -278,7 +290,8 @@ abstract interface class Tracker implements Listenable {
   });
 
   /// Write status/score/progress together for ONE title (the sync sheet's
-  /// Apply). A null field is left unchanged. [score] is 0–10. Best-effort and
+  /// Apply). A null field is left unchanged. [isPrivate] is AniList-only.
+  /// [score] is 0–10. Best-effort and
   /// self-gating like every other write.
   Future<void> updateEntry({
     int? malId,
@@ -290,6 +303,7 @@ abstract interface class Tracker implements Listenable {
     WatchStatus? status,
     double? score,
     int? progress,
+    bool? isPrivate,
     MediaKind kind = MediaKind.anime,
   });
 

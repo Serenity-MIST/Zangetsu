@@ -5,6 +5,9 @@
          providers, downloads). -->
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <!-- Requested only when the user starts custom phone voice search. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <uses-feature android:name="android.hardware.microphone" android:required="false"/>
     <!-- Download progress notification (Android 13+). -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <!-- In-app update: install the downloaded APK via the system installer. -->
@@ -32,7 +35,7 @@
          So it names the current mark and stays there — someone who picks Katana
          or Classic changes their home screen, not this. -->
     <application
-        android:label="Zangetsu Latest"
+        android:label="@string/app_name"
         android:extractNativeLibs="true"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher_crescent"
@@ -110,6 +113,13 @@
                 <!-- TV pairing QR: zangetsu://pair?code=… (see OpenLinkService). -->
                 <data android:scheme="zangetsu" android:host="pair"/>
             </intent-filter>
+            <!-- Keep the hostless Discord callback separate from tracker hosts. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="discord-1518610045422665748"/>
+            </intent-filter>
             <!-- "Open with" for local video files, so a file manager / Downloads
                  offers Zangetsu the way it offers any other player.
 
@@ -122,7 +132,7 @@
                  purpose: within one filter Android ORs the schemes with the
                  mime types, so merging them would also claim zangetsu://*
                  video/* and, worse, every file:// host for the tracker hosts. -->
-            <intent-filter android:label="Zangetsu Latest">
+            <intent-filter android:label="@string/app_name">
                 <action android:name="android.intent.action.VIEW"/>
                 <category android:name="android.intent.category.DEFAULT"/>
                 <category android:name="android.intent.category.BROWSABLE"/>
@@ -150,7 +160,7 @@
             android:exported="true"
             android:enabled="true"
             android:icon="@mipmap/ic_launcher_crescent"
-            android:label="Zangetsu Latest">
+            android:label="@string/app_name">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
@@ -162,7 +172,7 @@
             android:exported="true"
             android:enabled="false"
             android:icon="@mipmap/ic_launcher"
-            android:label="Zangetsu Latest">
+            android:label="@string/app_name">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
@@ -174,7 +184,7 @@
             android:exported="true"
             android:enabled="false"
             android:icon="@mipmap/ic_launcher_classic"
-            android:label="Zangetsu Latest">
+            android:label="@string/app_name">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
@@ -235,13 +245,14 @@
             android:screenOrientation="landscape"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
-        <!-- Native phone video player (PhonePlayerActivity). Starts landscape;
-             the player controls allow switching orientation. -->
+        <!-- Native phone video player (PhonePlayerActivity). The phone's
+            orientation preference controls its initial layout and rotation.
+            This is scoped to this Activity; TV keeps its fixed orientation. -->
         <activity
             android:name=".PhonePlayerActivity"
             android:exported="false"
-            android:screenOrientation="landscape"
-            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+            android:screenOrientation="unspecified"
+            android:theme="@style/Theme.PhonePlayer"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" />
         <!-- Google Cast Framework configuration. -->
         <meta-data
@@ -321,6 +332,9 @@
              (package visibility on Android 11+). -->
         <intent>
             <action android:name="android.speech.action.RECOGNIZE_SPEECH"/>
+        </intent>
+        <intent>
+            <action android:name="android.speech.RecognitionService"/>
         </intent>
     </queries>
 </manifest>

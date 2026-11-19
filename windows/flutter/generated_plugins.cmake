@@ -4,7 +4,6 @@
 
 list(APPEND FLUTTER_PLUGIN_LIST
   app_links
-  desktop_webview_window
   dynamic_color
   file_selector_windows
   firebase_core
@@ -13,12 +12,13 @@ list(APPEND FLUTTER_PLUGIN_LIST
   flutter_secure_storage_windows
   flutter_volume_controller
   gal
+  local_auth_windows
+  media_kit_libs_windows_video
   media_kit_video
   permission_handler_windows
   screen_brightness_windows
   share_plus
   url_launcher_windows
-  window_to_front
 )
 
 list(APPEND FLUTTER_FFI_PLUGIN_LIST

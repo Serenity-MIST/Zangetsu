@@ -11,6 +11,8 @@ import '../../core/models/provider_info.dart';
 import '../../core/models/watch_status.dart';
 import '../../core/playback/category_store.dart';
 import '../../core/playback/my_list.dart';
+import '../../core/stremio/stremio_library_badge.dart';
+import '../../core/stremio/stremio_ref.dart';
 import '../../core/prefs/list_sort.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
@@ -24,6 +26,7 @@ import '../../core/ui/poster_card.dart';
 import '../../core/ui/list_status_sheet.dart';
 import '../../core/ui/states.dart';
 import '../../core/ui/tracker_entry_sheet.dart';
+import '../../core/ui/tracker_badge.dart';
 import '../detail/detail_screen.dart';
 import 'cubit/my_list_cubit.dart';
 import 'cubit/tracker_list_cubit.dart';
@@ -234,6 +237,7 @@ class _MyListScreenTvState extends State<MyListScreenTv> {
               score: entry.score,
               tmdbIsTv: entry.tmdbIsTv,
               customLists: entry.customLists,
+              isPrivate: entry.isPrivate,
               onFind: () => _openTrackerItem(context, entry.item),
               onChanged: () => context.read<TrackerListCubit>().refresh(),
             );
@@ -351,6 +355,11 @@ class _MyListScreenTvState extends State<MyListScreenTv> {
           autofocus: autofocusFirst && i == 0,
           title: entry.item.title,
           logoItem: entry.item,
+          topRightBadge: entry.item.sourceId == stremioSourceId
+              ? const StremioLibraryBadge()
+              : entry.isPrivate
+              ? const PrivateTrackerBadge()
+              : null,
           imageUrl: entry.item.cover,
           wideImageUrl: entry.item.banner,
           headers: entry.item.coverHeaders,

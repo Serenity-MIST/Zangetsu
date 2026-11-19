@@ -11,6 +11,7 @@ import '../cache/app_image_cache.dart';
 import '../di/injector.dart';
 import '../metadata/title_logo_service.dart';
 import '../models/media_item.dart';
+import '../stremio/stremio_poster_shape.dart';
 import '../playback/playback_prefs.dart';
 
 import 'image_fade.dart';
@@ -46,6 +47,8 @@ class PosterCard extends StatefulWidget {
     this.genres = const [],
     this.isAdult = false,
     this.progressBadge,
+    this.topRightBadge,
+    this.wideOverride,
   });
   final String title;
   final String? imageUrl;
@@ -80,6 +83,10 @@ class PosterCard extends StatefulWidget {
   final List<String> genres;
   final bool isAdult;
   final String? progressBadge;
+  final Widget? topRightBadge;
+
+  /// Home catalogue artwork can declare its shape independently of preferences.
+  final bool? wideOverride;
   final double cellWidth;
 
   /// When false, omit an external title. An inside-image title still follows
@@ -190,11 +197,17 @@ double posterRowWidth(BuildContext context) {
 
 double posterRowHeight(BuildContext context) {
   final wide = posterLayout(context) == PosterCardLayout.wide;
-  if(defaultTargetPlatform==TargetPlatform.windows) {
-    return DesktopMediaCard.height(posterRowWidth(context),MediaQuery.textScalerOf(context).scale(1),wide:wide,titleInside:posterTitleInside(context,wide:wide));
+  if (defaultTargetPlatform == TargetPlatform.windows) {
+    return DesktopMediaCard.height(
+      posterRowWidth(context),
+      MediaQuery.textScalerOf(context).scale(1),
+      wide: wide,
+      titleInside: posterTitleInside(context, wide: wide),
+    );
   }
   return posterCellHeight(
     posterRowWidth(context),
+    textScaler: MediaQuery.textScalerOf(context),
     wide: wide,
     titleInside: posterTitleInside(context, wide: wide),
   );
@@ -231,11 +244,21 @@ double tvPosterGridAspect(BuildContext context) {
   return width / (artHeight + titleHeight);
 }
 
-bool posterTitleInside(BuildContext context, {required bool wide}) {
+bool posterTitleInside(
+  BuildContext context, {
+  required bool wide,
+  MediaItem? item,
+}) {
   PosterCardScope.watch(context);
   return switch (_posterPrefs?.posterTitlePlacement ??
       PosterTitlePlacement.adaptive) {
-    PosterTitlePlacement.adaptive => defaultTargetPlatform==TargetPlatform.windows ? false : wide,
+    // Windows keeps captions below the art; elsewhere upstream keeps Stremio
+    // addon artwork's own title placement.
+    PosterTitlePlacement.adaptive =>
+      defaultTargetPlatform == TargetPlatform.windows ||
+              item?.sourceId == 'stremio'
+          ? false
+          : wide,
     PosterTitlePlacement.inside => true,
     PosterTitlePlacement.below => false,
   };
@@ -293,45 +316,76 @@ class _PosterCardState extends State<PosterCard> {
   /// Sizes decoding to the real card constraint, including desktop grids and
   /// display scaling, instead of a caller's nominal phone-sized cell width.
   Widget _buildCard(BuildContext context, BoxConstraints constraints) {
-    final wide = posterLayout(context) == PosterCardLayout.wide;
-    if (defaultTargetPlatform==TargetPlatform.windows) {
-      final prefs=_posterPrefs;
-      final inside=posterTitleInside(context,wide:wide);
-      return DesktopMediaCard(title:widget.title,titleInside:inside,
-        titleWidget:prefs?.posterTitleStyle==PosterTitleStyle.artwork ?
-          PosterCardTitle(title:widget.title,logoItem:widget.logoItem,width:widget.cellWidth,
-            maxHeight:MediaQuery.textScalerOf(context).scale(34),inside:inside) : null,
-        image:wide && widget.wideImageUrl?.isNotEmpty==true ? widget.wideImageUrl : widget.imageUrl,
-        headers:wide && widget.wideImageUrl?.isNotEmpty==true ? null : widget.headers,
-        onTap:widget.onTap,onMenu:widget.onLongPress,showTitle:widget.showTitle,
-        score:(prefs?.posterScoreBadge ?? true) ? widget.scoreBadge : null,
-        badges:[...widget.tags,
-          if(widget.progressBadge!=null && prefs?.posterProgressBadge==true) widget.progressBadge!,
-          if(widget.isAdult && prefs?.posterAdultBadge==true) '18+',
-          if(wide && widget.genres.isNotEmpty && prefs?.posterGenreBadge==true) widget.genres.first,
-          if(widget.qualityBadge!=null && (prefs?.posterQualityBadge ?? true)) widget.qualityBadge!,
-          if(widget.dubBadge!=null && (prefs?.posterAudioBadge ?? true)) widget.dubBadge!]);
-    }
-    final titleInside = posterTitleInside(context, wide: wide);
-    final selectedArtUrl = wide && widget.wideImageUrl?.isNotEmpty == true
+    final landscapeMode = posterLayout(context) == PosterCardLayout.wide;
+    final wide = widget.wideOverride ?? landscapeMode;
+    final titleInside = posterTitleInside(
+      context,
+      wide: wide,
+      item: widget.wideOverride == null ? null : widget.logoItem,
+    );
+    final titleBoxHeight = _posterTitleHeight(MediaQuery.textScalerOf(context));
+    final stremio = widget.logoItem?.sourceId == 'stremio';
+    final artUrl = stremio
+        ? stremioPosterImage(widget.logoItem!, landscape: landscapeMode)
+        : widget.wideOverride == null &&
+              wide &&
+              widget.wideImageUrl?.isNotEmpty == true
         ? widget.wideImageUrl
         : widget.imageUrl;
-    final artUrl =
-        selectedArtUrl != null &&
-            defaultTargetPlatform == TargetPlatform.windows
-        ? desktopArtworkUrl(selectedArtUrl)
-        : selectedArtUrl;
-    final artHeaders = selectedArtUrl == widget.imageUrl
-        ? widget.headers
-        : null;
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      final card = desktopPosterCard(
+        context,
+        title: widget.title,
+        wide: wide,
+        titleInside: titleInside,
+        artUrl: artUrl,
+        sourceImageUrl: widget.imageUrl,
+        headers: widget.headers,
+        logoItem: widget.logoItem,
+        cellWidth: widget.cellWidth,
+        onTap: widget.onTap,
+        onMenu: widget.onLongPress,
+        showTitle: widget.showTitle,
+        tags: widget.tags,
+        qualityBadge: widget.qualityBadge,
+        dubBadge: widget.dubBadge,
+        scoreBadge: widget.scoreBadge,
+        genres: widget.genres,
+        isAdult: widget.isAdult,
+        progressBadge: widget.progressBadge,
+      );
+      // DesktopMediaCard has no corner slot, so upstream's top-right badge
+      // (e.g. the Stremio marker in My List) is overlaid on the artwork here.
+      if (widget.topRightBadge == null) return card;
+      return Stack(
+        children: [
+          Positioned.fill(child: card),
+          Positioned(
+            top: 6,
+            right: 6,
+            child: IgnorePointer(child: widget.topRightBadge!),
+          ),
+        ],
+      );
+    }
+    final overlayTitle =
+        titleInside ||
+        (stremio &&
+            landscapeMode &&
+            (_posterPrefs?.posterTitlePlacement ??
+                    PosterTitlePlacement.adaptive) ==
+                PosterTitlePlacement.adaptive &&
+            widget.logoItem!.landscapePoster?.trim().isNotEmpty != true &&
+            widget.logoItem!.banner?.trim().isNotEmpty == true &&
+            artUrl == widget.logoItem!.banner);
     final artFit = BoxFit.cover;
     final dpr = MediaQuery.devicePixelRatioOf(context);
     final paintedWidth = constraints.hasBoundedWidth
         ? constraints.maxWidth
         : widget.cellWidth;
     final memW = artworkDecodeWidth(paintedWidth, dpr, maximum: 2048);
-    final aniSrcId = selectedArtUrl == widget.imageUrl ? _aniSrcId : null;
-    final mihonSrcId = selectedArtUrl == widget.imageUrl ? _mihonSrcId : null;
+    final aniSrcId = artUrl == widget.imageUrl ? _aniSrcId : null;
+    final mihonSrcId = artUrl == widget.imageUrl ? _mihonSrcId : null;
     // Only wire the press-scale handlers when this card is actually tappable.
     // On TV the card is wrapped in a TvFocusable and passed onTap: null — if we
     // still attached onTapDown/Up/Cancel they'd claim the tap in the gesture
@@ -357,6 +411,33 @@ class _PosterCardState extends State<PosterCard> {
           _PosterTag(widget.progressBadge!, maxWidth: widget.cellWidth - 22),
       ],
     );
+    Widget networkArtwork(String url, [Set<String> failedUrls = const {}]) {
+      return CachedNetworkImage(
+        imageUrl: url,
+        cacheManager: AppImageCache.manager,
+        httpHeaders: url == widget.imageUrl ? widget.headers : null,
+        memCacheWidth: memW,
+        fit: artFit,
+        fadeInDuration: sl.isRegistered<AppMode>() && sl<AppMode>().isTv
+            ? Duration.zero
+            : const Duration(milliseconds: 180),
+        placeholder: (_, _) => ColoredBox(color: AppColors.surface2),
+        errorWidget: (_, _, _) {
+          final failed = {...failedUrls, url};
+          final next = stremio
+              ? stremioPosterImage(
+                  widget.logoItem!,
+                  landscape: landscapeMode,
+                  failedUrls: failed,
+                )
+              : null;
+          return next == null
+              ? ColoredBox(color: AppColors.surface2)
+              : networkArtwork(next, failed);
+        },
+      );
+    }
+
     return RepaintBoundary(
       child: MouseRegion(
         cursor: interactive ? SystemMouseCursors.click : MouseCursor.defer,
@@ -416,41 +497,41 @@ class _PosterCardState extends State<PosterCard> {
                                 ColoredBox(color: AppColors.surface2),
                           )
                         else
-                          CachedNetworkImage(
-                            imageUrl: artUrl,
-                            cacheManager: AppImageCache.manager,
-                            httpHeaders: artHeaders,
-                            memCacheWidth: memW,
-                            fit: artFit,
-                            fadeInDuration:
-                                sl.isRegistered<AppMode>() && sl<AppMode>().isTv
-                                ? Duration.zero
-                                : const Duration(milliseconds: 180),
-                            placeholder: (context, url) =>
-                                ColoredBox(color: AppColors.surface2),
-                            errorWidget: (context, url, err) =>
-                                ColoredBox(color: AppColors.surface2),
-                          ),
-                        if (titleInside || hasBottomBadges || hasRightBadges)
+                          networkArtwork(artUrl),
+                        if (overlayTitle || hasBottomBadges || hasRightBadges)
                           const DecoratedBox(
                             decoration: BoxDecoration(
                               gradient: _posterTextScrim,
                             ),
                           ),
-                        if (widget.qualityBadge != null &&
-                            (prefs?.posterQualityBadge ?? true))
+                        if (widget.topRightBadge != null ||
+                            (widget.qualityBadge != null &&
+                                (prefs?.posterQualityBadge ?? true)) ||
+                            (widget.scoreBadge != null &&
+                                widget.qualityBadge == null &&
+                                (prefs?.posterScoreBadge ?? true)))
                           Positioned(
                             top: 6,
                             right: 6,
-                            child: _PosterTag(widget.qualityBadge!),
-                          ),
-                        if (widget.scoreBadge != null &&
-                            widget.qualityBadge == null &&
-                            (prefs?.posterScoreBadge ?? true))
-                          Positioned(
-                            top: 6,
-                            right: 6,
-                            child: _ScoreTag(widget.scoreBadge!),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (widget.qualityBadge != null &&
+                                    (prefs?.posterQualityBadge ?? true))
+                                  _PosterTag(widget.qualityBadge!)
+                                else if (widget.scoreBadge != null &&
+                                    widget.qualityBadge == null &&
+                                    (prefs?.posterScoreBadge ?? true))
+                                  _ScoreTag(widget.scoreBadge!),
+                                if (widget.topRightBadge != null)
+                                  Padding(
+                                    padding: const EdgeInsets.only(left: 4),
+                                    child: IgnorePointer(
+                                      child: widget.topRightBadge!,
+                                    ),
+                                  ),
+                              ],
+                            ),
                           ),
                         if (widget.dubBadge != null &&
                             (prefs?.posterAudioBadge ?? true))
@@ -459,7 +540,7 @@ class _PosterCardState extends State<PosterCard> {
                             left: 6,
                             child: _PosterTag(widget.dubBadge!),
                           ),
-                        if (titleInside || hasBottomBadges || hasRightBadges)
+                        if (overlayTitle || hasBottomBadges || hasRightBadges)
                           Positioned(
                             left: 6,
                             bottom: 6,
@@ -467,7 +548,7 @@ class _PosterCardState extends State<PosterCard> {
                             child: Row(
                               crossAxisAlignment: CrossAxisAlignment.end,
                               children: [
-                                if (titleInside || hasBottomBadges)
+                                if (overlayTitle || hasBottomBadges)
                                   Expanded(
                                     child: Column(
                                       mainAxisSize: MainAxisSize.min,
@@ -476,11 +557,11 @@ class _PosterCardState extends State<PosterCard> {
                                       children: [
                                         if (hasBottomBadges) ...[
                                           bottomBadges,
-                                          if (titleInside &&
+                                          if (overlayTitle &&
                                               widget.title.isNotEmpty)
                                             const SizedBox(height: 4),
                                         ],
-                                        if (titleInside &&
+                                        if (overlayTitle &&
                                             widget.title.isNotEmpty)
                                           ExcludeSemantics(
                                             excluding: !widget.showTitle,
@@ -489,6 +570,8 @@ class _PosterCardState extends State<PosterCard> {
                                               logoItem: widget.logoItem,
                                               width: widget.cellWidth - 12,
                                               maxHeight: wide ? 34 : 54,
+                                              addonOverlay:
+                                                  stremio && !titleInside,
                                             ),
                                           ),
                                       ],
@@ -497,7 +580,7 @@ class _PosterCardState extends State<PosterCard> {
                                 else
                                   const Spacer(),
                                 if (hasRightBadges) ...[
-                                  if (titleInside || hasBottomBadges)
+                                  if (overlayTitle || hasBottomBadges)
                                     const SizedBox(width: 4),
                                   if (showGenre)
                                     _PosterTag(
@@ -523,12 +606,12 @@ class _PosterCardState extends State<PosterCard> {
                   // the same row. Pinning the text also pins the gap to whatever
                   // follows the row.
                   SizedBox(
-                    height: _titleBoxHeight,
+                    height: titleBoxHeight,
                     child: PosterCardTitle(
                       title: widget.title,
                       logoItem: widget.logoItem,
                       width: widget.cellWidth,
-                      maxHeight: _titleBoxHeight,
+                      maxHeight: titleBoxHeight,
                       inside: false,
                     ),
                   ),
@@ -542,6 +625,120 @@ class _PosterCardState extends State<PosterCard> {
   }
 }
 
+/// The Windows poster card with every Poster cards preference applied: title
+/// placement ([titleInside]), title artwork, and the score / progress / 18+ /
+/// genre / quality / sub-dub badge switches. [PosterCard] uses it on Windows,
+/// and the desktop Home shelves call it directly (with a [rank]) so Home
+/// follows exactly the same settings as search, see-all and My List.
+///
+/// [artUrl] is the artwork already chosen for the card's shape; headers are
+/// only sent when it is the source cover ([sourceImageUrl]).
+DesktopMediaCard desktopPosterCard(
+  BuildContext context, {
+  required String title,
+  required bool wide,
+  required bool titleInside,
+  String? artUrl,
+  String? sourceImageUrl,
+  Map<String, String>? headers,
+  MediaItem? logoItem,
+  double cellWidth = 180,
+  VoidCallback? onTap,
+  VoidCallback? onMenu,
+  bool showTitle = true,
+  List<String> tags = const [],
+  String? qualityBadge,
+  String? dubBadge,
+  int? scoreBadge,
+  List<String> genres = const [],
+  bool isAdult = false,
+  String? progressBadge,
+  int? rank,
+  Key? key,
+  Key? artworkKey,
+}) {
+  final prefs = _posterPrefs;
+  return DesktopMediaCard(
+    key: key,
+    artworkKey: artworkKey,
+    title: title,
+    rank: rank,
+    titleInside: titleInside,
+    titleWidget: prefs?.posterTitleStyle == PosterTitleStyle.artwork
+        ? PosterCardTitle(
+            title: title,
+            logoItem: logoItem,
+            width: cellWidth,
+            maxHeight: MediaQuery.textScalerOf(context).scale(34),
+            inside: titleInside,
+          )
+        : null,
+    // Upstream's art choice (Stremio shapes, catalogue wideOverride) feeds
+    // the desktop card; headers only belong to the source cover.
+    image: artUrl,
+    headers: artUrl == sourceImageUrl ? headers : null,
+    onTap: onTap,
+    onMenu: onMenu,
+    showTitle: showTitle,
+    score: (prefs?.posterScoreBadge ?? true) ? scoreBadge : null,
+    badges: [
+      ...tags,
+      if (progressBadge != null && prefs?.posterProgressBadge == true)
+        progressBadge,
+      if (isAdult && prefs?.posterAdultBadge == true) '18+',
+      if (wide && genres.isNotEmpty && prefs?.posterGenreBadge == true)
+        genres.first,
+      if (qualityBadge != null && (prefs?.posterQualityBadge ?? true))
+        qualityBadge,
+      if (dubBadge != null && (prefs?.posterAudioBadge ?? true)) dubBadge,
+    ],
+  );
+}
+
+/// [desktopPosterCard] for a catalogue [item], choosing its artwork the way
+/// [PosterCard] does for the current Shape setting (banner art in Landscape,
+/// Stremio's own shapes for addon items). Used by the desktop Home shelves.
+DesktopMediaCard desktopPosterCardForItem(
+  BuildContext context,
+  MediaItem item, {
+  required double cellWidth,
+  VoidCallback? onTap,
+  VoidCallback? onMenu,
+  List<String> tags = const [],
+  String? progressBadge,
+  int? rank,
+  Key? artworkKey,
+}) {
+  final wide = posterLayout(context) == PosterCardLayout.wide;
+  final artUrl = item.sourceId == 'stremio'
+      ? stremioPosterImage(item, landscape: wide)
+      : wide && item.banner?.isNotEmpty == true
+      ? item.banner
+      : item.cover;
+  return desktopPosterCard(
+    context,
+    title: item.title,
+    wide: wide,
+    titleInside: posterTitleInside(context, wide: wide),
+    artUrl: artUrl,
+    sourceImageUrl: item.cover,
+    headers: item.coverHeaders,
+    logoItem: item,
+    cellWidth: cellWidth,
+    onTap: onTap,
+    onMenu: onMenu,
+    tags: tags,
+    qualityBadge: item.quality,
+    dubBadge: item.dubBadge,
+    scoreBadge: item.score,
+    genres: item.genres,
+    isAdult: item.isAdult,
+    progressBadge: progressBadge,
+    rank: rank,
+    artworkKey: artworkKey,
+  );
+}
+
 class PosterCardTitle extends StatefulWidget {
   const PosterCardTitle({
     super.key,
@@ -552,6 +749,7 @@ class PosterCardTitle extends StatefulWidget {
     this.inside = true,
     this.maxLines = 2,
     this.textStyle,
+    this.addonOverlay = false,
   });
 
   final String title;
@@ -561,6 +759,7 @@ class PosterCardTitle extends StatefulWidget {
   final bool inside;
   final int maxLines;
   final TextStyle? textStyle;
+  final bool addonOverlay;
 
   @override
   State<PosterCardTitle> createState() => _PosterCardTitleState();
@@ -590,7 +789,8 @@ class _PosterCardTitleState extends State<PosterCardTitle> {
     if (oldWidget.title != widget.title ||
         oldWidget.logoItem?.id != widget.logoItem?.id ||
         oldWidget.logoItem?.tmdbId != widget.logoItem?.tmdbId ||
-        oldWidget.logoItem?.englishTitle != widget.logoItem?.englishTitle) {
+        oldWidget.logoItem?.englishTitle != widget.logoItem?.englishTitle ||
+        oldWidget.logoItem?.titleLogo != widget.logoItem?.titleLogo) {
       _logoUrl = null;
       _loadedTitle = null;
       _loadLogo();
@@ -625,10 +825,22 @@ class _PosterCardTitleState extends State<PosterCardTitle> {
 
   @override
   Widget build(BuildContext context) {
-    if (_posterPrefs?.posterTitleStyle == PosterTitleStyle.artwork &&
-        _logoUrl != null) {
+    final addonOverlay = widget.addonOverlay
+        ? widget.logoItem?.titleLogo
+        : null;
+    final addonUri = Uri.tryParse(addonOverlay ?? '');
+    final validAddonLogo =
+        addonUri != null &&
+        addonUri.host.isNotEmpty &&
+        (addonUri.scheme == 'https' || addonUri.scheme == 'http');
+    final logo = validAddonLogo
+        ? addonOverlay
+        : _posterPrefs?.posterTitleStyle == PosterTitleStyle.artwork
+        ? _logoUrl
+        : null;
+    if (logo != null) {
       return CachedNetworkImage(
-        imageUrl: _logoUrl!,
+        imageUrl: logo,
         cacheManager: AppImageCache.manager,
         width: widget.width,
         height: widget.maxHeight,
@@ -657,8 +869,11 @@ class _PosterCardTitleState extends State<PosterCardTitle> {
 
 /// Height of exactly two lines of the poster title, derived from the style so a
 /// change to the type scale carries here instead of silently clipping.
-final double _titleBoxHeight =
-    (AppText.caption.fontSize! * AppText.caption.height!) * 2;
+/// Round each line up because paragraph layout rounds fractional line heights.
+double _posterTitleHeight(TextScaler textScaler) =>
+    (textScaler.scale(AppText.caption.fontSize!) * AppText.caption.height!)
+        .ceilToDouble() *
+    2;
 
 /// Gap between the poster art and its title.
 const double _kTitleGap = 8;
@@ -672,33 +887,59 @@ const double _kTitleGap = 8;
 /// different component depending on which screen you were on.
 double posterCellHeight(
   double cellWidth, {
+  TextScaler textScaler = TextScaler.noScaling,
   bool wide = false,
   bool titleInside = false,
+  double? artAspectRatio,
 }) {
-  final artHeight = wide ? cellWidth * 9 / 16 : cellWidth * 1.5;
-  final titleHeight = titleInside ? 0.0 : _kTitleGap + _titleBoxHeight;
+  final artHeight = artAspectRatio != null
+      ? cellWidth / artAspectRatio
+      : wide
+      ? cellWidth * 9 / 16
+      : cellWidth * 1.5;
+  final titleHeight = titleInside
+      ? 0.0
+      : _kTitleGap + _posterTitleHeight(textScaler);
   final height = artHeight + titleHeight;
   return titleHeight == 0 ? height : height.ceilToDouble();
 }
 
 double posterCellAspect(
   double cellWidth, {
+  TextScaler textScaler = TextScaler.noScaling,
   bool wide = false,
   bool titleInside = false,
 }) =>
     cellWidth /
-    posterCellHeight(cellWidth, wide: wide, titleInside: titleInside);
+    posterCellHeight(
+      cellWidth,
+      textScaler: textScaler,
+      wide: wide,
+      titleInside: titleInside,
+    );
 
 /// [posterCellAspect] for the app's standard poster grid: three columns, 16px
 /// page padding, 12px between cells. Depends on the screen width, so it cannot
 /// be a constant — which is exactly why the hardcoded 0.62 drifted.
 double posterGridAspect(BuildContext context) {
-  final width=posterGridCellWidth(context);
-  final wide=posterLayout(context)==PosterCardLayout.wide;
-  if(defaultTargetPlatform==TargetPlatform.windows) {
-    return width/DesktopMediaCard.height(width,MediaQuery.textScalerOf(context).scale(1),wide:wide,titleInside:posterTitleInside(context,wide:wide));
+  final width = posterGridCellWidth(context);
+  final wide = posterLayout(context) == PosterCardLayout.wide;
+  final titleInside = posterTitleInside(context, wide: wide);
+  if (defaultTargetPlatform == TargetPlatform.windows) {
+    return width /
+        DesktopMediaCard.height(
+          width,
+          MediaQuery.textScalerOf(context).scale(1),
+          wide: wide,
+          titleInside: titleInside,
+        );
   }
-  return posterCellAspect(width,wide:wide,titleInside:posterTitleInside(context,wide:wide));
+  return posterCellAspect(
+    width,
+    textScaler: MediaQuery.textScalerOf(context),
+    wide: wide,
+    titleInside: titleInside,
+  );
 }
 
 /// Small frosted badge drawn over poster art (e.g. "SUB", "DUB", "MOVIE").
@@ -757,7 +998,7 @@ SliverGridDelegate posterGridDelegate(BuildContext context) =>
           wide: posterLayout(context) == PosterCardLayout.wide,
         ),
         scale: posterCardScale(context),
-        textScale:MediaQuery.textScalerOf(context).scale(1),
+        textScale: MediaQuery.textScalerOf(context).scale(1),
       )
     : SliverGridDelegateWithFixedCrossAxisCount(
         crossAxisCount: posterGridColumns(context),
@@ -787,8 +1028,12 @@ class DesktopPosterGridDelegate extends SliverGridDelegate {
             .ceil()
             .clamp(1, 30);
     final width = (constraints.crossAxisExtent - gap * (count - 1)) / count;
-    final height =
-        DesktopMediaCard.height(width,textScale,wide:wide,titleInside:titleInside);
+    final height = DesktopMediaCard.height(
+      width,
+      textScale,
+      wide: wide,
+      titleInside: titleInside,
+    );
     return SliverGridRegularTileLayout(
       crossAxisCount: count,
       mainAxisStride: height + 28,
@@ -803,7 +1048,8 @@ class DesktopPosterGridDelegate extends SliverGridDelegate {
   bool shouldRelayout(covariant DesktopPosterGridDelegate oldDelegate) =>
       wide != oldDelegate.wide ||
       titleInside != oldDelegate.titleInside ||
-      scale != oldDelegate.scale || textScale != oldDelegate.textScale;
+      scale != oldDelegate.scale ||
+      textScale != oldDelegate.textScale;
 }
 
 class _PosterTag extends StatelessWidget {

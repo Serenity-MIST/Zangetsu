@@ -274,6 +274,7 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
 
     override fun onResume() {
         super.onResume()
+        playerOrientationObserver?.enable()
         current = java.lang.ref.WeakReference(this)
         // CloudStream plugins that store their own settings grab a per-plugin
         // SharedPreferences via CommonActivity.getActivity().getSharedPreferences(name)
@@ -285,6 +286,8 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
     }
 
     override fun onPause() {
+        playerOrientationObserver?.disable()
+        phoneVoiceSearch?.cancelActive()
         if (current?.get() === this) current = null
         // Fail safe: never leave the volume rocker hijacked for an app that
         // isn't in front. Dart re-enables it when the reader resumes.
@@ -346,6 +349,7 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
     // In-flight TV voice-search dialog, completed in onActivityResult with the
     // recognised phrase (TV search fills the field + runs the query with it).
     private var pendingVoiceResult: MethodChannel.Result? = null
+    private var phoneVoiceSearch: PhoneVoiceSearchBridge? = null
 
     // Cached retriever so rapid scrubbing on one title doesn't re-open the
     // source for every frame (setDataSource is expensive, esp. over network).
@@ -400,12 +404,29 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
      *  dies with this activity, so there is nothing extra to undo here. */
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {}
 
+    private var playerOrientationObserver: PhoneOrientationObserver? = null
+    private var discordPresence: DiscordPresenceBridge? = null
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         // FlutterActivity.configureFlutterEngine did this for us; FlutterFragment
         // only forwards to the host, and FlutterEngine registers nothing on its
         // own, so without this line NO plugin (shared_preferences, path_provider,
         // media_kit …) would be attached and the app would come up dead.
         GeneratedPluginRegister.registerGeneratedPlugins(flutterEngine)
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, "zangetsu/player_orientation")
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                    playerOrientationObserver?.disable()
+                    playerOrientationObserver = PhoneOrientationObserver(this@MainActivity) {
+                        events.success(it)
+                    }.also { it.enable() }
+                }
+                override fun onCancel(arguments: Any?) {
+                    playerOrientationObserver?.disable()
+                    playerOrientationObserver = null
+                }
+            })
+        discordPresence = DiscordPresenceBridge(this, flutterEngine.dartExecutor.binaryMessenger)
 
         // Bridge mega-repo plugins → our repo list: when a plugin's load() calls
         // RepositoryManager.addRepository(...), forward each URL to Dart so it
@@ -488,6 +509,42 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
                             }
                         } catch (e: Exception) {
                             android.util.Log.w("ext-player", "proxyUrl failed: ${e.message}")
+                            result.success(null)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        // Unknown document providers return null rather than measuring a different drive.
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "zangetsu/storage")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "freeBytes" -> {
+                        try {
+                            val destination = call.argument<String>("destination")
+                            val privateStorage = call.argument<Boolean>("privateStorage") == true
+                            val storagePath = when {
+                                privateStorage -> applicationContext.filesDir.path
+                                destination.isNullOrBlank() -> android.os.Environment.getExternalStorageDirectory().path
+                                destination.startsWith("/") -> destination
+                                destination.startsWith("content://") -> {
+                                    val root = android.provider.DocumentsContract
+                                        .getTreeDocumentId(Uri.parse(destination)).substringBefore(':')
+                                    val sm = getSystemService(STORAGE_SERVICE) as StorageManager
+                                    getExternalFilesDirs(null).firstOrNull { file ->
+                                        if (file == null) false else {
+                                            val volume = sm.getStorageVolume(file)
+                                            if (root.equals("primary", ignoreCase = true)) volume?.isPrimary == true
+                                            else volume?.uuid?.equals(root, ignoreCase = true) == true
+                                        }
+                                    }?.path
+                                }
+                                else -> null
+                            }
+                            result.success(storagePath?.let { android.os.StatFs(it).availableBytes })
+                        } catch (e: Exception) {
+                            android.util.Log.w("storage", "freeBytes failed: ${e.message}")
                             result.success(null)
                         }
                     }
@@ -661,6 +718,9 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
                 else -> result.notImplemented()
             }
         }
+
+        phoneVoiceSearch?.dispose()
+        phoneVoiceSearch = PhoneVoiceSearchBridge(this, flutterEngine.dartExecutor.binaryMessenger)
 
         // Voice search (TV): open the system speech dialog and hand the
         // recognised phrase back to Dart. Uses ACTION_RECOGNIZE_SPEECH so no
@@ -1650,7 +1710,7 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
             intent.putExtra(TvPlayerActivity.EXTRA_POSITION, (call.argument<Number>("positionMs") ?: 0).toLong())
             intent.putExtra(
                 TvPlayerActivity.EXTRA_DECODER_MODE,
-                (call.argument<Number>("decoderMode") ?: 0).toInt(),
+                (call.argument<Number>("decoderMode") ?: TvPlayerActivity.DECODER_MODE_HARDWARE_FIRST).toInt(),
             )
             intent.putExtra(TvPlayerActivity.EXTRA_EP_COUNT, (call.argument<Number>("episodeCount") ?: 1).toInt())
             intent.putExtra(TvPlayerActivity.EXTRA_START_INDEX, (call.argument<Number>("startIndex") ?: 0).toInt())
@@ -1754,7 +1814,7 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
                 putExtra(RecognizerIntent.EXTRA_PROMPT, prompt ?: "Speak the title")
             }
             if (intent.resolveActivity(packageManager) == null) {
-                result.success(null)
+                result.error("voice_unavailable", "Voice search is unavailable", null)
                 return
             }
             // Complete any stale pending dialog defensively, then wait for this one.
@@ -1764,7 +1824,7 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
         } catch (e: Exception) {
             Log.w(TAG, "startVoiceSearch failed: ${e.message}")
             pendingVoiceResult = null
-            result.success(null)
+            result.error("voice_failed", "Could not start voice search", null)
         }
     }
 
@@ -1836,7 +1896,18 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
         if (requestCode == VOICE_SEARCH_REQUEST) {
             val text = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
                 ?.firstOrNull()
-            pendingVoiceResult?.let { try { it.success(text) } catch (_: Exception) {} }
+            pendingVoiceResult?.let {
+                try {
+                    when {
+                        resultCode == RESULT_CANCELED -> it.success(null)
+                        resultCode != RESULT_OK ->
+                            it.error("voice_failed", "Voice recognition failed", null)
+                        text.isNullOrBlank() ->
+                            it.error("voice_no_match", "No title recognised", null)
+                        else -> it.success(text)
+                    }
+                } catch (_: Exception) {}
+            }
             pendingVoiceResult = null
             return
         }
@@ -1939,6 +2010,12 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
     }
 
     override fun onDestroy() {
+        playerOrientationObserver?.disable()
+        playerOrientationObserver = null
+        discordPresence?.dispose()
+        discordPresence = null
+        phoneVoiceSearch?.dispose()
+        phoneVoiceSearch = null
         pip.unregister()
         releaseRetriever()
         executor.shutdown()

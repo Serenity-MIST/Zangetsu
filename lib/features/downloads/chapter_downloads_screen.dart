@@ -10,6 +10,9 @@ import '../../core/di/injector.dart';
 import '../../core/download/chapter_download.dart';
 import '../../core/download/chapter_download_store.dart';
 import '../../core/download/chapter_downloader.dart';
+// Same Recycle Bin gate the store uses, for the 'Moved to the Recycle Bin'
+// message (dl-2).
+import '../../core/download/download_recycle.dart';
 import '../../core/models/episode.dart';
 import '../../core/mode/content_mode.dart';
 import '../../core/theme/app_colors.dart';
@@ -20,6 +23,8 @@ import '../../core/ui/states.dart';
 import '../../l10n/l10n.dart';
 import '../reader/manga_reader_screen.dart';
 import '../reader/novel_reader_screen.dart';
+import '../../core/ui/poster_card.dart' show posterGridColumns;
+import 'download_library_widgets.dart';
 
 /// Saved chapters for one reading mode.
 ///
@@ -27,9 +32,18 @@ import '../reader/novel_reader_screen.dart';
 /// are text, they're browsed in different places, and mixing them under the
 /// episode downloads made the video screen read like a dumping ground.
 class ChapterDownloadsScreen extends StatefulWidget {
-  const ChapterDownloadsScreen({super.key, required this.mode, this.sourceId, this.showId});
+  const ChapterDownloadsScreen({
+    super.key,
+    required this.mode,
+    this.embedded = false,
+    this.query,
+    this.sourceId,
+    this.showId,
+  });
 
   final ContentMode mode;
+  final bool embedded;
+  final String? query;
 
   /// Optional exact title scope from the Windows unified offline library.
   final String? sourceId;
@@ -42,6 +56,7 @@ class ChapterDownloadsScreen extends StatefulWidget {
 class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
   final TextEditingController _searchCtrl = TextEditingController();
   String _query = '';
+  String get _effectiveQuery => widget.query ?? _query;
 
   /// Show keys the user has expanded. Empty = all collapsed.
   final Set<String> _expanded = <String>{};
@@ -61,7 +76,7 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
       (widget.showId == null || c.showId == widget.showId);
 
   bool _matchesQuery(ChapterDownload c) {
-    final q = _query.trim().toLowerCase();
+    final q = _effectiveQuery.trim().toLowerCase();
     return q.isEmpty ||
         c.showTitle.toLowerCase().contains(q) ||
         c.chapterTitle.toLowerCase().contains(q);
@@ -72,45 +87,49 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
     final store = sl<ChapterDownloadStore>();
     final isNovel = widget.mode == ContentMode.novel;
     final l10n = context.l10n;
-    return Scaffold(
-      backgroundColor: AppColors.bg,
-      appBar: settingsAppBar(
-        isNovel ? l10n.novelDownloads : l10n.mangaDownloads,
-      ),
-      // Only the box is watched here. The downloader fires per page, and
-      // rebuilding a few thousand rows twice a second for a progress bar on one
-      // of them is what made this screen crawl — the progress tiles subscribe
-      // to it themselves instead.
-      body: ValueListenableBuilder<Box<Map>>(
-        valueListenable: store.listenable(),
-        builder: (context, box, _) {
-          final all = store.all();
-          if (!all.any(_inScope)) {
-            return EmptyState(
-              icon: isNovel ? Icons.article_outlined : Icons.menu_book_outlined,
-              message: isNovel
-                  ? l10n.novelChaptersYouDownloadAppearHere
-                  : l10n.mangaChaptersYouDownloadAppearHere,
-            );
-          }
-          final sections = _sections(all, l10n);
-          return Column(
-            children: [
-              _searchField(),
-              Expanded(
-                // Lazily — a saved series can be thousands of rows, and the
-                // eager ListView built every one of them before the first
-                // frame.
-                child: ListView.builder(
-                  itemCount: sections.length,
-                  itemBuilder: (context, i) => sections[i](),
-                ),
-              ),
-            ],
+    // Only the box is watched here. The downloader fires per page, and
+    // rebuilding a few thousand rows twice a second for a progress bar on one
+    // of them is what made this screen crawl — the progress tiles subscribe
+    // to it themselves instead.
+    final content = ValueListenableBuilder<Box<Map>>(
+      valueListenable: store.listenable(),
+      builder: (context, box, _) {
+        final all = store.all();
+        if (!all.any(_inScope)) {
+          return EmptyState(
+            icon: isNovel ? Icons.article_outlined : Icons.menu_book_outlined,
+            message: isNovel
+                ? l10n.novelChaptersYouDownloadAppearHere
+                : l10n.mangaChaptersYouDownloadAppearHere,
           );
-        },
-      ),
+        }
+        if (widget.embedded) return _embeddedLibrary(all, l10n);
+        final sections = _sections(all, l10n);
+        return Column(
+          children: [
+            _searchField(),
+            Expanded(
+              // Lazily — a saved series can be thousands of rows, and the
+              // eager ListView built every one of them before the first
+              // frame.
+              child: ListView.builder(
+                itemCount: sections.length,
+                itemBuilder: (context, i) => sections[i](),
+              ),
+            ),
+          ],
+        );
+      },
     );
+    return widget.embedded
+        ? content
+        : Scaffold(
+            backgroundColor: AppColors.bg,
+            appBar: settingsAppBar(
+              isNovel ? l10n.novelDownloads : l10n.mangaDownloads,
+            ),
+            body: content,
+          );
   }
 
   /// What's running (plus anything that failed, so it can be cleared), then
@@ -119,8 +138,9 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
   /// group first for free.
   List<Widget Function()> _sections(
     List<ChapterDownload> all,
-    AppLocalizations l10n,
-  ) {
+    AppLocalizations l10n, {
+    bool activeOnly = false,
+  }) {
     final downloader = sl<ChapterDownloader>();
     final live = Map<String, ChapterDownload>.fromEntries(
       downloader.inFlight.entries.where((e) => _inScope(e.value)),
@@ -159,22 +179,124 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
           onAction: running > 0 ? () => _confirmStopAll(running, l10n) : null,
           extra: failed > 0 ? l10n.clearFailedCount(failed) : null,
           onExtra: failed > 0 ? () => _clearFailed(l10n) : null,
+          // Windows: re-queue every failed chapter at once (dl-10). Partial
+          // pages are kept, so only what is missing is fetched again.
+          retry: _desktop && failed > 0
+              ? l10n.retryFailedCount(failed)
+              : null,
+          onRetry: _desktop && failed > 0 ? _retryFailed : null,
         ),
         for (final c in active)
-          () => _ChapterProgressTile(id: c.id, fallback: c),
+          () => _ChapterProgressTile(
+            id: c.id,
+            fallback: c,
+            compact: widget.embedded,
+          ),
       ],
-      if (byShow.isNotEmpty) ...[
+      if (!activeOnly && byShow.isNotEmpty) ...[
         () => _sectionHeader(l10n.downloaded),
         for (final e in byShow.entries)
           () => _ChapterGroup(
             chapters: e.value,
             // Searching reveals the matches instead of making the user expand
             // every group.
-            expanded: widget.showId != null || _query.trim().isNotEmpty || _expanded.contains(e.key),
+            // A Windows title-scoped view always opens its single group.
+            expanded: widget.showId != null ||
+                _effectiveQuery.trim().isNotEmpty ||
+                _expanded.contains(e.key),
             onToggle: () => _toggle(e.key),
           ),
       ],
     ];
+  }
+
+  Widget _embeddedLibrary(List<ChapterDownload> all, AppLocalizations l10n) {
+    final active = _sections(all, l10n, activeOnly: true);
+    final byShow = <String, List<ChapterDownload>>{};
+    for (final chapter in all) {
+      if (!_inScope(chapter) ||
+          chapter.status != ChapterDownloadStatus.done ||
+          !_matchesQuery(chapter)) {
+        continue;
+      }
+      (byShow['${chapter.sourceId}|${chapter.showId}'] ??= []).add(chapter);
+    }
+    final groups = byShow.values.toList();
+    if (active.isEmpty && groups.isEmpty) {
+      return EmptyState(
+        icon: Icons.search_off_rounded,
+        message: l10n.noDownloadsMatchYourSearch,
+      );
+    }
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final columns = posterGridColumns(context);
+        final cellWidth =
+            (constraints.maxWidth - 32 - 12 * (columns - 1)) / columns;
+        return CustomScrollView(
+          key: PageStorageKey('chapter-downloads-${widget.mode.name}'),
+          slivers: [
+            SliverList.builder(
+              itemCount: active.length,
+              itemBuilder: (context, index) => active[index](),
+            ),
+            if (groups.isNotEmpty) ...[
+              SliverToBoxAdapter(child: _sectionHeader(l10n.downloaded)),
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                sliver: SliverGrid(
+                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: columns,
+                    crossAxisSpacing: 12,
+                    mainAxisSpacing: 16,
+                    mainAxisExtent:
+                        cellWidth * 1.5 +
+                        MediaQuery.textScalerOf(context).scale(12) * 6.5,
+                  ),
+                  delegate: SliverChildBuilderDelegate((context, index) {
+                    final chapters = groups[index];
+                    final head = chapters.first;
+                    final bytes = chapters.fold<int>(
+                      0,
+                      (sum, chapter) => sum + chapter.bytes,
+                    );
+                    return DownloadLibraryPoster(
+                      title: head.showTitle,
+                      heroTag: (
+                        'download-chapter',
+                        widget.mode,
+                        head.sourceId,
+                        head.showId,
+                      ),
+                      cover: head.cover,
+                      countLabel: '${chapters.length}',
+                      sizeLabel: fmtDownloadSize(bytes),
+                      deleteTooltip: l10n.deleteAllChaptersTooltip,
+                      onDelete: () => _confirmDeleteChapters(context, chapters),
+                      onOpen: () => Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => _DownloadedChaptersScreen(
+                            sourceId: head.sourceId,
+                            showId: head.showId,
+                            mode: widget.mode,
+                            query: _effectiveQuery,
+                          ),
+                        ),
+                      ),
+                    );
+                  }, childCount: groups.length),
+                ),
+              ),
+            ],
+            SliverToBoxAdapter(
+              child: SizedBox(
+                height: MediaQuery.paddingOf(context).bottom + 16,
+              ),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   Widget _sectionHeader(
@@ -183,11 +305,22 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
     VoidCallback? onAction,
     String? extra,
     VoidCallback? onExtra,
+    String? retry,
+    VoidCallback? onRetry,
   }) => Padding(
     padding: EdgeInsets.fromLTRB(16, 18, 8, action == null ? 4 : 0),
     child: Row(
       children: [
         Expanded(child: Text(text.toUpperCase(), style: AppText.overline)),
+        // 'Retry failed (N)' sits beside 'Clear failed' (Windows, dl-10).
+        if (retry != null)
+          TextButton(
+            onPressed: onRetry,
+            child: Text(
+              retry,
+              style: AppText.caption.copyWith(color: AppColors.textSecondary),
+            ),
+          ),
         if (extra != null)
           TextButton(
             onPressed: onExtra,
@@ -228,6 +361,25 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
       // A title-scoped desktop view must never cancel unrelated reading jobs.
       final ids = downloader.inFlight.values.where(_inScope).map((c) => c.id).toList();
       for (final id in ids) { await downloader.cancel(id); }
+    }
+  }
+
+  /// Windows desktop UI only: phone keeps its original chapter rows.
+  static bool get _desktop => defaultTargetPlatform == TargetPlatform.windows;
+
+  /// Re-queues the failed chapters this view shows (dl-10). A title-scoped
+  /// view only touches its own title, like Clear failed.
+  Future<void> _retryFailed() async {
+    final downloader = sl<ChapterDownloader>();
+    if (widget.sourceId == null && widget.showId == null) {
+      await downloader.retryFailed();
+      return;
+    }
+    final failed = sl<ChapterDownloadStore>().all().where(_inScope)
+        .where((c) => c.status == ChapterDownloadStatus.failed).toList();
+    // Oldest first, matching the unscoped retry order.
+    for (final c in failed.reversed) {
+      await downloader.retry(c.id);
     }
   }
 
@@ -301,7 +453,12 @@ IconData chapterIcon(ContentMode mode) =>
 /// One chapter that's running, queued, or dead. The X cancels a live one and
 /// clears a failed one — both end up dropping the record and its files.
 class _ChapterProgressTile extends StatelessWidget {
-  const _ChapterProgressTile({required this.id, required this.fallback});
+  const _ChapterProgressTile({
+    required this.id,
+    required this.fallback,
+    this.compact = false,
+  });
+  final bool compact;
 
   final String id;
 
@@ -348,16 +505,34 @@ class _ChapterProgressTile extends StatelessWidget {
 
   Widget _tile(BuildContext context, ChapterDownload chapter, bool live) {
     final l10n = context.l10n;
+    // The X: cancels a live chapter, clears a failed one.
+    final close = IconButton(
+      visualDensity: VisualDensity.compact,
+      tooltip: live ? l10n.cancelDownloadTooltip : l10n.removeDownloadTooltip,
+      icon: const Icon(Icons.close_rounded, color: AppColors.textSecondary),
+      onPressed: () => unawaited(
+        live
+            ? sl<ChapterDownloader>().cancel(chapter.id)
+            : sl<ChapterDownloadStore>().remove(chapter.id),
+      ),
+    );
+    // Failed rows on the Windows desktop UI also get a Retry button.
+    final retryable = !live && defaultTargetPlatform == TargetPlatform.windows;
     return ListTile(
+      dense: compact,
+      minLeadingWidth: compact ? 28 : null,
       contentPadding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
       leading: Icon(
         live ? chapterIcon(chapter.mode) : Icons.error_outline_rounded,
         color: AppColors.accent,
-        size: 26,
+        size: compact ? 21 : 26,
       ),
       title: Text(
         _titleOf(l10n, chapter),
-        style: AppText.body.copyWith(color: AppColors.textPrimary),
+        style: AppText.body.copyWith(
+          color: AppColors.textPrimary,
+          fontSize: compact ? 13 : null,
+        ),
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
       ),
@@ -384,16 +559,27 @@ class _ChapterProgressTile extends StatelessWidget {
           ],
         ],
       ),
-      trailing: IconButton(
-        visualDensity: VisualDensity.compact,
-        tooltip: live ? l10n.cancelDownloadTooltip : l10n.removeDownloadTooltip,
-        icon: const Icon(Icons.close_rounded, color: AppColors.textSecondary),
-        onPressed: () => unawaited(
-          live
-              ? sl<ChapterDownloader>().cancel(chapter.id)
-              : sl<ChapterDownloadStore>().remove(chapter.id),
-        ),
-      ),
+      trailing: retryable
+          // Windows: a failed chapter can be retried in place (dl-10); the
+          // pages it already fetched are reused.
+          ? Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  tooltip: l10n.retry,
+                  icon: const Icon(
+                    Icons.refresh_rounded,
+                    color: AppColors.textSecondary,
+                  ),
+                  onPressed: () =>
+                      unawaited(sl<ChapterDownloader>().retry(chapter.id)),
+                ),
+                close,
+              ],
+            )
+          // Phone (and live rows) keep the single X exactly as before.
+          : close,
     );
   }
 }
@@ -414,16 +600,7 @@ class _ChapterGroup extends StatelessWidget {
   /// Reading order, not download order. Sources that give a chapter number get
   /// sorted by it; the rest fall back to the order they were saved in, oldest
   /// first, which is the closest thing to reading order we have.
-  List<ChapterDownload> get ordered {
-    final out = [...chapters];
-    final numbered = out.every((c) => c.number != null);
-    out.sort(
-      numbered
-          ? (a, b) => a.number!.compareTo(b.number!)
-          : (a, b) => a.createdAt.compareTo(b.createdAt),
-    );
-    return out;
-  }
+  List<ChapterDownload> get ordered => _orderedChapters(chapters);
 
   @override
   Widget build(BuildContext context) {
@@ -486,7 +663,7 @@ class _ChapterGroup extends StatelessWidget {
                     size: 22,
                   ),
                   tooltip: l10n.deleteAllChaptersTooltip,
-                  onPressed: () => _confirmDeleteAll(context, l10n),
+                  onPressed: () => _confirmDeleteChapters(context, chapters),
                 ),
                 AnimatedRotation(
                   turns: expanded ? 0.25 : 0.0,
@@ -510,24 +687,136 @@ class _ChapterGroup extends StatelessWidget {
       ],
     );
   }
+}
 
-  Future<void> _confirmDeleteAll(
-    BuildContext context,
-    AppLocalizations l10n,
-  ) async {
-    final n = chapters.length;
-    final ok = await AppDialog.confirm(
-      context,
-      title: l10n.deleteAllChapters2,
-      message: l10n.removeAllChaptersOfShow(n, chapters.first.showTitle),
-      confirmLabel: l10n.deleteAll,
-      destructive: true,
-    );
-    if (ok != true) return;
+List<ChapterDownload> _orderedChapters(List<ChapterDownload> chapters) {
+  final out = [...chapters];
+  final numbered = out.every((c) => c.number != null);
+  out.sort(
+    numbered
+        ? (a, b) => a.number!.compareTo(b.number!)
+        : (a, b) => a.createdAt.compareTo(b.createdAt),
+  );
+  return out;
+}
+
+Future<void> _confirmDeleteChapters(
+  BuildContext context,
+  List<ChapterDownload> chapters,
+) async {
+  final l10n = context.l10n;
+  final ok = await AppDialog.confirm(
+    context,
+    title: l10n.deleteAllChapters2,
+    message: l10n.removeAllChaptersOfShow(
+      chapters.length,
+      chapters.first.showTitle,
+    ),
+    confirmLabel: l10n.deleteAll,
+    destructive: true,
+  );
+  if (ok != true) return;
+  final store = sl<ChapterDownloadStore>();
+  for (final c in chapters) {
+    await store.remove(c.id);
+  }
+}
+
+class _DownloadedChaptersScreen extends StatelessWidget {
+  const _DownloadedChaptersScreen({
+    required this.sourceId,
+    required this.showId,
+    required this.mode,
+    required this.query,
+  });
+  final String sourceId;
+  final String showId;
+  final ContentMode mode;
+  final String query;
+
+  @override
+  Widget build(BuildContext context) {
     final store = sl<ChapterDownloadStore>();
-    for (final c in chapters) {
-      await store.remove(c.id);
-    }
+    final l10n = context.l10n;
+    return Scaffold(
+      backgroundColor: AppColors.bg,
+      appBar: AppBar(
+        backgroundColor: AppColors.bg,
+        surfaceTintColor: Colors.transparent,
+        title: Text(
+          mode == ContentMode.novel ? l10n.novelDownloads : l10n.mangaDownloads,
+          style: AppText.headline,
+        ),
+      ),
+      body: ValueListenableBuilder<Box<Map>>(
+        valueListenable: store.listenable(),
+        builder: (context, _, _) {
+          final q = query.trim().toLowerCase();
+          final chapters = _orderedChapters(
+            store
+                .all()
+                .where(
+                  (c) =>
+                      c.sourceId == sourceId &&
+                      c.showId == showId &&
+                      c.mode == mode &&
+                      c.status == ChapterDownloadStatus.done &&
+                      (q.isEmpty ||
+                          c.showTitle.toLowerCase().contains(q) ||
+                          c.chapterTitle.toLowerCase().contains(q)),
+                )
+                .toList(),
+          );
+          if (chapters.isEmpty) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (context.mounted &&
+                  ModalRoute.of(context)?.isCurrent == true) {
+                Navigator.of(context).pop();
+              }
+            });
+            return const SizedBox.shrink();
+          }
+          final head = chapters.first;
+          final bytes = chapters.fold<int>(0, (sum, c) => sum + c.bytes);
+          return CustomScrollView(
+            slivers: [
+              SliverToBoxAdapter(
+                child: DownloadTitleSummary(
+                  title: head.showTitle,
+                  heroTag: ('download-chapter', mode, sourceId, showId),
+                  cover: head.cover,
+                  subtitle: l10n.chaptersWithSize(
+                    chapters.length,
+                    fmtDownloadSize(bytes),
+                  ),
+                  deleteTooltip: l10n.deleteAllChaptersTooltip,
+                  onDelete: () => _confirmDeleteChapters(context, chapters),
+                ),
+              ),
+              SliverList.separated(
+                itemCount: chapters.length,
+                itemBuilder: (context, index) => _SavedChapterTile(
+                  chapter: chapters[index],
+                  compact: true,
+                  onTap: () => _openReader(context, chapters, chapters[index]),
+                ),
+                separatorBuilder: (_, _) => const Divider(
+                  height: 12,
+                  indent: 56,
+                  endIndent: 20,
+                  color: AppColors.hairline,
+                ),
+              ),
+              SliverToBoxAdapter(
+                child: SizedBox(
+                  height: MediaQuery.paddingOf(context).bottom + 24,
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
   }
 }
 
@@ -575,7 +864,12 @@ void _openReader(
 
 /// One saved chapter — tapping reads it offline.
 class _SavedChapterTile extends StatelessWidget {
-  const _SavedChapterTile({required this.chapter, required this.onTap});
+  const _SavedChapterTile({
+    required this.chapter,
+    required this.onTap,
+    this.compact = false,
+  });
+  final bool compact;
 
   final ChapterDownload chapter;
   final VoidCallback onTap;
@@ -584,18 +878,46 @@ class _SavedChapterTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final l10n = context.l10n;
     return ListTile(
+      dense: compact,
+      minLeadingWidth: compact ? 28 : null,
       onTap: onTap,
       contentPadding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
+      // Windows keeps its scoped-header artwork tile; other platforms use the
+      // upstream chapter thumbnail.
       leading: defaultTargetPlatform == TargetPlatform.windows
           ? SizedBox(width: 72, height: 48, child: DownloadThumbnail(
               thumbnail: chapter.thumbnail, cover: chapter.cover, headers: chapter.coverHeaders,
               fallback: Center(child: Icon(chapterIcon(chapter.mode), color: AppColors.accent, size: 26))))
-          : Icon(chapterIcon(chapter.mode), color: AppColors.accent, size: 26),
+          : (chapter.thumbnail?.trim().isNotEmpty ?? false)
+          ? ClipRRect(
+              borderRadius: BorderRadius.circular(5),
+              child: SizedBox(
+                width: compact ? 30 : 36,
+                height: compact ? 40 : 48,
+                child: CachedNetworkImage(
+                  imageUrl: chapter.thumbnail!,
+                  fit: BoxFit.cover,
+                  memCacheWidth: 110,
+                  placeholder: (c, u) => ColoredBox(color: AppColors.surface2),
+                  errorWidget: (c, u, e) =>
+                      ColoredBox(color: AppColors.surface2),
+                ),
+              ),
+            )
+          : Icon(
+              chapterIcon(chapter.mode),
+              color: AppColors.accent,
+              size: compact ? 21 : 26,
+            ),
       title: Text(
         chapter.chapterTitle.trim().isEmpty
             ? l10n.chapter
             : chapter.chapterTitle,
-        style: AppText.body.copyWith(color: AppColors.textPrimary),
+        style: AppText.body.copyWith(
+          color: AppColors.textPrimary,
+          fontSize: compact ? 13 : null,
+          fontWeight: compact ? FontWeight.w600 : null,
+        ),
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
       ),
@@ -610,8 +932,28 @@ class _SavedChapterTile extends StatelessWidget {
           Icons.delete_outline_rounded,
           color: AppColors.textTertiary,
         ),
-        onPressed: () =>
-            unawaited(sl<ChapterDownloadStore>().remove(chapter.id)),
+        onPressed: () {
+          // Windows: the store sends the files to the Recycle Bin (dl-2);
+          // say so, so the user knows where to restore them from. Uses the
+          // same gate as the store so the message never claims a recycle
+          // that did not happen (phone, tests, unfinished chapters).
+          final messenger =
+              recycleDownloadDeletes &&
+                  chapter.status == ChapterDownloadStatus.done
+              ? ScaffoldMessenger.maybeOf(context)
+              : null;
+          unawaited(
+            sl<ChapterDownloadStore>().remove(chapter.id).then((_) {
+              messenger
+                ?..clearSnackBars()
+                ..showSnackBar(
+                  SnackBar(
+                    content: Text(appL10n.movedToRecycleBin),
+                  ),
+                );
+            }),
+          );
+        },
       ),
     );
   }

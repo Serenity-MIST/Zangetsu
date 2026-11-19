@@ -3,14 +3,50 @@ import 'package:watch_app/core/playback/source_health_store.dart';
 import 'package:watch_app/features/settings/source_priority_screen.dart';
 
 void main() {
-  test('reordering a filtered movie pool retains hidden anime pins', () {
+  test('reordering a filtered movie pool retains hidden anime pins in place',
+      () {
+    // The hidden pin sat at the front; it stays there instead of being
+    // appended after the visible pins (which demoted it on every edit).
     expect(
       sourcePinsAfterReorder(
         visible: ['movie-b', 'movie-a', 'movie-c'],
         previous: ['anime-only', 'movie-a'],
         placedAt: 0,
       ),
-      ['movie-b', 'anime-only'],
+      ['anime-only', 'movie-b'],
+    );
+  });
+
+  test('a hidden pin stays right after the visible pin it followed', () {
+    expect(
+      sourcePinsAfterReorder(
+        visible: ['a', 'b', 'c'],
+        previous: ['a', 'hidden', 'b'],
+        placedAt: 1,
+      ),
+      ['a', 'hidden', 'b'],
+    );
+  });
+
+  test('keepPinned never unpins the other pinned rows', () {
+    // c moved to the top; a and b were pinned and stay pinned.
+    expect(
+      sourcePinsAfterReorder(
+        visible: ['c', 'a', 'b', 'd'],
+        previous: ['a', 'b'],
+        placedAt: 0,
+        keepPinned: true,
+      ),
+      ['c', 'a', 'b'],
+    );
+    // Without it (phone / TV) only the moved row is pinned, as before.
+    expect(
+      sourcePinsAfterReorder(
+        visible: ['c', 'a', 'b', 'd'],
+        previous: ['a', 'b'],
+        placedAt: 0,
+      ),
+      ['c'],
     );
   });
 

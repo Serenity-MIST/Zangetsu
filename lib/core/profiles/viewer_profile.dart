@@ -147,6 +147,7 @@ class ViewerProfileStore {
     ViewerProfileRemote? remote,
     String? Function()? currentUserId,
     Future<bool> Function(String url)? deleteAvatar,
+    this.onProfileDataDeleted,
   }) : _remote = remote,
        _currentUserId = currentUserId,
        _deleteAvatar = deleteAvatar;
@@ -156,10 +157,13 @@ class ViewerProfileStore {
   static const int maxBioLength = 160;
   static const String boxName = 'viewer_profiles';
   static const String askOnLaunchKey = 'ask_on_launch';
+  static const String _isolatedGuestKey = 'isolated_guest_data';
 
   final ViewerProfileRemote? _remote;
   final String? Function()? _currentUserId;
   final Future<bool> Function(String url)? _deleteAvatar;
+  final Future<void> Function(String owner, String profileId)?
+  onProfileDataDeleted;
   int _loadRequest = 0;
   String? _loadedOwner;
   List<ViewerProfile> _profiles = const [];
@@ -173,6 +177,31 @@ class ViewerProfileStore {
   ViewerProfile get activeProfile =>
       active.value ?? const ViewerProfile(id: kDefaultProfileId, name: 'Home');
   String get activeId => activeProfile.id;
+
+  /// Guest mode must not read a signed-in account's legacy default bucket.
+  String get dataProfileId {
+    if (_currentUserId?.call() != null) return activeId;
+    final hasAccountData =
+        _box.get(_isolatedGuestKey) == true ||
+        _box.keys.any(
+          (key) =>
+              key is String &&
+              key.startsWith('profiles:') &&
+              key != _profilesKey('local'),
+        );
+    return hasAccountData ? kGuestProfileId : activeId;
+  }
+
+  Future<void> isolateGuestData() async {
+    if (_box.get(_isolatedGuestKey) == true) return;
+    await _box.put(_isolatedGuestKey, true);
+    if (_currentUserId?.call() != null) return;
+    contextRevision.value++;
+    active.value = activeProfile.copyWith();
+    revision.value++;
+  }
+
+  String get ownerKey => _loadedOwner ?? _owner;
   bool get adultMetadataAllowed => !activeProfile.isKids;
   bool get isLoadedForCurrentUser => _loadedOwner == _owner;
   bool get askOnLaunch => _box.get(askOnLaunchKey, defaultValue: true) as bool;
@@ -241,93 +270,167 @@ class ViewerProfileStore {
     });
   }
 
-  Future<void> loadForUser({String displayName = 'Home'}) async {
+  /// Loads this user's profiles from local storage and, when [attemptRemote]
+  /// is true, merges the cloud copy (bounded by a timeout). Boot passes false
+  /// after finding the network unreachable so the splash never waits on a
+  /// dead network; the merge runs later through a normal call once the
+  /// network returns.
+  Future<void> loadForUser({
+    String displayName = 'Home',
+    bool attemptRemote = true,
+  }) async {
     final request = ++_loadRequest;
     final userId = _currentUserId?.call();
     final owner = userId ?? 'local';
-    bool isCurrentLoad() => request == _loadRequest && owner == _owner;
+    if (userId != null && _box.get(_isolatedGuestKey) != true) {
+      await _box.put(_isolatedGuestKey, true);
+      if (request != _loadRequest || owner != _owner) return;
+    }
 
     final local = _readLocal(owner);
-    var recoverable = _readProfiles(_recoveryKey(owner));
-    var next = local.isEmpty ? [_defaultProfile(displayName)] : local;
+    final recoverable = _readProfiles(_recoveryKey(owner));
+    final next = local.isEmpty ? [_defaultProfile(displayName)] : local;
+    // Local first: boot (and the splash) never waits on the network. The
+    // cloud merge below re-applies over this when it arrives.
+    await _finishLoad(
+      recoverable: recoverable,
+      next: next,
+      owner: owner,
+      displayName: displayName,
+      request: request,
+    );
+
     final remote = _remote;
-    if (userId != null && remote != null) {
-      try {
-        final rows = await remote.listFor(userId);
+    // A blackholed network hangs every RPC until its timeout; when the
+    // caller already probed offline, skip the merge instead of burning ~10s.
+    if (userId == null || remote == null || !attemptRemote) return;
+    try {
+      await _mergeRemote(
+        remote: remote,
+        userId: userId,
+        local: local,
+        recoverable: recoverable,
+        owner: owner,
+        displayName: displayName,
+        request: request,
+      ).timeout(const Duration(seconds: 10));
+    } catch (_) {
+      // Offline or too slow: the local list applied above stays.
+    }
+  }
+
+  /// Cloud half of [loadForUser]: merge remote profiles over the locally
+  /// applied list, push pending writes, then re-apply. Runs bounded (see the
+  /// timeout at the call site) so a dead network can't trap boot.
+  Future<void> _mergeRemote({
+    required ViewerProfileRemote remote,
+    required String userId,
+    required List<ViewerProfile> local,
+    required List<ViewerProfile> recoverable,
+    required String owner,
+    required String displayName,
+    required int request,
+  }) async {
+    bool isCurrentLoad() => request == _loadRequest && owner == _owner;
+    var mergedRecoverable = recoverable;
+    try {
+      final rows = await remote.listFor(userId);
+      if (!isCurrentLoad()) return;
+      final cloud = [
+        for (final row in rows)
+          if (_validRemoteProfile(row)) _fromRemote(row),
+      ];
+      final pending = _pending(owner);
+      final cloudIds = cloud.map((profile) => profile.id).toSet();
+      mergedRecoverable = {
+        for (final profile in recoverable)
+          if (!cloudIds.contains(profile.id)) profile.id: profile,
+        for (final profile in local)
+          if (profile.id != kDefaultProfileId &&
+              !cloudIds.contains(profile.id) &&
+              pending[profile.id] == null)
+            profile.id: profile,
+      }.values.toList();
+      final unsynced = [
+        for (final profile in local)
+          if (pending[profile.id] == _PendingProfileWrite.create ||
+              (pending[profile.id] == _PendingProfileWrite.update &&
+                  cloudIds.contains(profile.id)))
+            profile,
+      ];
+      final deletedWhileOffline = [
+        for (final profile in local)
+          if (profile.id != kDefaultProfileId &&
+              pending[profile.id] == _PendingProfileWrite.update &&
+              !cloudIds.contains(profile.id))
+            profile.id,
+      ];
+      var merged = {
+        for (final profile in cloud) profile.id: profile,
+        for (final profile in unsynced) profile.id: profile,
+      }.values.toList();
+      if (!merged.any((p) => p.id == kDefaultProfileId)) {
+        final fallback =
+            local.where((p) => p.id == kDefaultProfileId).firstOrNull ??
+            _defaultProfile(displayName);
+        merged.insert(0, fallback);
+        await remote.upsert(userId, fallback);
         if (!isCurrentLoad()) return;
-        final cloud = [
-          for (final row in rows)
-            if (_validRemoteProfile(row)) _fromRemote(row),
-        ];
-        final pending = _pending(owner);
-        final cloudIds = cloud.map((profile) => profile.id).toSet();
-        recoverable = {
-          for (final profile in recoverable)
-            if (!cloudIds.contains(profile.id)) profile.id: profile,
-          for (final profile in local)
-            if (profile.id != kDefaultProfileId &&
-                !cloudIds.contains(profile.id) &&
-                pending[profile.id] == null)
-              profile.id: profile,
-        }.values.toList();
-        final unsynced = [
-          for (final profile in local)
-            if (pending[profile.id] == _PendingProfileWrite.create ||
-                (pending[profile.id] == _PendingProfileWrite.update &&
-                    cloudIds.contains(profile.id)))
-              profile,
-        ];
-        final deletedWhileOffline = [
-          for (final profile in local)
-            if (profile.id != kDefaultProfileId &&
-                pending[profile.id] == _PendingProfileWrite.update &&
-                !cloudIds.contains(profile.id))
-              profile.id,
-        ];
-        next = {
-          for (final profile in cloud) profile.id: profile,
-          for (final profile in unsynced) profile.id: profile,
-        }.values.toList();
-        if (!next.any((p) => p.id == kDefaultProfileId)) {
-          final fallback =
-              local.where((p) => p.id == kDefaultProfileId).firstOrNull ??
-              _defaultProfile(displayName);
-          next.insert(0, fallback);
-          await remote.upsert(userId, fallback);
-          if (!isCurrentLoad()) return;
-        }
-        for (final profileId in deletedWhileOffline) {
-          await _deleteLocalProfileData(profileId);
-          await _setPending(owner, profileId, null);
-        }
-        for (final profile in unsynced) {
-          await remote.upsert(userId, profile);
-          if (!isCurrentLoad()) return;
-          await _setPending(owner, profile.id, null);
-        }
-      } catch (_) {
-        // Keep the local profile list usable during offline startup.
       }
+      for (final profileId in deletedWhileOffline) {
+        await _deleteLocalProfileData(profileId);
+        await _setPending(owner, profileId, null);
+      }
+      for (final profile in unsynced) {
+        await remote.upsert(userId, profile);
+        if (!isCurrentLoad()) return;
+        await _setPending(owner, profile.id, null);
+      }
+      await _finishLoad(
+        recoverable: mergedRecoverable,
+        next: merged,
+        owner: owner,
+        displayName: displayName,
+        request: request,
+      );
+    } catch (_) {
+      // Offline: the local list applied by loadForUser stays.
+      return;
     }
+  }
+
+  /// Applies a profile list: guarantees a default profile first, persists the
+  /// recovery + local copies, then picks the active profile and theme.
+  /// Idempotent — [loadForUser] runs it for local data first, then again
+  /// after a cloud merge arrives.
+  Future<void> _finishLoad({
+    required List<ViewerProfile> recoverable,
+    required List<ViewerProfile> next,
+    required String owner,
+    required String displayName,
+    required int request,
+  }) async {
+    bool isCurrentLoad() => request == _loadRequest && owner == _owner;
+    final result = [...next];
     // Do not trim older profiles to make room for Home; let users remove them.
-    if (!next.any((p) => p.id == kDefaultProfileId)) {
-      next.insert(0, _defaultProfile(displayName));
+    if (!result.any((p) => p.id == kDefaultProfileId)) {
+      result.insert(0, _defaultProfile(displayName));
     }
-    final defaultIndex = next.indexWhere((p) => p.id == kDefaultProfileId);
-    if (defaultIndex > 0) next.insert(0, next.removeAt(defaultIndex));
+    final defaultIndex = result.indexWhere((p) => p.id == kDefaultProfileId);
+    if (defaultIndex > 0) result.insert(0, result.removeAt(defaultIndex));
     if (!isCurrentLoad()) return;
     await _box.put(_recoveryKey(owner), [
       for (final profile in recoverable) profile.toJson(),
     ]);
     if (!isCurrentLoad()) return;
-    await _saveLocal(owner, next);
+    await _saveLocal(owner, result);
     if (!isCurrentLoad()) return;
     _loadedOwner = owner;
-    _profiles = next;
+    _profiles = result;
     final storedId = _box.get(_activeKey(owner)) as String?;
     final chosen =
-        next.where((p) => p.id == storedId).firstOrNull ??
-        next.firstWhere((p) => p.id == kDefaultProfileId);
+        result.where((p) => p.id == storedId).firstOrNull ??
+        result.firstWhere((p) => p.id == kDefaultProfileId);
     active.value = chosen;
     await _applyTheme(chosen);
     revision.value++;
@@ -477,9 +580,11 @@ class ViewerProfileStore {
   Future<void> switchTo(String profileId) async {
     final profile = _profiles.where((p) => p.id == profileId).firstOrNull;
     if (profile == null || profile.id == activeId) return;
+    final owner = _loadedOwner ?? _owner;
     await _applyTheme(profile);
+    if (owner != _owner || owner != (_loadedOwner ?? _owner)) return;
     active.value = profile;
-    await _box.put(_activeKey(_loadedOwner ?? _owner), profile.id);
+    await _box.put(_activeKey(owner), profile.id);
     revision.value++;
     contextRevision.value++;
   }
@@ -512,6 +617,7 @@ class ViewerProfileStore {
     await _deleteLocalProfileData(profileId);
     await _saveLocal(_loadedOwner ?? _owner);
     await _setPending(_loadedOwner ?? _owner, profileId, null);
+    await onProfileDataDeleted?.call(_loadedOwner ?? _owner, profileId);
     if (photoUrl != null && !photoIsShared) {
       try {
         await _deleteAvatar?.call(photoUrl);

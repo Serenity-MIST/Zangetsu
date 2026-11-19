@@ -1,9 +1,11 @@
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
+import 'package:zangetsu_source_bridge/zangetsu_source_bridge.dart';
 
 import '../aniyomi/aniyomi_extension_service.dart';
 import '../aniyomi/aniyomi_repo.dart';
 import '../lnreader/lnreader_extension_service.dart';
+import '../mangayomi/mangayomi_manager.dart';
 import '../mihon/mihon_extension_service.dart';
 import '../mihon/mihon_repo.dart';
 import '../provider/cloudstream_provider.dart';
@@ -39,11 +41,13 @@ class SourcesBackup {
     Future<List<AniyomiRepoEntry>> Function(String repoBaseUrl)?
         fetchMihonIndex,
     LnReaderExtensionService? lnreader,
+    MangayomiManager? mangayomi,
   })  : _ani = aniyomi,
         _fetchAniyomiIndex = fetchAniyomiIndex ?? AniyomiRepo.fetchIndex,
         _mihon = mihon,
         _fetchMihonIndex = fetchMihonIndex ?? MihonRepo.fetchIndex,
-        _lnr = lnreader;
+        _lnr = lnreader,
+        _mangayomi = mangayomi;
 
   final ProviderReposRegistry _repos;
   final ProviderRegistry _registry;
@@ -65,6 +69,8 @@ class SourcesBackup {
 
   /// Null in tests that don't need LNReader restore.
   final LnReaderExtensionService? _lnr;
+
+  final MangayomiManager? _mangayomi;
 
   static const String _psBoxName = 'provider_settings';
 
@@ -103,6 +109,8 @@ class SourcesBackup {
   /// - `mihonPkgs` — installed Mihon extension package names.
   /// - `lnreaderRepoUrls` — tracked LNReader (novel) repo index URLs.
   /// - `lnreaderPkgs` — installed LNReader (novel) plugin ids.
+  /// - `mangayomiRepoUrls` — tracked Mangayomi repository URLs.
+  /// - `mangayomiSourceKeys` — installed Mangayomi source identities.
   /// - `settings`   — contents of the `provider_settings` Hive box, or `{}`.
   Map<String, dynamic> build() => {
         'jsRepoUrls': _repos.getAll().map((r) => r.url).toList(),
@@ -115,6 +123,14 @@ class SourcesBackup {
         'mihonPkgs': _readMihonPkgs(),
         'lnreaderRepoUrls': _readLnReaderRepoUrls(),
         'lnreaderPkgs': _readLnReaderPkgs(),
+        'mangayomiRepoUrls': _mangayomi?.repositories
+                .map((url) => url.toString())
+                .toList() ??
+            const <String>[],
+        'mangayomiSourceKeys': _mangayomi?.installed
+                .map((item) => item.source.key)
+                .toList() ??
+            const <String>[],
         'settings': _readProviderSettings(),
       };
 
@@ -346,6 +362,62 @@ class SourcesBackup {
           } catch (_) {
             failures.add('Novel source: ${meta.name}');
           }
+        }
+      }
+    }
+
+    // Save only repository URLs and stable identities; restore re-downloads
+    // code from the repository instead of embedding extension scripts.
+    final mg = _mangayomi;
+    if (mg != null) {
+      final repositoryUrls =
+          (data['mangayomiRepoUrls'] as List?)?.whereType<String>() ??
+              const <String>[];
+      final sourceKeys =
+          (data['mangayomiSourceKeys'] as List?)?.whereType<String>() ??
+              const <String>[];
+      final wantedSources = sourceKeys
+          .where((key) => mg.sourceFor(key) == null)
+          .toSet();
+      final available = <String, MangayomiSource>{};
+      final handledUrls = <Uri>{};
+
+      for (final rawUrl in repositoryUrls) {
+        final url = Uri.tryParse(rawUrl);
+        if (url == null ||
+            url.scheme != 'https' ||
+            url.host.isEmpty ||
+            url.userInfo.isNotEmpty ||
+            url.hasQuery ||
+            url.hasFragment) {
+          failures.add('Mangayomi repository: $rawUrl');
+          continue;
+        }
+        if (!handledUrls.add(url)) continue;
+        try {
+          final sources = mg.repositories.contains(url)
+              ? wantedSources.isEmpty
+                    ? const <MangayomiSource>[]
+                    : await mg.refreshRepository(url)
+              : await mg.addRepository(url);
+          for (final source in sources) {
+            available[source.key] = source;
+          }
+        } catch (_) {
+          failures.add('Mangayomi repository: $rawUrl');
+        }
+      }
+
+      for (final key in wantedSources) {
+        final source = available[key];
+        if (source == null) {
+          failures.add('Mangayomi source: $key');
+          continue;
+        }
+        try {
+          await mg.install(source);
+        } catch (_) {
+          failures.add('Mangayomi source: ${source.name}');
         }
       }
     }

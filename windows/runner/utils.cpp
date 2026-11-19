@@ -67,3 +67,58 @@ std::string Utf8FromUtf16(const wchar_t* utf16_string) {
   }
   return utf8_string;
 }
+
+bool IsAllowedUrlScheme(const std::wstring& scheme) {
+  if (scheme == L"zangetsu") return true;
+  // Discord application ids are 17-20 digit snowflakes.
+  const std::wstring prefix = L"discord-";
+  if (scheme.size() < prefix.size() + 17 ||
+      scheme.size() > prefix.size() + 20 ||
+      scheme.compare(0, prefix.size(), prefix) != 0) {
+    return false;
+  }
+  for (size_t i = prefix.size(); i < scheme.size(); ++i) {
+    if (scheme[i] < L'0' || scheme[i] > L'9') return false;
+  }
+  return true;
+}
+
+LSTATUS RegisterUrlProtocol(const std::wstring& scheme) {
+  if (!IsAllowedUrlScheme(scheme)) return ERROR_INVALID_PARAMETER;
+  wchar_t executable[32768];
+  const DWORD length = ::GetModuleFileNameW(nullptr, executable, 32768);
+  if (length == 0 || length >= 32768) return ERROR_FILE_NOT_FOUND;
+  const std::wstring root = L"Software\\Classes\\" + scheme;
+  HKEY key = nullptr;
+  LSTATUS status = ::RegCreateKeyExW(HKEY_CURRENT_USER, root.c_str(), 0,
+                                     nullptr, 0, KEY_WRITE, nullptr, &key,
+                                     nullptr);
+  if (status == ERROR_SUCCESS) {
+    const wchar_t description[] = L"URL:Zangetsu";
+    status = ::RegSetValueExW(key, nullptr, 0, REG_SZ,
+                              reinterpret_cast<const BYTE*>(description),
+                              sizeof(description));
+    if (status == ERROR_SUCCESS) {
+      // The empty "URL Protocol" value is what marks this as a URL scheme.
+      const wchar_t empty[] = L"";
+      status = ::RegSetValueExW(key, L"URL Protocol", 0, REG_SZ,
+                                reinterpret_cast<const BYTE*>(empty),
+                                sizeof(empty));
+    }
+    ::RegCloseKey(key);
+  }
+  if (status != ERROR_SUCCESS) return status;
+  const std::wstring command_key = root + L"\\shell\\open\\command";
+  status = ::RegCreateKeyExW(HKEY_CURRENT_USER, command_key.c_str(), 0,
+                             nullptr, 0, KEY_WRITE, nullptr, &key, nullptr);
+  if (status != ERROR_SUCCESS) return status;
+  // Quote both executable and URI; never route through a command shell.
+  const std::wstring command =
+      L"\"" + std::wstring(executable, length) + L"\" \"%1\"";
+  status = ::RegSetValueExW(key, nullptr, 0, REG_SZ,
+                            reinterpret_cast<const BYTE*>(command.c_str()),
+                            static_cast<DWORD>((command.size() + 1) *
+                                               sizeof(wchar_t)));
+  ::RegCloseKey(key);
+  return status;
+}

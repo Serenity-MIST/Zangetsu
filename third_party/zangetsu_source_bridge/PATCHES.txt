@@ -1,5 +1,5 @@
 Pinned source: https://github.com/Spyou/Zangetsu-Source-Bridge.git
-Commit: c006c8c33e21fb7cf844855e109d64ead977eeb8
+Commit: c006c8c33e21fb7cf844855e109d64ead977eeb8, plus the Stremio addon client (lib/stremio.dart, lib/src/stremio/) from 8c780e1df2ee1df7efcc9ad39d066fd81d3b8340
 
 Local changes: optional request-specific root-isolate session-header callback in cloudflare_http.dart and runtime_worker.dart, bounded dedicated reply ports, retired-worker guards, and preservation of verified browser UA without cookies. Original mobile MethodChannel remains fallback.
 

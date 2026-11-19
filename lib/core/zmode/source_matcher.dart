@@ -513,9 +513,13 @@ class SourceMatcher {
     }
     // An explicit kind-wide default (set via the "source went quiet" recovery
     // picker) is honoured as-is — a genuine miss there is reported, not
-    // silently papered over by trying another source.
+    // silently papered over by trying another source. On Windows the default
+    // is "try first" instead (see [preferredIsTryFirst]) and is handled below,
+    // ahead of the sweep.
     final selId = _prefs.get(c.kind);
-    if (selId != null && candidates.any((s) => s.id == selId)) {
+    if (!preferredIsTryFirst &&
+        selId != null &&
+        candidates.any((s) => s.id == selId)) {
       debugPrint(
         '[source-matcher] _resolve · kind=${c.kind} title="$title" '
         'kind default=$selId',
@@ -539,7 +543,34 @@ class SourceMatcher {
     final isReading = c.kind == ZKind.manga || c.kind == ZKind.novel;
     final remembered = isReading ? _prefs.lastGood(c.kind) : null;
     final tried = <String>{};
-    if (remembered != null && sweep.any((s) => s.id == remembered)) {
+
+    // Windows: the preferred source is tried FIRST, and a miss falls through
+    // to Auto Resolve instead of leaving the title empty. Checked against the
+    // whole installed list (not just the capped sweep) because the user
+    // picked it by hand.
+    final preferred = preferredIsTryFirst ? preferredFor(c.kind) : null;
+    if (preferred != null) {
+      tried.add(preferred);
+      debugPrint(
+        '[source-matcher] _resolve · kind=${c.kind} title="$title" '
+        'preferred first=$preferred',
+      );
+      final match = await matchOn(
+        c,
+        preferred,
+        title: title,
+        altTitle: altTitle,
+        metadataAliases: metadataAliases,
+        malId: malId,
+        abandoned: abandoned,
+      );
+      if (abandoned?.call() ?? false) return null;
+      if (match != null && await _usableAutoMatch(c, match)) return match;
+    }
+
+    if (remembered != null &&
+        !tried.contains(remembered) &&
+        sweep.any((s) => s.id == remembered)) {
       tried.add(remembered);
       debugPrint(
         '[source-matcher] _resolve · kind=${c.kind} title="$title" '
@@ -619,7 +650,12 @@ class SourceMatcher {
   /// what makes Auto Resolve the true default). Synchronous and never
   /// searches, so the Detail screen can name a fixed source on the first
   /// frame; it says nothing about what Auto Resolve itself will land on.
+  ///
+  /// Always null on Windows: there the kind default is only tried first (see
+  /// [preferredIsTryFirst]) and a title without its own choice is on Auto
+  /// Resolve, so nothing may name the default as this title's fixed source.
   String? selectedFor(ZKind kind) {
+    if (preferredIsTryFirst) return null;
     final list = _candidates(kind);
     final saved = _prefs.get(kind);
     if (saved != null && list.any((s) => s.id == saved)) {
@@ -656,6 +692,21 @@ class SourceMatcher {
     return _sweepCandidates(c.kind).any((s) => s.id == remembered)
         ? remembered
         : null;
+  }
+
+  /// True where the kind's preferred source (Settings > Source Priority) means
+  /// "try this one first, then fall back to Auto Resolve" rather than "use
+  /// only this one". Windows only: that is where the setting is offered, and
+  /// phone/TV keep their existing fixed-default behaviour.
+  static bool get preferredIsTryFirst =>
+      defaultTargetPlatform == TargetPlatform.windows;
+
+  /// The kind's preferred source when one is set and still installed, else
+  /// null. Unlike [selectedFor] this is the raw preference on every platform.
+  String? preferredFor(ZKind kind) {
+    final saved = _prefs.get(kind);
+    if (saved == null) return null;
+    return _candidates(kind).any((s) => s.id == saved) ? saved : null;
   }
 
   /// Make [sourceId] the explicit default for [kind], for every title of that
@@ -737,15 +788,26 @@ class SourceMatcher {
   /// kind) genuinely sweeps again. A per-title pin alone isn't enough here —
   /// a kind default set earlier (e.g. via [chooseSource]) would otherwise
   /// keep outranking Auto Resolve and the picker would never actually show it.
+  ///
+  /// Windows: only THIS title's own choice is removed. The kind default is a
+  /// try-first hint there (it never outranks Auto Resolve) and the reading
+  /// hint is shared by every title of the kind, so wiping either from one
+  /// title's picker reset Settings for the whole library. The global default
+  /// is cleared from Settings > Source Priority only.
   Future<void> clearAuto(ZCanonical c) async {
     await clearTitlePin(c);
+    if (preferredIsTryFirst) {
+      // Per-title: forget which source last played this title, so its next
+      // resolve really is a fresh Auto Resolve.
+      await _store.clearLastPlayed(c);
+      return;
+    }
     await _prefs.clear(c.kind);
     // Reading remembers the source that last matched and starts there instead
     // of sweeping. Picking "Auto Resolve" has to forget that too, or the very
     // next resolve snaps straight back to it and the choice does nothing.
     await _prefs.clearLastGood(c.kind);
-    // Upstream no longer caches failed searches, so Auto Resolve can retry
-    // immediately without retaining or clearing a separate miss record.
+    await _store.clearLastPlayed(c);
   }
 
   /// The Cloudflare-challenge url for a [kind] candidate that got flagged

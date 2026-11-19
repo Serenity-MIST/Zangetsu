@@ -1,3 +1,4 @@
+import 'package:watch_app/core/download/folder_manifest.dart';
 import 'package:flutter/services.dart';
 import 'package:watch_app/core/download/desktop_download_retry.dart';
 import 'package:watch_app/core/download/desktop_download_recovery.dart';
@@ -3199,4 +3200,137 @@ void main() {
     },
     skip: !Platform.isWindows,
   );
+
+  group('scanning folders that carry a manifest', () {
+    const tag = '30251cdca76184b5769de3203112c7d2';
+
+    /// A show folder with a real, app-named video file and a manifest for it.
+    Future<Directory> makeShow(
+      String parent, {
+      String folder = 'Frieren',
+      String? sourceId = 'src',
+      String? showId = 'show-1',
+      String fileTag = tag,
+    }) async {
+      final dir = await Directory('$parent/$folder').create(recursive: true);
+      final name = 'Frieren_S1E1_best_$fileTag.mp4';
+      await File('${dir.path}/$name').writeAsBytes([1, 2, 3, 4]);
+      await FolderManifestStore(hideOnWindows: false).write(
+        dir,
+        FolderManifest(
+          folderId: FolderManifest.newFolderId(),
+          title: 'Frieren',
+          sourceId: sourceId,
+          showId: showId,
+          ids: const ManifestIds(mal: 52991, tmdb: 209867),
+          episodes: [
+            ManifestEpisode(
+              key: fileTag,
+              file: name,
+              title: 'The Journey',
+              number: 1,
+              season: 1,
+              category: 'dub',
+              quality: 'best',
+              savedAt: 5,
+            ),
+          ],
+        ),
+      );
+      return dir;
+    }
+
+    test('adds an unknown folder once, with the identity from its manifest', () async {
+      final shelf = '${root.path}/library';
+      await makeShow(shelf);
+      final first = await manager.scanFolderForDownloads(shelf);
+      expect(first.folders, 1);
+      expect(first.added, 1);
+      final r = manager.all.single;
+      expect(r.showTitle, 'Frieren');
+      expect(r.category, 'dub');
+      expect(r.sourceId, 'src');
+      expect(r.malId, 52991);
+      expect(r.tmdbId, 209867);
+      expect(r.status, DownloadStatus.done);
+      expect(await manager.filePresent(r), isTrue);
+
+      // Scanning again must not duplicate anything.
+      final second = await manager.scanFolderForDownloads(shelf);
+      expect(second.added, 0);
+      expect(second.skipped, 1);
+      expect(manager.all, hasLength(1));
+    }, skip: !Platform.isWindows);
+
+    test('a moved folder keeps its record and is re-linked', () async {
+      final before = '${root.path}/library';
+      final show = await makeShow(before);
+      await manager.scanFolderForDownloads(before);
+      final id = manager.all.single.id;
+
+      final after = '${root.path}/external-drive';
+      await Directory(after).create();
+      await show.rename('$after/Sousou no Frieren');
+
+      final result = await manager.scanFolderForDownloads(root.path);
+      expect(result.relinked, 1);
+      expect(result.added, 0);
+      expect(manager.all, hasLength(1));
+      final moved = manager.all.single;
+      expect(moved.id, id);
+      // Compare with one separator style: Windows paths mix '/' and '\'.
+      expect(
+        moved.filePath!.replaceAll(r'\', '/'),
+        startsWith(after.replaceAll(r'\', '/')),
+      );
+      expect(await manager.filePresent(moved), isTrue);
+    }, skip: !Platform.isWindows);
+
+    test('a copy never steals the record from the original', () async {
+      final shelf = '${root.path}/library';
+      final show = await makeShow(shelf);
+      await manager.scanFolderForDownloads(shelf);
+      final original = manager.all.single.filePath;
+
+      // Copy the folder elsewhere while the original still exists.
+      final copy = await Directory('${root.path}/backup/Frieren')
+          .create(recursive: true);
+      await for (final e in show.list()) {
+        if (e is File) {
+          await e.copy('${copy.path}/${e.uri.pathSegments.last}');
+        }
+      }
+      await Directory('${show.path}/.zangetsu').list().forEach((e) async {
+        if (e is File) {
+          await Directory('${copy.path}/.zangetsu').create(recursive: true);
+          await e.copy('${copy.path}/.zangetsu/${e.uri.pathSegments.last}');
+        }
+      });
+
+      final result = await manager.scanFolderForDownloads('${root.path}/backup');
+      expect(result.relinked, 0);
+      expect(manager.all.single.filePath, original);
+    }, skip: !Platform.isWindows);
+
+    test('an episode listed in the manifest but missing on disk is not added', () async {
+      final shelf = '${root.path}/library';
+      final show = await makeShow(shelf);
+      for (final f in show.listSync().whereType<File>()) {
+        await f.delete();
+      }
+      final result = await manager.scanFolderForDownloads(shelf);
+      expect(result.folders, 1);
+      expect(result.added, 0);
+      expect(manager.all, isEmpty);
+    }, skip: !Platform.isWindows);
+
+    test('a folder without a manifest is left alone', () async {
+      final plain = await Directory('${root.path}/library/Plain').create(recursive: true);
+      await File('${plain.path}/movie.mp4').writeAsBytes([1, 2, 3]);
+      final result = await manager.scanFolderForDownloads('${root.path}/library');
+      expect(result.folders, 0);
+      expect(manager.all, isEmpty);
+      expect(await File('${plain.path}/movie.mp4').exists(), isTrue);
+    }, skip: !Platform.isWindows);
+  });
 }

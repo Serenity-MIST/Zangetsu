@@ -12,6 +12,12 @@ third-party code it incorporates, and the licenses that apply to those parts.
 Third-party components
 ────────────────────────────────────────────────────────────────────────────
 
+AndroidX Jetpack Compose
+  https://developer.android.com/jetpack/compose
+  License: Apache-2.0
+  Compose UI, Material 3, and Activity integration provide runtime support for
+  Android extension settings screens.
+
 CloudStream (recloudstream)
   https://github.com/recloudstream/cloudstream
   License: GPL-3.0
@@ -63,6 +69,22 @@ flutter_inappwebview_windows
 Other dependencies (Flutter/Dart packages and Android libraries) are used under
 their respective open-source licenses; refer to each package for details.
 
+Liquid Glass Widgets
+  https://pub.dev/packages/liquid_glass_widgets
+  License: MIT
+  Used for the optional phone navigation style.
+
+KLIPY proxy (server-side Python dependencies)
+  PyJWT 2.15.1 — MIT
+  https://github.com/jpadilla/pyjwt
+  cryptography 50.0.2 — Apache-2.0 OR BSD-3-Clause
+  https://github.com/pyca/cryptography
+  cffi 2.1.1 — MIT-0
+  https://github.com/python-cffi/cffi
+  pycparser 3.12 — BSD-3-Clause
+  https://github.com/eliben/pycparser
+  Pinned versions are listed in server/sync/requirements-klipy.txt.
+
 Mozilla CA certificate bundle
   https://curl.se/docs/caextract.html
   Source: Mozilla NSS certdata, extracted by curl's mk-ca-bundle.
@@ -74,6 +96,18 @@ Runtime-loaded profile teaser GIF (not bundled)
   Source: https://custom-doodle.com/wp-content/uploads/doodle/auto-draft/one-piece-dancing-roronoa-zoro-doodle.gif
   Loaded from Custom Doodle when the profile screen is shown and cached on the
   device. The GIF is not included in the repository or app package.
+
+Runtime-loaded voice-search GIF (not bundled)
+  Source: https://media.tenor.com/EjowFmPUajMAAAAj/death-note-l-lawliet.gif
+  L Lawliet voice-search animation hosted by Tenor, fetched when phone voice
+  search opens and cached on the device. Not included in the repository or APK.
+
+Runtime-loaded Zoro voice-search GIF (not bundled)
+  Source: https://media1.tenor.com/m/9Y5b3kVpNzsAAAAC/zoro-baron-omatsuri.gif
+  Transparent redraw hosted at:
+  https://avatars.zangetsu.online/voice-search/zoro-hearing-bf88c2298404.gif
+  Fetched when selected for phone voice search and cached on the device.
+  Not included in the repository or app package.
 
 ────────────────────────────────────────────────────────────────────────────
 Keeping this file current
@@ -99,3 +133,8 @@ Lucide dock icons
   Six dock icons are rendered from Lucide SVGs with a 1.8 stroke.
   Licenses: ISC (Lucide) and MIT (Feather-derived icons).
   Full notices: assets/icons/lucide/LICENSE
+
+Local Authentication (Flutter)
+  https://pub.dev/packages/local_auth
+  License: BSD-3-Clause
+  Used for optional device-local profile unlock with biometrics.

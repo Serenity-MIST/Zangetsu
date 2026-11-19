@@ -8,6 +8,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:watch_app/core/ui/nav_prefs.dart';
 import 'package:watch_app/features/shell/desktop_shell_workspace.dart';
+import 'package:watch_app/features/home/desktop_home_page.dart' show desktopHomeMenuIcon;
+import 'package:flutter_svg/flutter_svg.dart';
 
 /// Local mode fixture keeps shell geometry tests independent of disk/network.
 class _Mode extends Cubit<ContentMode> implements ContentModeCubit {
@@ -101,4 +103,44 @@ void main() {
       expect(tester.takeException(), isNull);
     });
   }
+
+  // Icon consistency: the rail's Sources item uses the same Lucide 'blocks'
+  // icon as Settings > Sources (not the old puzzle piece).
+  testWidgets('rail Sources item uses the Settings blocks icon', (tester) async {
+    final mode = _Mode();
+    GetIt.instance.registerSingleton<ContentModeCubit>(mode);
+    addTearDown(() async {
+      await GetIt.instance.reset();
+      await mode.close();
+    });
+    await tester.pumpWidget(MaterialApp(
+      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      supportedLocales: AppLocalizations.supportedLocales,
+      home: DesktopShellWorkspace(
+        active: DockTab.home, onSelected: (_) {}, onSearch: (_) {},
+        profile: const Icon(Icons.person_outline), child: const Text('Page'),
+      ),
+    ));
+    await tester.pumpAndSettle();
+    // Asset names of every SVG drawn inside the Sources rail button.
+    final assets = tester
+        .widgetList<SvgPicture>(find.descendant(
+          of: find.byKey(const ValueKey('desktop-rail-sources')),
+          matching: find.byType(SvgPicture)))
+        .map((p) => p.bytesLoader)
+        .whereType<SvgAssetLoader>()
+        .map((l) => l.assetName)
+        .toList();
+    expect(assets, contains('assets/icons/lucide/blocks.svg'));
+    expect(assets, isNot(contains('assets/icons/lucide/puzzle.svg')));
+    expect(desktopRailTabs.firstWhere((t) => t.$1 == DockTab.sources).$3,
+      'blocks');
+  });
+
+  // Windows menus/catalogue pill map the sources icon names to the Material
+  // twin of 'blocks', never the puzzle-piece extension icon.
+  test('Home menu maps sources icon names to the blocks look', () {
+    expect(desktopHomeMenuIcon('blocks'), Icons.widgets_outlined);
+    expect(desktopHomeMenuIcon('puzzle'), Icons.widgets_outlined);
+  });
 }

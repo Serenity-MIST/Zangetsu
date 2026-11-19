@@ -205,7 +205,7 @@ void main() {
       }
       final frequency = crossings * 8000 / data.lengthInBytes;
       expect(frequency, closeTo(440, 12));
-      final inspect = await Process.run(executable!, [
+      final inspect = await Process.run(executable, [
         '-nostdin',
         '-hide_banner',
         '-i',
@@ -219,7 +219,7 @@ void main() {
         '-',
       ]);
       expect(inspect.stderr.toString(), contains('(eng): Audio'));
-      final extra = await Process.run(executable!, [
+      final extra = await Process.run(executable, [
         '-nostdin',
         '-hide_banner',
         '-i',

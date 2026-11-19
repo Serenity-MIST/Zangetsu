@@ -1,6 +1,7 @@
 import 'package:dio/dio.dart';
 
-import '../app_config.dart';
+import '../environment.dart';
+import '../supabase/supabase_service.dart';
 import 'profile_avatar_reference.dart';
 
 class KlipyGif {
@@ -39,8 +40,12 @@ class KlipyGif {
 }
 
 class KlipyGifService {
-  KlipyGifService(this._dio, {String? apiKey})
-    : _apiKey = apiKey ?? kKlipyApiKey;
+  KlipyGifService(
+    this._dio, {
+    required String baseUrl,
+    required String? Function() accessToken,
+  }) : _baseUrl = baseUrl.replaceFirst(RegExp(r'/+$'), ''),
+       _accessToken = accessToken;
 
   static final shared = KlipyGifService(
     Dio(
@@ -49,29 +54,59 @@ class KlipyGifService {
         receiveTimeout: const Duration(seconds: 8),
       ),
     ),
+    baseUrl:
+        '${Environment.vpsSyncUrl.replaceFirst(RegExp(r'/+$'), '')}/klipy/v1',
+    accessToken: () {
+      try {
+        return SupabaseService().client.auth.currentSession?.accessToken;
+      } catch (_) {
+        return null;
+      }
+    },
   );
 
-  static const _host = 'api.klipy.com';
   final Dio _dio;
-  final String _apiKey;
+  final String _baseUrl;
+  final String? Function() _accessToken;
   final Map<String, Future<String?>> _avatarUrls = {};
 
-  bool get isConfigured => _apiKey.trim().isNotEmpty;
+  bool get isConfigured {
+    final uri = Uri.tryParse(_baseUrl);
+    return uri != null &&
+        uri.scheme == 'https' &&
+        uri.host.isNotEmpty &&
+        uri.userInfo.isEmpty &&
+        !uri.hasQuery &&
+        !uri.hasFragment;
+  }
+
+  bool get isSignedIn => _token != null;
+
+  String? get _token {
+    try {
+      final token = _accessToken()?.trim();
+      return token == null || token.isEmpty ? null : token;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Options? get _authOptions {
+    final token = _token;
+    if (!isConfigured || token == null) return null;
+    return Options(headers: {'Authorization': 'Bearer $token'});
+  }
 
   Future<List<KlipyGif>> search(
     String query, {
     CancelToken? cancelToken,
   }) async {
-    if (!isConfigured || query.trim().isEmpty) return const [];
+    final options = _authOptions;
+    if (options == null || query.trim().isEmpty) return const [];
     final response = await _dio.get<dynamic>(
       _url('gifs/search'),
-      queryParameters: {
-        'q': query,
-        'page': 1,
-        'per_page': 24,
-        'content_filter': 'high',
-        'format_filter': 'gif',
-      },
+      queryParameters: {'q': query},
+      options: options,
       cancelToken: cancelToken,
     );
     return _rows(
@@ -81,18 +116,21 @@ class KlipyGifService {
 
   /// Resolves older profiles that stored only a KLIPY slug.
   Future<String?> avatarUrlForSlug(String slug) {
-    if (!isConfigured || klipyAvatarSlug(klipyAvatarReference(slug)) == null) {
+    if (_authOptions == null ||
+        klipyAvatarSlug(klipyAvatarReference(slug)) == null) {
       return Future.value(null);
     }
     return _avatarUrls.putIfAbsent(slug, () => _resolveAvatar(slug));
   }
 
   Future<void> registerSelection(KlipyGif gif, String query) async {
-    if (!isConfigured) return;
+    final options = _authOptions;
+    if (options == null) return;
     try {
       await _dio.post<void>(
         _url('gifs/share/${Uri.encodeComponent(gif.slug)}'),
         data: {'q': query},
+        options: options,
       );
     } catch (_) {
       // Selection still works if KLIPY's optional usage-tracking call fails.
@@ -101,9 +139,12 @@ class KlipyGifService {
 
   Future<String?> _resolveAvatar(String slug) async {
     try {
+      final options = _authOptions;
+      if (options == null) return null;
       final response = await _dio.get<dynamic>(
         _url('gifs/items'),
-        queryParameters: {'slugs': slug, 'format_filter': 'gif'},
+        queryParameters: {'slugs': slug},
+        options: options,
       );
       for (final row in _rows(response.data)) {
         final gif = KlipyGif.fromJson(row);
@@ -116,8 +157,7 @@ class KlipyGifService {
     return null;
   }
 
-  String _url(String path) =>
-      'https://$_host/api/v1/${Uri.encodeComponent(_apiKey.trim())}/$path';
+  String _url(String path) => '$_baseUrl/$path';
 
   static List<Object?> _rows(Object? body) {
     if (body is! Map || body['result'] != true) return const [];

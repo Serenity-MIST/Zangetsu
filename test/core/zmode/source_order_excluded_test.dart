@@ -35,29 +35,61 @@ void main() {
     expect(prefs.excluded(ZKind.anime), isEmpty);
   });
 
-  test('anime and movies share one list; reading kinds keep their own',
+  test('anime and movies/TV keep separate lists; reading kinds their own',
       () async {
-    // They were split. The same installed pool serves both, so it only ever
-    // meant two orders of the same sources — twice the list to keep straight
-    // for a distinction most people don't draw. Manga and novel stay separate
-    // because those genuinely are different sources.
+    // Source Priority shows Anime and Movies / TV as two lists, so they are
+    // stored as two: switching one off, reordering or changing the limit in
+    // one must not change the other. Movies and TV share one.
     await prefs.exclude(ZKind.anime, 'hdhub4u');
-    expect(prefs.excluded(ZKind.movie), {'hdhub4u'});
+    expect(prefs.excluded(ZKind.movie), isEmpty);
     expect(prefs.excluded(ZKind.manga), isEmpty);
-    await prefs.exclude(ZKind.manga, 'mihon:1');
+    await prefs.exclude(ZKind.movie, 'animeonly');
+    expect(prefs.excluded(ZKind.tv), {'animeonly'});
     expect(prefs.excluded(ZKind.anime), {'hdhub4u'});
+    await prefs.exclude(ZKind.manga, 'mihon:1');
     expect(prefs.excluded(ZKind.manga), {'mihon:1'});
   });
 
-  test('an order saved before the split went away is still honoured', () async {
-    // Written under the old per-kind key. Falling back to it is the
+  test('orders and limits are separate per list', () async {
+    await prefs.set(ZKind.movie, ['m1', 'm2']);
+    await prefs.setCap(ZKind.movie, 4);
+    expect(prefs.get(ZKind.anime), isEmpty);
+    expect(prefs.cap(ZKind.anime), kAutoResolveDefaultCap);
+    expect(prefs.get(ZKind.tv), ['m1', 'm2']);
+    expect(prefs.cap(ZKind.tv), 4);
+  });
+
+  test('the old shared video bucket seeds BOTH lists until each is saved',
+      () async {
+    final box = Hive.box<List>(SourceOrderPrefs.boxName);
+    await box.putAll({
+      'video': ['b', 'a'],
+      'video:cap': [6],
+      'video:off': ['x'],
+    });
+    for (final kind in [ZKind.anime, ZKind.movie]) {
+      expect(prefs.get(kind), ['b', 'a']);
+      expect(prefs.cap(kind), 6);
+      expect(prefs.excluded(kind), {'x'});
+    }
+    // Saving the movie list takes it over without touching anime.
+    await prefs.set(ZKind.movie, ['a']);
+    await prefs.setCap(ZKind.movie, 12);
+    expect(prefs.get(ZKind.anime), ['b', 'a']);
+    expect(prefs.cap(ZKind.anime), 6);
+    expect(prefs.get(ZKind.movie), ['a']);
+  });
+
+  test('an order saved before the shared bucket is still honoured', () async {
+    // Written under the oldest per-kind key. Falling back to it is the
     // difference between keeping someone's order and silently resetting it.
     await Hive.box<List>(SourceOrderPrefs.boxName).put('anime', ['b', 'a']);
     expect(prefs.get(ZKind.anime), ['b', 'a']);
     expect(prefs.get(ZKind.movie), ['b', 'a']);
-    // …until a new one is saved, which takes over.
+    // …until a new one is saved, which takes over for that list only.
     await prefs.set(ZKind.anime, ['a', 'b']);
-    expect(prefs.get(ZKind.movie), ['a', 'b']);
+    expect(prefs.get(ZKind.anime), ['a', 'b']);
+    expect(prefs.get(ZKind.movie), ['b', 'a']);
   });
 
   test('the off-list survives a reorder, and order survives a switch-off',
@@ -83,11 +115,16 @@ void main() {
     await prefs.clear(ZKind.movie);
     await box.close();
     prefs = await SourceOrderPrefs.open();
-    expect(prefs.get(ZKind.anime), isEmpty);
+    // Unpin all on Movies/TV clears that list only; anime keeps its own pin.
+    expect(prefs.get(ZKind.anime), ['new-pin']);
     expect(prefs.get(ZKind.tv), isEmpty);
     expect(prefs.excluded(ZKind.movie), {'blocked'});
-    expect(prefs.cap(ZKind.tv), 17);
+    expect(prefs.cap(ZKind.anime), 17);
+    expect(prefs.cap(ZKind.tv), kAutoResolveDefaultCap);
     expect(prefs.get(ZKind.manga), ['reader-pin']);
+    // And clearing anime does not revive the legacy 'anime' order either.
+    await prefs.clear(ZKind.anime);
+    expect(prefs.get(ZKind.anime), isEmpty);
   });
 
   test('reset clears both', () async {

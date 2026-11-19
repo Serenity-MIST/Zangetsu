@@ -21,6 +21,9 @@ class _Repo implements SourceRepository {
     (id: 'mihon:1', name: 'MangaDex'),
     (id: 'lnr:2', name: 'NovelUpdates'),
     (id: 'cs:3', name: 'A CS source'),
+    (id: 'mg:repo:1:1:3', name: 'MG Anime'),
+    (id: 'mg:repo:0:0:4', name: 'MG Manga'),
+    (id: 'mg:repo:2:0:5', name: 'MG Novel'),
   ];
 }
 
@@ -28,12 +31,24 @@ void main() {
   final repo = _Repo();
 
   test('candidates are filtered by source-id prefix', () {
-    expect(candidatesForKind(repo, ZKind.manga).map((s) => s.id), ['mihon:1']);
-    expect(candidatesForKind(repo, ZKind.novel).map((s) => s.id), ['lnr:2']);
-    expect(candidatesForKind(repo, ZKind.anime).map((s) => s.id),
-        ['allanime', 'cs:3']);
-    expect(candidatesForKind(repo, ZKind.movie).map((s) => s.id),
-        ['allanime', 'cs:3']);
+    expect(candidatesForKind(repo, ZKind.manga).map((s) => s.id), [
+      'mihon:1',
+      'mg:repo:0:0:4',
+    ]);
+    expect(candidatesForKind(repo, ZKind.novel).map((s) => s.id), [
+      'lnr:2',
+      'mg:repo:2:0:5',
+    ]);
+    expect(candidatesForKind(repo, ZKind.anime).map((s) => s.id), [
+      'allanime',
+      'cs:3',
+      'mg:repo:1:1:3',
+    ]);
+    expect(candidatesForKind(repo, ZKind.movie).map((s) => s.id), [
+      'allanime',
+      'cs:3',
+      'mg:repo:1:1:3',
+    ]);
   });
 
   test('browse kind splits Movie/TV out of the anime content mode', () {

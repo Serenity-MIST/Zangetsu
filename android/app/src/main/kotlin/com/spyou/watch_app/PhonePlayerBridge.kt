@@ -25,11 +25,53 @@ object PhonePlayerBridge {
     var channel: MethodChannel? = null
         private set
 
+    // Display rows stay in-process: long libraries must not fill an Intent parcel.
+    private var watchData: Pair<Long, Map<String, Any?>>? = null
+
+    internal fun watchDataFor(session: Long): Map<String, Any?> =
+        watchData?.takeIf { it.first == session }?.second.orEmpty()
+
+    internal fun clearWatchData(session: Long) {
+        if (watchData?.first == session) watchData = null
+    }
+
     fun register(engine: FlutterEngine, activity: Activity) {
         val ch = MethodChannel(engine.dartExecutor.binaryMessenger, CHANNEL)
         ch.setMethodCallHandler { call, result ->
             when (call.method) {
                 "launch" -> launch(activity, call, result)
+                "cacheInfo", "clearPlaybackCache" -> Thread({
+                    try {
+                        val prepared = runCatching {
+                            PhonePlaybackCache.prepare(activity,
+                                (call.argument<Number>("diskCacheGb")?.toLong() ?: 2L).coerceIn(1L, 20L) * 1024 * 1024 * 1024)
+                        }
+                        val response: Any = if (call.method == "clearPlaybackCache") {
+                            prepared.getOrThrow()
+                            PhonePlaybackCache.clear()
+                        } else mapOf("nativeLimitMb" to PhonePlaybackCache.nativeLimitMb(activity),
+                            "javaLimitMb" to Runtime.getRuntime().maxMemory() / (4L * 1024 * 1024),
+                            "diskBytes" to PhonePlaybackCache.sizeBytes(), "cacheError" to prepared.isFailure)
+                        activity.runOnUiThread { result.success(response) }
+                    } catch (_: Exception) {
+                        activity.runOnUiThread { result.error("cache_unavailable", "Playback cache is unavailable", null) }
+                    }
+                }, "ZangetsuCacheInfo").start()
+                // Dart-side enrichment (e.g. the show synopsis) arriving after
+                // launch. Session-checked: a stale Dart session's late result
+                // must not paint over the live player's screen.
+                "updateMetadata" -> {
+                    val session = (call.argument<Number>("sessionId") ?: -1).toLong()
+                    val target = PhonePlayerActivity.active
+                    if (target != null && target.sessionId == session) {
+                        target.onMetadataUpdate(
+                            (call.argument<String>("showDescription") ?: "").ifEmpty { null },
+                        )
+                        result.success(true)
+                    } else {
+                        result.success(false)
+                    }
+                }
                 else -> result.notImplemented()
             }
         }
@@ -37,17 +79,26 @@ object PhonePlayerBridge {
     }
 
     fun dispose() {
+        watchData = null
         channel?.setMethodCallHandler(null)
         channel = null
     }
 
     @Suppress("UNCHECKED_CAST")
     private fun launch(activity: Activity, call: MethodCall, result: MethodChannel.Result) {
-        val url = call.argument<String>("url")
-        if (url.isNullOrEmpty()) { result.success(false); return }
+        // url is optional: without it the Activity opens on its own loading
+        // screen and asks Dart to resolve the first episode.
+        val url = call.argument<String>("url").orEmpty()
         try {
+            watchData = ((call.argument<Number>("sessionId") ?: 0).toLong() to
+                call.argument<Map<String, Any?>>("watchData").orEmpty())
             val i = Intent(activity, PhonePlayerActivity::class.java)
-            i.putExtra(PhonePlayerIntent.EXTRA_URL, url)
+            i.putExtra(PhonePlayerIntent.EXTRA_AUTO_ENGINE_FALLBACK,
+                call.argument<Boolean>("autoPlayerFallback") ?: false)
+            call.argument<Map<String, Any?>>("controlLayout")?.let {
+                i.putExtra(PhonePlayerIntent.EXTRA_CONTROLS, org.json.JSONObject(it).toString())
+            }
+            if (url.isNotEmpty()) i.putExtra(PhonePlayerIntent.EXTRA_URL, url)
             i.putExtra(
                 PhonePlayerIntent.EXTRA_HEADERS,
                 PhonePlayerIntent.headersToArray(
@@ -69,9 +120,14 @@ object PhonePlayerBridge {
                 (call.argument<Number>("episodeCount") ?: 1).toInt(),
             )
             i.putExtra(
+                PhonePlayerIntent.EXTRA_IS_MOVIE,
+                call.argument<Boolean>("isMovie") ?: false,
+            )
+            i.putExtra(
                 PhonePlayerIntent.EXTRA_START_INDEX,
                 (call.argument<Number>("startIndex") ?: 0).toInt(),
             )
+            i.putExtra(PhonePlayerIntent.EXTRA_STREMIO_SUBTITLES, call.argument<Boolean>("stremioSubtitles") ?: false)
             call.argument<List<String>>("subUrls")
                 ?.let { i.putExtra(PhonePlayerIntent.EXTRA_SUB_URLS, it.toTypedArray()) }
             call.argument<List<String>>("subLangs")
@@ -90,6 +146,13 @@ object PhonePlayerBridge {
                 PhonePlayerIntent.EXTRA_SW_DECODE,
                 call.argument<Boolean>("softwareDecoding") ?: false,
             )
+            i.putExtra(PhonePlayerIntent.EXTRA_DECODER_MODE, call.argument<String>("decoderMode"))
+            i.putExtra(PhonePlayerIntent.EXTRA_NATIVE_CACHE, call.argument<Boolean>("nativeCacheEnabled") ?: false)
+            i.putExtra(PhonePlayerIntent.EXTRA_NATIVE_CACHE_MB,
+                (call.argument<Number>("nativeCacheMb")?.toInt() ?: 128).coerceIn(32, 512))
+            i.putExtra(PhonePlayerIntent.EXTRA_DISK_CACHE, call.argument<Boolean>("diskCacheEnabled") ?: false)
+            i.putExtra(PhonePlayerIntent.EXTRA_DISK_CACHE_GB,
+                (call.argument<Number>("diskCacheGb")?.toInt() ?: 2).coerceIn(1, 20))
             i.putExtra(
                 PhonePlayerIntent.EXTRA_SPEED,
                 (call.argument<Number>("defaultSpeed") ?: 1.0).toFloat(),
@@ -106,6 +169,9 @@ object PhonePlayerBridge {
                 PhonePlayerIntent.EXTRA_AUTOPLAY_NEXT,
                 call.argument<Boolean>("autoplayNext") ?: true,
             )
+            i.putExtra(PhonePlayerIntent.EXTRA_MEGA_SKIP, call.argument<Boolean>("megaSkip") ?: true)
+            i.putExtra(PhonePlayerIntent.EXTRA_MEGA_SKIP_SECONDS,
+                (call.argument<Number>("megaSkipSeconds") ?: 85).toInt().coerceIn(5, 180))
             i.putExtra(
                 PhonePlayerIntent.EXTRA_SEEK_SECONDS,
                 (call.argument<Number>("seekSeconds") ?: 10).toInt(),
@@ -152,12 +218,37 @@ object PhonePlayerBridge {
             )
             call.argument<String>("subtitleFontPath")
                 ?.let { i.putExtra(PhonePlayerIntent.EXTRA_SUB_FONT, it) }
+            call.argument<String>("cover")
+                ?.let { i.putExtra(PhonePlayerIntent.EXTRA_COVER, it) }
+            i.putExtra(
+                PhonePlayerIntent.EXTRA_ORIENTATION,
+                call.argument<String>("playerOrientation") ?: "landscape",
+            )
+            call.argument<String>("showDescription")
+                ?.let { i.putExtra(PhonePlayerIntent.EXTRA_SHOW_DESC, it) }
+            call.argument<List<String>>("availableCategories")
+                ?.let { i.putExtra(PhonePlayerIntent.EXTRA_CATEGORIES, it.toTypedArray()) }
+            i.putExtra(
+                PhonePlayerIntent.EXTRA_CATEGORY,
+                call.argument<String>("category") ?: "sub",
+            )
+            i.putExtra(
+                PhonePlayerIntent.EXTRA_SESSION,
+                (call.argument<Number>("sessionId") ?: 0).toLong(),
+            )
+            i.putExtra(
+                PhonePlayerIntent.EXTRA_COVER_HEADERS,
+                PhonePlayerIntent.headersToArray(
+                    call.argument<Map<String, String>>("coverHeaders"),
+                ),
+            )
             // No FLAG_ACTIVITY_NEW_TASK: we hold the real Activity, so the
             // player opens inside the app's own task rather than showing up
             // as a second card in recents.
             activity.startActivity(i)
             result.success(true)
         } catch (e: Exception) {
+            clearWatchData((call.argument<Number>("sessionId") ?: 0).toLong())
             Log.w(TAG, "launch failed: ${e.message}")
             result.success(false)
         }

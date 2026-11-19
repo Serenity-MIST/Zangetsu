@@ -1,6 +1,10 @@
 import 'dart:math' as math;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_svg/flutter_svg.dart';
+import '../desktop/desktop_shortcuts.dart';
+import '../theme/app_colors.dart';
 import 'artwork_quality.dart';
 import 'native_cover_provider.dart';
 import 'progressive_artwork.dart';
@@ -42,8 +46,15 @@ class DesktopMediaCard extends StatelessWidget {
   Widget build(BuildContext context) => LayoutBuilder(
     builder: (context, bounds) {
       final textHeight = MediaQuery.textScalerOf(context).scale(56);
+      // With the title inside the art there is no caption row for the score,
+      // so it joins the artwork badges instead of disappearing.
+      final insideBadges = [
+        ...badges,
+        if (titleInside && showTitle && score != null)
+          '★ ${(score! / 10).toStringAsFixed(1)}',
+      ];
       // Captions retain the same click/right-click actions as the artwork.
-      return GestureDetector(
+      final card = GestureDetector(
         behavior: HitTestBehavior.opaque,
         onTap: onTap,
         onSecondaryTap: onMenu,
@@ -78,20 +89,33 @@ class DesktopMediaCard extends StatelessWidget {
                         left: 8,
                         right: 8,
                         bottom: 8,
-                        child:
-                            titleWidget ??
-                            Text(
-                              title,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.w600,
-                                color: Colors.white,
-                              ),
+                        // Inside placement keeps the rank beside the title,
+                        // so a ranked shelf still reads as ranked.
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            if (rank != null) ...[
+                              _RankNumeral(rank!),
+                              const SizedBox(width: 7),
+                            ],
+                            Expanded(
+                              child:
+                                  titleWidget ??
+                                  Text(
+                                    title,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w600,
+                                      color: Colors.white,
+                                    ),
+                                  ),
                             ),
+                          ],
+                        ),
                       ),
-                    if (badges.isNotEmpty)
+                    if (insideBadges.isNotEmpty)
                       Positioned(
                         left: 6,
                         top: titleInside ? 6 : null,
@@ -101,7 +125,7 @@ class DesktopMediaCard extends StatelessWidget {
                           spacing: 4,
                           runSpacing: 3,
                           children: [
-                            for (final badge in badges)
+                            for (final badge in insideBadges)
                               Container(
                                 padding: const EdgeInsets.symmetric(
                                   horizontal: 5,
@@ -137,32 +161,31 @@ class DesktopMediaCard extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       if (rank != null) ...[
-                        Text(
-                          '$rank',
-                          style: const TextStyle(
-                            fontFamily: 'Georgia',
-                            fontSize: 23,
-                            height: 1,
-                          ),
-                        ),
+                        _RankNumeral(rank!),
                         const SizedBox(width: 9),
                       ],
                       Expanded(
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            titleWidget ??
-                                Text(
-                                  title,
-                                  maxLines: 2,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    fontSize: 11,
-                                    height: 1.2,
-                                    fontWeight: FontWeight.w600,
-                                    color: Colors.white,
+                            // Flexible: a title-artwork logo (fixed height)
+                            // shrinks to leave room for the score row instead
+                            // of overflowing the caption.
+                            Flexible(
+                              child:
+                                  titleWidget ??
+                                  Text(
+                                    title,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontSize: 11,
+                                      height: 1.2,
+                                      fontWeight: FontWeight.w600,
+                                      color: Colors.white,
+                                    ),
                                   ),
-                                ),
+                            ),
                             if (score != null) ...[
                               const SizedBox(height: 4),
                               Row(
@@ -198,7 +221,156 @@ class DesktopMediaCard extends StatelessWidget {
           ],
         ),
       );
+      // Phone (and TV) keep the bare card exactly as before.
+      if (!desktopCardExtrasEnabled || title.trim().isEmpty) return card;
+      // Windows: the full title in a tooltip after a short hover, because the
+      // caption stops after two lines (home-13). The tooltip stays out of the
+      // semantics tree so screen readers do not hear the title twice.
+      Widget result = Tooltip(
+        message: title,
+        waitDuration: desktopCardTooltipWait,
+        excludeFromSemantics: true,
+        child: card,
+      );
+      // Title-artwork logos and hidden captions leave no text behind, so the
+      // card gets the title as its accessible name instead of only badges.
+      if (titleWidget != null || !showTitle) {
+        result = Semantics(
+          label: title,
+          button: onTap != null,
+          container: true,
+          child: result,
+        );
+      }
+      return result;
     },
+  );
+}
+
+/// True on the Windows desktop build, where cards add tooltips, accessible
+/// names and keyboard actions. Uses the target platform (not dart:io) so
+/// widget tests can opt in with debugDefaultTargetPlatformOverride.
+bool get desktopCardExtrasEnabled =>
+    defaultTargetPlatform == TargetPlatform.windows;
+
+/// How long the pointer rests on a card before its full-title tooltip shows.
+const desktopCardTooltipWait = Duration(milliseconds: 500);
+
+/// Where a keyboard-opened card menu should appear.
+///
+/// Menu callbacks (onMenu) carry no position, so a menu opened from the
+/// Menu key or Shift+F10 would otherwise appear at the last mouse click.
+/// [DesktopCardKeys] sets [pending] to the card's centre for the duration of
+/// the onMenu call; menu helpers read it synchronously before opening.
+abstract final class DesktopMediaMenuOrigin {
+  static Offset? _pending;
+
+  /// Global centre of the card whose menu is being opened from the keyboard,
+  /// or null when the menu came from the mouse.
+  static Offset? get pending => _pending;
+
+  /// Runs [open] with [at] published as [pending], then clears it again.
+  static void run(Offset? at, VoidCallback open) {
+    _pending = at;
+    try {
+      open();
+    } finally {
+      _pending = null;
+    }
+  }
+}
+
+/// Windows keyboard actions for a focused card (home-9): Enter opens it and
+/// the Menu key / Shift+F10 opens its menu at the card's centre.
+///
+/// It is a pass-through focus node: it never takes focus itself, it only
+/// sees keys bubbling up from a focused descendant (the card's InkWell).
+/// Off Windows the child is returned untouched.
+class DesktopCardKeys extends StatelessWidget {
+  const DesktopCardKeys({
+    super.key,
+    required this.child,
+    this.onOpen,
+    this.onMenu,
+  });
+  final Widget child;
+  final VoidCallback? onOpen, onMenu;
+
+  /// True for the shared "open the focused item's menu" keys. Falls back to
+  /// the stock keys when the shortcut catalogue was never registered (tests).
+  static bool isMenuKey(KeyEvent event) {
+    if (DesktopShortcuts.spec('app.contextMenu') != null) {
+      return DesktopShortcuts.matches('app.contextMenu', event);
+    }
+    return event.logicalKey == LogicalKeyboardKey.contextMenu ||
+        (event.logicalKey == LogicalKeyboardKey.f10 &&
+            HardwareKeyboard.instance.isShiftPressed);
+  }
+
+  /// True for the "open the focused title" keys; the numpad Enter always
+  /// counts too, like the main Enter key.
+  static bool isOpenKey(KeyEvent event) {
+    if (event.logicalKey == LogicalKeyboardKey.numpadEnter) return true;
+    if (DesktopShortcuts.spec('home.open') != null) {
+      return DesktopShortcuts.matches('home.open', event);
+    }
+    return event.logicalKey == LogicalKeyboardKey.enter;
+  }
+
+  /// Global centre of [context]'s box, where a keyboard menu opens.
+  static Offset? centreOf(BuildContext? context) {
+    final box = context?.findRenderObject();
+    if (box is! RenderBox || !box.hasSize) return null;
+    return box.localToGlobal(box.size.center(Offset.zero));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!desktopCardExtrasEnabled || (onOpen == null && onMenu == null)) {
+      return child;
+    }
+    return Focus(
+      canRequestFocus: false,
+      skipTraversal: true,
+      onKeyEvent: (node, event) {
+        if (event is! KeyDownEvent) return KeyEventResult.ignored;
+        if (onMenu != null && isMenuKey(event)) {
+          DesktopMediaMenuOrigin.run(centreOf(node.context), onMenu!);
+          return KeyEventResult.handled;
+        }
+        // Modifier+Enter is left to other handlers.
+        final keyboard = HardwareKeyboard.instance;
+        if (onOpen != null &&
+            !keyboard.isControlPressed &&
+            !keyboard.isAltPressed &&
+            !keyboard.isShiftPressed &&
+            isOpenKey(event)) {
+          onOpen!();
+          return KeyEventResult.handled;
+        }
+        return KeyEventResult.ignored;
+      },
+      child: child,
+    );
+  }
+}
+
+/// Large rank number on ranked shelves. No fixed family: it inherits the app
+/// font chosen in Theme & colour > Font, like every other label.
+class _RankNumeral extends StatelessWidget {
+  const _RankNumeral(this.rank);
+  final int rank;
+  @override
+  Widget build(BuildContext context) => Text(
+    '$rank',
+    key: ValueKey('desktop-media-rank-$rank'),
+    style: const TextStyle(
+      fontSize: 23,
+      height: 1,
+      fontWeight: FontWeight.w700,
+      color: Colors.white,
+      shadows: [Shadow(color: Color(0x99000000), blurRadius: 6)],
+    ),
   );
 }
 
@@ -247,10 +419,15 @@ class DesktopMediaSurface extends StatefulWidget {
     required this.child,
     this.onTap,
     this.onMenu,
+    this.tooltip,
   });
   final Widget child;
   final VoidCallback? onTap;
   final VoidCallback? onMenu;
+
+  /// Full title shown after a short hover on Windows (for cards whose own
+  /// caption is cut off, such as the one-line Continue cards). Null = none.
+  final String? tooltip;
   @override
   State<DesktopMediaSurface> createState() => DesktopMediaSurfaceState();
 }
@@ -259,7 +436,22 @@ class DesktopMediaSurface extends StatefulWidget {
 class DesktopMediaSurfaceState extends State<DesktopMediaSurface> {
   bool _active = false;
   @override
-  Widget build(BuildContext context) => AnimatedContainer(
+  Widget build(BuildContext context) {
+    final surface = _surface(context);
+    final tip = widget.tooltip?.trim();
+    // Windows only: full title after a short hover (home-13).
+    if (!desktopCardExtrasEnabled || tip == null || tip.isEmpty) {
+      return surface;
+    }
+    return Tooltip(
+      message: tip,
+      waitDuration: desktopCardTooltipWait,
+      excludeFromSemantics: true,
+      child: surface,
+    );
+  }
+
+  Widget _surface(BuildContext context) => AnimatedContainer(
     duration: MediaQuery.disableAnimationsOf(context)
         ? Duration.zero
         : const Duration(milliseconds: 160),
@@ -268,17 +460,25 @@ class DesktopMediaSurfaceState extends State<DesktopMediaSurface> {
       color: const Color(0xFF12161B),
       borderRadius: BorderRadius.circular(11),
       border: Border.all(
-        color: _active ? const Color(0xFFFF3656) : const Color(0xFF2A3038),
+        // Hover/focus ring follows the Theme & colour accent; it is read on
+        // every hover change, so a new accent shows on the next hover.
+        color: _active ? AppColors.accent : const Color(0xFF2A3038),
       ),
     ),
     child: Material(
       color: Colors.transparent,
-      child: InkWell(
-        onTap: widget.onTap,
-        onSecondaryTap: widget.onMenu,
-        onHover: (v) => setState(() => _active = v),
-        onFocusChange: (v) => setState(() => _active = v),
-        child: widget.child,
+      // Windows: Enter opens and Menu key / Shift+F10 opens the menu of the
+      // focused card (pass-through elsewhere).
+      child: DesktopCardKeys(
+        onOpen: widget.onTap,
+        onMenu: widget.onMenu,
+        child: InkWell(
+          onTap: widget.onTap,
+          onSecondaryTap: widget.onMenu,
+          onHover: (v) => setState(() => _active = v),
+          onFocusChange: (v) => setState(() => _active = v),
+          child: widget.child,
+        ),
       ),
     ),
   );

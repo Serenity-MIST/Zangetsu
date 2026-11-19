@@ -7,8 +7,12 @@ project(runner LANGUAGES CXX)
 #
 # Any new source files that you add to the application should be added here.
 add_executable(${BINARY_NAME} WIN32
+  "desktop_registry.cpp"
+  "desktop_shell.cpp"
+  "drop_target.cpp"
   "flutter_window.cpp"
   "main.cpp"
+  "media_session.cpp"
   "utils.cpp"
   "win32_window.cpp"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
@@ -35,6 +39,14 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
 target_link_libraries(${BINARY_NAME} PRIVATE "advapi32.lib")
+# Shell integration: tray / notifications (shell32), lock-screen session
+# events (wtsapi32), OLE drag and drop (ole32) and the WinRT media overlay
+# through WRL (runtimeobject, the header-only alternative to windowsapp.lib
+# that works with this runner's no-exceptions build).
+target_link_libraries(${BINARY_NAME} PRIVATE "shell32.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "wtsapi32.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "ole32.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "runtimeobject.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.

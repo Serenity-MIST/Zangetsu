@@ -1,9 +1,17 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
+import '../../core/desktop/desktop_focus_repair.dart';
 import '../../core/app_mode.dart';
+import '../../core/desktop/desktop_sheet.dart';
+import '../../core/desktop/desktop_undo_toast.dart';
 import '../../core/di/injector.dart';
+import '../../core/playback/source_health_store.dart';
+import '../../core/ui/desktop_docked_panel.dart';
 import '../../core/tv/tv_focusable.dart';
 import '../../core/ui/app_toast.dart';
 import '../../core/models/media_item.dart';
@@ -135,6 +143,14 @@ class _MatchLineState extends State<MatchLine> {
 
   Future<void> _fix(String sourceId) async {
     final before = sl<SourceMatcher>().sourceForTitle(widget.canonical);
+    // Windows: the title's match entries as they are now, so the "Match
+    // saved" toast can Undo a misclick exactly (ar-7). Taken before the
+    // sheet opens because picking a result pins (and demotes the old pin)
+    // before the sheet even closes.
+    final store = sl<MatchStore>();
+    final snapshot = desktopPanelsEnabled
+        ? store.snapshot(widget.canonical)
+        : null;
     final picked = await showWrongTitleSheet(
       context,
       canonical: widget.canonical,
@@ -155,11 +171,29 @@ class _MatchLineState extends State<MatchLine> {
     }
     _cubit.applyPinned(picked);
     _refreshAfterMatchChange();
-    showAppToast(
+    final message = context.l10n.matchSaved(
+      sl<SourceRepository>().displayName(picked.sourceId),
+    );
+    if (snapshot == null) {
+      // Phone / TV: the plain notice, as before.
+      showAppToast(context, message);
+      return;
+    }
+    // Windows: remember the title's own name for the Manual matches page,
+    // then offer Undo, which puts every entry of this title back as it was
+    // (the previous pin included) and refreshes the row and the page.
+    // Not awaited: the name is written to memory at once, and the toast
+    // should not wait on the disk flush.
+    unawaited(store.rememberTitle(widget.canonical, widget.title));
+    showUndoToast(
       context,
-      context.l10n.matchSaved(
-        sl<SourceRepository>().displayName(picked.sourceId),
-      ),
+      message: message,
+      onUndo: () async {
+        await store.restore(widget.canonical, snapshot);
+        if (!mounted) return;
+        await _cubit.load();
+        if (mounted) _refreshAfterMatchChange();
+      },
     );
   }
 
@@ -492,10 +526,17 @@ class _MatchLineState extends State<MatchLine> {
                         semanticLabel: l10n.wrongTitle,
                         borderRadius: 6,
                         child: Padding(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 4,
-                            vertical: 8,
-                          ),
+                          // Windows: a bigger target for the mouse (ar-4);
+                          // the 4px-wide phone padding was easy to miss.
+                          padding: desktopPanelsEnabled
+                              ? const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 10,
+                                )
+                              : const EdgeInsets.symmetric(
+                                  horizontal: 4,
+                                  vertical: 8,
+                                ),
                           child: Text(
                             l10n.wrongTitle,
                             style: AppText.caption.copyWith(
@@ -525,6 +566,23 @@ Future<SourceMatch?> showWrongTitleSheet(
   List<String> metadataAliases = const [],
   int? malId,
 }) {
+  if (desktopPanelsEnabled) {
+    // Windows (ar-4): a panel docked to the right of the detail page, so
+    // the show's own cover, year and episode count stay visible to compare
+    // against while picking. The body brings its own header and close.
+    return showAdaptiveSheet<SourceMatch>(
+      context,
+      desktopStyle: DesktopSheetStyle.sidePanel,
+      desktopWidth: _desktopPanelWidth,
+      builder: (_) => _WrongTitleBody(
+        canonical: canonical,
+        initialQuery: title,
+        sourceId: sourceId,
+        metadataAliases: metadataAliases,
+        malId: malId,
+      ),
+    );
+  }
   return showModalBottomSheet<SourceMatch>(
     context: context,
     isScrollControlled: true,
@@ -565,6 +623,9 @@ class _WrongTitleBody extends StatelessWidget {
             matcher: sl<SourceMatcher>(),
             canonical: canonical,
             sourceId: sourceId,
+            // Status-aware, paged search only where the Windows panel shows
+            // its failure messages and "Load more" (not TV, even on Windows).
+            statusAware: desktopPanelsEnabled,
           )..search(
             initialQuery,
             retryWithMetadataAliases: true,
@@ -586,9 +647,28 @@ class _WrongTitleView extends StatefulWidget {
 class _WrongTitleViewState extends State<_WrongTitleView> {
   late final _ctrl = TextEditingController(text: widget.initialQuery);
 
+  /// Focus of the search field, so the Windows panel can start there.
+  final FocusNode _field = FocusNode(debugLabel: 'wrong-title-field');
+
+  @override
+  void initState() {
+    super.initState();
+    // Windows panel: put the caret in the search field once the panel is
+    // built. A plain `autofocus` loses to the docked panel's Esc handler,
+    // which autofocuses its own Focus higher up the tree.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && DesktopSheetScope.of(context)) _field.requestFocus();
+    });
+  }
+
   @override
   void dispose() {
     _ctrl.dispose();
+    _field.dispose();
+    _firstResult.dispose();
+    for (final n in _cellNodes.values) {
+      n.dispose();
+    }
     super.dispose();
   }
 
@@ -612,12 +692,24 @@ class _WrongTitleViewState extends State<_WrongTitleView> {
 
   @override
   Widget build(BuildContext context) {
-    final l10n = context.l10n;
     final cubit = context.read<WrongTitleCubit>();
     // Matches the Search screen's grid exactly: 3 up, 12 across, 16 down, and
     // the same aspect helper — so a result here is the same object a search
     // result is, at the same size, with the same press animation.
     final cellWidth = posterGridCellWidth(context);
+    // Windows side panel (ar-4): fills the docked panel's height instead of
+    // 75% of the window, and lays the grid out for the panel's own width.
+    final desktop = DesktopSheetScope.of(context);
+    if (desktop) {
+      return LayoutBuilder(
+        builder: (context, box) => SizedBox(
+          height: box.maxHeight.isFinite
+              ? box.maxHeight
+              : MediaQuery.sizeOf(context).height * 0.85,
+          child: _content(context, cubit, cellWidth, desktop: true),
+        ),
+      );
+    }
     return SafeArea(
       child: Padding(
         padding: EdgeInsets.only(
@@ -625,142 +717,230 @@ class _WrongTitleViewState extends State<_WrongTitleView> {
         ),
         child: SizedBox(
           height: MediaQuery.sizeOf(context).height * 0.75,
-          child: BlocBuilder<WrongTitleCubit, WrongTitleState>(
-            builder: (context, state) {
-              final currentUrl = _currentUrl(cubit.sourceId);
-              return Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
+          child: _content(context, cubit, cellWidth, desktop: false),
+        ),
+      ),
+    );
+  }
+
+  /// Focus of the first result, so Down in the search box can jump into the
+  /// grid on Windows (the rest is reached with the arrow keys).
+  final FocusNode _firstResult = FocusNode(debugLabel: 'wrong-title-first');
+
+  /// Focus nodes of the other result cells (Windows), by index, kept here so
+  /// arrow-key moves can reach a cell and they survive grid rebuilds.
+  final Map<int, FocusNode> _cellNodes = {};
+
+  FocusNode _cellNode(int i) => i == 0
+      ? _firstResult
+      : _cellNodes.putIfAbsent(
+          i,
+          () => FocusNode(debugLabel: 'wrong-title-result-$i'),
+        );
+
+  /// Moves keyboard focus from the search field into the results (Windows).
+  KeyEventResult _fieldKey(FocusNode _, KeyEvent e) {
+    if (e is! KeyDownEvent || e.logicalKey != LogicalKeyboardKey.arrowDown) {
+      return KeyEventResult.ignored;
+    }
+    if (_firstResult.context == null) return KeyEventResult.ignored;
+    _firstResult.requestFocus();
+    return KeyEventResult.handled;
+  }
+
+  /// Header, search field, status line and results; shared by the phone
+  /// sheet and the Windows panel ([desktop] adds a close button, keyboard
+  /// focus handling, failure messages and "Load more").
+  Widget _content(
+    BuildContext context,
+    WrongTitleCubit cubit,
+    double cellWidth, {
+    required bool desktop,
+  }) {
+    final l10n = context.l10n;
+    return BlocBuilder<WrongTitleCubit, WrongTitleState>(
+      builder: (context, state) {
+        final currentUrl = _currentUrl(cubit.sourceId);
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const SizedBox(height: 12),
+            // Title left, source right, one line. The source used to sit
+            // centred underneath as grey text with a caret, which read as
+            // a label rather than the button it is.
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
+              child: Row(
                 children: [
-                  const SizedBox(height: 12),
-                  // Title left, source right, one line. The source used to sit
-                  // centred underneath as grey text with a caret, which read as
-                  // a label rather than the button it is.
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            l10n.whichOneIsIt,
-                            style: AppText.headline,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        _SourcePill(
-                          sourceId: cubit.sourceId,
-                          onTap: () => _openSourcePicker(cubit),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
-                    // The metadata Search bar, same shape: a fully rounded
-                    // surface2 pill with the icon INSIDE it, not an
-                    // InputDecoration prefix on a boxed field. This sheet is
-                    // reached from a catalogue title, so it should look like
-                    // catalogue search rather than like a settings input.
-                    child: DecoratedBox(
-                      decoration: BoxDecoration(
-                        color: AppColors.surface2,
-                        borderRadius: BorderRadius.circular(26),
-                      ),
-                      child: Row(
-                        children: [
-                          const SizedBox(width: 14),
-                          // A tap target, like the Search screen's: it runs the
-                          // query the same as Enter does.
-                          GestureDetector(
-                            behavior: HitTestBehavior.opaque,
-                            onTap: () {
-                              FocusScope.of(context).unfocus();
-                              cubit.search(_ctrl.text);
-                            },
-                            child: const Icon(
-                              Icons.search_rounded,
-                              size: 20,
-                              color: AppColors.textTertiary,
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: TextField(
-                              controller: _ctrl,
-                              onSubmitted: cubit.search,
-                              textInputAction: TextInputAction.search,
-                              style: AppText.body.copyWith(
-                                color: AppColors.textPrimary,
-                              ),
-                              cursorColor: AppColors.accent,
-                              decoration: InputDecoration(
-                                hintText: l10n.searchThisSource,
-                                hintStyle: AppText.body,
-                                border: InputBorder.none,
-                                isDense: true,
-                                contentPadding: const EdgeInsets.symmetric(
-                                  vertical: 11,
-                                ),
-                              ),
-                            ),
-                          ),
-                          // The field opens pre-filled with the title, so
-                          // searching for something else means clearing it
-                          // first. Keeps the pill's right inset when hidden.
-                          ValueListenableBuilder<TextEditingValue>(
-                            valueListenable: _ctrl,
-                            builder: (context, value, _) => value.text.isEmpty
-                                ? const SizedBox(width: 14)
-                                : IconButton(
-                                    icon: const Icon(
-                                      Icons.close_rounded,
-                                      size: 18,
-                                      color: AppColors.textTertiary,
-                                    ),
-                                    tooltip: context.l10n.clear,
-                                    onPressed: () => _ctrl.clear(),
-                                  ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  // Says which query is running, not merely that one is: a
-                  // source can take seconds, and after switching source this is
-                  // the only thing naming what is being re-searched.
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 2, 16, 8),
+                  Expanded(
                     child: Text(
-                      state.loading
-                          ? '${l10n.searching}: ${state.query}'
-                          : l10n.matchResultCount(state.results.length),
-                      style: AppText.caption.copyWith(
-                        color: AppColors.textTertiary,
-                      ),
+                      l10n.whichOneIsIt,
+                      style: AppText.headline,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
                   ),
-                  Expanded(
-                    child: _Results(
+                  const SizedBox(width: 10),
+                  _SourcePill(
+                    sourceId: cubit.sourceId,
+                    onTap: () => _openSourcePicker(cubit),
+                  ),
+                  // Windows panel: no drag-to-dismiss, so a close
+                  // button like the other desktop panels (Esc works
+                  // too).
+                  if (desktop)
+                    IconButton(
+                      key: const ValueKey('wrong-title-close'),
+                      tooltip: MaterialLocalizations.of(
+                        context,
+                      ).closeButtonTooltip,
+                      onPressed: () => Navigator.of(context).maybePop(),
+                      icon: const Icon(Icons.close_rounded),
+                      color: AppColors.textSecondary,
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 10),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+              // The metadata Search bar, same shape: a fully rounded
+              // surface2 pill with the icon INSIDE it, not an
+              // InputDecoration prefix on a boxed field. This sheet is
+              // reached from a catalogue title, so it should look like
+              // catalogue search rather than like a settings input.
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: AppColors.surface2,
+                  borderRadius: BorderRadius.circular(26),
+                ),
+                child: Row(
+                  children: [
+                    const SizedBox(width: 14),
+                    // A tap target, like the Search screen's: it runs the
+                    // query the same as Enter does.
+                    GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () {
+                        DesktopFocusRepair.dropFocus(context);
+                        cubit.search(_ctrl.text);
+                      },
+                      child: const Icon(
+                        Icons.search_rounded,
+                        size: 20,
+                        color: AppColors.textTertiary,
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      // Windows: Down moves from the field into the
+                      // results (this Focus sees the key before the
+                      // app's text-editing shortcuts do).
+                      child: Focus(
+                        canRequestFocus: false,
+                        skipTraversal: true,
+                        onKeyEvent: desktop ? _fieldKey : null,
+                        child: TextField(
+                          controller: _ctrl,
+                          // Windows: typing a different name is the
+                          // usual next step, so the field starts
+                          // focused there (requested after the first
+                          // frame in initState: the panel's own Esc
+                          // Focus autofocuses first and would win).
+                          focusNode: _field,
+                          onSubmitted: cubit.search,
+                          textInputAction: TextInputAction.search,
+                          style: AppText.body.copyWith(
+                            color: AppColors.textPrimary,
+                          ),
+                          cursorColor: AppColors.accent,
+                          decoration: InputDecoration(
+                            hintText: l10n.searchThisSource,
+                            hintStyle: AppText.body,
+                            border: InputBorder.none,
+                            isDense: true,
+                            contentPadding: const EdgeInsets.symmetric(
+                              vertical: 11,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    // The field opens pre-filled with the title, so
+                    // searching for something else means clearing it
+                    // first. Keeps the pill's right inset when hidden.
+                    ValueListenableBuilder<TextEditingValue>(
+                      valueListenable: _ctrl,
+                      builder: (context, value, _) => value.text.isEmpty
+                          ? const SizedBox(width: 14)
+                          : IconButton(
+                              icon: const Icon(
+                                Icons.close_rounded,
+                                size: 18,
+                                color: AppColors.textTertiary,
+                              ),
+                              tooltip: context.l10n.clear,
+                              onPressed: () => _ctrl.clear(),
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            // Says which query is running, not merely that one is: a
+            // source can take seconds, and after switching source this is
+            // the only thing naming what is being re-searched.
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 2, 16, 8),
+              child: Text(
+                state.loading
+                    ? '${l10n.searching}: ${state.query}'
+                    : l10n.matchResultCount(state.results.length),
+                style: AppText.caption.copyWith(color: AppColors.textTertiary),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            Expanded(
+              child: desktop
+                  // Windows: focusable cells, failure messages with
+                  // Retry and "Load more" (ar-4 / ar-5 / ar-6).
+                  ? _DesktopResults(
+                      state: state,
+                      currentUrl: currentUrl,
+                      firstFocus: _firstResult,
+                      nodeFor: _cellNode,
+                      sourceName: sl<SourceRepository>().displayName(
+                        cubit.sourceId,
+                      ),
+                      onPick: (r) async {
+                        final m = await cubit.choose(r);
+                        if (context.mounted) {
+                          Navigator.of(context).pop(m);
+                        }
+                      },
+                      onChangeSource: () => _openSourcePicker(cubit),
+                      onRetry: cubit.retry,
+                      onLoadMore: cubit.loadMore,
+                      // Up from the top row goes back to the search box.
+                      onExitTop: _field.requestFocus,
+                    )
+                  : _Results(
                       state: state,
                       cellWidth: cellWidth,
                       currentUrl: currentUrl,
                       onPick: (r) async {
                         final m = await cubit.choose(r);
-                        if (context.mounted) Navigator.of(context).pop(m);
+                        if (context.mounted) {
+                          Navigator.of(context).pop(m);
+                        }
                       },
                       onChangeSource: () => _openSourcePicker(cubit),
                     ),
-                  ),
-                ],
-              );
-            },
-          ),
-        ),
-      ),
+            ),
+          ],
+        );
+      },
     );
   }
 }
@@ -866,6 +1046,7 @@ class _Results extends StatelessWidget {
     final l10n = context.l10n;
     final aspect = posterCellAspect(
       cellWidth,
+      textScaler: MediaQuery.textScalerOf(context),
       wide: posterLayout(context) == PosterCardLayout.wide,
       titleInside: posterTitleInside(
         context,
@@ -948,6 +1129,374 @@ class _Results extends StatelessWidget {
         // the child untouched on TV or with list animations off.
         return RevealItem(index: i, child: cell);
       },
+    );
+  }
+}
+
+/// Width of the Windows "Wrong title?" side panel: three poster columns,
+/// leaving the detail page's own cover and facts visible on the left.
+const double _desktopPanelWidth = 600;
+
+/// The Windows results area of "Wrong title?" (ar-4 / ar-5 / ar-6).
+///
+/// Separate from [_Results] so the phone sheet stays exactly as it was.
+/// Adds: a grid laid out for the panel's width with keyboard-focusable cells
+/// (visible focus ring, arrows move, Enter picks); its own message and
+/// Retry for a timeout, a Cloudflare block and an error, instead of the
+/// "this source may not carry it" of a real empty result; and paging
+/// ("Load more" at the end, also fetched when scrolled near the end).
+class _DesktopResults extends StatelessWidget {
+  const _DesktopResults({
+    required this.state,
+    required this.currentUrl,
+    required this.firstFocus,
+    required this.sourceName,
+    required this.onPick,
+    required this.onChangeSource,
+    required this.onRetry,
+    required this.onLoadMore,
+    required this.nodeFor,
+    required this.onExitTop,
+  });
+
+  final WrongTitleState state;
+  final String? currentUrl;
+
+  /// Focus node of the first cell, so Down in the search field lands there.
+  final FocusNode firstFocus;
+
+  /// The focus node of the cell at an index (owned by the view's State so
+  /// it survives rebuilds); used to move focus with the arrow keys.
+  final FocusNode Function(int index) nodeFor;
+
+  /// Called when Up is pressed on the top row.
+  final VoidCallback onExitTop;
+  final String sourceName;
+  final ValueChanged<MediaItem> onPick;
+  final VoidCallback onChangeSource;
+  final VoidCallback onRetry;
+  final VoidCallback onLoadMore;
+
+  /// The failure message for a source that did not really answer.
+  String _failureMessage(SourceOutcome failure) => switch (failure) {
+    // No context in this helper; appL10n follows the app language.
+    SourceOutcome.timeout =>
+      appL10n.sourceTookTooLongNamed(sourceName),
+    SourceOutcome.blocked =>
+      appL10n.sourceBlockedByCloudflare(sourceName),
+    _ =>
+      appL10n.couldntReachSource(sourceName),
+  };
+
+  /// Arrow-key movement inside the grid. Done by index rather than by
+  /// Flutter's geometric directional focus, which would jump out of the
+  /// grid to the docked panel's own (focusable) Esc handler.
+  void _move(int from, TraversalDirection d, int columns) {
+    final to = switch (d) {
+      TraversalDirection.left => from - 1,
+      TraversalDirection.right => from + 1,
+      TraversalDirection.up => from - columns,
+      TraversalDirection.down => from + columns,
+    };
+    if (to < 0) {
+      if (d == TraversalDirection.up) onExitTop();
+      return;
+    }
+    if (to >= state.results.length) return;
+    final node = nodeFor(to);
+    // Only cells the lazy grid has built have a context; the cache extent
+    // keeps the next rows built, so this is the normal case.
+    final ctx = node.context;
+    if (ctx == null) return;
+    node.requestFocus();
+    Scrollable.ensureVisible(
+      ctx,
+      alignment: 0.5,
+      duration: const Duration(milliseconds: 120),
+    );
+  }
+
+  /// A glyph per failure, so the three cases also look different.
+  IconData _failureIcon(SourceOutcome failure) => switch (failure) {
+    SourceOutcome.timeout => Icons.hourglass_empty_rounded,
+    SourceOutcome.blocked => Icons.shield_outlined,
+    _ => Icons.cloud_off_rounded,
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = context.l10n;
+    return LayoutBuilder(
+      builder: (context, box) {
+        // Columns from the panel's width (the phone helpers read the whole
+        // window, which would cram a dozen tiny posters into the panel).
+        final width = box.maxWidth.isFinite ? box.maxWidth : _desktopPanelWidth;
+        final columns = ((width - 32 + 12) / (150 + 12)).floor().clamp(2, 6);
+        final cellWidth = (width - 32 - 12 * (columns - 1)) / columns;
+        final aspect = posterCellAspect(
+          cellWidth,
+          textScaler: MediaQuery.textScalerOf(context),
+        );
+        if (state.results.isEmpty) {
+          if (state.loading) {
+            return Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              child: SkeletonGrid(
+                crossAxisCount: columns,
+                childAspectRatio: aspect,
+              ),
+            );
+          }
+          final failure = state.failure;
+          if (failure != null) {
+            // The source failed: say how, and offer the same search again
+            // rather than implying the show is not there.
+            return _DesktopFailure(
+              key: ValueKey('wrong-title-failure-${failure.name}'),
+              icon: _failureIcon(failure),
+              message: _failureMessage(failure),
+              retryLabel: l10n.retry,
+              onRetry: onRetry,
+              changeLabel: l10n.chooseSource,
+              onChangeSource: onChangeSource,
+            );
+          }
+          return EmptyState(
+            icon: Icons.search_off_rounded,
+            message: l10n.sourceMayNotCarryIt,
+            actionLabel: l10n.chooseSource,
+            onAction: onChangeSource,
+          );
+        }
+        return NotificationListener<ScrollUpdateNotification>(
+          // Near the end of the grid: fetch the next page without waiting
+          // for a click (the button below covers short lists).
+          onNotification: (n) {
+            if (n.metrics.extentAfter < 400 &&
+                state.hasMore &&
+                !state.loadingMore &&
+                !state.loadMoreFailed) {
+              onLoadMore();
+            }
+            return false;
+          },
+          child: FocusTraversalGroup(
+            child: CustomScrollView(
+              scrollCacheExtent: const ScrollCacheExtent.pixels(800),
+              slivers: [
+                SliverPadding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                  sliver: SliverGrid.builder(
+                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: columns,
+                      childAspectRatio: aspect,
+                      crossAxisSpacing: 12,
+                      mainAxisSpacing: 16,
+                    ),
+                    itemCount: state.results.length,
+                    itemBuilder: (_, i) {
+                      final r = state.results[i];
+                      // Same "current match" tag as the phone grid.
+                      final isCurrent =
+                          currentUrl != null && r.url == currentUrl;
+                      return _DesktopResultCell(
+                        key: ValueKey('wrong-title-result-$i'),
+                        focusNode: i == 0 ? firstFocus : nodeFor(i),
+                        semanticLabel: r.title,
+                        onActivate: () => onPick(r),
+                        onMove: (d) => _move(i, d, columns),
+                        child: PosterCard(
+                          title: r.title,
+                          logoItem: r,
+                          imageUrl: r.cover,
+                          wideImageUrl: r.banner,
+                          genres: r.genres,
+                          isAdult: r.isAdult,
+                          headers: r.coverHeaders,
+                          cellWidth: cellWidth,
+                          qualityBadge: r.quality,
+                          dubBadge: r.dubBadge,
+                          tags: isCurrent ? [l10n.currentMatchBadge] : const [],
+                          onTap: () => onPick(r),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                SliverToBoxAdapter(child: _footer(context)),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// End of the grid: a spinner while the next page loads, Retry when it
+  /// failed, "Load more" while the source may have more.
+  Widget _footer(BuildContext context) {
+    Widget? child;
+    if (state.loadingMore) {
+      child = SizedBox(
+        width: 22,
+        height: 22,
+        child: CircularProgressIndicator(
+          strokeWidth: 2,
+          color: AppColors.accent,
+        ),
+      );
+    } else if (state.loadMoreFailed) {
+      child = Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            context.l10n.couldntLoadMoreResults,
+            style: AppText.caption.copyWith(color: AppColors.textSecondary),
+          ),
+          const SizedBox(height: 6),
+          OutlinedButton(
+            key: const ValueKey('wrong-title-load-more-retry'),
+            onPressed: onLoadMore,
+            child: Text(context.l10n.retry),
+          ),
+        ],
+      );
+    } else if (state.hasMore) {
+      child = OutlinedButton.icon(
+        key: const ValueKey('wrong-title-load-more'),
+        onPressed: onLoadMore,
+        icon: const Icon(Icons.expand_more_rounded, size: 18),
+        label: Text(context.l10n.loadMore),
+      );
+    }
+    if (child == null) return const SizedBox(height: 16);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
+      child: Center(child: child),
+    );
+  }
+}
+
+/// A result poster that the keyboard can reach (Windows): Tab / arrows move
+/// focus between cells, Enter or Space picks, and the focused cell shows an
+/// accent ring. The mouse still clicks the poster itself.
+class _DesktopResultCell extends StatefulWidget {
+  const _DesktopResultCell({
+    super.key,
+    required this.child,
+    required this.onActivate,
+    required this.semanticLabel,
+    required this.onMove,
+    this.focusNode,
+  });
+
+  final Widget child;
+  final VoidCallback onActivate;
+  final String semanticLabel;
+  final FocusNode? focusNode;
+
+  /// An arrow key was pressed on this cell (the grid moves focus).
+  final ValueChanged<TraversalDirection> onMove;
+
+  @override
+  State<_DesktopResultCell> createState() => _DesktopResultCellState();
+}
+
+class _DesktopResultCellState extends State<_DesktopResultCell> {
+  /// True while focus came from the keyboard (no ring for mouse clicks).
+  bool _highlight = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      button: true,
+      label: widget.semanticLabel,
+      child: FocusableActionDetector(
+        focusNode: widget.focusNode,
+        // Enter / Space map to ActivateIntent through the app's default
+        // shortcuts; picking a result is the cell's only action.
+        actions: {
+          ActivateIntent: CallbackAction<ActivateIntent>(
+            onInvoke: (_) {
+              widget.onActivate();
+              return null;
+            },
+          ),
+          // Arrows arrive as DirectionalFocusIntent from the app's default
+          // shortcuts; the grid moves by index instead (see _move).
+          DirectionalFocusIntent: CallbackAction<DirectionalFocusIntent>(
+            onInvoke: (intent) {
+              widget.onMove(intent.direction);
+              return null;
+            },
+          ),
+        },
+        onShowFocusHighlight: (v) => setState(() => _highlight = v),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 120),
+          foregroundDecoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: _highlight ? AppColors.accent : Colors.transparent,
+              width: 2.5,
+            ),
+          ),
+          child: widget.child,
+        ),
+      ),
+    );
+  }
+}
+
+/// "The source failed" message of the Windows panel: icon, what went wrong,
+/// Retry and a way to pick another source.
+class _DesktopFailure extends StatelessWidget {
+  const _DesktopFailure({
+    super.key,
+    required this.icon,
+    required this.message,
+    required this.retryLabel,
+    required this.onRetry,
+    required this.changeLabel,
+    required this.onChangeSource,
+  });
+
+  final IconData icon;
+  final String message;
+  final String retryLabel;
+  final VoidCallback onRetry;
+  final String changeLabel;
+  final VoidCallback onChangeSource;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 44, color: AppColors.textTertiary),
+            const SizedBox(height: 12),
+            Text(message, textAlign: TextAlign.center, style: AppText.body),
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 10,
+              runSpacing: 8,
+              alignment: WrapAlignment.center,
+              children: [
+                FilledButton.icon(
+                  key: const ValueKey('wrong-title-retry'),
+                  onPressed: onRetry,
+                  icon: const Icon(Icons.refresh_rounded, size: 18),
+                  label: Text(retryLabel),
+                ),
+                TextButton(onPressed: onChangeSource, child: Text(changeLabel)),
+              ],
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

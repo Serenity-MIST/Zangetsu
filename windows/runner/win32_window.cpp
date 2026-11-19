@@ -141,8 +141,35 @@ bool Win32Window::Create(const std::wstring& title,
   return OnCreate();
 }
 
+bool Win32Window::CreateAt(const std::wstring& title, const RECT& frame,
+                           bool maximized) {
+  Destroy();
+
+  const wchar_t* window_class =
+      WindowClassRegistrar::GetInstance()->GetWindowClass();
+
+  // The frame is already in physical pixels for its monitor, so no DPI
+  // scaling here (unlike Create, which takes logical sizes).
+  HWND window = CreateWindow(
+      window_class, title.c_str(), WS_OVERLAPPEDWINDOW, frame.left, frame.top,
+      frame.right - frame.left, frame.bottom - frame.top, nullptr, nullptr,
+      GetModuleHandle(nullptr), this);
+
+  if (!window) {
+    return false;
+  }
+
+  start_maximized_ = maximized;
+  UpdateTheme(window);
+
+  return OnCreate();
+}
+
 bool Win32Window::Show() {
-  return ShowWindow(window_handle_, SW_SHOWNORMAL);
+  // Only the first show honours a remembered maximised state.
+  const int command = start_maximized_ ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+  start_maximized_ = false;
+  return ShowWindow(window_handle_, command);
 }
 
 // static

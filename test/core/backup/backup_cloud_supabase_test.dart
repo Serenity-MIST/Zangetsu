@@ -16,6 +16,25 @@ class FakeBackupRemote implements BackupRemote {
   Future<Map<String, dynamic>?> getRow(String userKey) async {
     return byUser[userKey];
   }
+
+  /// Counts timestamp-only reads, to prove the date never pulls the payload.
+  int updatedAtReads = 0;
+  int rowReads = 0;
+
+  @override
+  Future<String?> getUpdatedAt(String userKey) async {
+    updatedAtReads++;
+    return byUser[userKey]?['updated_at'] as String?;
+  }
+}
+
+/// Same fake, but counts full-row reads too.
+class CountingBackupRemote extends FakeBackupRemote {
+  @override
+  Future<Map<String, dynamic>?> getRow(String userKey) async {
+    rowReads++;
+    return super.getRow(userKey);
+  }
 }
 
 void main() {
@@ -28,7 +47,10 @@ void main() {
   });
 
   test('upload then download round-trips the payload map', () async {
-    final payload = {'mylist': [1, 2, 3], 'settings': {'theme': 'dark'}};
+    final payload = {
+      'mylist': [1, 2, 3],
+      'settings': {'theme': 'dark'},
+    };
 
     await backup.upload('user1', payload);
     final result = await backup.download('user1');
@@ -42,7 +64,21 @@ void main() {
     final ts = await backup.lastBackupAt('user1');
 
     expect(ts, isA<DateTime>());
-    expect(ts!.difference(DateTime.now().toUtc()).abs() < const Duration(minutes: 1), isTrue);
+    expect(
+      ts!.difference(DateTime.now().toUtc()).abs() < const Duration(minutes: 1),
+      isTrue,
+    );
+  });
+
+  test('lastBackupAt reads only the timestamp, never the payload', () async {
+    final counting = CountingBackupRemote();
+    final cloud = BackupCloud(SupabaseService(), remote: counting);
+    await cloud.upload('user1', {'big': 'payload'});
+
+    expect(await cloud.lastBackupAt('user1'), isNotNull);
+    expect(await cloud.lastBackupAt('nobody'), isNull);
+    expect(counting.updatedAtReads, 2);
+    expect(counting.rowReads, 0);
   });
 
   test('download for a user with no row returns null', () async {

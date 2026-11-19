@@ -11,6 +11,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 import '../../core/di/injector.dart';
 import '../../core/discord/discord_presence.dart';
 import '../../core/discord/discord_rpc.dart';
+import '../../core/share/share_link.dart';
 import '../../core/metadata/episode_metadata_service.dart';
 import '../../core/models/episode.dart';
 import '../../core/models/episode_title.dart';
@@ -19,6 +20,7 @@ import '../../core/models/video_source.dart';
 import '../../core/playback/filler_service.dart';
 import '../../core/playback/hls.dart';
 import '../../core/playback/playback_prefs.dart';
+import '../../core/repository/source_repository.dart';
 import '../../core/playback/resume_store.dart';
 import '../../core/playback/watch_history.dart';
 import '../../core/playback/skip_service.dart';
@@ -536,6 +538,15 @@ class _TvExoPlayerScreenState extends State<TvExoPlayerScreen> {
         position: Duration(milliseconds: c?.position.value ?? 0),
         duration: Duration(milliseconds: c?.duration.value ?? 0),
         playing: !_discordPaused,
+        openUrl: ShareLink.watchUrl(
+          sourceId: widget.sourceId,
+          url: widget.showUrl,
+          title: title,
+          type: (widget.scrobbleTitle != null || widget.malId != null)
+              ? ProviderType.anime
+              : ProviderType.movie,
+          cover: widget.cover,
+        ),
       ),
     );
   }
@@ -968,6 +979,15 @@ class _TvExoPlayerScreenState extends State<TvExoPlayerScreen> {
 
   List<TvMenuOption> _rootSettingsOptions(TvExoController c) {
     final options = <TvMenuOption>[];
+    // Raw id of the provider actually playing (cs:hiAnime) — the session id
+    // is just 'zm' under Z Mode. Info row, not a setting: selecting it is a
+    // no-op.
+    options.add(TvMenuOption(
+      label: 'Provider',
+      trailing: _playingProviderId(),
+      showCheck: false,
+      onSelect: () {},
+    ));
     final servers = sortByQuality(_qualityPool());
     if (servers.length > 1) {
       final active = servers.where((s) => s.url == _activeSource?.url).firstOrNull;
@@ -1017,6 +1037,30 @@ class _TvExoPlayerScreenState extends State<TvExoPlayerScreen> {
       onSelect: () => _pushMenu(_TvSettingsPage.volume),
     ));
     return options;
+  }
+
+  /// Raw id of the provider actually playing (mirrors the phone player's
+  /// info-overlay Provider row): the resolver's winner for the current
+  /// episode, else the session id — plus the display name when the id is an
+  /// opaque number ("HiAnime (ani:7667)").
+  String _playingProviderId() {
+    var id = widget.sourceId;
+    try {
+      final ep = _ep;
+      if (ep != null && sl.isRegistered<PlaybackResolver>()) {
+        final winner = sl<PlaybackResolver>().resolvedSourceId(
+          tvEpisodeUrl(ep.url, _category),
+          category: _category,
+        );
+        if (winner != null && winner.isNotEmpty) id = winner;
+      }
+    } catch (_) {}
+    return providerInfoLabel(
+      id,
+      (sid) => sl.isRegistered<SourceRepository>()
+          ? sl<SourceRepository>().displayName(sid)
+          : sid,
+    );
   }
 
   String? _qualityTrailing(TvExoController c) {
@@ -1148,13 +1192,13 @@ class _TvExoPlayerScreenState extends State<TvExoPlayerScreen> {
       TvMenuOption(
         label: context.l10n.off,
         selected: text.every((t) => !t.selected),
-        onSelect: () => c.selectTextTrack(null),
+        onSelect: () => _selectSub(c, null, null),
       ),
       for (final t in text)
         TvMenuOption(
           label: t.label ?? (t.language.isEmpty ? 'Subtitle' : t.language),
           selected: t.selected,
-          onSelect: () => c.selectTextTrack(t.id),
+          onSelect: () => _selectSub(c, t.id, t.language),
         ),
       TvMenuOption(
         label: context.l10n.preferredLanguage,
@@ -1368,9 +1412,38 @@ class _TvExoPlayerScreenState extends State<TvExoPlayerScreen> {
     );
     if (picked == null) return;
     await sl<PlaybackPrefs>().setSubtitlePreference(picked);
+    _rememberSubChoice(picked);
     _subApplied = false;
     await _maybeApplySubPref();
     if (mounted) setState(() {});
+  }
+
+  /// Manual track pick that also remembers the choice for this show.
+  void _selectSub(TvExoController c, String? id, String? language) {
+    c.selectTextTrack(id);
+    if (id == null) {
+      _rememberSubChoice('off');
+      return;
+    }
+    final lang = languageOfSource(language ?? '');
+    if (lang != null) _rememberSubChoice(lang.iso1);
+  }
+
+  /// This show's remembered subtitle, or null. No memory here for
+  /// peek/incognito; those sessions must not persist anything.
+  String? get _showSubChoice {
+    final show = widget.showUrl;
+    if (show == null || show.isEmpty) return null;
+    return sl<TitlePrefsStore>().subtitleChoice(widget.sourceId, show);
+  }
+
+  void _rememberSubChoice(String choice) {
+    final show = widget.showUrl;
+    if (show == null || show.isEmpty) return;
+    if (!sl.isRegistered<TitlePrefsStore>()) return;
+    unawaited(
+      sl<TitlePrefsStore>().setSubtitleChoice(widget.sourceId, show, choice),
+    );
   }
 
   Future<void> _openSubtitleSearch() async {
@@ -1529,7 +1602,8 @@ class _TvExoPlayerScreenState extends State<TvExoPlayerScreen> {
     final tracks = c.textTracks.value;
     if (tracks.isEmpty && c.duration.value <= 0) return; // not ready yet
     _subApplied = true;
-    final pref = sl<PlaybackPrefs>().subtitlePreference;
+    // This show's pick beats the global preference; no memory → global.
+    final pref = _showSubChoice ?? sl<PlaybackPrefs>().subtitlePreference;
     final d = decideSubtitle(textTracks: tracks, pref: pref);
     switch (d.action) {
       case TvSubAction.off:

@@ -10,7 +10,9 @@ import 'package:get_it/get_it.dart';
 import 'package:hive/hive.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../logging/app_logger.dart';
 import '../models/source_pref.dart';
+import '../provider/extension_install_failure.dart';
 import '../provider/provider_manager.dart' show AniyomiManager;
 import 'aniyomi_provider.dart';
 import 'aniyomi_repo.dart';
@@ -18,6 +20,8 @@ import 'aniyomi_source_info.dart';
 import 'aniyomi_update.dart';
 
 export 'aniyomi_source_info.dart';
+// Callers that catch install failures get the type with the service.
+export '../provider/extension_install_failure.dart';
 
 /// Dart-side wrapper around the `zangetsu/aniyomi` [MethodChannel].
 ///
@@ -197,7 +201,8 @@ class AniyomiExtensionService {
   /// 5. Register each new provider in the optional [manager] (falls back to
   ///    `GetIt.instance<AniyomiManager>()` when the type is registered there).
   ///
-  /// Never throws — returns `[]` on any failure and logs the error.
+  /// Never throws — returns `[]` on any failure and logs the error. Use
+  /// [installFromRepoOrThrow] to learn why it failed.
   ///
   /// [downloader] lets callers (and tests) substitute the download step without
   /// a real network connection. When omitted the method calls `sl<Dio>().download`.
@@ -207,6 +212,38 @@ class AniyomiExtensionService {
     Directory? apkDirectory,
     Future<void> Function(String url, String savePath)? downloader,
     AniyomiManager? manager,
+  }) async {
+    try {
+      return await installFromRepoOrThrow(
+        entry,
+        dio: dio,
+        apkDirectory: apkDirectory,
+        downloader: downloader,
+        manager: manager,
+      );
+    } on ExtensionInstallFailure {
+      // Already logged by installFromRepoOrThrow; this path keeps the old
+      // never-throws contract for existing callers.
+      return [];
+    }
+  }
+
+  /// Same steps as [installFromRepo], but a failure throws an
+  /// [ExtensionInstallFailure] carrying a readable reason and the raw error
+  /// (src-2 A) instead of collapsing to an empty list. A package that
+  /// installs yet registers no source throws too (it used to read as
+  /// "No source loaded" with nothing else to go on).
+  ///
+  /// [onProgress] reports the APK download (src-2 B); [cancelToken] lets the
+  /// row's Cancel button stop it.
+  Future<List<AniyomiProvider>> installFromRepoOrThrow(
+    AniyomiRepoEntry entry, {
+    Dio? dio,
+    Directory? apkDirectory,
+    Future<void> Function(String url, String savePath)? downloader,
+    AniyomiManager? manager,
+    ExtensionInstallProgress? onProgress,
+    CancelToken? cancelToken,
   }) async {
     try {
       // 1. Resolve the APK save directory.
@@ -241,7 +278,13 @@ class AniyomiExtensionService {
         await downloader(entry.apkUrl, apkPath);
       } else {
         final effectiveDio = dio ?? GetIt.instance.get<Dio>();
-        await _downloadApk(effectiveDio, entry.apkUrl, apkPath);
+        await _downloadApk(
+          effectiveDio,
+          entry.apkUrl,
+          apkPath,
+          onProgress: onProgress,
+          cancelToken: cancelToken,
+        );
       }
 
       // 3. Install and list sources.
@@ -265,10 +308,23 @@ class AniyomiExtensionService {
               : null);
       effectiveManager?.registerAll(providers);
 
+      // Nothing registered: say so instead of a silent empty success. Thrown
+      // after steps 4-5 so the stored state matches what the never-throws
+      // [installFromRepo] always left behind.
+      if (providers.isEmpty) {
+        throw ExtensionInstallFailure.noSource(entry.pkg);
+      }
       return providers;
     } catch (e, st) {
-      debugPrint('[aniyomi] installFromRepo(${entry.pkg}) failed: $e\n$st');
-      return [];
+      final failure = ExtensionInstallFailure.from(e);
+      // AppLogger keeps the line in the shareable log in release builds
+      // (debugPrint alone did not), so a reported failure can be traced.
+      AppLogger.instance.log(
+        '[aniyomi] installFromRepo(${entry.pkg}) failed: '
+        '${failure.reason} | ${failure.details}\n$st',
+        level: failure.cancelled ? 'I' : 'E',
+      );
+      throw failure;
     }
   }
 
@@ -285,7 +341,13 @@ class AniyomiExtensionService {
   /// sat waiting on — and a mirror retry means several connections to make.
   static const Duration _apkConnectTimeout = Duration(seconds: 30);
 
-  Future<void> _downloadApk(Dio dio, String url, String savePath) async {
+  Future<void> _downloadApk(
+    Dio dio,
+    String url,
+    String savePath, {
+    ExtensionInstallProgress? onProgress,
+    CancelToken? cancelToken,
+  }) async {
     final opts = Options(
       receiveTimeout: _apkDownloadTimeout,
       sendTimeout: _apkDownloadTimeout,
@@ -300,11 +362,20 @@ class AniyomiExtensionService {
     Object? lastError;
     for (final u in urls) {
       try {
-        await dio.download(u, savePath, options: opts);
+        await dio.download(
+          u,
+          savePath,
+          options: opts,
+          // Progress + Cancel for the install row (src-2 B).
+          onReceiveProgress: onProgress,
+          cancelToken: cancelToken,
+        );
         return; // first success wins
       } on DioException catch (e) {
+        // A cancel is the user's choice: stop instead of trying mirrors.
+        if (e.type == DioExceptionType.cancel) rethrow;
         lastError = e;
-        debugPrint(
+        AppLogger.instance.log(
           '[aniyomi] download mirror failed '
           '(${e.response?.statusCode ?? e.type}): $u',
         );

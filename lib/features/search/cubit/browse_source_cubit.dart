@@ -20,7 +20,18 @@ class BrowseSourceState {
     this.page = 1,
     this.loadingMore = false,
     this.atEnd = false,
+    this.loadMoreFailed = false,
+    this.loadError,
+    this.searchError,
   });
+
+  /// What the catalogue load threw, kept with [failed] so Windows can tell a
+  /// source time-out from other failures (src-11). Null otherwise.
+  final Object? loadError;
+
+  /// What the search, filter browse or next page threw, kept with
+  /// [searchFailed] / [loadMoreFailed] for the same reason (src-11).
+  final Object? searchError;
 
   final List<HomeSection> sections;
   final bool loading;
@@ -57,6 +68,11 @@ class BrowseSourceState {
   /// No more pages: an empty page, or one whose items we already had. Sources
   /// rarely report a total, so the end is something you discover.
   final bool atEnd;
+
+  /// The last next-page request threw (search-8). Recorded so the screen can
+  /// show the failure with a Retry instead of the list quietly stopping.
+  /// Cleared as soon as another page request starts or succeeds.
+  final bool loadMoreFailed;
 
   /// Whether the screen should be showing search results/spinner/failure
   /// instead of the catalogue rows.
@@ -154,7 +170,11 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
       if (!state.isSearchActive) emit(_catalogue);
     } catch (error) {
       if (isClosed || version != _homeVersion || !checkSourceAvailability()) return;
-      _catalogue = const BrowseSourceState(loading: false, failed: true);
+      _catalogue = BrowseSourceState(
+        loading: false,
+        failed: true,
+        loadError: error, // src-11: lets the screen spot a time-out
+      );
       // This base request is still current even if Search owns the visible
       // results. Recording a target never opens a solver; Clear can offer it.
       _recordChallenge(error);
@@ -169,6 +189,7 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
   Future<void> search(String query) async {
     if (!checkSourceAvailability()) return;
     final q = query.trim();
+    final filters = state.filtersJson;
     if (q.isEmpty) {
       clearSearch();
       return;
@@ -179,19 +200,25 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
         sections: _catalogue.sections,
         loading: false,
         searching: true,
+        filtersJson: state.filtersJson,
         query: q,
       ),
     );
     try {
-      final results = await _repo
-          .search(q, sourceId: sourceId)
-          .timeout(timeout);
+      // Upstream: Mangayomi applies the active filters to the text search too.
+      final results = filters.isNotEmpty && sourceId.startsWith('mg:')
+          ? (await _repo
+                    .searchStatus(q, sourceId: sourceId, filtersJson: filters)
+                    .timeout(timeout))
+                .items
+          : await _repo.search(q, sourceId: sourceId).timeout(timeout);
       if (!_current(version)) return;
       emit(
         BrowseSourceState(
           sections: _catalogue.sections,
           loading: false,
           searchResults: results,
+          filtersJson: filters,
           query: q,
         ),
       );
@@ -203,6 +230,8 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
           sections: _catalogue.sections,
           loading: false,
           searchFailed: true,
+          searchError: error, // src-11: lets the screen spot a time-out
+          filtersJson: filters,
           query: q,
         ),
       );
@@ -252,6 +281,7 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
           sections: _catalogue.sections,
           loading: false,
           searchFailed: true,
+          searchError: error, // src-11: lets the screen spot a time-out
           filtersJson: filtersJson,
         ),
       );
@@ -291,10 +321,11 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
           atEnd: fresh.isEmpty,
         ),
       );
-    } catch (_) {
+    } catch (error) {
       if (!_current(version)) return;
-      // A failed page is not the end — the next scroll may work.
-      emit(_copy(loadingMore: false));
+      // A failed page is not the end — the next scroll may work. The flag
+      // lets the screen say so instead of silently stopping (search-8).
+      emit(_copy(loadingMore: false, loadMoreFailed: true, searchError: error));
     }
   }
 
@@ -303,6 +334,8 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
     int? page,
     bool? loadingMore,
     bool? atEnd,
+    bool loadMoreFailed = false,
+    Object? searchError,
   }) => BrowseSourceState(
     sections: _catalogue.sections,
     loading: false,
@@ -312,6 +345,10 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
     page: page ?? state.page,
     loadingMore: loadingMore ?? state.loadingMore,
     atEnd: atEnd ?? state.atEnd,
+    // Any other emission (page start / success) clears a previous failure.
+    loadMoreFailed: loadMoreFailed,
+    // Only the failing page keeps its error; other emissions clear it.
+    searchError: searchError,
   );
 
   /// Drops the search results and returns to the already-loaded catalogue

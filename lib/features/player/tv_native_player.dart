@@ -270,6 +270,7 @@ class TvNativePlayer {
     final posMs = (res?['positionMs'] as num?)?.toInt() ?? 0;
     final durMs = (res?['durationMs'] as num?)?.toInt() ?? 0;
     _saveProgress(index, posMs, durMs);
+    _tracker?.stopLive();
     // A fatal ExoPlayer error (e.g. PARSING_CONTAINER_NOT_SUPPORTED) is
     // reported on the channel BEFORE the activity finishes; the result flag
     // confirms it so launchTvPlayback can offer Try Next Source / Select Source.
@@ -321,6 +322,14 @@ class TvNativePlayer {
         final completed = args['completed'] as bool? ?? false;
         _saveProgress(index, posMs, durMs, completed: completed);
         if (index >= 0 && index < _episodes.length) {
+          _tracker?.liveProgress(
+            index: index,
+            episode: _episodes[index],
+            positionMs: posMs,
+            durationMs: durMs,
+            playing: args['playing'] as bool? ?? true,
+            completed: completed,
+          );
           _announceWatching(
             _episodes[index],
             positionMs: posMs,
@@ -328,6 +337,21 @@ class TvNativePlayer {
             playing: args['playing'] as bool? ?? true,
           );
         }
+        return null;
+      case 'trackingTick':
+        // Slow heartbeat from the native player while it plays. Position-only:
+        // no resume/history write, just the live tracker timeline.
+        final args = (call.arguments as Map).cast<String, dynamic>();
+        final index = (args['index'] as num?)?.toInt() ?? -1;
+        if (index < 0 || index >= _episodes.length) return null;
+        _tracker?.liveProgress(
+          index: index,
+          episode: _episodes[index],
+          positionMs: (args['positionMs'] as num?)?.toInt() ?? 0,
+          durationMs: (args['durationMs'] as num?)?.toInt() ?? 0,
+          playing: args['playing'] as bool? ?? true,
+          completed: args['completed'] as bool? ?? false,
+        );
         return null;
       case 'setCategory':
         // The native player switched sub/dub — remember it for this title so the
@@ -351,6 +375,21 @@ class TvNativePlayer {
               }
             } catch (_) {}
           }
+        }
+        return null;
+      case 'rememberSubtitle':
+        // Native track pick — remember it for this show, same as the mpv
+        // player's in-player picker. 'off' is a real choice, not empty.
+        final choice = (call.arguments as Map)['choice'] as String?;
+        if (choice != null &&
+            choice.isNotEmpty &&
+            _showUrl != null &&
+            _showUrl!.isNotEmpty) {
+          await sl<TitlePrefsStore>().setSubtitleChoice(
+            _sourceId,
+            _showUrl!,
+            choice,
+          );
         }
         return null;
       case 'setSubtitleScale':
@@ -391,7 +430,11 @@ class TvNativePlayer {
         return await stageSubtitleFont(font);
       case 'searchSubtitles':
         // OpenSubtitles search for the current show; results cached for download.
-        final pref = sl<PlaybackPrefs>().subtitlePreference;
+        // The show's own pick beats the global preference for the search lang.
+        final showSub = (_showUrl != null && _showUrl!.isNotEmpty)
+            ? sl<TitlePrefsStore>().subtitleChoice(_sourceId, _showUrl!)
+            : null;
+        final pref = showSub ?? sl<PlaybackPrefs>().subtitlePreference;
         final lang = (pref.isEmpty || pref == 'off') ? 'en' : pref;
         try {
           _subResults = await SubtitleSearchService().search(

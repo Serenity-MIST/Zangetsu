@@ -1,4 +1,3 @@
-import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:watch_app/core/mihon/mihon_mapping.dart';
 import 'package:watch_app/core/models/media_detail.dart';
@@ -31,7 +30,7 @@ void main() {
       expect(item.cover, isNull);
     });
 
-    test('non-empty headers are forwarded as coverHeaders, unmodified', () {
+    test('cover headers preserve Referer and include the source marker', () {
       final item = mediaItemFromSManga(
         {
           'url': 'https://source.test/manga/3',
@@ -43,7 +42,7 @@ void main() {
       );
       expect(item.coverHeaders, {
         'Referer': 'https://source.test/',
-        if (Platform.isWindows) 'x-mihon-src': '111',
+        'x-mihon-src': '111',
       });
     });
 
@@ -136,7 +135,7 @@ void main() {
       );
       expect(detail.coverHeaders, {
         'Referer': 'https://source.test/',
-        if (Platform.isWindows) 'x-mihon-src': '10',
+        'x-mihon-src': '10',
       });
     });
 

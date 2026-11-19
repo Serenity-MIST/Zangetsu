@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:cs3_engine/cs3_engine.dart';
 import 'package:flutter/material.dart';
 import '../ui/global_messenger.dart';
+import '../../l10n/l10n.dart';
 
 /// Opens a Flutter renderer for the plugin's declarative settings UI.
 /// Android-only settings activities are outside this protocol.
@@ -193,7 +194,7 @@ class _ExtensionSettingsState extends State<_ExtensionSettings> {
                       ),
                     ),
                     IconButton(
-                      tooltip: 'Close',
+                      tooltip: context.l10n.close,
                       onPressed: () => Navigator.of(context).pop(),
                       icon: const Icon(Icons.close),
                     ),

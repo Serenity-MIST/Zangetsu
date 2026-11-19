@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import '../../core/ui/settings_widgets.dart';
@@ -13,9 +14,11 @@ import '../../core/di/injector.dart';
 import '../../core/profiles/viewer_profile.dart';
 import '../../l10n/l10n.dart';
 import '../../core/ui/animation_prefs.dart';
+import '../../core/ui/detail_prefs.dart';
 
 /// Theme and colour: accent as preview cards (+ a Custom colour picker), the
-/// pure-black AMOLED toggle, the app font and how lists animate.
+/// pure-black AMOLED toggle, the adaptive poster tint, the app font and how
+/// lists animate.
 ///
 /// The app icon, splash and Home banner pickers used to live at the bottom of
 /// this page, below four other sections. They answer a different question —
@@ -46,21 +49,49 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
   );
 
   Future<void> _pickCustom() async {
-    var temp = AppColors.accent;
+    // Desktop keeps the bounded Graphite colour dialog; elsewhere the
+    // upstream accent wheel helper is used.
     final result = DesktopSettingsScope.contains(context)
         ? await showGraphiteSettingsColorChoice(
             context,
             title: context.l10n.customColour,
-            current: temp,
+            current: AppColors.accent,
             applyLabel: context.l10n.apply,
           )
-        : await showDialog<Color>(
-            context: context,
-            builder: (ctx) => AlertDialog(
-              backgroundColor: AppColors.surface,
-              title: Text(context.l10n.customColour, style: AppText.headline),
-              content: SingleChildScrollView(
-                child: ColorPicker(
+        : await _showColourPicker(
+            title: context.l10n.customColour,
+            initial: AppColors.accent,
+          );
+    if (result != null) {
+      await _updateProfileTheme(accentColor: result.toARGB32());
+    }
+  }
+
+  /// The accent colour wheel. (The background has its own picker below —
+  /// the wheel's brightness track cannot be capped.)
+  Future<Color?> _showColourPicker({
+    required String title,
+    required Color initial,
+  }) {
+    var temp = initial;
+    return showDialog<Color>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Text(title, style: AppText.headline),
+        content: SingleChildScrollView(
+          // set-5: on Windows (this page opened outside the settings
+          // workspace) the wheel gets the shared hex field with Paste; phone
+          // keeps its plain wheel.
+          child: defaultTargetPlatform == TargetPlatform.windows
+              ? SizedBox(
+                  width: 300,
+                  child: GraphiteColorPickerBody(
+                    initial: temp,
+                    onChanged: (c) => temp = c,
+                  ),
+                )
+              : ColorPicker(
                   pickerColor: temp,
                   onColorChanged: (c) => temp = c,
                   enableAlpha: false,
@@ -69,28 +100,325 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
                   labelTypes: const [],
                   pickerAreaBorderRadius: BorderRadius.circular(12),
                 ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(
+              context.l10n.cancel,
+              style: TextStyle(color: AppColors.textSecondary),
+            ),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, temp),
+            child: Text(
+              context.l10n.apply,
+              style: TextStyle(color: AppColors.accent),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Background picker: sliders instead of the wheel, whose brightness track
+  /// paints the whole range no matter what. Here the slider simply ends at
+  /// [ThemeController.maxBackgroundValue] — the top IS the readable maximum,
+  /// so nothing the picker offers gets silently darkened afterwards.
+  Future<Color?> _showBackgroundPicker() {
+    var hsv = HSVColor.fromColor(AppColors.bg);
+    if (hsv.value > ThemeController.maxBackgroundValue) {
+      hsv = hsv.withValue(ThemeController.maxBackgroundValue);
+    }
+
+    String hueName(double h) => const [
+      'Red',
+      'Orange',
+      'Yellow',
+      'Lime',
+      'Green',
+      'Teal',
+      'Cyan',
+      'Azure',
+      'Blue',
+      'Indigo',
+      'Violet',
+      'Magenta',
+    ][((h % 360) / 30).floor() % 12];
+    String satName(double s) => s < 0.15
+        ? 'Muted'
+        : s < 0.45
+        ? 'Soft'
+        : s < 0.75
+        ? 'Rich'
+        : 'Full';
+    String brightName(double v) => v < 0.14
+        ? 'Dim'
+        : v < 0.28
+        ? 'Soft'
+        : v < 0.4
+        ? 'Deep'
+        : 'Max';
+
+    // Desktop settings: a bounded graphite dialog like the other desktop
+    // pickers. A plain Dialog only sets a minimum width, so with a stretched
+    // Column it spread across almost the whole window.
+    final desktop = DesktopSettingsScope.contains(context);
+    return showDialog<Color>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) {
+          final colour = hsv.toColor();
+
+          Widget trackRow(
+            String label,
+            String valueLabel,
+            List<Color> gradient,
+            double value,
+            double max,
+            HSVColor Function(double) apply,
+          ) => Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Text(
+                    label,
+                    style: AppText.body.copyWith(
+                      color: const Color(0xFFE9E9EF),
+                      fontWeight: FontWeight.w600,
+                      fontSize: 12.5,
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(valueLabel, style: AppText.caption),
+                ],
               ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(ctx),
-                  child: Text(
-                    context.l10n.cancel,
-                    style: TextStyle(color: AppColors.textSecondary),
-                  ),
+              const SizedBox(height: 8),
+              SizedBox(
+                height: 34,
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 11),
+                      child: Container(
+                        height: 12,
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(8),
+                          gradient: LinearGradient(colors: gradient),
+                          border: Border.all(color: AppColors.hairline),
+                        ),
+                      ),
+                    ),
+                    SliderTheme(
+                      data: SliderTheme.of(context).copyWith(
+                        trackHeight: 12,
+                        activeTrackColor: Colors.transparent,
+                        inactiveTrackColor: Colors.transparent,
+                        overlayShape: SliderComponentShape.noOverlay,
+                        thumbShape: const RoundSliderThumbShape(
+                          enabledThumbRadius: 11,
+                          elevation: 5,
+                        ),
+                        thumbColor: Colors.white,
+                      ),
+                      child: Slider(
+                        value: value,
+                        max: max,
+                        onChanged: (v) => setDialogState(() => hsv = apply(v)),
+                      ),
+                    ),
+                  ],
                 ),
-                TextButton(
-                  onPressed: () => Navigator.pop(ctx, temp),
-                  child: Text(
-                    context.l10n.apply,
-                    style: TextStyle(color: AppColors.accent),
-                  ),
+              ),
+              const SizedBox(height: 17),
+            ],
+          );
+
+          return Dialog(
+            key: const ValueKey('background-colour-dialog'),
+            // set-9: the desktop dialog follows Pure black / Background.
+            backgroundColor: desktop
+                ? GraphiteSettingsColors.dialog
+                : AppColors.surface,
+            insetPadding: desktop ? const EdgeInsets.all(24) : null,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(desktop ? 20 : 26),
+              side: desktop
+                  ? BorderSide(color: GraphiteSettingsColors.dialogEdge)
+                  : BorderSide.none,
+            ),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: desktop ? 420 : double.infinity,
+              ),
+              child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 20, 20, 12),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(context.l10n.appBackgroundColour, style: AppText.headline),
+                    const SizedBox(height: 16),
+                    // A Stack, not `color` + `gradient` in one BoxDecoration:
+                    // when a gradient is present Flutter ignores the colour, so
+                    // the preview would stay the dialog's surface colour.
+                    Container(
+                      height: 88,
+                      clipBehavior: Clip.antiAlias,
+                      decoration: BoxDecoration(
+                        color: colour,
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(color: AppColors.hairline),
+                      ),
+                      child: Stack(
+                        children: [
+                          Positioned.fill(
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  begin: Alignment.topLeft,
+                                  end: Alignment.centerRight,
+                                  colors: [
+                                    Colors.white.withValues(alpha: 0.14),
+                                    Colors.transparent,
+                                  ],
+                                  stops: const [0, 0.42],
+                                ),
+                              ),
+                            ),
+                          ),
+                          Positioned(
+                            left: 10,
+                            bottom: 10,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 9,
+                                vertical: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.black.withValues(alpha: 0.4),
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              child: Text(
+                                '${hueName(hsv.hue)} · preview',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+                    trackRow(
+                      'Hue',
+                      hueName(hsv.hue),
+                      const [
+                        Color(0xFFF43F5E),
+                        Color(0xFFF59E0B),
+                        Color(0xFF84CC16),
+                        Color(0xFF10B981),
+                        Color(0xFF06B6D4),
+                        Color(0xFF3B82F6),
+                        Color(0xFF8B5CF6),
+                        Color(0xFFEC4899),
+                        Color(0xFFF43F5E),
+                      ],
+                      hsv.hue,
+                      360,
+                      (v) => hsv.withHue(v),
+                    ),
+                    trackRow(
+                      'Saturation',
+                      satName(hsv.saturation),
+                      [
+                        HSVColor.fromAHSV(1, hsv.hue, 0, hsv.value).toColor(),
+                        HSVColor.fromAHSV(1, hsv.hue, 1, hsv.value).toColor(),
+                      ],
+                      hsv.saturation,
+                      1,
+                      (v) => hsv.withSaturation(v),
+                    ),
+                    trackRow(
+                      'Brightness',
+                      brightName(hsv.value),
+                      [
+                        const Color(0xFF050507),
+                        Color.lerp(Colors.black, colour, 0.55)!,
+                        colour,
+                      ],
+                      hsv.value,
+                      ThemeController.maxBackgroundValue,
+                      (v) => hsv.withValue(v),
+                    ),
+                    const SizedBox(height: 2),
+                    Row(
+                      children: [
+                        TextButton(
+                          onPressed: () =>
+                              Navigator.pop(ctx, AppColors.defaultBg),
+                          child: Text(
+                            'Reset',
+                            style: TextStyle(color: AppColors.textSecondary),
+                          ),
+                        ),
+                        const Spacer(),
+                        TextButton(
+                          onPressed: () => Navigator.pop(ctx),
+                          child: Text(
+                            context.l10n.cancel,
+                            style: TextStyle(color: AppColors.textSecondary),
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        FilledButton(
+                          style: FilledButton.styleFrom(
+                            backgroundColor: AppColors.accent,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 22,
+                              vertical: 11,
+                            ),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                            textStyle: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          onPressed: () => Navigator.pop(ctx, hsv.toColor()),
+                          child: Text(context.l10n.apply),
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
-              ],
+              ),
+              ),
             ),
           );
-    if (result != null) {
-      await _updateProfileTheme(accentColor: result.toARGB32());
+        },
+      ),
+    );
+  }
+
+  Future<void> _pickBackground() async {
+    if (_blockedByMaterialYou()) return;
+    if (ThemeController.amoled) {
+      showAppToast(context, 'Turn off Pure black background first');
+      return;
     }
+    final result = await _showBackgroundPicker();
+    if (result == null) return;
+    await ThemeController.setBackgroundColour(result);
+    if (mounted) setState(() {});
   }
 
   Future<void> _updateProfileTheme({
@@ -112,7 +440,7 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
   Widget build(BuildContext context) {
     final presets = ThemeController.accentPresets;
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       // Matches the row that opens it in Interface → Look.
       appBar: settingsAppBar('Theme & colour'),
       body: ListView(
@@ -126,7 +454,9 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
             // Dimmed while the wallpaper is choosing — the swatches still work,
             // and tapping one takes you back to picking by hand.
             opacity: ThemeController.materialYou ? 0.4 : 1,
-            child: SizedBox(
+            child: DesktopSettingsScope.contains(context)
+                ? _desktopAccentGrid(presets)
+                : SizedBox(
               // Desktop preview labels need room at the user's text scale;
               // the fixed phone strip clips their baseline in this workspace.
               height: DesktopSettingsScope.contains(context)
@@ -188,6 +518,45 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
                 value: ThemeController.amoled,
                 onChanged: (value) => _updateProfileTheme(amoled: value),
               ),
+              SettingsTile(
+                icon: Icons.format_color_fill_rounded,
+                title: context.l10n.appBackgroundColour,
+                subtitle:
+                    'Behind every screen; Home and Detail use the adaptive tint while it is on. Kept dark for readable text',
+                subtitleMaxLines: null,
+                trailing: Container(
+                  width: 22,
+                  height: 22,
+                  decoration: BoxDecoration(
+                    color: AppColors.bg,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: AppColors.hairline),
+                  ),
+                ),
+                onTap: _pickBackground,
+              ),
+              _switchTile(
+                icon: Icons.auto_awesome_outlined,
+                title: context.l10n.adaptiveColour,
+                subtitle:
+                    'Tints the background of Home and Detail from the poster colour',
+                value: ThemeController.adaptiveColour,
+                onChanged: ThemeController.setAdaptiveColour,
+                subtitleMaxLines: null,
+              ),
+              _switchTile(
+                icon: Icons.title_rounded,
+                // Desktop names it apart from Poster cards' "Title logo on
+                // cards", which controls the logo on cards rather than Detail.
+                title: DesktopSettingsScope.contains(context)
+                    ? context.l10n.titleLogoOnDetail
+                    : 'Title artwork',
+                subtitle:
+                    'Show the official title logo instead of plain text on Detail',
+                value: ThemeController.titleLogo,
+                onChanged: ThemeController.setTitleLogo,
+                subtitleMaxLines: null,
+              ),
             ],
           ),
 
@@ -197,8 +566,8 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
             children: [
               SettingsTile(
                 icon: Icons.text_fields_rounded,
-                title: 'App font',
-                subtitle: 'Everything in the app is drawn in this',
+                title: context.l10n.appFont,
+                subtitle: context.l10n.appFontSubtitle,
                 trailing: Text(AppFontPrefs.label, style: AppText.caption),
                 onTap: _pickFont,
               ),
@@ -230,10 +599,61 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
                 ),
             ],
           ),
+          // ── Behaviour ─────────────────────────────────────────────────────
+          SettingsSectionLabel('Behaviour'),
+          SettingsCard(
+            children: [
+              _switchTile(
+                icon: Icons.swap_vert_rounded,
+                title: context.l10n.reverseEpisodeListAlwaysOn,
+                subtitle:
+                    'Every detail screen opens newest-first; the list button still flips it for that visit',
+                value: DetailPrefs.reverseEpisodesDefault,
+                onChanged: DetailPrefs.setReverseEpisodesDefault,
+                subtitleMaxLines: null,
+              ),
+            ],
+          ),
         ],
       ),
     );
   }
+
+  /// Desktop accent picker: every swatch plus Custom laid out in a wrapping
+  /// grid. The phone strip is a horizontal list that a mouse wheel cannot
+  /// scroll, which hid the last swatches and Custom in a narrow pane.
+  Widget _desktopAccentGrid(List<(String, Color)> presets) => Padding(
+    padding: const EdgeInsets.symmetric(horizontal: 16),
+    child: Wrap(
+      spacing: 10,
+      runSpacing: 10,
+      children: [
+        for (final (name, color) in presets)
+          _AccentCard(
+            key: ValueKey('accent-${color.toARGB32()}'),
+            name: name,
+            color: color,
+            selected:
+                !_accentIsCustom &&
+                AppColors.accent.toARGB32() == color.toARGB32(),
+            isDefault: ThemeController.isDefault(color),
+            onTap: () async {
+              if (_blockedByMaterialYou()) return;
+              await _updateProfileTheme(accentColor: color.toARGB32());
+            },
+          ),
+        _CustomCard(
+          key: const ValueKey('accent-custom'),
+          selected: _accentIsCustom,
+          currentColor: AppColors.accent,
+          onTap: () {
+            if (_blockedByMaterialYou()) return;
+            _pickCustom();
+          },
+        ),
+      ],
+    ),
+  );
 
   /// True when the wallpaper is choosing the accent, so a swatch tap can't
   /// apply. Says so rather than doing nothing — the swatches are dimmed, but a
@@ -268,14 +688,16 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
     final picked = DesktopSettingsScope.contains(context)
         ? await showGraphiteSettingsChoice<String>(
             context,
-            title: 'App font',
+            title: context.l10n.appFont,
             current: AppFontPrefs.family,
             options: [
               for (final font in AppFontPrefs.fonts) (font.family, font.label),
             ],
             optionDescriptions: {
               for (final font in AppFontPrefs.fonts)
-                font.family: font.bundled
+                font.family: AppFontPrefs.isSystem(font.family)
+                    ? "Your system's default font"
+                    : font.bundled
                     ? 'Watch anime, movies and series'
                     : 'Downloads on first use',
             },
@@ -285,7 +707,8 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
             },
             downloadableOptions: {
               for (final font in AppFontPrefs.fonts)
-                if (!font.bundled) font.family,
+                if (!font.bundled && !AppFontPrefs.isSystem(font.family))
+                  font.family,
             },
           )
         : await showModalBottomSheet<String>(
@@ -302,7 +725,7 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
                     Padding(
                       padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
                       child: Row(
-                        children: [Text('App font', style: AppText.headline)],
+                        children: [Text(context.l10n.appFont, style: AppText.headline)],
                       ),
                     ),
                     const Divider(color: AppColors.hairline, height: 1),
@@ -322,7 +745,9 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
                           ),
                         ),
                         subtitle: Text(
-                          f.bundled
+                          AppFontPrefs.isSystem(f.family)
+                              ? "Your phone's default font"
+                              : f.bundled
                               ? 'Watch anime, movies and series'
                               : 'Downloads on first use',
                           style: AppText.caption.copyWith(
@@ -331,7 +756,7 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
                         ),
                         trailing: f.family == AppFontPrefs.family
                             ? Icon(Icons.check, color: AppColors.accent)
-                            : (f.bundled
+                            : (f.bundled || AppFontPrefs.isSystem(f.family)
                                   ? null
                                   : Icon(
                                       Icons.download_outlined,
@@ -375,6 +800,7 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
     required String subtitle,
     required bool value,
     required Future<void> Function(bool) onChanged,
+    int? subtitleMaxLines = 1,
   }) {
     Future<void> flip(bool v) async {
       await onChanged(v);
@@ -385,6 +811,7 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
       icon: icon,
       title: title,
       subtitle: subtitle,
+      subtitleMaxLines: subtitleMaxLines,
       onTap: () => flip(!value),
       trailing: Switch.adaptive(
         value: value,
@@ -479,6 +906,7 @@ class _AppearanceScreenState extends State<AppearanceScreen> {
 /// A single accent option, rendered as a mini app preview in that colour.
 class _AccentCard extends StatelessWidget {
   const _AccentCard({
+    super.key,
     required this.name,
     required this.color,
     required this.selected,
@@ -494,9 +922,10 @@ class _AccentCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
+    return _ClickableCard(
+      label: isDefault ? context.l10n.defaultLabel : name,
+      selected: selected,
       onTap: onTap,
-      behavior: HitTestBehavior.opaque,
       child: SizedBox(
         width: 98,
         child: Container(
@@ -538,6 +967,7 @@ class _AccentCard extends StatelessWidget {
 /// or the current custom colour when one is active.
 class _CustomCard extends StatelessWidget {
   const _CustomCard({
+    super.key,
     required this.selected,
     required this.currentColor,
     required this.onTap,
@@ -548,9 +978,10 @@ class _CustomCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
+    return _ClickableCard(
+      label: context.l10n.custom,
+      selected: selected,
       onTap: onTap,
-      behavior: HitTestBehavior.opaque,
       child: SizedBox(
         width: 98,
         child: Container(
@@ -617,6 +1048,47 @@ class _CustomCard extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Tap target for the accent cards. Phone keeps the plain opaque gesture it
+/// always had; in desktop settings the card also shows a hand cursor and can
+/// be reached and activated with the keyboard (Tab, then Enter or Space).
+class _ClickableCard extends StatelessWidget {
+  const _ClickableCard({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+    required this.child,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!DesktopSettingsScope.contains(context)) {
+      return GestureDetector(
+        onTap: onTap,
+        behavior: HitTestBehavior.opaque,
+        child: child,
+      );
+    }
+    return Semantics(
+      button: true,
+      selected: selected,
+      label: label,
+      child: InkWell(
+        onTap: onTap,
+        mouseCursor: SystemMouseCursors.click,
+        borderRadius: BorderRadius.circular(14),
+        focusColor: AppColors.accent.withValues(alpha: 0.25),
+        hoverColor: Colors.white.withValues(alpha: 0.04),
+        child: child,
       ),
     );
   }

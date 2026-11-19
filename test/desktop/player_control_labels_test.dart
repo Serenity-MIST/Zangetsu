@@ -31,5 +31,6 @@ void main() {
     expect(find.text('Fullscreen'), findsOneWidget);
     expect(find.text('Portrait'), findsNothing);
     expect(tester.takeException(), isNull);
-  }, skip: !Platform.isWindows);
+    // The label follows the Windows target platform, not the host OS.
+  }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
 }

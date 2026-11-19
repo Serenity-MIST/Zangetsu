@@ -1,6 +1,8 @@
 import 'dart:io';
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
@@ -8,6 +10,7 @@ import 'package:watch_app/core/app_mode.dart';
 import 'package:watch_app/core/di/injector.dart' show sl;
 import 'package:watch_app/core/mode/content_mode.dart';
 import 'package:watch_app/core/mode/content_mode_cubit.dart';
+import 'package:watch_app/core/playback/pinned_sources.dart';
 import 'package:watch_app/core/playback/playback_prefs.dart';
 import 'package:watch_app/core/provider/cloudstream_provider.dart';
 import 'package:watch_app/core/provider/provider_downloader.dart';
@@ -115,6 +118,8 @@ void main() {
   });
 
   tearDown(() async {
+    // Pins are static app state; the hover-pin test must not leak into others.
+    PinnedSources.notifier.value = const [];
     await modeCubit.close();
     await activeSource.close();
     await sl.reset();
@@ -228,4 +233,77 @@ void main() {
       expect(find.widgetWithText(FilledButton, 'Browse repositories'), findsNothing);
     },
   );
+
+  // R3: Windows rows get a hover-revealed pin button (desktop replacement for
+  // the phone's long-press). The hint names it instead of long-press.
+  testWidgets('Windows: hovering a row reveals a pin button that pins it', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      await PinnedSources.init();
+      await _seedJsSource(id: 'js:a', type: 'anime');
+      await _seedJsSource(id: 'js:b', type: 'anime');
+    });
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    try {
+      await pumpSwitcher(tester);
+
+      // Desktop hint replaces the phone's long-press wording.
+      expect(
+        find.text('Long-press a source to pin it to the top'),
+        findsNothing,
+      );
+      expect(find.textContaining('click the pin'), findsOneWidget);
+
+      // One (hidden) pin per row until the mouse is over it.
+      final pins = find.byKey(const ValueKey('source-picker-pin'));
+      expect(pins, findsNWidgets(2));
+      double opacityOfPinIn(Finder row) => tester
+          .widget<AnimatedOpacity>(
+            find.ancestor(
+              of: find.descendant(of: row, matching: pins),
+              matching: find.byType(AnimatedOpacity),
+            ),
+          )
+          .opacity;
+      final rowB = find.ancestor(
+        of: find.text('js:b'),
+        matching: find.byType(InkWell),
+      ).first;
+      expect(opacityOfPinIn(rowB), 0);
+
+      // Hover row b: its pin shows.
+      final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+      addTearDown(mouse.removePointer);
+      await mouse.addPointer(location: Offset.zero);
+      await mouse.moveTo(tester.getCenter(find.text('js:b')));
+      await tester.pumpAndSettle();
+      expect(opacityOfPinIn(rowB), 1);
+
+      // Clicking it pins the source (same toggle as long-press/right-click).
+      await tester.runAsync(() async {
+        await tester.tap(find.descendant(of: rowB, matching: pins));
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      });
+      await tester.pumpAndSettle();
+      expect(PinnedSources.isPinned('js:b'), isTrue);
+      expect(PinnedSources.isPinned('js:a'), isFalse);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
+  testWidgets('phone: rows have no hover pin button and keep the long-press '
+      'hint', (tester) async {
+    await tester.runAsync(() async {
+      await _seedJsSource(id: 'js:a', type: 'anime');
+      await _seedJsSource(id: 'js:b', type: 'anime');
+    });
+    await pumpSwitcher(tester);
+    expect(find.byKey(const ValueKey('source-picker-pin')), findsNothing);
+    expect(
+      find.text('Long-press a source to pin it to the top'),
+      findsOneWidget,
+    );
+  });
 }

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 
 import '../app_mode.dart';
 import '../anilist/anilist_service.dart';
+import '../desktop/desktop_sheet.dart';
 import '../di/injector.dart';
 import '../models/watch_status.dart';
 import '../models/provider_info.dart';
@@ -41,8 +42,15 @@ Future<int?> showTrackerSyncSheet(
   String? bindingKey,
   Tracker? tracker,
 }) {
-  return showModalBottomSheet<int?>(
-    context: context,
+  // Windows: a graphite dialog with a title bar (close button + Esc); opened
+  // from the tracker list dialog it is nested, so it centres over it with no
+  // second scrim. Phone/TV get exactly the bottom sheet they had before.
+  return showAdaptiveSheet<int?>(
+    context,
+    title: 'Tracking',
+    // The tracker being edited (or the show, for "Sync all") under the title.
+    subtitle: tracker?.displayName ?? title,
+    desktopWidth: 520,
     isScrollControlled: true,
     backgroundColor: AppColors.surface,
     shape: const RoundedRectangleBorder(
@@ -125,6 +133,14 @@ class _TrackerSyncSheetState extends State<TrackerSyncSheet> {
   WatchStatus? _status;
   int _score = 0; // 0 = unrated, else 1–10
   int _progress = 0;
+  bool _private = false;
+  bool _initPrivate = false;
+
+  bool get _supportsPrivacy =>
+      widget.tracker is AniListService ||
+      (widget.tracker == null &&
+          (_kind == MediaKind.anime || _kind == MediaKind.manga) &&
+          _hub.connected.any((t) => t is AniListService));
   int? _maxEpisodes;
   int? _nextEp;
   DateTime? _nextAt;
@@ -172,6 +188,9 @@ class _TrackerSyncSheetState extends State<TrackerSyncSheet> {
       pinnedIds: _pinnedIds,
       kind: _kind,
     );
+    _private =
+        all.where((e) => e.trackerName == 'AniList').firstOrNull?.isPrivate ??
+        false;
     // Only entries actually on a list can disagree — a tracker that's never
     // seen the title has no opinion to conflict with.
     _conflicts = [
@@ -203,6 +222,8 @@ class _TrackerSyncSheetState extends State<TrackerSyncSheet> {
     if (!mounted) return;
     setState(() {
       _matchedTitle = entry?.title;
+      if (one is AniListService) _private = entry?.isPrivate ?? false;
+      _initPrivate = _private;
       _status = entry?.status;
       _score = (entry?.score ?? 0).round().clamp(0, 10);
       // When trackers disagree, start from the furthest along — pulling the
@@ -210,8 +231,8 @@ class _TrackerSyncSheetState extends State<TrackerSyncSheet> {
       _progress = _conflicts.isEmpty
           ? (entry?.progress ?? 0)
           : _conflicts
-              .map((e) => e.progress ?? 0)
-              .reduce((a, b) => a > b ? a : b);
+                .map((e) => e.progress ?? 0)
+                .reduce((a, b) => a > b ? a : b);
       _maxEpisodes = widget.reading ? entry?.chapters : entry?.maxEpisodes;
       _nextEp = entry?.nextAiringEpisode;
       _nextAt = entry?.nextAiringAt;
@@ -230,42 +251,59 @@ class _TrackerSyncSheetState extends State<TrackerSyncSheet> {
     final statusChanged = _status != _initStatus;
     final scoreChanged = _score != _initScore;
     final progressChanged = _progress != _initProgress;
-    if (!statusChanged && !scoreChanged && !progressChanged) {
+    final privacyChanged = _supportsPrivacy && _private != _initPrivate;
+    if (!statusChanged &&
+        !scoreChanged &&
+        !progressChanged &&
+        !privacyChanged) {
       Navigator.pop(context);
       return;
     }
     setState(() => _saving = true);
     final one = widget.tracker;
-    if (one != null) {
-      await one.updateEntry(
-        malId: widget.malId,
-        title: (widget.isAnime || widget.reading) ? widget.title : null,
-        tmdbId: widget.tmdbId,
-        tmdbIsTv: widget.tmdbIsTv,
-        imdbId: widget.imdbId,
-        pinnedId: _pinnedIds[one.displayName],
-        status: statusChanged ? _status : null,
-        score: scoreChanged ? _score.toDouble() : null,
-        progress: progressChanged ? _progress : null,
-        kind: _kind,
+    try {
+      if (one != null) {
+        await one.updateEntry(
+          malId: widget.malId,
+          title: (widget.isAnime || widget.reading) ? widget.title : null,
+          tmdbId: widget.tmdbId,
+          tmdbIsTv: widget.tmdbIsTv,
+          imdbId: widget.imdbId,
+          pinnedId: _pinnedIds[one.displayName],
+          status: statusChanged ? _status : null,
+          score: scoreChanged ? _score.toDouble() : null,
+          progress: progressChanged ? _progress : null,
+          isPrivate: privacyChanged ? _private : null,
+          kind: _kind,
+        );
+      } else {
+        await _hub.updateEntry(
+          malId: widget.malId,
+          title: (widget.isAnime || widget.reading) ? widget.title : null,
+          tmdbId: widget.tmdbId,
+          tmdbIsTv: widget.tmdbIsTv,
+          imdbId: widget.imdbId,
+          pinnedIds: _pinnedIds,
+          status: statusChanged ? _status : null,
+          score: scoreChanged ? _score.toDouble() : null,
+          progress: progressChanged ? _progress : null,
+          isPrivate: privacyChanged ? _private : null,
+          kind: _kind,
+        );
+      }
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _saving = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not save changes. Please try again.'),
+        ),
       );
-    } else {
-      await _hub.updateEntry(
-        malId: widget.malId,
-        title: (widget.isAnime || widget.reading) ? widget.title : null,
-        tmdbId: widget.tmdbId,
-        tmdbIsTv: widget.tmdbIsTv,
-        imdbId: widget.imdbId,
-        pinnedIds: _pinnedIds,
-        status: statusChanged ? _status : null,
-        score: scoreChanged ? _score.toDouble() : null,
-        progress: progressChanged ? _progress : null,
-        kind: _kind,
-      );
+      return;
     }
     if (!mounted) return;
-    final names = one?.displayName ??
-        _hub.connected.map((t) => t.displayName).join(', ');
+    final names =
+        one?.displayName ?? _hub.connected.map((t) => t.displayName).join(', ');
     showGlobalSnack('Synced to $names');
     Navigator.pop(context, progressChanged ? _progress : null);
   }
@@ -298,27 +336,33 @@ class _TrackerSyncSheetState extends State<TrackerSyncSheet> {
 
   @override
   Widget build(BuildContext context) {
+    // True inside the Windows dialog, whose title bar already says "Tracking".
+    final desktop = DesktopSheetScope.of(context);
     return SafeArea(
       child: SingleChildScrollView(
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 10, 20, 16),
+          padding: EdgeInsets.fromLTRB(20, desktop ? 4 : 10, 20, 16),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Center(
-                child: Container(
-                  width: 36,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: AppColors.hairline,
-                    borderRadius: BorderRadius.circular(2),
+              // Phone drag handle and heading; the Windows dialog has nothing
+              // to drag and shows the heading in its title bar instead.
+              if (!desktop) ...[
+                Center(
+                  child: Container(
+                    width: 36,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: AppColors.hairline,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
                   ),
                 ),
-              ),
-              const SizedBox(height: 16),
-              Text('Tracking', style: AppText.headline),
-              const SizedBox(height: 2),
+                const SizedBox(height: 16),
+                Text('Tracking', style: AppText.headline),
+                const SizedBox(height: 2),
+              ],
               _connectedLine(),
               const SizedBox(height: 18),
               if (_loading)
@@ -391,6 +435,16 @@ class _TrackerSyncSheetState extends State<TrackerSyncSheet> {
         ],
       ),
       const SizedBox(height: 20),
+      if (_supportsPrivacy)
+        SwitchListTile.adaptive(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('Private on AniList'),
+          subtitle: const Text('Only you can see this entry on AniList'),
+          value: _private,
+          onChanged: _saving
+              ? null
+              : (value) => setState(() => _private = value),
+        ),
       _sectionLabel('YOUR SCORE'),
       const SizedBox(height: 8),
       _stepperRow(
@@ -484,8 +538,10 @@ class _TrackerSyncSheetState extends State<TrackerSyncSheet> {
       const SizedBox(height: 6),
       InkWell(
         onTap: () async {
-          final rootContext =
-              Navigator.of(context, rootNavigator: true).context;
+          final rootContext = Navigator.of(
+            context,
+            rootNavigator: true,
+          ).context;
           Navigator.pop(context);
           await showAniListCustomListsSheet(
             rootContext,
@@ -509,18 +565,23 @@ class _TrackerSyncSheetState extends State<TrackerSyncSheet> {
           padding: const EdgeInsets.symmetric(vertical: 10),
           child: Row(
             children: [
-              const Icon(Icons.playlist_add_rounded,
-                  size: 18, color: AppColors.textSecondary),
+              const Icon(
+                Icons.playlist_add_rounded,
+                size: 18,
+                color: AppColors.textSecondary,
+              ),
               const SizedBox(width: 10),
               Expanded(
                 child: Text(
                   'AniList custom lists',
-                  style:
-                      AppText.body.copyWith(color: AppColors.textSecondary),
+                  style: AppText.body.copyWith(color: AppColors.textSecondary),
                 ),
               ),
-              const Icon(Icons.chevron_right_rounded,
-                  size: 20, color: AppColors.textSecondary),
+              const Icon(
+                Icons.chevron_right_rounded,
+                size: 20,
+                color: AppColors.textSecondary,
+              ),
             ],
           ),
         ),
@@ -686,7 +747,6 @@ class _TrackerSyncSheetState extends State<TrackerSyncSheet> {
       child: child,
     );
   }
-
 }
 
 /// Search each connected tracker for the correct entry and return the picked
@@ -697,8 +757,13 @@ Future<TrackerSearchResult?> showTrackerMatchPicker(
   Tracker? tracker,
   MediaKind kind = MediaKind.anime,
 }) {
-  return showModalBottomSheet<TrackerSearchResult>(
-    context: context,
+  // Windows: a centred graphite dialog (nested over the sync dialog, so no
+  // extra scrim) with a title bar; phone/TV keep the bottom sheet.
+  return showAdaptiveSheet<TrackerSearchResult>(
+    context,
+    title: 'Change match',
+    subtitle: tracker?.displayName,
+    desktopWidth: 560,
     isScrollControlled: true,
     backgroundColor: AppColors.surface,
     shape: const RoundedRectangleBorder(
@@ -760,8 +825,8 @@ class _TrackerMatchPickerState extends State<_TrackerMatchPicker> {
     // the hub path already swallows per-tracker errors the same way.
     final r = one != null
         ? await one
-            .searchEntries(q, kind: widget.kind)
-            .catchError((_) => const <TrackerSearchResult>[])
+              .searchEntries(q, kind: widget.kind)
+              .catchError((_) => const <TrackerSearchResult>[])
         : await _hub.searchEntries(q, kind: widget.kind);
     if (!mounted) return;
     setState(() {
@@ -773,6 +838,9 @@ class _TrackerMatchPickerState extends State<_TrackerMatchPicker> {
   @override
   Widget build(BuildContext context) {
     final maxH = MediaQuery.of(context).size.height * 0.72;
+    // True inside the Windows dialog, which has a title bar instead of a
+    // drag handle.
+    final desktop = DesktopSheetScope.of(context);
     return Padding(
       padding: EdgeInsets.only(
         bottom: MediaQuery.of(context).viewInsets.bottom,
@@ -783,19 +851,22 @@ class _TrackerMatchPickerState extends State<_TrackerMatchPicker> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const SizedBox(height: 10),
-              Center(
-                child: Container(
-                  width: 36,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: AppColors.hairline,
-                    borderRadius: BorderRadius.circular(2),
+              // Phone drag handle only.
+              if (!desktop) ...[
+                const SizedBox(height: 10),
+                Center(
+                  child: Container(
+                    width: 36,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: AppColors.hairline,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
                   ),
                 ),
-              ),
+              ],
               Padding(
-                padding: const EdgeInsets.fromLTRB(20, 14, 20, 10),
+                padding: EdgeInsets.fromLTRB(20, desktop ? 4 : 14, 20, 10),
                 child: Row(
                   children: [
                     Expanded(
