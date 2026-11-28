@@ -1,0 +1,69 @@
+# Runs the Flutter test suite on Windows machines, split into 20 parts that
+# run at the same time on GitHub's machines. Only lives on temporary test
+# branches (windows-upstream-ci, windows-upstream-baseline).
+# If ci-test-files.txt exists at the repo root, only the test files listed in
+# it (one per line) run - used to rerun just the tests that failed.
+name: Windows merge tests
+
+on:
+  push:
+    branches: [windows-upstream-ci, windows-upstream-baseline]
+  workflow_dispatch:
+    inputs:
+      clean:
+        description: Clean slate (no cached Flutter or packages)
+        type: boolean
+        default: false
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Allow long paths
+        run: git config --system core.longpaths true
+      # The app expects the Connect package next to it (pubspec: path ../connect).
+      - uses: actions/checkout@v4
+        with:
+          path: app
+      - uses: actions/checkout@v4
+        with:
+          repository: Spyou/Zangetsu-Connect
+          path: connect
+      # Reuses the cached Flutter SDK and Dart packages between runs (faster
+      # setup). A clean slate skips the cache: run the workflow by hand with
+      # "clean" ticked, or put [clean] in the pushed commit message.
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.47.9
+          cache: ${{ !(inputs.clean || contains(github.event.head_commit.message, '[clean]')) }}
+      - name: Get packages
+        working-directory: app
+        run: flutter pub get
+      - name: Run tests (part ${{ matrix.shard }} of 20)
+        working-directory: app
+        continue-on-error: true
+        # Each machine gets its own 1/20 of the test FILES (not 1/20 of the
+        # tests in every file), balanced by file size: the biggest files are
+        # handed out first, each to the machine with the least work so far.
+        run: |
+          if [ -f ci-test-files.txt ]; then pool=$(grep -v '^\s*$' ci-test-files.txt | tr -d '\r'); else pool=$(find test -name '*_test.dart' | sort); fi
+          mine=$(for f in $pool; do echo "$(wc -c < "$f") $f"; done | sort -rn | awk -v me=${{ matrix.shard }} '
+            { best=0; for (i=1;i<20;i++) if (load[i]<load[best]) best=i; load[best]+=$1; if (best==me) print $2 }')
+          echo "This machine runs $(echo "$mine" | grep -c .) test files"
+          if [ -z "$mine" ]; then echo '{"type":"done","success":true}' > ../results-${{ matrix.shard }}.json; exit 0; fi
+          flutter test --reporter expanded --timeout 120s \
+            --file-reporter json:../results-${{ matrix.shard }}.json $mine
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.shard }}
+          path: results-${{ matrix.shard }}.json
