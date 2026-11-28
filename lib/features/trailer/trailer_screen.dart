@@ -8,6 +8,8 @@ import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/trailer/trailer_service.dart';
 import '../../core/ui/brand_loader.dart';
+import '../player/desktop_floating_player.dart'
+    show pauseFloatingPlayerForOwnSound;
 
 import '../../l10n/l10n.dart';
 
@@ -35,6 +37,9 @@ class _TrailerScreenState extends State<TrailerScreen> {
   @override
   void initState() {
     super.initState();
+    // Windows: a video in the floating mini player is paused so the trailer
+    // does not play over it. Does nothing on phone and TV.
+    pauseFloatingPlayerForOwnSound();
     _resolveAndOpen();
   }
 

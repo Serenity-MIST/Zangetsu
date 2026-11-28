@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../core/mode/content_mode.dart';
@@ -251,9 +252,11 @@ List<(String, String)> videoDecoderOptions(AppLocalizations l10n) => [
 
 List<(String, String)> videoRendererOptions(AppLocalizations l10n) => [
   ('auto', l10n.rendererAutoRecommended),
-  ('gpu', l10n.rendererGpuStandard),
-  ('gpu-next', l10n.rendererGpuNextExperimental),
-  ('mediacodec_embed', l10n.rendererMediacodecEmbed),
+  if (defaultTargetPlatform != TargetPlatform.windows) ...[
+    ('gpu', l10n.rendererGpuStandard),
+    ('gpu-next', l10n.rendererGpuNextExperimental),
+    ('mediacodec_embed', l10n.rendererMediacodecEmbed),
+  ],
 ];
 
 List<(String, String)> closeConfirmPickerOptions(AppLocalizations l10n) => [

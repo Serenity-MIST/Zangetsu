@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 
+import '../../../core/desktop/desktop_sheet.dart';
+import '../../../core/desktop/desktop_text_prompt.dart';
 import '../../../core/di/injector.dart';
+import '../../../core/ui/desktop_docked_panel.dart' show desktopPanelsEnabled;
 import '../../../core/playback/resume_store.dart';
 import '../../../core/playback/watch_history.dart';
 import '../../../core/repository/source_repository.dart';
@@ -16,23 +19,33 @@ Future<void> showWatchTogetherSheet(
   required RoomState Function() buildInitialRoom,
   required WatchTogetherController controller,
 }) {
-  return showModalBottomSheet(
-    context: context,
+  // Phone: the same bottom sheet as before. Windows: a graphite dialog with
+  // its own title bar (so the in-body title is skipped there).
+  return showAdaptiveSheet<void>(
+    context,
+    title: context.l10n.watchTogether,
+    desktopWidth: 420,
     backgroundColor: const Color(0xFF161616),
     builder: (ctx) => SafeArea(
       child: Padding(
         padding: const EdgeInsets.all(20),
         child: Column(
           mainAxisSize: MainAxisSize.min,
+          // Stretch on Windows so the buttons span the dialog width.
+          crossAxisAlignment: DesktopSheetScope.of(ctx)
+              ? CrossAxisAlignment.stretch
+              : CrossAxisAlignment.center,
           children: [
-            Text(context.l10n.watchTogether,
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-                color: Colors.white,
+            if (!DesktopSheetScope.of(ctx)) ...[
+              Text(context.l10n.watchTogether,
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
               ),
-            ),
-            const SizedBox(height: 16),
+              const SizedBox(height: 16),
+            ],
             FilledButton.icon(
               icon: const Icon(Icons.group_add),
               label: Text(context.l10n.createARoom),
@@ -109,6 +122,17 @@ Future<void> joinWatchPartyByCode(BuildContext context, String code) async {
 }
 
 Future<String?> _askCode(BuildContext context) {
+  // Windows: graphite one-field prompt (Enter joins, Esc cancels). Phone
+  // keeps the Material dialog below.
+  if (desktopPanelsEnabled) {
+    return showDesktopTextPrompt(
+      context,
+      title: context.l10n.enterRoomCode,
+      hint: context.l10n.eGABC234,
+      confirmLabel: context.l10n.join,
+      textCapitalization: TextCapitalization.characters,
+    );
+  }
   final ctrl = TextEditingController();
   return showDialog<String>(
     context: context,

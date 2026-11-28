@@ -1,12 +1,16 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import '../desktop/extension_runtime.dart';
+import '../desktop/extension_boot_failures.dart';
+import '../desktop/desktop_prefs.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
 import 'package:watch_app/core/hive/source_icon_store.dart';
 import 'package:watch_app/core/lnreader/novel_cloudflare.dart';
 
 import 'package:dio/dio.dart';
-import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, debugPrint, defaultTargetPlatform, kDebugMode;
 import 'package:flutter/services.dart' show MethodChannel, rootBundle;
 import 'package:get_it/get_it.dart';
 import 'package:hive_flutter/hive_flutter.dart';
@@ -23,6 +27,7 @@ import '../platform/apple_tv.dart';
 import '../platform/app_paths.dart';
 import '../playback/category_store.dart';
 import '../playback/series_groups.dart';
+import '../playback/list_idle_runner.dart';
 import '../playback/list_status_store.dart';
 import '../playback/my_list.dart';
 import '../playback/playback_prefs.dart';
@@ -39,6 +44,8 @@ import '../../features/player/mpv_player_pool.dart';
 import '../schedule/airing_service.dart';
 import '../schedule/coming_soon_service.dart';
 import '../privacy/incognito_mode.dart';
+import '../boot_network.dart';
+import '../profiles/profile_pin_store.dart';
 import '../profiles/viewer_profile.dart';
 import '../profiles/profile_lock_store.dart';
 import '../profiles/profile_lock_remote.dart';
@@ -91,6 +98,7 @@ import '../environment.dart';
 import '../metadata/tmdb.dart';
 import 'package:watch_app/core/metadata/tmdb_fallback.dart';
 import '../metadata/title_logo_service.dart';
+import '../metadata/tmdb_poster_service.dart';
 import '../mode/content_mode_cubit.dart';
 import '../trailer/trailer_service.dart';
 import '../anilist/anilist_graphql.dart';
@@ -134,6 +142,8 @@ import '../../features/auth/auth_cubit.dart';
 import '../../features/auth/tv_pairing_service.dart';
 import '../../features/home/cubit/home_cache.dart';
 import '../../features/home/cubit/home_cubit.dart';
+import '../../features/home/lists_hub_data.dart';
+import '../../features/home/lists_hub_models.dart';
 import '../../features/watch_together/watch_room_service.dart';
 import '../../features/watch_together/watch_together_controller.dart';
 import '../cast/cast_controller.dart';
@@ -234,7 +244,11 @@ void applySimklConventions(RequestOptions options) {
   options.headers['User-Agent'] = '$kAppName/$kAppVersion';
 }
 
-Future<void> initDependencies({bool Function()? isOffline}) async {
+Future<void> initDependencies({
+  void Function(String)? onProgress,
+  bool Function()? isOffline,
+}) async {
+  onProgress?.call('detecting device');
   // Detect device class first so every subsequent registration can gate on it.
   // Wrapped in try/catch: no native handler (tests, iOS, web) → phone behavior.
   // tvOS has no Android `isTv` channel; [isAppleTv] covers Apple TV.
@@ -254,6 +268,7 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
   sl.registerSingleton<AppMode>(AppMode(isTv: isTv));
 
   await initHiveForApp();
+  onProgress?.call('opening local settings and library');
   if (isAppleTv) await AppImageCache.init();
   // Cache of the signed-in user so the logged-in UI appears INSTANTLY on boot
   // (AuthCubit reads it before the network session check). See AuthCubit.restore.
@@ -310,6 +325,26 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
       },
     ),
   );
+  // Windows: PINs set by older PC-only builds (hashes in the OS credential
+  // store). NOT the profile lock any more: the synced ProfileLockStore below
+  // is the one lock on every platform. Kept only so an old PIN is verified
+  // once and moved into the synced lock (profile_unlock.dart), and honoured
+  // offline until it can be moved. Refreshed when profiles or account change.
+  if (Platform.isWindows) {
+    final pinStore = ProfilePinStore(
+      storage: SecurePinStorage(),
+      owner: () => currentUserId() ?? 'local',
+    );
+    sl.registerSingleton<ProfilePinStore>(pinStore);
+    Future<void> reloadPins() => pinStore.load(
+      sl<ViewerProfileStore>().profiles.map((profile) => profile.id),
+    );
+    sl<ViewerProfileStore>().revision.addListener(
+      () => unawaited(reloadPins()),
+    );
+    unawaited(reloadPins());
+  }
+
   sl.registerSingleton<ProfileLockStore>(
     SyncedProfileLockStore(
       remote: PostgrestProfileLockRemote(vpsClient, cloudAccessToken),
@@ -376,6 +411,9 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
   sl.registerSingleton<ListStatusStore>(
     ListStatusStore(currentProfileId: currentProfileId),
   );
+  // R5: boxes for auto Paused/Dropped (settings + per-title idle clocks).
+  // The runner itself is a plain singleton started from main after boot.
+  await ListIdleRunner.init();
   // User-made categories for My List. Its own box, beside the status store and
   // for the same reason: a cloud pull clears the list box, and a category must
   // not go with it.
@@ -406,6 +444,8 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
       currentUserId: currentUserId,
     ),
   );
+  await TitlePrefsStore.init();
+  sl.registerSingleton<TitlePrefsStore>(TitlePrefsStore());
   await MyListStore.init();
   sl.registerSingleton<MyListStore>(
     MyListStore(
@@ -433,8 +473,6 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
       ),
     ),
   );
-  await TitlePrefsStore.init();
-  sl.registerSingleton<TitlePrefsStore>(TitlePrefsStore());
   await HomeCache.init();
   await PlaybackPrefs.init();
   // One-time: Android phones default to the native ExoPlayer player. Absent
@@ -504,6 +542,9 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
   sl.registerSingleton<SearchPrefs>(SearchPrefs());
   await NavPrefs.init();
   sl.registerSingleton<NavPrefs>(NavPrefs());
+  // Windows desktop prefs (window, tray, start page, backups, auto-lock);
+  // also registers the keyboard shortcut catalogue and loads user remaps.
+  await DesktopPrefs.init();
   // Per-source reliability: orders search healthy-first, recoverably skips dead
   // sources, and backs the "Source health" test screen.
   await SourceHealthStore.init();
@@ -549,6 +590,19 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
       },
     ),
   );
+  // A request that fails because the connection itself is gone asks the
+  // connectivity watcher to check right away, so the app switches to offline
+  // mode within seconds instead of waiting for its next scheduled check.
+  dio.interceptors.add(
+    InterceptorsWrapper(
+      onError: (error, handler) {
+        if (isNetworkFailure(error)) {
+          BootConnectivity.instance.suspectOffline();
+        }
+        handler.next(error);
+      },
+    ),
+  );
   // One retry on TMDB's other host when a network blocks the usual one.
   dio.interceptors.add(TmdbFallbackInterceptor(dio));
   // AniList gets a longer read than the 8s above and honours 429 — see
@@ -570,6 +624,7 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
 
   // Discord Rich Presence (opt-in; off until the user connects + enables it).
   await DiscordRpc.init();
+  onProgress?.call('initializing trackers');
   sl.registerSingleton<DiscordRpc>(DiscordRpc(dio));
   // Restore the saved token + reconnect now (before the UI), so presence resumes
   // promptly after a restart instead of looking disconnected.
@@ -607,7 +662,24 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
     ),
   );
 
-  // Accurate OP/ED skip times for anime (AniList → MAL id → AniSkip).
+  // Windows: sharper TMDB posters for catalogue cards, looked up in the
+  // background one at a time (phone and TV keep their pictures).
+  if (defaultTargetPlatform == TargetPlatform.windows) {
+    await TmdbPosterService.init();
+    sl.registerSingleton<TmdbPosterService>(
+      TmdbPosterService(
+        dio,
+        episodeMeta: sl<EpisodeMetadataService>(),
+        offline: BootConnectivity.instance.offline,
+      ),
+    );
+  }
+
+  // Accurate OP/ED skip times for anime (AniList → MAL id → AniSkip). On
+  // Windows the answers are also saved on this PC so skipping works offline.
+  if (defaultTargetPlatform == TargetPlatform.windows) {
+    await SkipService.init();
+  }
   sl.registerSingleton<SkipService>(SkipService(dio));
   // Content-warnings card shown when playback starts (IMDb parents guide).
   sl.registerSingleton<ParentalGuideService>(ParentalGuideService(dio));
@@ -638,6 +710,13 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
       sl<MangaBakaService>(),
     ]),
   );
+  // Windows "Schedule and lists" page data: one shared instance whose Hive
+  // cache is already open on the page's first frame, so it renders instantly.
+  if (defaultTargetPlatform == TargetPlatform.windows) {
+    final listsHub = ListsHubDataImpl();
+    await listsHub.ensureLoaded();
+    sl.registerSingleton<ListsHubData>(listsHub);
+  }
   // Manual match corrections (the sync sheet's "Change match"): show → chosen
   // tracker entry id, persisted so a fixed match sticks.
   await TrackerBindingStore.init();
@@ -674,6 +753,7 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
   // startup. Sources register a moment after launch; a saved `cs:` active
   // source is restored via reapplySaved + a Home reload.
   await CloudStreamManager.init();
+  onProgress?.call('initializing source runtimes');
   final csManager = CloudStreamManager();
   sl.registerSingleton<CloudStreamManager>(csManager);
 
@@ -788,6 +868,16 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
           validateStatus: (_) => true,
         ),
       );
+      // Windows uses Dio rather than the mobile NovelHttp bridge. Preserve
+      // the response for the plugin, but expose genuine challenges to Home.
+      if (Platform.isWindows &&
+          looksLikeCfChallenge(
+            status: res.statusCode ?? 0,
+            body: res.data ?? '',
+            cfMitigated: res.headers.value('cf-mitigated'),
+          )) {
+        NovelCloudflare.needsSolve(res.realUri.toString());
+      }
       return LnReaderHttpResponse(
         status: res.statusCode ?? 0,
         body: res.data ?? '',
@@ -814,6 +904,9 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
   // until the user opens or calls an installed source.
   final mangayomiManager = MangayomiManager(
     MangayomiExtensionService(await writableAppSubdir('mangayomi')),
+    // Windows has no native cookie channel; hand Mangayomi the cookies and
+    // browser user agent saved by the desktop verification browser instead.
+    sessionHeaders: Platform.isWindows ? _desktopSessionHeaders : null,
   );
   await mangayomiManager.init();
   sl.registerSingleton<MangayomiManager>(mangayomiManager);
@@ -925,6 +1018,7 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
   // (miruro, uhdmovies, …) freeze the isolate for their timeout each.
   // Playback still loads a source on demand via ensureRuntimeLoaded.
   if (!isTv) {
+    onProgress?.call('loading enabled JavaScript sources');
     await loadProviders();
   } else {
     debugPrint(
@@ -944,7 +1038,18 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
   // Guarded Aniyomi boot step — reload any previously installed extensions.
   // This runs on a microtask so it never blocks or slows app startup. Any
   // failure is caught and logged; it must never propagate to the caller.
-  Future.microtask(() async {
+  // Named so the Windows load-failure notice's Retry can run it again.
+  Future<void> bootAniyomi() async {
+    if (Platform.isWindows && !DesktopExtensionRuntime.isAvailable) {
+      // src-10 (Windows): engine files missing - list the installed Aniyomi
+      // extensions in the startup notice instead of dropping them silently.
+      await reportMissingExtensionEngine(
+        ecosystem: 'Aniyomi',
+        installedBoxName: AniyomiExtensionService.installedBoxName,
+        boot: bootAniyomi,
+      );
+      return;
+    }
     try {
       if (!Hive.isBoxOpen(AniyomiExtensionService.installedBoxName)) {
         await openBoxSafely<dynamic>(AniyomiExtensionService.installedBoxName);
@@ -989,8 +1094,12 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
       }
     } catch (e, st) {
       debugPrint('[aniyomi] boot step failed (non-fatal): $e\n$st');
+      // src-10 (Windows): surface the failure in the startup notice.
+      reportExtensionBootFailure('Aniyomi', e, bootAniyomi);
     }
-  });
+  }
+
+  Future.microtask(bootAniyomi);
 
   // Guarded Mihon boot step — the manga twin of the Aniyomi step above.
   // Same shape: its own microtask so it never blocks startup, and a try/catch
@@ -1009,8 +1118,18 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
   //     so the check lives here, where it covers boot-reload, the source
   //     picker's listing, and every data call in one place: on iOS nothing is
   //     ever loaded, so no MihonProvider is ever constructed.
-  Future.microtask(() async {
-    if (!Platform.isAndroid) return; // Mihon extensions are Android-only (DEX)
+  // Named so the Windows load-failure notice's Retry can run it again.
+  Future<void> bootMihon() async {
+    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable) {
+      // src-10 (Windows): engine files missing - list the installed Mihon
+      // extensions in the startup notice instead of dropping them silently.
+      await reportMissingExtensionEngine(
+        ecosystem: 'Mihon',
+        installedBoxName: MihonExtensionService.installedBoxName,
+        boot: bootMihon,
+      );
+      return;
+    }
     try {
       if (!Hive.isBoxOpen(MihonExtensionService.installedBoxName)) {
         await openBoxSafely<dynamic>(MihonExtensionService.installedBoxName);
@@ -1074,14 +1193,19 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
       }
     } catch (e, st) {
       debugPrint('[mihon] boot step failed (non-fatal): $e\n$st');
+      // src-10 (Windows): surface the failure in the startup notice.
+      reportExtensionBootFailure('Mihon', e, bootMihon);
     }
-  });
+  }
+
+  Future.microtask(bootMihon);
 
   // Global cubit so any widget can read/write the active source id and
   // descendants can react via BlocBuilder/BlocListener. Persists the pick to a
   // Hive box and restores it on launch, validated against the providers that
   // actually loaded (so a removed/disabled source falls back to allanime).
   await ActiveSourceCubit.init();
+  onProgress?.call('restoring content mode');
   sl.registerSingleton<ActiveSourceCubit>(
     ActiveSourceCubit(
       box: Hive.box(ActiveSourceCubit.boxName),
@@ -1205,6 +1329,7 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
   // Offline downloads (background_downloader). setup() restores persisted
   // records and starts listening for task progress/status updates.
   await DownloadManager.init();
+  onProgress?.call('initializing downloads');
   await DownloadService.initialize(); // configure the foreground-service host
   sl.registerSingleton<DownloadManager>(
     DownloadManager(sl<CatalogueRepository>(), sl<DownloadPrefs>())..setup(),
@@ -1274,4 +1399,23 @@ Future<void> initDependencies({bool Function()? isOffline}) async {
       debugPrint('[cloudstream] deferred load failed (non-fatal): $e\n$st');
     }
   });
+}
+
+/// Windows session lookup for Mangayomi requests: the cookies and exact browser
+/// user agent saved by the desktop verification browser for [url]'s host
+/// (or a parent domain), so a site verified once keeps working. Returns no
+/// headers when nothing was saved, which lets the source ask for verification.
+Future<Map<String, String>> _desktopSessionHeaders(Uri url) async {
+  final saved = CfClearanceStore().restore();
+  final host = url.host;
+  final match = saved[host] ??
+      saved.entries
+          .where((e) => host.endsWith('.${e.key}'))
+          .map((e) => e.value)
+          .firstOrNull;
+  if (match == null) return const {};
+  return {
+    if (match.cookie.isNotEmpty) 'Cookie': match.cookie,
+    if (match.ua != null && match.ua!.isNotEmpty) 'User-Agent': match.ua!,
+  };
 }

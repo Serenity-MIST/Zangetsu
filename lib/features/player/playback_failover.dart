@@ -125,3 +125,72 @@ VideoSource? pickPlaybackFallback({
     preferQuality: preferredQuality,
   );
 }
+
+/// What the player should do when every online option has failed or stalled.
+enum LocalFallbackAction {
+  /// Stay on the error: the feature is off, already used, or not possible.
+  none,
+
+  /// Switch to the downloaded copy without asking.
+  switchNow,
+
+  /// Offer the downloaded copy and switch only if the viewer agrees.
+  ask,
+}
+
+/// Decides whether to fall back to the downloaded copy of the episode.
+///
+/// [mode] is the saved setting: `'auto'`, `'ask'` or `'off'` (anything else is
+/// treated as `'auto'`). The fallback only applies when the player is not
+/// already on a local file, has not already tried it for this episode (so a
+/// failing local file can never bounce back to the network and loop), and has
+/// a way to look for the download.
+LocalFallbackAction localFallbackAction({
+  required String mode,
+  required bool alreadyLocal,
+  required bool alreadyTried,
+  required bool hasFinder,
+}) {
+  if (alreadyLocal || alreadyTried || !hasFinder) {
+    return LocalFallbackAction.none;
+  }
+  return switch (mode) {
+    'off' => LocalFallbackAction.none,
+    'ask' => LocalFallbackAction.ask,
+    _ => LocalFallbackAction.switchNow,
+  };
+}
+
+/// How far before a resume target a seek may land and still count as having
+/// worked. Seeks in streams with sparse keyframes (an HLS-saved `.ts` can go
+/// ten seconds between them) land on the keyframe before the target, so
+/// demanding an exact landing makes the player seek again, land in the same
+/// place, and replay the same few seconds over and over.
+const Duration kResumeLandingSlack = Duration(seconds: 12);
+
+/// True when playback is close enough to the resume [target] that seeking again
+/// would only undo a good seek.
+///
+/// A position at or past the target always counts. Before it, the allowed gap
+/// is [kResumeLandingSlack], but never more than half the target, so a mark of
+/// a few seconds still gets a real seek rather than being ignored.
+bool resumeSeekLanded({required Duration position, required Duration target}) {
+  final half = target ~/ 2;
+  final slack = half < kResumeLandingSlack ? half : kResumeLandingSlack;
+  return position + slack >= target;
+}
+
+/// Whether an mpv subtitle track ([title], [language]) is the player's own copy
+/// of one of the [saved] subtitles (label and language as they were passed to
+/// `sub-add`). Both must match exactly, so a real embedded track, which has its
+/// own language code, is never hidden by mistake.
+bool isSavedSubCopy({
+  required String? title,
+  required String? language,
+  required List<({String label, String lang})> saved,
+}) {
+  final t = (title ?? '').trim();
+  final l = (language ?? '').trim();
+  if (t.isEmpty || l.isEmpty) return false;
+  return saved.any((s) => s.label.trim() == t && s.lang.trim() == l);
+}

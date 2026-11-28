@@ -1,9 +1,16 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
+import '../../core/provider/js_engine.dart' show JsEngine;
+import '../../core/repository/source_actions.dart' as source_actions;
+import '../../core/ui/desktop_docked_panel.dart';
 import 'manage_source_route.dart';
+import 'sources_desktop_kit.dart' show DesktopProviderScope;
 import '../../core/ui/settings_widgets.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 
 import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
@@ -105,6 +112,18 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
   /// off the UI isolate, which is a much bigger change than this screen.
   static const int _maxConcurrentDeep = 2;
 
+  /// Deep-check pool size for this run (src-1). On Windows, JS providers now
+  /// run in [JsEngine]'s own isolate, so a deep check no longer blocks the UI
+  /// and the full [_maxConcurrent] pool is safe. Phone keeps the cap of 2 so
+  /// its behaviour is unchanged. LNReader plugins (`lnr:` ids) still run on
+  /// the UI isolate everywhere, so [_runTests] keeps their deep checks at
+  /// [_maxConcurrentDeep] in flight even inside the bigger pool.
+  static int get _deepPoolSize =>
+      defaultTargetPlatform == TargetPlatform.windows &&
+          JsEngine.runsOffUiIsolate
+      ? _maxConcurrent
+      : _maxConcurrentDeep;
+
   List<_ProbeResult> _results = const [];
   bool _testing = false;
 
@@ -139,22 +158,54 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
     // [_maxConcurrent] probes are ever in flight.
     final queue = List<_ProbeResult>.of(_results);
     var next = 0;
+
+    // src-1: LNReader plugins still run on the UI isolate, so when the deep
+    // pool is bigger than the old cap (Windows), a small slot counter keeps
+    // at most [_maxConcurrentDeep] of their deep checks in flight. A worker
+    // waiting for a slot just pauses; the other workers keep going.
+    final pool = deep ? _deepPoolSize : _maxConcurrent;
+    final capLnr = deep && pool > _maxConcurrentDeep;
+    var lnrFree = _maxConcurrentDeep;
+    final lnrWaiters = <Completer<void>>[];
+    Future<void> takeLnrSlot() async {
+      if (lnrFree > 0) {
+        lnrFree--;
+        return;
+      }
+      final waiter = Completer<void>();
+      lnrWaiters.add(waiter);
+      await waiter.future;
+    }
+
+    // Hands the slot straight to the next waiter, or frees it.
+    void giveLnrSlot() {
+      if (lnrWaiters.isNotEmpty) {
+        lnrWaiters.removeAt(0).complete();
+      } else {
+        lnrFree++;
+      }
+    }
+
     Future<void> worker() async {
       while (true) {
         if (gen != _runGen || !mounted) return;
         final i = next++;
         if (i >= queue.length) return;
-        await _probe(queue[i], deep: deep, gen: gen);
+        final r = queue[i];
+        final limited = capLnr && r.id.startsWith('lnr:');
+        if (limited) await takeLnrSlot();
+        try {
+          await _probe(r, deep: deep, gen: gen);
+        } finally {
+          if (limited) giveLnrSlot();
+        }
         // Hand the frame back between sources — without this a run of
         // synchronous provider work never lets the list repaint.
         await Future<void>.delayed(Duration.zero);
       }
     }
 
-    await Future.wait([
-      for (var i = 0; i < (deep ? _maxConcurrentDeep : _maxConcurrent); i++)
-        worker(),
-    ]);
+    await Future.wait([for (var i = 0; i < pool; i++) worker()]);
 
     if (mounted && gen == _runGen) setState(() => _testing = false);
   }
@@ -246,9 +297,7 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
       }
     }
     if (!ok) {
-      note = opened
-          ? 'opens, but lists nothing to play'
-          : "can't open titles";
+      note = opened ? 'opens, but lists nothing to play' : "can't open titles";
     }
     if (!mounted || gen != _runGen) return;
     setState(() {
@@ -309,6 +358,10 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Windows: the desktop settings look whatever opened it (src-3 A).
+    if (desktopPanelsEnabled && !DesktopSettingsScope.contains(context)) {
+      return DesktopProviderScope(child: Builder(builder: build));
+    }
     // context.l10n.working means it returned results — not merely that it answered.
     final working = _results
         .where((r) => !r.running && r.outcome == SourceOutcome.ok)
@@ -322,25 +375,29 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
       appBar: settingsAppBar(
         context.l10n.sourceHealth,
         actions: [
-          IconButton(
-            tooltip: 'Deep test (opens a title from each source)',
-            icon: const Icon(Icons.biotech_outlined),
-            color: _deep ? AppColors.accent : AppColors.textPrimary,
-            // Live even mid-run. The screen kicks off a test on open, and
-            // disabling this until that finished meant waiting out the whole
-            // list before you could ask for the deeper one. Safe now that a new
-            // run supersedes the old via [_runGen] instead of racing it.
-            onPressed: () => _runTests(deep: true),
-          ),
-          IconButton(
-            tooltip: context.l10n.reTest,
-            icon: const Icon(Icons.refresh_rounded),
-            color: AppColors.textPrimary,
-            onPressed: _testing ? null : () => _runTests(),
-          ),
+          if (!DesktopSettingsScope.contains(context)) ...[
+            IconButton(
+              tooltip: 'Deep test (opens a title from each source)',
+              icon: const Icon(Icons.biotech_outlined),
+              color: _deep ? AppColors.accent : AppColors.textPrimary,
+              // Live even mid-run. The screen kicks off a test on open, and
+              // disabling this until that finished meant waiting out the whole
+              // list before you could ask for the deeper one. Safe now that a new
+              // run supersedes the old via [_runGen] instead of racing it.
+              onPressed: () => _runTests(deep: true),
+            ),
+            IconButton(
+              tooltip: context.l10n.reTest,
+              icon: const Icon(Icons.refresh_rounded),
+              color: AppColors.textPrimary,
+              onPressed: _testing ? null : () => _runTests(),
+            ),
+          ],
         ],
       ),
-      body: _results.isEmpty
+      body: DesktopSettingsScope.contains(context)
+          ? _desktopBody(working: working, done: done, unusable: unusable)
+          : _results.isEmpty
           ? Center(
               child: Text(
                 context.l10n.noEnabledSourcesToTest,
@@ -359,13 +416,13 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
                     child: Text(
                       _testing
                           ? '${_deep ? 'Deep t' : 'T'}esting '
-                              '${_results.length} source'
-                              '${_results.length == 1 ? '' : 's'}…'
+                                '${_results.length} source'
+                                '${_results.length == 1 ? '' : 's'}…'
                           : '$working of $done returned results.'
-                              '${unusable > 0 ? ' $unusable opened nothing '
-                                  'playable.' : ''}'
-                              ' Amber answered but may give you nothing;'
-                              ' only red is treated as dead.',
+                                '${unusable > 0 ? ' $unusable opened nothing '
+                                          'playable.' : ''}'
+                                ' Amber answered but may give you nothing;'
+                                ' only red is treated as dead.',
                       style: AppText.caption,
                     ),
                   ),
@@ -412,6 +469,159 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
     );
   }
 
+  /// Desktop diagnostics use labeled actions and lazy rows. Search success
+  /// remains distinct from opening a title or obtaining a playable stream.
+  Widget _desktopBody({
+    required int working,
+    required int done,
+    required int unusable,
+  }) => ListView.builder(
+    padding: const EdgeInsets.fromLTRB(22, 18, 22, 32),
+    itemCount: _results.length + 1,
+    itemBuilder: (context, index) {
+      if (index == 0) {
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 16),
+          child: GraphiteSettingsPanel(
+            margin: EdgeInsets.zero,
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _testing ? 'Testing sources…' : 'Source diagnostics',
+                      style: AppText.headline,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Quick test checks search responses. Deep test also opens a title. '
+                      'Playback is not tested here.',
+                      style: AppText.caption,
+                    ),
+                    const SizedBox(height: 16),
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 10,
+                      children: [
+                        FilledButton.icon(
+                          key: const ValueKey('health-quick-test'),
+                          onPressed: _testing ? null : () => _runTests(),
+                          icon: const Icon(Icons.refresh_rounded, size: 18),
+                          label: const Text('Quick test'),
+                        ),
+                        OutlinedButton.icon(
+                          key: const ValueKey('health-deep-test'),
+                          onPressed: () => _runTests(deep: true),
+                          icon: const Icon(Icons.biotech_outlined, size: 18),
+                          label: const Text('Deep test'),
+                        ),
+                      ],
+                    ),
+                    if (_results.isEmpty) ...[
+                      const SizedBox(height: 16),
+                      Text(
+                        context.l10n.noEnabledSourcesToTest,
+                        style: AppText.body,
+                      ),
+                    ] else ...[
+                      const SizedBox(height: 18),
+                      Text(
+                        '$done / ${_results.length} completed · $working returned results'
+                        '${unusable > 0 ? ' · $unusable could not open a title' : ''}',
+                        style: AppText.caption,
+                      ),
+                      if (_testing) ...[
+                        const SizedBox(height: 10),
+                        LinearProgressIndicator(value: done / _results.length),
+                      ],
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      }
+      final result = _results[index - 1];
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 10),
+        child: GraphiteSettingsPanel(
+          margin: EdgeInsets.zero,
+          children: [
+            _HealthRow(
+              key: ValueKey('health-row-${result.id}'),
+              result: result,
+              present: _present,
+              onDisable: result.isCloudStream
+                  ? null
+                  : () => _disableForSearch(result),
+              searchIncluded: _searchPrefs.isIncluded(result.id),
+              playbackFails: _health.playbackFailures(result.id),
+              onManage: canManageSource(result.id)
+                  ? () => openManageSource(context, result.id)
+                  : null,
+              // Windows: Verify on Blocked rows (src-9 A).
+              onVerify: desktopPanelsEnabled
+                  ? () => _verifyAndRetest(result)
+                  : null,
+            ),
+          ],
+        ),
+      );
+    },
+  );
+
+  /// Re-tests one source (after a verification) without restarting the run.
+  /// Uses the current run's generation, so a newer full run still wins.
+  Future<void> _retestOne(_ProbeResult r) async {
+    if (!mounted) return;
+    setState(() {
+      r.running = true;
+      r.outcome = null;
+      r.deepOk = null;
+      r.deepNote = null;
+    });
+    await _probe(r, gen: _runGen, deep: _deep);
+  }
+
+  /// src-9 A: a Blocked (Cloudflare) source gets a Verify button. It opens
+  /// the site's verification window and, once that is passed, re-tests just
+  /// that source so the row updates in place.
+  Future<void> _verifyAndRetest(_ProbeResult r) async {
+    final messenger = ScaffoldMessenger.of(context);
+    // Read before the awaits below so no context is used across them.
+    final l10n = context.l10n;
+    void say(String text) => messenger
+      ..clearSnackBars()
+      ..showSnackBar(SnackBar(content: Text(text)));
+    final target = await _repo.cfSolveTargetFor(r.id);
+    if (!mounted) return;
+    if (target == null || target.isEmpty) {
+      say(l10n.sourceNoSiteToVerify(r.name));
+      return;
+    }
+    bool verified;
+    try {
+      verified = await source_actions.verifySourceChallenge(r.id, target);
+    } on PlatformException catch (error) {
+      if (error.code == 'CANCELLED') return;
+      say(l10n.verificationFailedError(error.message ?? error.code));
+      return;
+    } catch (error) {
+      say(l10n.verificationFailedError('$error'));
+      return;
+    }
+    if (!mounted) return;
+    if (!verified) {
+      say(l10n.verificationNotCompleted);
+      return;
+    }
+    say(l10n.verifiedTestingAgain(r.name));
+    await _retestOne(r);
+  }
+
   /// Inline action for a dead source: drop it from cross-source search (the same
   /// search-only toggle the source picker uses). Reversible from search settings.
   Future<void> _disableForSearch(_ProbeResult r) async {
@@ -429,18 +639,24 @@ class _SourceHealthScreenState extends State<SourceHealthScreen> {
 /// a dead JS source.
 class _HealthRow extends StatelessWidget {
   const _HealthRow({
+    super.key,
     required this.result,
     required this.present,
     required this.searchIncluded,
     this.onDisable,
     this.playbackFails = 0,
     this.onManage,
+    this.onVerify,
     this.autofocus = false,
   });
 
   final _ProbeResult result;
+
+  /// Opens the site's verification and re-tests the source; shown on
+  /// Blocked rows (src-9 A). Null hides it (phone / TV).
+  final VoidCallback? onVerify;
   final ({Color color, IconData icon, String label}) Function(SourceOutcome)
-      present;
+  present;
   final bool searchIncluded;
   final VoidCallback? onDisable;
 
@@ -504,9 +720,7 @@ class _HealthRow extends StatelessWidget {
         icon: Icons.error_outline_rounded,
         label: context.l10n.notUsable,
       );
-    } else if (p != null &&
-        result.deepOk == null &&
-        o == SourceOutcome.ok) {
+    } else if (p != null && result.deepOk == null && o == SourceOutcome.ok) {
       // Only the SEARCH probe has run — the deep check is opt-in behind the
       // microscope because it runs the JS engine on the UI isolate. So all this
       // green actually proves is that search answered. Saying "Working" claims
@@ -514,6 +728,95 @@ class _HealthRow extends StatelessWidget {
       // is how a rotted source keeps a green tick. Stays green: search really
       // did work. Upgrades to the full label once the deep check has run.
       p = (color: p.color, icon: p.icon, label: context.l10n.searchOk);
+    }
+    if (DesktopSettingsScope.contains(context)) {
+      return Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(
+                  p?.icon ?? Icons.hourglass_top_rounded,
+                  color: p?.color ?? AppColors.textSecondary,
+                  size: 23,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    result.name,
+                    style: AppText.body.copyWith(fontWeight: FontWeight.w600),
+                  ),
+                ),
+                if (result.running)
+                  const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              result.running
+                  ? context.l10n.testing
+                  : [
+                      ?p?.label,
+                      ?_meta,
+                      if (!searchIncluded) context.l10n.notSearched,
+                    ].join(' · '),
+              style: AppText.caption.copyWith(
+                color: p?.color ?? AppColors.textSecondary,
+              ),
+            ),
+            if (!result.running &&
+                result.outcome == SourceOutcome.blocked &&
+                onVerify != null) ...[
+              // Blocked = a Cloudflare check; verifying it is the fix.
+              const SizedBox(height: 10),
+              Align(
+                alignment: AlignmentDirectional.centerEnd,
+                child: Tooltip(
+                  message: context.l10n.openSitePassCheckTestAgain,
+                  child: FilledButton.icon(
+                    key: ValueKey('health-verify-${result.id}'),
+                    onPressed: onVerify,
+                    icon: const Icon(Icons.verified_user_outlined, size: 18),
+                    label: Text(context.l10n.verify),
+                  ),
+                ),
+              ),
+            ] else if (!result.running &&
+                _isDead &&
+                onDisable != null &&
+                searchIncluded) ...[
+              const SizedBox(height: 10),
+              Align(
+                alignment: AlignmentDirectional.centerEnd,
+                child: TextButton.icon(
+                  onPressed: onDisable,
+                  icon: const Icon(Icons.search_off_rounded, size: 18),
+                  label: const Text('Remove from search'),
+                ),
+              ),
+            ] else if (!result.running &&
+                (_isDead || _playbackDead) &&
+                onManage != null) ...[
+              const SizedBox(height: 10),
+              Align(
+                alignment: AlignmentDirectional.centerEnd,
+                child: OutlinedButton.icon(
+                  onPressed: onManage,
+                  icon: const Icon(Icons.extension_outlined, size: 18),
+                  label: const Text('Manage source'),
+                ),
+              ),
+            ],
+          ],
+        ),
+      );
     }
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 12, 12),

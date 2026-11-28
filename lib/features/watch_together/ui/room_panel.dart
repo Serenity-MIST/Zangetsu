@@ -1,15 +1,31 @@
 // lib/features/watch_together/ui/room_panel.dart
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../model/room_state.dart';
 import '../watch_together_controller.dart';
 import '../../../l10n/l10n.dart';
+import '../../../core/desktop/desktop_focus_repair.dart';
+import '../../../core/ui/desktop_docked_panel.dart';
 
 /// Opens a bottom sheet listing room participants. The host sees a "Give
 /// control" action per other participant; viewers see a read-only list.
 /// Rebuilds reactively via [AnimatedBuilder] on [controller].
 void showRoomParticipantsSheet(
-    BuildContext context, WatchTogetherController controller) {
+  BuildContext context,
+  WatchTogetherController controller,
+) {
+  // Windows: right-docked graphite panel (Esc / click-outside close).
+  if (desktopPanelsEnabled) {
+    showDesktopDockedPanel<void>(
+      context,
+      width: 420,
+      dialogKey: const ValueKey('room-participants-desktop-panel'),
+      builder: (_) =>
+          _RoomParticipantsSheet(controller: controller, desktop: true),
+    );
+    return;
+  }
   showModalBottomSheet<void>(
     context: context,
     backgroundColor: Colors.transparent,
@@ -18,9 +34,15 @@ void showRoomParticipantsSheet(
 }
 
 class _RoomParticipantsSheet extends StatelessWidget {
-  const _RoomParticipantsSheet({required this.controller});
+  const _RoomParticipantsSheet({
+    required this.controller,
+    this.desktop = false,
+  });
 
   final WatchTogetherController controller;
+
+  /// Windows docked panel: title row with close instead of a drag handle.
+  final bool desktop;
 
   @override
   Widget build(BuildContext context) {
@@ -30,46 +52,62 @@ class _RoomParticipantsSheet extends StatelessWidget {
         final participants = controller.participants;
         final canControl = controller.canControl;
         return Container(
-          decoration: const BoxDecoration(
-            color: Color(0xE6121212),
-            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-          ),
+          // Windows: the docked panel supplies the surface and corners.
+          decoration: desktop
+              ? null
+              : const BoxDecoration(
+                  color: Color(0xE6121212),
+                  borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+                ),
           child: SafeArea(
             top: false,
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // Handle bar.
-                Padding(
-                  padding: const EdgeInsets.only(top: 10, bottom: 6),
-                  child: Container(
-                    width: 36,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: Colors.white24,
-                      borderRadius: BorderRadius.circular(2),
+                // Windows: a title row with a close button, no drag handle.
+                if (desktop)
+                  DesktopPanelTitleBar(
+                    title: 'Participants (${participants.length})',
+                  )
+                else ...[
+                  // Handle bar.
+                  Padding(
+                    padding: const EdgeInsets.only(top: 10, bottom: 6),
+                    child: Container(
+                      width: 36,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: Colors.white24,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
                     ),
                   ),
-                ),
-                // Header.
-                Padding(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
-                  child: Row(
-                    children: [
-                      const Icon(Icons.group, color: Colors.white70, size: 18),
-                      const SizedBox(width: 8),
-                      Text(
-                        'Participants (${participants.length})',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 15,
-                          fontWeight: FontWeight.w600,
+                  // Header.
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 8,
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.group,
+                          color: Colors.white70,
+                          size: 18,
                         ),
-                      ),
-                    ],
+                        const SizedBox(width: 8),
+                        Text(
+                          'Participants (${participants.length})',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 15,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
+                ],
                 const Divider(color: Colors.white12, height: 1),
                 // Viewer banner — shown when the local user is not the host.
                 if (controller.room != null && !canControl)
@@ -79,7 +117,9 @@ class _RoomParticipantsSheet extends StatelessWidget {
                       if (context.mounted) {
                         Navigator.of(context).pop();
                         ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text(context.l10n.requestedControl)),
+                          SnackBar(
+                            content: Text(context.l10n.requestedControl),
+                          ),
                         );
                       }
                     },
@@ -129,11 +169,14 @@ class _RoomParticipantsSheet extends StatelessWidget {
                                 children: [
                                   if (isThisHost)
                                     _Chip(
-                                        label: context.l10n.hostBadge, color: Colors.amber),
+                                      label: context.l10n.hostBadge,
+                                      color: Colors.amber,
+                                    ),
                                   if (p.wantsControl && !isThisHost) ...[
                                     _Chip(
-                                        label: context.l10n.wantsControl,
-                                        color: Colors.blueAccent),
+                                      label: context.l10n.wantsControl,
+                                      color: Colors.blueAccent,
+                                    ),
                                   ],
                                 ],
                               ),
@@ -143,14 +186,19 @@ class _RoomParticipantsSheet extends StatelessWidget {
                                         Navigator.of(context).pop();
                                         await controller.grantControl(p.userId);
                                         if (context.mounted) {
-                                          ScaffoldMessenger.of(context)
-                                              .showSnackBar(SnackBar(
-                                            content: Text(
-                                                'Control given to ${p.name.isEmpty ? context.l10n.guest : p.name}'),
-                                          ));
+                                          ScaffoldMessenger.of(
+                                            context,
+                                          ).showSnackBar(
+                                            SnackBar(
+                                              content: Text(
+                                                'Control given to ${p.name.isEmpty ? context.l10n.guest : p.name}',
+                                              ),
+                                            ),
+                                          );
                                         }
                                       },
-                                      child: Text(context.l10n.giveControl,
+                                      child: Text(
+                                        context.l10n.giveControl,
                                         style: TextStyle(
                                           color: Colors.greenAccent,
                                           fontSize: 12,
@@ -192,7 +240,9 @@ class _ViewerControlBanner extends StatelessWidget {
         color: Colors.white.withValues(alpha: 0.06),
         borderRadius: BorderRadius.circular(12),
         border: Border.all(
-            color: Colors.white.withValues(alpha: 0.1), width: 0.5),
+          color: Colors.white.withValues(alpha: 0.1),
+          width: 0.5,
+        ),
       ),
       child: Row(
         children: [
@@ -209,15 +259,15 @@ class _ViewerControlBanner extends StatelessWidget {
             style: TextButton.styleFrom(
               backgroundColor: Colors.blueAccent.withValues(alpha: 0.85),
               foregroundColor: Colors.white,
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               minimumSize: Size.zero,
               tapTargetSize: MaterialTapTargetSize.shrinkWrap,
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(8),
               ),
             ),
-            child: Text(context.l10n.requestControl,
+            child: Text(
+              context.l10n.requestControl,
               style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
             ),
           ),
@@ -299,16 +349,19 @@ class RoomStrip extends StatelessWidget {
           GestureDetector(
             onTap: () {
               Clipboard.setData(
-                  ClipboardData(text: 'zangetsu://room/${room.code}'));
-              ScaffoldMessenger.of(context)
-                  .showSnackBar(SnackBar(content: Text(context.l10n.inviteCopied)));
+                ClipboardData(text: 'zangetsu://room/${room.code}'),
+              );
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text(context.l10n.inviteCopied)),
+              );
             },
             child: const Icon(Icons.copy, size: 12, color: Colors.white54),
           ),
           const SizedBox(width: 8),
           InkWell(
             onTap: () => controller.leave(),
-            child: Text(context.l10n.leave,
+            child: Text(
+              context.l10n.leave,
               style: TextStyle(color: Colors.redAccent, fontSize: 12),
             ),
           ),
@@ -320,7 +373,19 @@ class RoomStrip extends StatelessWidget {
 
 /// Opens a full-width keyboard-aware bottom sheet for Watch Together chat.
 void showRoomChatSheet(
-    BuildContext context, WatchTogetherController controller) {
+  BuildContext context,
+  WatchTogetherController controller,
+) {
+  // Windows: right-docked graphite panel (Esc / click-outside close).
+  if (desktopPanelsEnabled) {
+    showDesktopDockedPanel<void>(
+      context,
+      width: 420,
+      dialogKey: const ValueKey('room-chat-desktop-panel'),
+      builder: (_) => _RoomChatSheet(controller: controller, desktop: true),
+    );
+    return;
+  }
   showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
@@ -330,9 +395,12 @@ void showRoomChatSheet(
 }
 
 class _RoomChatSheet extends StatefulWidget {
-  const _RoomChatSheet({required this.controller});
+  const _RoomChatSheet({required this.controller, this.desktop = false});
 
   final WatchTogetherController controller;
+
+  /// Windows docked panel: title row with close instead of a drag handle.
+  final bool desktop;
 
   @override
   State<_RoomChatSheet> createState() => _RoomChatSheetState();
@@ -368,49 +436,64 @@ class _RoomChatSheetState extends State<_RoomChatSheet> {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding:
-          EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      padding: EdgeInsets.only(
+        bottom: MediaQuery.of(context).viewInsets.bottom,
+      ),
       child: Container(
-        decoration: const BoxDecoration(
-          color: Color(0xE6121212),
-          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-        ),
+        // Windows: the docked panel supplies the surface and corners.
+        decoration: widget.desktop
+            ? null
+            : const BoxDecoration(
+                color: Color(0xE6121212),
+                borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+              ),
         child: SafeArea(
           top: false,
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              // Drag handle.
-              Padding(
-                padding: const EdgeInsets.only(top: 10, bottom: 6),
-                child: Container(
-                  width: 36,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: Colors.white24,
-                    borderRadius: BorderRadius.circular(2),
+              // Windows: a title row with a close button, no drag handle.
+              if (widget.desktop)
+                DesktopPanelTitleBar(title: context.l10n.roomChat)
+              else ...[
+                // Drag handle.
+                Padding(
+                  padding: const EdgeInsets.only(top: 10, bottom: 6),
+                  child: Container(
+                    width: 36,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Colors.white24,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
                   ),
                 ),
-              ),
-              // Header.
-              Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
-                child: Row(
-                  children: [
-                    const Icon(Icons.chat_bubble_outline,
-                        color: Colors.white70, size: 18),
-                    const SizedBox(width: 8),
-                    Text(context.l10n.roomChat,
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w600,
+                // Header.
+                Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 8,
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.chat_bubble_outline,
+                        color: Colors.white70,
+                        size: 18,
                       ),
-                    ),
-                  ],
+                      const SizedBox(width: 8),
+                      Text(
+                        context.l10n.roomChat,
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
+              ],
               const Divider(color: Colors.white12, height: 1),
               // Message list.
               AnimatedBuilder(
@@ -433,7 +516,9 @@ class _RoomChatSheetState extends State<_RoomChatSheet> {
                             controller: _scrollCtrl,
                             shrinkWrap: true,
                             padding: const EdgeInsets.symmetric(
-                                horizontal: 16, vertical: 8),
+                              horizontal: 16,
+                              vertical: 8,
+                            ),
                             itemCount: messages.length,
                             itemBuilder: (context, i) =>
                                 _ChatBubble(message: messages[i]),
@@ -451,28 +536,40 @@ class _RoomChatSheetState extends State<_RoomChatSheet> {
                       child: TextField(
                         controller: _textCtrl,
                         style: const TextStyle(
-                            color: Colors.white, fontSize: 14),
+                          color: Colors.white,
+                          fontSize: 14,
+                        ),
                         decoration: InputDecoration(
                           hintText: context.l10n.message,
                           hintStyle: const TextStyle(
-                              color: Colors.white38, fontSize: 14),
+                            color: Colors.white38,
+                            fontSize: 14,
+                          ),
                           filled: true,
                           fillColor: Colors.white.withValues(alpha: 0.08),
                           contentPadding: const EdgeInsets.symmetric(
-                              horizontal: 14, vertical: 10),
+                            horizontal: 14,
+                            vertical: 10,
+                          ),
                           border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(24),
                             borderSide: BorderSide.none,
                           ),
                         ),
                         onSubmitted: (_) => _send(),
+                        // Windows: Enter sends and the caret stays in the
+                        // field for the next message (no soft keyboard).
+                        onEditingComplete: widget.desktop ? () {} : null,
                         textInputAction: TextInputAction.send,
                         maxLines: 1,
                       ),
                     ),
                     IconButton(
-                      icon: const Icon(Icons.send_rounded,
-                          color: Colors.white70, size: 22),
+                      icon: const Icon(
+                        Icons.send_rounded,
+                        color: Colors.white70,
+                        size: 22,
+                      ),
                       onPressed: _send,
                       splashRadius: 20,
                     ),
@@ -494,11 +591,7 @@ class _RoomChatSheetState extends State<_RoomChatSheet> {
 /// whenever the [WatchTogetherController] notifies. Wrap in a [StatefulWidget]
 /// so the [TextEditingController] is properly disposed.
 class RoomChatPanel extends StatefulWidget {
-  const RoomChatPanel({
-    super.key,
-    required this.controller,
-    this.onClose,
-  });
+  const RoomChatPanel({super.key, required this.controller, this.onClose});
 
   final WatchTogetherController controller;
   final VoidCallback? onClose;
@@ -510,6 +603,9 @@ class RoomChatPanel extends StatefulWidget {
 class _RoomChatPanelState extends State<RoomChatPanel> {
   final _textCtrl = TextEditingController();
   final _scrollCtrl = ScrollController();
+
+  // Windows UI gate (phone keeps the SDK's Enter behaviour).
+  bool get _windowsUi => defaultTargetPlatform == TargetPlatform.windows;
 
   @override
   void dispose() {
@@ -557,8 +653,9 @@ class _RoomChatPanelState extends State<RoomChatPanel> {
                 padding: const EdgeInsets.symmetric(horizontal: 12),
                 decoration: BoxDecoration(
                   border: Border(
-                    bottom:
-                        BorderSide(color: Colors.white.withValues(alpha: 0.1)),
+                    bottom: BorderSide(
+                      color: Colors.white.withValues(alpha: 0.1),
+                    ),
                   ),
                 ),
                 child: Row(
@@ -574,8 +671,11 @@ class _RoomChatPanelState extends State<RoomChatPanel> {
                       ),
                     ),
                     IconButton(
-                      icon: const Icon(Icons.close,
-                          color: Colors.white70, size: 20),
+                      icon: const Icon(
+                        Icons.close,
+                        color: Colors.white70,
+                        size: 20,
+                      ),
                       onPressed: () => widget.onClose?.call(),
                       splashRadius: 18,
                       padding: EdgeInsets.zero,
@@ -592,13 +692,17 @@ class _RoomChatPanelState extends State<RoomChatPanel> {
                         child: Text(
                           context.l10n.noMessagesYet,
                           style: const TextStyle(
-                              color: Colors.white38, fontSize: 12),
+                            color: Colors.white38,
+                            fontSize: 12,
+                          ),
                         ),
                       )
                     : ListView.builder(
                         controller: _scrollCtrl,
                         padding: const EdgeInsets.symmetric(
-                            horizontal: 10, vertical: 8),
+                          horizontal: 10,
+                          vertical: 8,
+                        ),
                         itemCount: messages.length,
                         itemBuilder: (context, i) =>
                             _ChatBubble(message: messages[i]),
@@ -614,28 +718,45 @@ class _RoomChatPanelState extends State<RoomChatPanel> {
                       child: TextField(
                         controller: _textCtrl,
                         style: const TextStyle(
-                            color: Colors.white, fontSize: 13),
+                          color: Colors.white,
+                          fontSize: 13,
+                        ),
                         decoration: InputDecoration(
                           hintText: context.l10n.message,
                           hintStyle: const TextStyle(
-                              color: Colors.white38, fontSize: 13),
+                            color: Colors.white38,
+                            fontSize: 13,
+                          ),
                           filled: true,
                           fillColor: Colors.white.withValues(alpha: 0.08),
                           contentPadding: const EdgeInsets.symmetric(
-                              horizontal: 12, vertical: 8),
+                            horizontal: 12,
+                            vertical: 8,
+                          ),
                           border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(20),
                             borderSide: BorderSide.none,
                           ),
                         ),
-                        onSubmitted: (_) => _send(),
+                        onSubmitted: (_) {
+                          _send();
+                          // Windows (R1): Enter sends, then hands the keys
+                          // back to the player (click the field to type more).
+                          if (_windowsUi) DesktopFocusRepair.dropFocus(context);
+                        },
+                        // Windows: stops the SDK from parking focus on the
+                        // route scope on Enter, which left the player deaf.
+                        onEditingComplete: _windowsUi ? () {} : null,
                         textInputAction: TextInputAction.send,
                         maxLines: 1,
                       ),
                     ),
                     IconButton(
-                      icon: const Icon(Icons.send_rounded,
-                          color: Colors.white70, size: 20),
+                      icon: const Icon(
+                        Icons.send_rounded,
+                        color: Colors.white70,
+                        size: 20,
+                      ),
                       onPressed: _send,
                       splashRadius: 20,
                     ),

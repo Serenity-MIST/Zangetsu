@@ -53,6 +53,8 @@ class _FakeSoon implements ComingSoonService {
 }
 
 class _FakeMyList implements MyListStore {
+  @override
+  final ValueNotifier<int> revision = ValueNotifier<int>(0);
   _FakeMyList(this._items);
   final List<MediaItem> _items;
   @override
@@ -93,6 +95,30 @@ AiringEntry _entry(int? mal) => AiringEntry(
 );
 
 void main() {
+  test('retained schedule updates local followed list without refetching', () async {
+    final items = [_item(1)];
+    final mine = _FakeMyList(items);
+    final cubit = ScheduleCubit(_FakeAiring([_entry(1),_entry(2)]),
+      _FakeSoon(const []),mine,retryDelays:const []);
+    await cubit.load();
+    cubit.selectMyListFilter();
+    final day = DateTime(2026,7,10);
+    cubit.selectDay(day);
+    expect(cubit.state.activeFollowed!.matches(_entry(1)),isTrue);
+    items..clear()..add(_item(2));
+    mine.revision.value++;
+    expect(cubit.state.activeFollowed!.matches(_entry(1)),isFalse);
+    expect(cubit.state.activeFollowed!.matches(_entry(2)),isTrue);
+    expect(cubit.state.myListByDay.values.expand((e)=>e).single.malId,2);
+    expect(cubit.state.selectedDay,day);
+    expect(cubit.state.myListOnly,isTrue);
+    final closedState = cubit.state;
+    await cubit.close();
+    items.clear(); mine.revision.value++;
+    expect(cubit.state,same(closedState));
+    mine.revision.dispose();
+  });
+
   test(
     'load populates airing (grouped) + comingSoon, clears loading',
     () async {

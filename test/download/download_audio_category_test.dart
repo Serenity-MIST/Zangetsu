@@ -43,12 +43,9 @@ void main() {
     );
   });
 
-  test('leaves a single-cut source list unchanged', () {
+  test('rejects sub-only results when dub is requested', () {
     final sources = [_source('sub', kind: AudioKind.sub)];
 
-    expect(
-      DownloadManager.sourcesForDownloadCategory(sources, 'dub'),
-      same(sources),
-    );
+    expect(DownloadManager.sourcesForDownloadCategory(sources, 'dub'), isEmpty);
   });
 }

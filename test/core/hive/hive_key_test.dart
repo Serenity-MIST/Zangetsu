@@ -60,7 +60,8 @@ void main() {
 
     test('shortens an oversized key enough to survive the round trip', () {
       // A real key shape: the URL carries a multi-kilobyte `?data={...}` blob.
-      final huge = 'cs:AnimeWitcher::https://example.test/e?data='
+      final huge =
+          'cs:AnimeWitcher::https://example.test/e?data='
           '${'x' * 10000}';
       final key = hiveKey(huge);
 

@@ -7,6 +7,8 @@ import '../zmode/metadata_provider_prefs.dart';
 import 'anilist_title.dart';
 import '../models/person.dart';
 import '../tracker/tracker.dart' show MediaKind;
+// track-2: lets _gql report a lost login to the tracker sync outbox.
+import '../tracker/tracker_sync_queue.dart' show TrackerWriteScope;
 
 /// AniList's `type:` enum value for [kind].
 String _anilistType(MediaKind kind) =>
@@ -58,7 +60,14 @@ String searchMediaQuery(MediaKind kind, {bool novelFormat = false}) {
 /// byte-identical to the pre-manga text apart from the totals/airing fields.
 String mediaListCollectionQuery(MediaKind kind) {
   final formatField = kind == MediaKind.manga ? ' format' : '';
-  final airingField = kind == MediaKind.manga ? '' : ' nextAiringEpisode{episode}';
+  // Windows: airingAt + endDate (with the `status` every read selects) date
+  // the latest release, so the desktop "New from your list" row can tell a
+  // fresh episode from an old one. Phone and TV keep upstream's query.
+  final airingField = kind == MediaKind.manga
+      ? ''
+      : defaultTargetPlatform == TargetPlatform.windows
+      ? ' nextAiringEpisode{episode airingAt} endDate{year month day}'
+      : ' nextAiringEpisode{episode}';
   return 'query(\$u:String){ MediaListCollection(userName:\$u, type:${_anilistType(kind)}){ '
       'lists { status entries { status progress score(format:POINT_10) '
       'updatedAt private customLists(asArray:true) '
@@ -130,6 +139,15 @@ class AniListApi {
           validateStatus: (s) => s != null && s < 500,
         ),
       );
+      // track-2: a revoked or expired token answers 401/403. Tell the sync
+      // outbox so it shows "needs sign-in" instead of retrying it as a
+      // network failure. A no-op outside a watched tracker write. Only when a
+      // token was sent: an anonymous 403 is not a lost login.
+      final code = res.statusCode;
+      if ((code == 401 || code == 403) &&
+          headers.containsKey('Authorization')) {
+        TrackerWriteScope.reportStatus(code);
+      }
       final data = res.data;
       if (data is Map && data['data'] is Map) {
         return Map<String, dynamic>.from(data['data'] as Map);

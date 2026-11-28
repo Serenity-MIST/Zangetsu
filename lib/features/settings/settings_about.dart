@@ -19,6 +19,10 @@ class _AboutSettingsScreenState extends State<AboutSettingsScreen> {
   static const String _discordUrl = kDiscordInviteUrl;
   static const String _githubUrl = 'https://github.com/Spyou/Zangetsu';
 
+  /// Where Windows builds are published from: the desktop fork's branch.
+  static const String _windowsUpdatesUrl =
+      'https://github.com/Serenity-MIST/Zangetsu/commits/zangetsu-windows-desktop';
+
   final UpdateService _updateService = UpdateService();
   bool _betaUpdates = false;
 
@@ -44,7 +48,7 @@ class _AboutSettingsScreenState extends State<AboutSettingsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar(context.l10n.about),
       body: ListView(
         padding: const EdgeInsets.only(top: 24, bottom: 30),
@@ -102,16 +106,28 @@ class _AboutSettingsScreenState extends State<AboutSettingsScreen> {
               ),
               SettingsTile(
                 icon: Icons.system_update_rounded,
-                title: context.l10n.checkForUpdates,
-                subtitle: context.l10n.checkForUpdatesSubtitle,
+                title: _windowsUi
+                    ? context.l10n.windowsUpdates
+                    : context.l10n.checkForUpdates,
+                subtitle: _windowsUi
+                    ? context.l10n.windowsUpdatesSubtitle
+                    : context.l10n.checkForUpdatesSubtitle,
                 onTap: () {
+                  // Upstream's installer flow downloads Android APKs. The
+                  // Windows build comes from its own fork and branch, so the
+                  // useful page is that branch's history, not upstream main.
+                  if (_windowsUi) {
+                    _open(_windowsUpdatesUrl);
+                    return;
+                  }
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(content: Text(context.l10n.checkingForUpdates)),
                   );
                   maybeShowUpdateDialog(context, manual: true);
                 },
               ),
-              SettingsTile(
+              // Beta opt-in controls APK updates and has no desktop effect.
+              if (!_windowsUi) SettingsTile(
                 icon: Icons.science_outlined,
                 title: context.l10n.betaUpdates,
                 subtitle: context.l10n.betaUpdatesSubtitle,

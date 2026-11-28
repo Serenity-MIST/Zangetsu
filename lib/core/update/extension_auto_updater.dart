@@ -27,8 +27,8 @@ class ExtensionAutoUpdater {
   static Future<int> run() async {
     var updated = 0;
     updated += await _updateZangetsu();
-    // CloudStream + Aniyomi are Android-only; their managers aren't registered
-    // elsewhere, so guard on registration rather than platform.
+    // Windows uses the same manager contracts through its bundled engines.
+    // Registration guards below keep unsupported platforms out of these paths.
     updated += await _updateCloudStream();
     updated += await _updateAniyomi();
     return updated;
@@ -85,7 +85,8 @@ class ExtensionAutoUpdater {
   /// CloudStream: updateRepo() re-fetches + reinstalls only changed plugins and
   /// returns how many it updated.
   static Future<int> _updateCloudStream() async {
-    if (!Platform.isAndroid || !sl.isRegistered<CloudStreamManager>()) return 0;
+    if ((!Platform.isAndroid && !Platform.isWindows) ||
+        !sl.isRegistered<CloudStreamManager>()) return 0;
     try {
       final mgr = sl<CloudStreamManager>();
       final urls = <String>{
@@ -107,7 +108,8 @@ class ExtensionAutoUpdater {
   /// Aniyomi: detect updates across its repos, then install each via the same
   /// installFromRepo() the Sources screen uses.
   static Future<int> _updateAniyomi() async {
-    if (!Platform.isAndroid || !sl.isRegistered<AniyomiManager>()) return 0;
+    if ((!Platform.isAndroid && !Platform.isWindows) ||
+        !sl.isRegistered<AniyomiManager>()) return 0;
     try {
       final repoUrls = Hive.isBoxOpen(_aniyomiReposBox)
           ? Hive.box<String>(_aniyomiReposBox).values.toList()

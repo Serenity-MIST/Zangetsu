@@ -1,7 +1,6 @@
 // CloudStream sources — phone UI.
 part of 'cloudstream_sources_screen.dart';
 
-
 // ---------------------------------------------------------------------------
 // Phone view
 // ---------------------------------------------------------------------------
@@ -23,10 +22,66 @@ class _CsPhoneViewState extends State<_CsPhoneView> {
     super.dispose();
   }
 
+  /// Windows layout (src-3 A + B): settings app bar, the shared toolbar
+  /// (tabs, Add repo, search) and no floating button, whatever opened it;
+  /// Ctrl+F / Esc / F5 via [DesktopSourcesKeys] (src-13 A), where F5
+  /// re-fetches every repository.
+  Widget _desktop(BuildContext context) => DesktopSourcesKeys(
+    onRefresh: () =>
+        sl<CloudStreamManager>().checkAllUpdates(force: true).ignore(),
+    child: DefaultTabController(
+      length: 2,
+      initialIndex: sl<CloudStreamManager>().all.isEmpty ? 1 : 0,
+      child: Scaffold(
+        backgroundColor: AppColors.bg,
+        appBar: desktopSourcesAppBar(context.l10n.cloudStream),
+        body: Column(
+          children: [
+            DesktopSourcesToolbar(
+              tabs: [context.l10n.installed, context.l10n.repositories],
+              actions: [
+                // Builder: the keys scope sits below `context` here.
+                Builder(
+                  builder: (inner) => IconButton(
+                    tooltip: inner.l10n.refreshRepositoriesF5,
+                    icon: const Icon(Icons.refresh_rounded),
+                    onPressed: () =>
+                        DesktopSourcesKeys.maybeOf(inner)?.refresh(),
+                  ),
+                ),
+              ],
+              addLabel: context.l10n.addCloudStreamRepo,
+              addKey: const ValueKey('desktop-add-cloudstream-repo'),
+              onAdd: () => _showAddCsRepoDialog(context),
+              search: SourcesSearchField(
+                controller: _searchCtrl,
+                onChanged: (q) => setState(() => _query = q),
+              ),
+            ),
+            Expanded(
+              child: TabBarView(
+                children: [
+                  _CsInstalledTab(query: _query),
+                  _CsReposTab(query: _query),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
+    if (desktopPanelsEnabled) {
+      return DesktopProviderScope(child: Builder(builder: _desktop));
+    }
     return DefaultTabController(
       length: 2,
+      initialIndex: Platform.isWindows && sl<CloudStreamManager>().all.isEmpty
+          ? 1
+          : 0,
       child: Scaffold(
         backgroundColor: AppColors.bg,
         appBar: AppBar(
@@ -108,7 +163,10 @@ class _CsInstalledTab extends StatelessWidget {
           ),
     ];
     return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
+      // Windows has no floating button to leave room for (src-3 B).
+      padding: desktopPanelsEnabled
+          ? kDesktopSourcesListPadding
+          : const EdgeInsets.fromLTRB(16, 12, 16, 96),
       children: [
         if (installedGroups.isEmpty)
           EmptyState(
@@ -146,8 +204,9 @@ class _CsReposTab extends StatelessWidget {
         ? all
         : [
             for (final g in all)
-              if (g.catalog
-                  .any((m) => sourceSearchMatches(query, m.name, m.language)))
+              if (g.catalog.any(
+                (m) => sourceSearchMatches(query, m.name, m.language),
+              ))
                 CsRepoGroup(
                   url: g.url,
                   name: g.name,
@@ -160,14 +219,19 @@ class _CsReposTab extends StatelessWidget {
                 ),
           ];
     return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
+      // Windows has no floating button to leave room for (src-3 B).
+      padding: desktopPanelsEnabled
+          ? kDesktopSourcesListPadding
+          : const EdgeInsets.fromLTRB(16, 12, 16, 96),
       children: [
         if (groups.isEmpty)
           EmptyState(
             icon: Icons.cloud_outlined,
             message: searching
                 ? context.l10n.noExtensionsMatchQuery(query.trim())
-                : context.l10n.noCloudStreamReposAddedYetTap(context.l10n.addCSRepo),
+                : context.l10n.noCloudStreamReposAddedYetTap(
+                    context.l10n.addCSRepo,
+                  ),
           )
         else
           BlocBuilder<ActiveSourceCubit, String>(
@@ -215,7 +279,9 @@ Future<void> _showAddCsRepoDialog(BuildContext context) async {
   } catch (e) {
     messenger
       ..clearSnackBars()
-      ..showSnackBar(SnackBar(content: Text(context.l10n.failedToAddRepo('$e'))));
+      ..showSnackBar(
+        SnackBar(content: Text(context.l10n.failedToAddRepo('$e'))),
+      );
   }
 }
 
@@ -380,76 +446,108 @@ class _CsScreenSourceRowState extends State<_CsScreenSourceRow> {
         : active
         ? AppColors.accent
         : AppColors.textPrimary;
-    return InkWell(
-      onTap: () {
-        context.read<ActiveSourceCubit>().setSource(source.sourceId);
-        ScaffoldMessenger.of(context)
-          ..clearSnackBars()
-          ..showSnackBar(
-            SnackBar(
-              content: Text(context.l10n.activeSourceColon(source.displayName)),
-            ),
-          );
-      },
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 6, 8),
-        child: Row(
-          children: [
-            Padding(
-              padding: const EdgeInsetsDirectional.only(end: 12),
-              // A loaded plugin has no icon of its own; the catalog entry it
-              // came from does.
-              child: SourceIconTile(
-                name: source.displayName,
-                icon: cloudStreamIconUrls()[source.sourceId],
+    void activate() {
+      context.read<ActiveSourceCubit>().setSource(source.sourceId);
+      ScaffoldMessenger.of(context)
+        ..clearSnackBars()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(context.l10n.activeSourceColon(source.displayName)),
+          ),
+        );
+    }
+
+    void openSettings() => Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => SourceSettingsScreen(
+          sourceId: source.sourceId,
+          repoUrl: '',
+          displayName: source.displayName,
+        ),
+      ),
+    );
+
+    // Windows: hover highlight + right-click with the row's actions
+    // (src-13 B).
+    return DesktopSourceRow(
+      tooltip: source.displayName,
+      items: () => desktopSourceMenuItems(
+        context,
+        onActivate: active ? null : activate,
+        onSettings: openSettings,
+        onUninstall: _removing ? null : _uninstall,
+        extra: [
+          DesktopMenuItem<Object?>(
+            label: enabled ? context.l10n.disable : context.l10n.enable,
+            icon: enabled
+                ? Icons.toggle_off_outlined
+                : Icons.toggle_on_outlined,
+            onTap: () => manager.setEnabled(source.sourceId, !enabled),
+          ),
+        ],
+      ),
+      child: InkWell(
+        onTap: activate,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 6, 8),
+          child: Row(
+            children: [
+              Padding(
+                padding: const EdgeInsetsDirectional.only(end: 12),
+                // A loaded plugin has no icon of its own; the catalog entry it
+                // came from does.
+                child: SourceIconTile(
+                  name: source.displayName,
+                  icon: cloudStreamIconUrls()[source.sourceId],
+                ),
               ),
-            ),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    source.displayName,
-                    style: AppText.headline.copyWith(
-                      fontSize: 15,
-                      color: nameColor,
-                      fontWeight: active ? FontWeight.w600 : null,
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      source.displayName,
+                      style: AppText.headline.copyWith(
+                        fontSize: 15,
+                        color: nameColor,
+                        fontWeight: active ? FontWeight.w600 : null,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                     ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  const SizedBox(height: 2),
-                  Text(context.l10n.cloudstream, style: AppText.caption),
-                ],
+                    const SizedBox(height: 2),
+                    Text(context.l10n.cloudstream, style: AppText.caption),
+                  ],
+                ),
               ),
-            ),
-            Switch.adaptive(
-              value: enabled,
-              activeThumbColor: AppColors.accent,
-              onChanged: (v) => manager.setEnabled(source.sourceId, v),
-            ),
-            IconButton(
-              tooltip: context.l10n.sourceSettings,
-              icon: const Icon(Icons.tune_rounded, size: 20),
-              color: AppColors.textSecondary,
-              onPressed: () => Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => SourceSettingsScreen(
-                    sourceId: source.sourceId,
-                    repoUrl: '',
-                    displayName: source.displayName,
+              Switch.adaptive(
+                value: enabled,
+                activeThumbColor: AppColors.accent,
+                onChanged: (v) => manager.setEnabled(source.sourceId, v),
+              ),
+              IconButton(
+                tooltip: context.l10n.sourceSettings,
+                icon: const Icon(Icons.tune_rounded, size: 20),
+                color: AppColors.textSecondary,
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => SourceSettingsScreen(
+                      sourceId: source.sourceId,
+                      repoUrl: '',
+                      displayName: source.displayName,
+                    ),
                   ),
                 ),
               ),
-            ),
-            IconButton(
-              tooltip: context.l10n.uninstall,
-              icon: const Icon(Icons.delete_outline_rounded, size: 20),
-              color: AppColors.textSecondary,
-              visualDensity: VisualDensity.compact,
-              onPressed: _removing ? null : _uninstall,
-            ),
-          ],
+              IconButton(
+                tooltip: context.l10n.uninstall,
+                icon: const Icon(Icons.delete_outline_rounded, size: 20),
+                color: AppColors.textSecondary,
+                visualDensity: VisualDensity.compact,
+                onPressed: _removing ? null : _uninstall,
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -482,9 +580,7 @@ Future<void> _uninstallCsPlugin(
     if (!context.mounted || !messenger.mounted) return;
     messenger
       ..clearSnackBars()
-      ..showSnackBar(
-        SnackBar(content: Text(l10n.uninstallFailed('$e'))),
-      );
+      ..showSnackBar(SnackBar(content: Text(l10n.uninstallFailed('$e'))));
   }
 }
 
@@ -495,7 +591,10 @@ Future<void> _uninstallCsPlugin(
 
 /// Confirms then removes an entire CloudStream repo (its sources too) via
 /// [CloudStreamManager.deleteRepo]; shows a context.l10n.removed snackbar on success.
-Future<void> _confirmDeleteCsRepo(BuildContext context, CsRepoGroup group) async {
+Future<void> _confirmDeleteCsRepo(
+  BuildContext context,
+  CsRepoGroup group,
+) async {
   final messenger = ScaffoldMessenger.of(context);
   final ok = await AppDialog.confirm(
     context,
@@ -542,7 +641,10 @@ Future<void> _checkCsUpdates(BuildContext context, CsRepoGroup group) async {
 
 /// Applies all available updates for a repo (re-download newer `.cs3`s) via
 /// [CloudStreamManager.updateRepo], with progress + an honest result count.
-Future<void> _applyCsRepoUpdates(BuildContext context, CsRepoGroup group) async {
+Future<void> _applyCsRepoUpdates(
+  BuildContext context,
+  CsRepoGroup group,
+) async {
   final messenger = ScaffoldMessenger.of(context);
   messenger
     ..clearSnackBars()
@@ -554,7 +656,9 @@ Future<void> _applyCsRepoUpdates(BuildContext context, CsRepoGroup group) async 
       ..showSnackBar(
         SnackBar(
           content: Text(
-            count == 0 ? context.l10n.alreadyUpToDate : context.l10n.updatedNSources(count),
+            count == 0
+                ? context.l10n.alreadyUpToDate
+                : context.l10n.updatedNSources(count),
           ),
         ),
       );
@@ -639,7 +743,9 @@ class _CsScreenRepoSectionState extends State<_CsScreenRepoSection> {
   Widget build(BuildContext context) {
     final manager = sl<CloudStreamManager>();
     final isOther = group.url.isEmpty;
-    final updates = isOther ? const <CsUpdate>[] : manager.updatesFor(group.url);
+    final updates = isOther
+        ? const <CsUpdate>[]
+        : manager.updatesFor(group.url);
     final catalog = isOther ? _otherCatalog : group.catalog;
     final installedCount = isOther
         ? group.sources.length
@@ -898,19 +1004,23 @@ class _CsScreenPluginRowState extends State<_CsScreenPluginRow> {
 
   Future<void> _install() async {
     final messenger = ScaffoldMessenger.of(context);
+    // The row may be disposed while the native extension call is running.
+    final l10n = context.l10n;
     setState(() => _busy = true);
     try {
-      await sl<CloudStreamManager>()
-          .installPlugin(widget.plugin, repoUrl: widget.repoUrl);
+      await sl<CloudStreamManager>().installPlugin(
+        widget.plugin,
+        repoUrl: widget.repoUrl,
+      );
       messenger
         ..clearSnackBars()
         ..showSnackBar(
-          SnackBar(content: Text(context.l10n.installedName(widget.plugin.name))),
+          SnackBar(content: Text(l10n.installedName(widget.plugin.name))),
         );
     } catch (e) {
       messenger
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(content: Text(context.l10n.installFailed('$e'))));
+        ..showSnackBar(SnackBar(content: Text(l10n.installFailed('$e'))));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -920,19 +1030,23 @@ class _CsScreenPluginRowState extends State<_CsScreenPluginRow> {
     final update = widget.update;
     if (update == null) return;
     final messenger = ScaffoldMessenger.of(context);
+    // The row may be disposed while the native extension call is running.
+    final l10n = context.l10n;
     setState(() => _busy = true);
     try {
-      await sl<CloudStreamManager>()
-          .updatePlugin(update, repoUrl: widget.repoUrl);
+      await sl<CloudStreamManager>().updatePlugin(
+        update,
+        repoUrl: widget.repoUrl,
+      );
       messenger
         ..clearSnackBars()
         ..showSnackBar(
-          SnackBar(content: Text(context.l10n.updatedName(widget.plugin.name))),
+          SnackBar(content: Text(l10n.updatedName(widget.plugin.name))),
         );
     } catch (e) {
       messenger
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(content: Text(context.l10n.updateFailed('$e'))));
+        ..showSnackBar(SnackBar(content: Text(l10n.updateFailed('$e'))));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -952,94 +1066,124 @@ class _CsScreenPluginRowState extends State<_CsScreenPluginRow> {
     // Read live from the manager (not the parent-computed widget.installed) so
     // this row's own setState after _install/_uninstall reflects the new state
     // immediately, even if the parent group hasn't rebuilt.
-    final installed = sl<CloudStreamManager>()
-        .isPluginInstalled(widget.plugin.internalName, repoUrl: widget.repoUrl);
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 12, 8),
-      child: Row(
-        children: [
-          Padding(
-            padding: const EdgeInsetsDirectional.only(end: 12),
-            child: SourceIconTile(
-              name: widget.plugin.name,
-              icon: widget.plugin.iconUrl,
+    final installed = sl<CloudStreamManager>().isPluginInstalled(
+      widget.plugin.internalName,
+      repoUrl: widget.repoUrl,
+    );
+    final desktop = desktopPanelsEnabled;
+    // Windows actions: one list for the '...' menu and right-click
+    // (src-6 B / src-13 B).
+    List<DesktopMenuItem<Object?>> menuItems() => desktopSourceMenuItems(
+      context,
+      onInstall: !installed && !_busy ? _install : null,
+      onUpdate: installed && widget.update != null && !_busy ? _update : null,
+      updateLabel: widget.update == null
+          ? null
+          : context.l10n.updateArrowVersion('${widget.update!.onlineVersion}'),
+      onUninstall: installed && !_busy ? _uninstall : null,
+    );
+    return DesktopSourceRow(
+      items: menuItems,
+      tooltip: '${widget.plugin.name} · $_meta',
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 12, 8),
+        child: Row(
+          children: [
+            Padding(
+              padding: const EdgeInsetsDirectional.only(end: 12),
+              child: SourceIconTile(
+                name: widget.plugin.name,
+                icon: widget.plugin.iconUrl,
+              ),
             ),
-          ),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  widget.plugin.name,
-                  style: AppText.headline.copyWith(fontSize: 15),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                const SizedBox(height: 2),
-                Text(_meta, style: AppText.caption),
-              ],
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    widget.plugin.name,
+                    style: AppText.headline.copyWith(fontSize: 15),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 2),
+                  Text(_meta, style: AppText.caption),
+                ],
+              ),
             ),
-          ),
-          const SizedBox(width: 8),
-          if (_busy)
-            SizedBox(
-              width: 96,
-              height: 36,
-              child: Center(
-                child: SizedBox(
-                  width: 20,
-                  height: 20,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    color: AppColors.accent,
+            const SizedBox(width: 8),
+            if (_busy)
+              SizedBox(
+                width: 96,
+                height: 36,
+                child: Center(
+                  child: SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: AppColors.accent,
+                    ),
                   ),
                 ),
-              ),
-            )
-          else if (installed && widget.update != null)
-            FilledButton(
-              onPressed: _update,
-              style: FilledButton.styleFrom(
-                backgroundColor: AppColors.accent,
-                foregroundColor: Colors.white,
-                elevation: 0,
-                minimumSize: const Size(96, 36),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
+              )
+            else if (installed && desktop)
+              // A status, not a button: clicking 'Installed' no longer
+              // uninstalls; Update / Uninstall live in the '...' menu, with a
+              // dot when an update waits (src-6 B).
+              DesktopInstalledActions(
+                items: menuItems,
+                updateAvailable: widget.update != null,
+              )
+            else if (installed && widget.update != null)
+              FilledButton(
+                onPressed: _update,
+                style: FilledButton.styleFrom(
+                  backgroundColor: AppColors.accent,
+                  foregroundColor: Colors.white,
+                  elevation: 0,
+                  minimumSize: const Size(96, 36),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
                 ),
-              ),
-              child: Text(context.l10n.updateArrowVersion('${widget.update!.onlineVersion}')),
-            )
-          else if (installed)
-            OutlinedButton(
-              onPressed: _uninstall,
-              style: OutlinedButton.styleFrom(
-                foregroundColor: AppColors.textSecondary,
-                side: BorderSide(
-                  color: AppColors.textSecondary.withValues(alpha: 0.4),
+                child: Text(
+                  context.l10n.updateArrowVersion(
+                    '${widget.update!.onlineVersion}',
+                  ),
                 ),
-                minimumSize: const Size(96, 36),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
+              )
+            else if (installed)
+              OutlinedButton(
+                onPressed: _uninstall,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: AppColors.textSecondary,
+                  side: BorderSide(
+                    color: AppColors.textSecondary.withValues(alpha: 0.4),
+                  ),
+                  minimumSize: const Size(96, 36),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
                 ),
-              ),
-              child: Text(context.l10n.installed),
-            )
-          else
-            FilledButton(
-              onPressed: _install,
-              style: FilledButton.styleFrom(
-                backgroundColor: AppColors.accent,
-                foregroundColor: Colors.white,
-                elevation: 0,
-                minimumSize: const Size(96, 36),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
+                child: Text(context.l10n.installed),
+              )
+            else
+              FilledButton(
+                onPressed: _install,
+                style: FilledButton.styleFrom(
+                  backgroundColor: AppColors.accent,
+                  foregroundColor: Colors.white,
+                  elevation: 0,
+                  minimumSize: const Size(96, 36),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
                 ),
+                child: Text(context.l10n.install),
               ),
-              child: Text(context.l10n.install),
-            ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -1058,8 +1202,7 @@ class _CsScreenAddRepoDialog extends StatefulWidget {
   const _CsScreenAddRepoDialog();
 
   @override
-  State<_CsScreenAddRepoDialog> createState() =>
-      _CsScreenAddRepoDialogState();
+  State<_CsScreenAddRepoDialog> createState() => _CsScreenAddRepoDialogState();
 }
 
 class _CsScreenAddRepoDialogState extends State<_CsScreenAddRepoDialog> {
@@ -1079,28 +1222,33 @@ class _CsScreenAddRepoDialogState extends State<_CsScreenAddRepoDialog> {
       backgroundColor: AppColors.surface,
       title: Text(context.l10n.addCSRepo, style: AppText.headline),
       content: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            TextField(
-              controller: _urlCtrl,
-              autofocus: false,
-              keyboardType: TextInputType.url,
-              cursorColor: AppColors.accent,
-              style: AppText.body.copyWith(color: AppColors.textPrimary),
-              onSubmitted: (_) => _submit(),
-              decoration: InputDecoration(
-                labelText: context.l10n.repoUrl,
-                hintText: context.l10n.repoUrlHint,
+        // Windows: clipboard pre-fill + drop a link / file (src-12 B).
+        child: DesktopAddRepoAssist(
+          controller: _urlCtrl,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              TextField(
+                controller: _urlCtrl,
+                // Windows: focus the field so Enter adds a pre-filled link.
+                autofocus: desktopPanelsEnabled,
+                keyboardType: TextInputType.url,
+                cursorColor: AppColors.accent,
+                style: AppText.body.copyWith(color: AppColors.textPrimary),
+                onSubmitted: (_) => _submit(),
+                decoration: InputDecoration(
+                  labelText: context.l10n.repoUrl,
+                  hintText: context.l10n.repoUrlHint,
+                ),
               ),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              context.l10n.pasteCloudStreamRepoUrlFull,
-              style: AppText.caption,
-            ),
-          ],
+              const SizedBox(height: 10),
+              Text(
+                context.l10n.pasteCloudStreamRepoUrlFull,
+                style: AppText.caption,
+              ),
+            ],
+          ),
         ),
       ),
       actions: [

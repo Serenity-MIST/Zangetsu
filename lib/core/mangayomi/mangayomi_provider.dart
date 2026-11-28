@@ -19,6 +19,7 @@ const MethodChannel _mangayomiCloudflareChannel = MethodChannel(
   'zangetsu/mihon',
 );
 
+/// Adapts extension results to shared playback and reading provider models.
 class MangayomiProvider implements BaseProvider, ReadingProvider {
   MangayomiProvider({required this.manager, required this.installed});
 
@@ -234,6 +235,10 @@ class MangayomiProvider implements BaseProvider, ReadingProvider {
         uri.host.isEmpty) {
       return const {};
     }
+    // Desktop requests use the same root-isolate lookup as worker HTTP.
+    // Mobile retains its native cookie channel when no callback is installed.
+    final lookup = manager.sessionHeaders;
+    if (lookup != null) return lookup(uri);
     try {
       final result = await _mangayomiCloudflareChannel
           .invokeMapMethod<String, String>('imageCookie', {'url': url});
@@ -260,12 +265,18 @@ class MangayomiProvider implements BaseProvider, ReadingProvider {
       return null;
     }
 
-    final cookieKey = existingKey('cookie');
-    final existingCookie = cookieKey == null ? null : headers.remove(cookieKey);
-    final clearance = cloudflareHeaders['Cookie']!;
-    headers['Cookie'] = existingCookie == null || existingCookie.isEmpty
-        ? clearance
-        : '$clearance; $existingCookie';
+    final clearance = cloudflareHeaders['Cookie'];
+    // A verified browser can contribute only its UA; preserve extension cookies
+    // in that case instead of assuming every session contains cf_clearance.
+    if (clearance != null && clearance.isNotEmpty) {
+      final cookieKey = existingKey('cookie');
+      final existingCookie = cookieKey == null
+          ? null
+          : headers.remove(cookieKey);
+      headers['Cookie'] = existingCookie == null || existingCookie.isEmpty
+          ? clearance
+          : '$clearance; $existingCookie';
+    }
     if (existingKey('user-agent') == null) {
       final userAgent = cloudflareHeaders['User-Agent'];
       if (userAgent != null) headers['User-Agent'] = userAgent;

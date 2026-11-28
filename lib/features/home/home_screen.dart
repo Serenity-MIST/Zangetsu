@@ -1,15 +1,36 @@
+import '../../core/zmode/metadata_provider_prefs.dart';
+import '../../core/lnreader/novel_cloudflare.dart';
+import '../../core/error/exceptions.dart';
 import 'dart:async';
+
+import 'desktop_home_page.dart';
+import 'home_banner_meta.dart';
+import 'home_known_artwork.dart';
+import 'cubit/home_cache.dart';
+import 'desktop_continue_store.dart';
+import 'desktop_source_catalogue_split.dart';
+import '../../core/desktop/desktop_catalogue_switch.dart';
+import '../../core/desktop/desktop_undo_toast.dart';
+import '../../core/reading/read_store.dart';
+import 'desktop_home_downloads_feed.dart';
+import '../../core/boot_network.dart';
+import '../../core/download/chapter_download_store.dart';
+import '../../core/download/download_manager.dart';
+
 import 'dart:io';
 
-import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 
 import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
 import '../../core/stremio/stremio_poster_shape.dart';
+import '../../core/stremio/stremio_ref.dart';
 import '../../core/metadata/streaming_service.dart';
+import '../../core/metadata/streaming_providers.dart';
+import '../../core/ui/streaming_prefs.dart';
 import '../../core/zmode/tmdb_catalogue.dart';
 import '../../core/platform/apple_tv.dart';
 import '../../core/mihon/mihon_extension_service.dart';
@@ -58,6 +79,7 @@ import '../settings/streaming_services_screen.dart';
 import '../sources/aniyomi_repo_tab.dart' show kAniyomiReposBoxName;
 import '../sources/providers_hub_screen.dart';
 import '../sources/source_picker_row_actions.dart';
+// Wraps the Providers hub in the desktop settings look on Windows (src-3).
 import '../sources/zangetsu_sources_screen.dart';
 import '../update/update_dialog.dart';
 import 'continue_section.dart';
@@ -101,6 +123,7 @@ import 'home_screen_tv.dart';
 import 'search_screen.dart';
 import 'cubit/tracker_home_rows.dart' show releasedCount;
 import 'see_all_screen.dart';
+import '../downloads/resume_downloaded.dart';
 
 /// Provides the [HomeCubit] (which owns the three browse rows + the carousel's
 /// trending source) and kicks off the first load. The view itself stays
@@ -132,6 +155,143 @@ class HomeScreen extends StatelessWidget {
   }
 }
 
+/// Launch-time checks: the GitHub update dialog, the one-time community
+/// welcome and developer announcements, then the daily extension auto-update
+/// (or the Android read-only source-update notification).
+///
+/// They run at most once per app process, from whichever host asks first.
+/// Windows starts them from RootShell at launch, so a Start page other than
+/// Home still gets them; phones start them when Home mounts (unchanged). The
+/// static flag means Home mounting later never runs them a second time.
+abstract final class AppLaunchChecks {
+  static bool _started = false;
+
+  /// Whether the checks have already been started this process.
+  static bool get started => _started;
+
+  /// Replaces the real checks in tests (no network, no dialogs).
+  @visibleForTesting
+  static void Function(State host)? debugRunOverride;
+
+  /// Clears the once-per-process flag between tests.
+  @visibleForTesting
+  static void debugReset() {
+    _started = false;
+    debugRunOverride = null;
+  }
+
+  /// Starts the checks against [host] (its context shows the dialogs) unless
+  /// they already started. Returns true when this call started them.
+  static bool runOnce(State host) {
+    if (_started || isAppleTv) return false;
+    _started = true;
+    final override = debugRunOverride;
+    if (override != null) {
+      override(host);
+      return true;
+    }
+    // Silently check GitHub Releases; the dialog only appears if a newer,
+    // non-skipped version exists. Best-effort — never blocks startup.
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!host.mounted) return;
+      await maybeShowUpdateDialog(host.context);
+      // One-time community welcome (its own flag, independent of the per-id
+      // announcement feed), then any new developer announcement — all awaited
+      // in sequence so the modals never fight over the stack.
+      if (host.mounted) await maybeShowCommunitySheet(host.context);
+      if (host.mounted) await maybeShowAnnouncement(host.context);
+    });
+    unawaited(_checkSourceUpdates(host));
+    return true;
+  }
+
+  /// Best-effort, non-blocking check for source updates on launch. The
+  /// auto-update path applies updates (throttled to ~once a day); otherwise the
+  /// READ-ONLY Android path re-fetches catalogs and posts a notification when
+  /// updates exist and the user left that toggle on. Deferred a few seconds so
+  /// it never competes with first content load, and fully guarded so it can
+  /// NEVER affect startup or playback.
+  static Future<void> _checkSourceUpdates(State host) async {
+    final prefs = sl<PlaybackPrefs>();
+    final autoUpdate = prefs.autoUpdateExtensions;
+    // The read-only notify path below is Android-only; keep that gate unless
+    // we're auto-updating (JS providers auto-update on any platform).
+    if (!autoUpdate && !Platform.isAndroid) return;
+    await Future<void>.delayed(const Duration(seconds: 4));
+    if (!host.mounted) return;
+
+    // Auto-update path: apply updates across all ecosystems, throttled to
+    // ~once a day across launches. Best-effort — never touches startup.
+    if (autoUpdate) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      const dayMs = 24 * 60 * 60 * 1000;
+      if (now - prefs.lastExtensionUpdateMs < dayMs) return;
+      await prefs.setLastExtensionUpdateMs(now);
+      final updated = await ExtensionAutoUpdater.run();
+      if (!host.mounted) return;
+      await announceExtensionUpdates(host.context, updated);
+      return;
+    }
+
+    try {
+      final csManager = sl<CloudStreamManager>();
+      final csCount = await csManager.checkAllUpdates();
+
+      var aniCount = 0;
+      try {
+        final repoUrls = Hive.isBoxOpen(kAniyomiReposBoxName)
+            ? Hive.box<String>(kAniyomiReposBoxName).values.toList()
+            : const <String>[];
+        if (repoUrls.isNotEmpty) {
+          aniCount = await sl<AniyomiManager>().checkAllUpdates(repoUrls);
+        }
+      } catch (_) {
+        /* aniyomi check must never break the CS check or startup */
+      }
+
+      final total = csCount + aniCount;
+      if (total > 0 && csManager.notifyUpdates) {
+        await NotificationService.instance.showSourceUpdates(count: total);
+      }
+    } catch (_) {
+      /* never affects startup */
+    }
+  }
+
+  /// Tells the user how many extensions the daily auto-update refreshed.
+  ///
+  /// Phones post a system notification. The Windows build has no notification
+  /// backend for this, so it shows an in-app floating toast instead.
+  @visibleForTesting
+  static Future<void> announceExtensionUpdates(
+    BuildContext context,
+    int updated,
+  ) async {
+    if (updated <= 0) return;
+    final body =
+        '$updated extension${updated == 1 ? '' : 's'} updated to the latest version.';
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      final messenger =
+          ScaffoldMessenger.maybeOf(context) ?? rootMessengerKey.currentState;
+      messenger?.showSnackBar(
+        SnackBar(
+          key: const ValueKey('extensions-updated-toast'),
+          content: Text(body),
+          behavior: SnackBarBehavior.floating,
+          width: 440,
+          duration: const Duration(seconds: 4),
+        ),
+      );
+      return;
+    }
+    await NotificationService.instance.showMessage(
+      id: 779100,
+      title: context.l10n.extensionsUpdated,
+      body: body,
+    );
+  }
+}
+
 class _HomeView extends StatefulWidget {
   const _HomeView({
     required this.isTabActive,
@@ -148,6 +308,10 @@ class _HomeView extends StatefulWidget {
 }
 
 class _HomeViewState extends State<_HomeView> {
+  /// Selects the Windows featured/header presentation and desktop interactions.
+  // Presentation follows Flutter's platform so phone/desktop widget tests can
+  // select their target without changing native engine platform detection.
+  bool get _isDesktop => defaultTargetPlatform == TargetPlatform.windows;
   final _repo = sl<CatalogueRepository>();
   final _myList = sl<MyListStore>();
   final _sourceCatalogueController = SourceCatalogueHomeController();
@@ -162,6 +326,103 @@ class _HomeViewState extends State<_HomeView> {
   /// Hero metadata cache: key = "sourceId:id". Futures are stored so they're
   /// never re-fetched on carousel rotation; pre-warmed when hero items load.
   final Map<String, Future<HeroMeta?>> _metaCache = {};
+
+  /// Windows Home Continue lists (home-10): only notifies when entries are
+  /// added, removed or reordered, never on a plain position save. Created on
+  /// first use by the desktop Home and disposed with this state.
+  DesktopContinueStore? _continueStore;
+  DesktopContinueStore get _continue =>
+      _continueStore ??= DesktopContinueStore.fromHistory(
+        watch: sl.isRegistered<WatchHistory>() ? sl<WatchHistory>() : null,
+        read: sl.isRegistered<ReadHistory>() ? sl<ReadHistory>() : null,
+      );
+
+  /// Windows Home saved-shows shelf: redraws Home only when that shelf is
+  /// needed and really changed, not on every download progress tick. Created
+  /// on first use by the desktop Home and disposed with this state.
+  DesktopHomeDownloadsFeed? _downloadsFeedStore;
+  DesktopHomeDownloadsFeed get _downloadsFeed =>
+      _downloadsFeedStore ??= DesktopHomeDownloadsFeed(
+        changes: Listenable.merge([
+          sl<DownloadManager>(),
+          sl<ChapterDownloadStore>().listenable(),
+        ]),
+        videos: () => sl<DownloadManager>().all,
+        chapters: () => sl<ChapterDownloadStore>().all(),
+      );
+
+  /// Windows (home-11 B): the last rows a source catalogue loaded, kept on
+  /// screen while a refresh of the same source is in flight.
+  ({String key, List<HomeSection> sections})? _lastDesktopSourceRows;
+
+  /// Windows (home-6): ids + labels last published to the shell's catalogue
+  /// switch, so it is only republished when the choices really change.
+  String? _publishedCatalogueSignature;
+
+  /// Hero metadata, cached per "sourceId:id" so a slide is never re-fetched
+  /// on carousel rotation; pre-warmed when hero items load. Windows never
+  /// loads it at all (see [HomeBannerMeta]).
+  late final HomeBannerMeta _bannerMeta = HomeBannerMeta(
+    loadDetail: _detailOf,
+    known: _heldCatalogueTitles,
+  );
+
+  /// Windows: catalogue titles already held (see [_heldCatalogueTitles]),
+  /// rebuilt only when one of the in-memory row lists changes.
+  HomeKnownTitles? _heldTitles;
+  int? _heldStamp;
+
+  /// Windows: metadata Home rows saved on disk, read once per Home.
+  List<MediaItem>? _diskCatalogueTitles;
+
+  /// Windows: every metadata catalogue title the app already holds, of any
+  /// kind (anime, movies, TV, manga, novels): the rows loaded this session
+  /// and the ones saved on disk. Used to borrow a show's wide picture or
+  /// description for the banner and the Continue cards. Reads only what is
+  /// already there; nothing is fetched. Empty on other platforms.
+  HomeKnownTitles _heldCatalogueTitles() {
+    if (!_isDesktop) return HomeKnownTitles.empty;
+    final meta = sl.isRegistered<MetadataRepository>()
+        ? sl<MetadataRepository>()
+        : null;
+    final live = [for (final k in ZKind.values) meta?.peekHomeCache(k)];
+    final stamp = Object.hashAll(live.map(identityHashCode));
+    final held = _heldTitles;
+    if (held != null && stamp == _heldStamp) return held;
+    final disk = _diskCatalogueTitles ??= [
+      for (final k in ZKind.values)
+        for (final section
+            in HomeCache.read(ZmodeIds.sourceId, k.name) ?? const [])
+          ...section.items,
+    ];
+    _heldStamp = stamp;
+    // Live rows first: they carry descriptions, which disk rows do not keep.
+    return _heldTitles = HomeKnownTitles([
+      for (final rows in live)
+        for (final section in rows ?? const <HomeSection>[]) ...section.items,
+      ...disk,
+    ]);
+  }
+
+  /// Windows: the wide picture for history entry [e]: the one stored with it,
+  /// else the one last seen for that show this session, else the same show's
+  /// from catalogue titles already held. Null when none is known.
+  String? _heldBackdropFor(HistoryEntry e) {
+    final stored = e.backdrop ?? ShowBackdrops.of(e.showUrl);
+    if (stored != null) return stored;
+    final twin = _heldCatalogueTitles().twin(
+      title: e.showTitle,
+      url: e.showUrl.isEmpty ? null : e.showUrl,
+      malId: e.malId,
+      reading: false,
+      wanted: (i) => homeWideArtOf(i) != null,
+      // A Continue card keeps its poster rather than risk the picture of a
+      // different show that only shares the title.
+      titleNeedsKind: true,
+    );
+    return twin == null ? null : homeWideArtOf(twin);
+  }
+
   bool _heroPrewarmed = false;
   bool _resumePrewarmed = false;
   bool _openingSourceCatalogueItem = false;
@@ -234,6 +495,13 @@ class _HomeViewState extends State<_HomeView> {
   }
 
   void _maybeStartLaunchChecks() {
+    // Windows: RootShell starts the launch checks at startup whatever the
+    // Start page; AppLaunchChecks runs once per process, so this is a no-op
+    // there unless the shell has not started them yet.
+    if (_isDesktop) {
+      AppLaunchChecks.runOnce(this);
+      return;
+    }
     if (widget.deferStartupPrompts || _updateChecked || isAppleTv) return;
     _updateChecked = true;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
@@ -299,6 +567,21 @@ class _HomeViewState extends State<_HomeView> {
     HomeCataloguePrefs.revision.removeListener(_onCatalogueRevision);
     ThemeController.revision.removeListener(_onThemeRevision);
     _heroTint.dispose();
+    _continueStore?.dispose();
+    _downloadsFeedStore?.dispose();
+    // Home owns the shell's catalogue switch content; drop it with Home.
+    // Deferred to after the frame: clearing now would rebuild the shell's
+    // switcher while this tree is being torn down. Skipped if a new Home
+    // published its own options in the meantime.
+    if (_publishedCatalogueSignature != null) {
+      final published = DesktopCatalogueSwitch.options.value;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (identical(DesktopCatalogueSwitch.options.value, published)) {
+          DesktopCatalogueSwitch.clear();
+        }
+      });
+      WidgetsBinding.instance.scheduleFrame();
+    }
     super.dispose();
   }
 
@@ -455,8 +738,12 @@ class _HomeViewState extends State<_HomeView> {
   ///
   /// A source-backed title never calls `onPartial` — it has nothing to search
   /// for — and completes on the second branch exactly as it always did.
-  Future<HeroMeta?> _heroMeta(MediaItem m) =>
-      _metaCache.putIfAbsent('${m.sourceId}:${m.id}', () async {
+  ///
+  /// Windows: the loading rules live in [HomeBannerMeta], which never loads
+  /// a detail, so rotating slides costs no catalogue or source request.
+  Future<HeroMeta?> _heroMeta(MediaItem m) => _isDesktop
+      ? _bannerMeta(m)
+      : _metaCache.putIfAbsent('${m.sourceId}:${m.id}', () async {
         final first = Completer<MediaDetail?>();
         void settle(MediaDetail? d) {
           if (!first.isCompleted) first.complete(d);
@@ -778,6 +1065,22 @@ class _HomeViewState extends State<_HomeView> {
   /// player resolves the episode list behind its own branded loader (no blocking
   /// pre-navigation spinner).
   Future<void> _resume(HistoryEntry e) async {
+    // Windows: a downloaded episode resumes from the saved file (works
+    // offline). Phone and TV stream as before.
+    if (_isDesktop) {
+      final local = await resumeFromDownload(
+        context,
+        e,
+        onlineEpisodes: () => _repo.episodes(
+          e.showUrl,
+          category: e.category,
+          sourceId: e.sourceId,
+        ),
+        onlineSources: (u) =>
+            _repo.sources(u, sourceId: e.sourceId, fast: true),
+      );
+      if (!mounted || local) return;
+    }
     await Navigator.push(
       context,
       episodePlayerRoute(
@@ -869,7 +1172,10 @@ class _HomeViewState extends State<_HomeView> {
       bottom: false,
       child: LayoutBuilder(
         builder: (context, constraints) {
-          final splitEdgeHeader = edgeBanner && constraints.maxWidth < 520;
+          // A narrow desktop window also needs the second source row; its
+          // wider wordmark cannot share 320px with all header controls.
+          final splitEdgeHeader =
+              constraints.maxWidth < 520 && (edgeBanner || _isDesktop);
           final brand = edgeBanner
               ? IconButton(
                   tooltip: 'Zangetsu',
@@ -889,11 +1195,19 @@ class _HomeViewState extends State<_HomeView> {
                     // 48px minimum tap target, and vertical padding alone
                     // cannot shift a left-aligned image.
                     padding: const EdgeInsets.symmetric(vertical: 8),
-                    child: Image.asset(
-                      'assets/icon/wordmark.png',
-                      height: 22,
-                      fit: BoxFit.contain,
-                    ),
+                    child: _isDesktop
+                        ? const Text(
+                            'Discover',
+                            style: TextStyle(
+                              fontSize: 26,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          )
+                        : Image.asset(
+                            'assets/icon/wordmark.png',
+                            height: 22,
+                            fit: BoxFit.contain,
+                          ),
                   ),
                 );
           final actions = [
@@ -914,7 +1228,22 @@ class _HomeViewState extends State<_HomeView> {
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Row(children: [brand, const Spacer(), ...actions]),
+                      // Windows bounds the wider "Discover" title so it
+                      // never pushes the actions; phone keeps the Spacer row.
+                      if (_isDesktop)
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Align(
+                                alignment: AlignmentDirectional.centerStart,
+                                child: brand,
+                              ),
+                            ),
+                            ...actions,
+                          ],
+                        )
+                      else
+                        Row(children: [brand, const Spacer(), ...actions]),
                       ValueListenableBuilder<int>(
                         valueListenable: ZModePrefs.revision,
                         builder: (context, _, _) {
@@ -1499,6 +1828,991 @@ class _HomeViewState extends State<_HomeView> {
     );
   }
 
+  /// Explicit desktop catalogue selection preserves the chosen metadata
+  /// provider separately from installed playback/reading sources.
+  Future<void> _selectDesktopAnimeCatalogue(AnimeProvider provider) async {
+    final cubit = context.read<HomeCubit>();
+    await sl<MetadataProviderPrefs>().setAnime(provider);
+    await HomeCataloguePrefs.setSourceSelected(false);
+    if (mounted && !cubit.isClosed) {
+      await cubit.load(reset: true);
+    }
+  }
+
+  /// Movies/TV keep their independent metadata choice when leaving sources.
+  Future<void> _selectDesktopVideoCatalogue(VideoProvider provider) async {
+    final cubit = context.read<HomeCubit>();
+    await sl<MetadataProviderPrefs>().setVideo(provider);
+    await HomeCataloguePrefs.setSourceSelected(false);
+    if (mounted && !cubit.isClosed) {
+      await cubit.load(reset: true);
+    }
+  }
+
+  Future<List<HomeSection>>? _newDesktopSourceFuture;
+  String? _newDesktopSourceKey;
+
+  /// Fetch source catalogue data directly. No hidden/offstage legacy view is
+  /// mounted to obtain it; source selection never changes the global provider.
+  Future<List<HomeSection>> _newDesktopSourceRows(ContentMode mode) {
+    final repository = sl<SourceRepository>();
+    final sources = repository.loadedSources
+        .where(
+          (source) => switch (mode) {
+            ContentMode.manga => source.id.startsWith('mihon:'),
+            ContentMode.novel => source.id.startsWith('lnr:'),
+            ContentMode.anime =>
+              !source.id.startsWith('mihon:') && !source.id.startsWith('lnr:'),
+          },
+        )
+        .toList();
+    final sourceId =
+        sources.any((source) => source.id == _sourceCatalogueSourceId)
+        ? _sourceCatalogueSourceId
+        : sources.firstOrNull?.id;
+    final key = '${mode.name}:$sourceId';
+    if (key != _newDesktopSourceKey) {
+      _newDesktopSourceKey = key;
+      _sourceCatalogueSourceId = sourceId;
+      _newDesktopSourceFuture = sourceId == null
+          ? Future.value(const [])
+          : repository.home(sourceId: sourceId).then((sections) {
+              // Novel plugins swallow fetch failures. Convert only this site's
+              // pending challenge into the same typed recovery as Mihon.
+              final challenge = sourceId.startsWith('lnr:') && sections.isEmpty
+                  ? NovelCloudflare.pendingForSite(
+                      repository.baseUrlFor(sourceId),
+                    )
+                  : null;
+              if (challenge != null) {
+                throw CloudflareRequiredException(challenge);
+              }
+              // Windows (home-11 B): remembered so a later refresh of this
+              // same source keeps these rows on screen while it loads.
+              _lastDesktopSourceRows = (key: key, sections: sections);
+              return sections;
+            });
+    }
+    return _newDesktopSourceFuture!;
+  }
+
+  /// Maps the saved Home rows arrangement ([HomeState.rows], Settings > Home
+  /// rows) onto the desktop Home: order, visibility and reset all come from
+  /// the same merge the phone renders. Null before the first merge, which
+  /// keeps the desktop's built-in order.
+  List<DesktopHomeRow>? _desktopHomeRows(
+    List<HomeRow>? rows,
+    List<HomeSection> sections,
+    ContentMode mode,
+  ) {
+    if (rows == null && !_sourceCatalogueSelected) return null;
+    final out = <DesktopHomeRow>[];
+    if (_sourceCatalogueSelected) {
+      // Same rule as the phone: a source catalogue keeps only the Continue
+      // row and the catalogue's position from the layout.
+      var inserted = false;
+      void insertCatalogue() {
+        if (inserted) return;
+        inserted = true;
+        // home-11 A: the banner's titles are not repeated as a shelf.
+        out.addAll(_desktopSourceShelves(sections));
+      }
+
+      // Before the first merge there is no saved layout: Continue first,
+      // then the catalogue (the desktop's built-in order).
+      if (rows == null) out.add(DesktopHomeRow.resume());
+      for (final row in rows ?? const <HomeRow>[]) {
+        if (row is LocalContinueHomeRow) {
+          out.add(DesktopHomeRow.resume());
+        } else if (row is ProviderHomeRow || row is StreamingServicesHomeRow) {
+          insertCatalogue();
+        }
+      }
+      insertCatalogue();
+      return out;
+    }
+    // The phone feeds its banner from a first section it then leaves out of
+    // the rows (providerRowSections), so the editor never lists it. Desktop
+    // keeps that section as a shelf just above the first catalogue row, as it
+    // always has, so no catalogue content disappears.
+    final listed = providerRowSections(sections, isTv: false);
+    final unlisted = sections.length > listed.length ? sections.first : null;
+    var placedUnlisted = unlisted == null;
+    void placeUnlisted() {
+      if (placedUnlisted) return;
+      placedUnlisted = true;
+      out.add(DesktopHomeRow.shelf(unlisted!));
+    }
+
+    for (final row in rows ?? const <HomeRow>[]) {
+      switch (row) {
+        case LocalContinueHomeRow():
+          out.add(DesktopHomeRow.resume());
+        case ProviderHomeRow(:final section):
+          placeUnlisted();
+          out.add(DesktopHomeRow.shelf(section));
+        case StreamingServicesHomeRow():
+          out.add(
+            DesktopHomeRow.custom(
+              (context) => DesktopHomeServicesShelf(
+                key: const ValueKey('desktop-home-services'),
+                title: context.l10n.streamingServices,
+                load: () => sl.isRegistered<StreamingProvidersService>()
+                    ? sl<StreamingProvidersService>().list(
+                        StreamingPrefs.region,
+                      )
+                    : Future.value(const <StreamingService>[]),
+                onOpen: (service) => unawaited(_openStreamingService(service)),
+                onAll: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => const StreamingServicesScreen(),
+                  ),
+                ),
+              ),
+            ),
+          );
+        case TrackerContinueHomeRow(:final items, :final trackerName):
+          out.add(
+            _desktopTrackerShelf(
+              title: context.l10n.homeRowTrackerContinue(trackerName),
+              items: items,
+              trackerName: trackerName,
+              status: WatchStatus.watching,
+              onAll: () =>
+                  _openTrackerList(trackerName, WatchStatus.watching),
+              progress: true,
+            ),
+          );
+        case NewEpisodesHomeRow(:final items, :final trackerName):
+          out.add(
+            _desktopTrackerShelf(
+              title: context.l10n.homeRowNewEpisodes,
+              items: items,
+              trackerName: trackerName,
+              status: WatchStatus.watching,
+              onAll: () => _openNewEpisodes(items),
+              // Always shown: the count is why the title is in this row.
+              tags: (e) => ['+${releasedCount(e) - (e.progress ?? 0)}'],
+            ),
+          );
+        case TrackerListHomeRow(:final status, :final items, :final trackerName):
+          out.add(
+            _desktopTrackerShelf(
+              title: trackerStatusLabel(
+                context,
+                status,
+                reading: mode.isReading,
+              ),
+              items: items,
+              trackerName: trackerName,
+              status: status,
+              onAll: () => _openTrackerList(trackerName, status),
+              progress: true,
+            ),
+          );
+      }
+    }
+    placeUnlisted();
+    return out;
+  }
+
+  /// Windows (home-11 A): banner titles of a source catalogue
+  /// (see [desktopSourceCatalogueSplit]).
+  List<MediaItem> _desktopSourceFeatured(List<HomeSection> sections) =>
+      desktopSourceCatalogueSplit(sections).featured;
+
+  /// Windows (home-11 A): the shelves of a source catalogue, without the
+  /// titles already in the banner. A trimmed lone section still opens the
+  /// whole original section (and its paging) from See all.
+  List<DesktopHomeRow> _desktopSourceShelves(List<HomeSection> sections) {
+    final split = desktopSourceCatalogueSplit(sections);
+    final whole = split.trimmedFrom;
+    return [
+      for (final s in split.shelves)
+        DesktopHomeRow.shelf(
+          s,
+          onAll: whole == null
+              ? null
+              : () => _openSeeAll(whole, sourceCatalogue: true),
+        ),
+    ];
+  }
+
+  /// A tracker row (Continue on tracker, New episodes, a status list) as a
+  /// desktop poster shelf. Opens and menus go through the tracker paths, and
+  /// the episode count shows only while Poster cards > Watch progress is on.
+  DesktopHomeRow _desktopTrackerShelf({
+    required String title,
+    required List<TrackerListItem> items,
+    required String trackerName,
+    required WatchStatus status,
+    required VoidCallback onAll,
+    bool progress = false,
+    List<String> Function(TrackerListItem)? tags,
+  }) {
+    final entries = Map<MediaItem, TrackerListItem>.identity()
+      ..addEntries(items.map((e) => MapEntry(e.item, e)));
+    return DesktopHomeRow.shelf(
+      HomeSection(title: title, items: [for (final e in items) e.item]),
+      onOpen: _openTrackerItem,
+      onAll: onAll,
+      onMenu: (item) => unawaited(
+        showDesktopHomeMenu(
+          context,
+          title: item.title,
+          actions: [
+            (label: 'Details', icon: 'info', run: () => _openTrackerItem(item)),
+            (
+              label: 'Open $trackerName list',
+              icon: 'bookmark',
+              run: () => _openTrackerList(trackerName, status),
+            ),
+          ],
+        ),
+      ),
+      tagsFor: tags == null
+          ? null
+          : (item) => entries[item] == null ? const [] : tags(entries[item]!),
+      progressFor: progress
+          ? (item) => entries[item] == null
+                ? null
+                : trackerProgressSubtitle(entries[item]!)
+          : null,
+    );
+  }
+
+  // ── Windows Continue menu actions (home-8) ─────────────────────────────────
+
+  /// The show behind a Continue watching card, for Details (same stub the
+  /// phone info sheet uses).
+  MediaItem _continueWatchItem(HistoryEntry e) => MediaItem(
+    id: e.showId,
+    title: e.showTitle,
+    cover: e.cover,
+    coverHeaders: e.coverHeaders,
+    url: e.showUrl,
+    type: ProviderType.anime,
+    sourceId: e.sourceId,
+  );
+
+  /// The title behind a Continue reading card, for Details.
+  MediaItem _continueReadItem(ReadEntry e) => MediaItem(
+    id: e.showId,
+    title: e.title,
+    cover: e.cover,
+    url: e.detailUrl,
+    type: e.type,
+    sourceId: e.sourceId,
+  );
+
+  /// home-8 A: removes the card at once and offers Undo, which puts the
+  /// exact entry (episode + position) back.
+  Future<void> _removeWatchFromContinue(HistoryEntry e) async {
+    final history = sl<WatchHistory>();
+    final removal = history.remove(e.sourceId, e.showId);
+    if (mounted) {
+      showUndoToast(
+        context,
+        message: context.l10n.removedFromContinueWatching,
+        onUndo: () => unawaited(() async {
+          // Let the remove (and its cloud delete) finish first, so the
+          // restored row is the one that stays.
+          try {
+            await removal;
+          } catch (_) {}
+          await history.restore(e);
+        }()),
+      );
+    }
+    try {
+      await removal;
+    } catch (_) {
+      showGlobalSnack(appL10n.couldntRemoveFromContinueWatching);
+    }
+  }
+
+  /// home-8 A for reading: remove with Undo.
+  Future<void> _removeReadingFromContinue(ReadEntry e) async {
+    final history = sl<ReadHistory>();
+    final removal = history.remove(e.sourceId, e.showId);
+    if (mounted) {
+      showUndoToast(
+        context,
+        message: context.l10n.removedFromContinueReading,
+        onUndo: () => unawaited(() async {
+          try {
+            await removal;
+          } catch (_) {}
+          await history.save(e, flush: true);
+        }()),
+      );
+    }
+    try {
+      await removal;
+    } catch (_) {
+      showGlobalSnack(appL10n.couldntRemoveFromContinueReading);
+    }
+  }
+
+  /// home-8 B: plays the Continue episode from 0:00. The episode's own resume
+  /// mark is reset too, otherwise the player would jump back to it.
+  Future<void> _restartEpisode(HistoryEntry e) async {
+    if (sl.isRegistered<ResumeStore>()) {
+      await sl<ResumeStore>().save(
+        e.sourceId,
+        e.showUrl,
+        e.episodeId,
+        Duration.zero,
+        e.duration,
+      );
+    }
+    if (!mounted) return;
+    await _resume(
+      HistoryEntry(
+        sourceId: e.sourceId,
+        showId: e.showId,
+        showTitle: e.showTitle,
+        cover: e.cover,
+        coverHeaders: e.coverHeaders,
+        thumbnail: e.thumbnail,
+        backdrop: e.backdrop,
+        showUrl: e.showUrl,
+        category: e.category,
+        episodeId: e.episodeId,
+        episodeNumber: e.episodeNumber,
+        episodeUrl: e.episodeUrl,
+        position: Duration.zero,
+        duration: e.duration,
+        updatedAt: e.updatedAt,
+        malId: e.malId,
+      ),
+    );
+  }
+
+  /// home-8 B: marks the Continue episode watched (episode list tick + a
+  /// finished history row, which drops the card from Continue).
+  Future<void> _markEpisodeWatched(HistoryEntry e) async {
+    if (sl.isRegistered<ResumeStore>()) {
+      await sl<ResumeStore>().setWatched(
+        e.sourceId,
+        e.showUrl,
+        e.episodeId,
+        watched: true,
+      );
+    }
+    // A row with no known length still has to count as finished.
+    final length = e.duration > Duration.zero
+        ? e.duration
+        : const Duration(milliseconds: 1);
+    await sl<WatchHistory>().save(
+      HistoryEntry(
+        sourceId: e.sourceId,
+        showId: e.showId,
+        showTitle: e.showTitle,
+        cover: e.cover,
+        coverHeaders: e.coverHeaders,
+        thumbnail: e.thumbnail,
+        backdrop: e.backdrop,
+        showUrl: e.showUrl,
+        category: e.category,
+        episodeId: e.episodeId,
+        episodeNumber: e.episodeNumber,
+        episodeUrl: e.episodeUrl,
+        position: length,
+        duration: length,
+        updatedAt: e.updatedAt,
+        malId: e.malId,
+      ),
+      flush: true,
+    );
+  }
+
+  /// home-8 B for reading: opens the Continue chapter from its first page.
+  Future<void> _restartReading(ReadEntry e) async {
+    if (sl.isRegistered<ReadStore>()) {
+      // Unmarking clears the saved position, so the reader starts at page 1.
+      await sl<ReadStore>().setRead(
+        e.sourceId,
+        e.showId,
+        e.chapterId,
+        read: false,
+      );
+    }
+    if (!mounted) return;
+    await _resumeReading(e);
+  }
+
+  /// home-8 B for reading: marks the Continue chapter read.
+  Future<void> _markReadingDone(ReadEntry e) async {
+    if (sl.isRegistered<ReadStore>()) {
+      await sl<ReadStore>().setRead(
+        e.sourceId,
+        e.showId,
+        e.chapterId,
+        read: true,
+      );
+    }
+    await sl<ReadHistory>().save(readEntryMarkedRead(e), flush: true);
+  }
+
+  // ── Windows catalogue choices (home-6) ─────────────────────────────────────
+
+  /// Every catalogue Home can show in [mode]: the metadata catalogues, the
+  /// generic browse catalogue and the loaded extensions. Used by the hero's
+  /// "Choose catalogue" menu and published to the shell's catalogue switch.
+  List<
+    ({String id, String group, String label, String icon, VoidCallback run})
+  >
+  _desktopCatalogueChoices(ContentMode mode) {
+    final catalogues = context.l10n.cataloguesGroup;
+    final extensions = context.l10n.extensionsGroup;
+    final meta = sl.isRegistered<MetadataProviderPrefs>();
+    return [
+      if (meta &&
+          (mode == ContentMode.manga ||
+              (mode == ContentMode.anime &&
+                  ZModePrefs.streamKind == StreamKind.anime)))
+        for (final provider in AnimeProvider.values)
+          (
+            id: 'meta:anime:${provider.name}',
+            group: catalogues,
+            label: provider == AnimeProvider.anilist
+                ? 'AniList catalogue'
+                : 'MyAnimeList catalogue',
+            icon: 'blocks',
+            run: () => unawaited(_selectDesktopAnimeCatalogue(provider)),
+          ),
+      if (meta &&
+          mode == ContentMode.anime &&
+          ZModePrefs.streamKind == StreamKind.movie)
+        for (final provider in VideoProvider.values)
+          (
+            id: 'meta:video:${provider.name}',
+            group: catalogues,
+            label: provider == VideoProvider.tmdb
+                ? 'TMDB catalogue'
+                : 'Simkl catalogue',
+            icon: 'blocks',
+            run: () => unawaited(_selectDesktopVideoCatalogue(provider)),
+          ),
+      (
+        id: 'browse',
+        group: catalogues,
+        label: 'Browse catalogue',
+        icon: 'blocks',
+        run: () => unawaited(HomeCataloguePrefs.setSourceSelected(false)),
+      ),
+      for (final source in sl<SourceRepository>().loadedSources.where(
+        (source) => switch (mode) {
+          ContentMode.manga => source.id.startsWith('mihon:'),
+          ContentMode.novel => source.id.startsWith('lnr:'),
+          ContentMode.anime =>
+            !source.id.startsWith('mihon:') && !source.id.startsWith('lnr:'),
+        },
+      ))
+        (
+          id: 'source:${source.id}',
+          group: extensions,
+          label: source.id == stremioSourceId
+              ? 'Stremio catalogue'
+              : source.name,
+          // Extension sources use the Settings > Sources 'blocks' icon so a
+          // source looks the same in the catalogue menu and on the rail.
+          icon: source.id == stremioSourceId ? 'clapperboard' : 'blocks',
+          run: () {
+            // Stremio is its own catalogue kind (installed addon
+            // catalogues), not an ordinary source: saving it via
+            // setSourceSelected would flip the kind back to "source" and
+            // lose the Stremio rows.
+            if (source.id == stremioSourceId) {
+              unawaited(
+                HomeCataloguePrefs.setCatalogue(
+                  mode,
+                  HomeCatalogueKind.stremio,
+                ),
+              );
+              return;
+            }
+            _selectHomeCatalogueSource(source.id);
+            unawaited(HomeCataloguePrefs.setSourceSelected(true));
+          },
+        ),
+    ];
+  }
+
+  /// Compact pill name for a [_desktopCatalogueChoices] entry: just the
+  /// tracker / source name ('AniList', 'MAL', 'TMDB', 'Simkl', 'Browse',
+  /// 'Stremio'), without the menu's "catalogue" suffix. Extension sources
+  /// already carry their plain name in [label].
+  String _desktopCatalogueShortLabel(String id, String label) => switch (id) {
+    'meta:anime:anilist' => 'AniList',
+    'meta:anime:mal' => 'MAL',
+    'meta:video:tmdb' => 'TMDB',
+    'meta:video:simkl' => 'Simkl',
+    'browse' => 'Browse',
+    _ when id == 'source:$stremioSourceId' => 'Stremio',
+    _ => label,
+  };
+
+  /// Id (in [_desktopCatalogueChoices] terms) of the catalogue on screen.
+  String _desktopCurrentCatalogueId(ContentMode mode) {
+    if (HomeCataloguePrefs.stremioSelected) return 'source:$stremioSourceId';
+    if (_sourceCatalogueSelected) return 'source:$_sourceCatalogueSourceId';
+    if (!sl.isRegistered<MetadataProviderPrefs>()) return 'browse';
+    final prefs = sl<MetadataProviderPrefs>();
+    if (mode == ContentMode.manga ||
+        (mode == ContentMode.anime &&
+            ZModePrefs.streamKind == StreamKind.anime)) {
+      return 'meta:anime:${prefs.anime.name}';
+    }
+    if (mode == ContentMode.anime && ZModePrefs.streamKind == StreamKind.movie) {
+      return 'meta:video:${prefs.video.name}';
+    }
+    return 'browse';
+  }
+
+  /// home-6: hands the catalogue choices to the shell's switcher. Only
+  /// republished when ids, labels or the current one change, and after the
+  /// frame, because the switcher's listeners rebuild other widgets.
+  void _publishDesktopCatalogues(
+    List<
+      ({String id, String group, String label, String icon, VoidCallback run})
+    >
+    choices,
+  ) {
+    final mode = sl<ContentModeCubit>().state;
+    final currentId = _desktopCurrentCatalogueId(mode);
+    final signature = [
+      mode.name,
+      currentId,
+      for (final c in choices) '${c.id}=${c.label}',
+    ].join('\n');
+    if (signature == _publishedCatalogueSignature) return;
+    _publishedCatalogueSignature = signature;
+    final options = [
+      for (final c in choices)
+        DesktopCatalogueOption(
+          id: c.id,
+          label: c.label,
+          shortLabel: _desktopCatalogueShortLabel(c.id, c.label),
+          group: c.group,
+          // Fallback matches the Sources 'blocks' icon, not the puzzle.
+          icon: desktopHomeMenuIcon(c.icon) ?? Icons.widgets_outlined,
+          onSelect: c.run,
+        ),
+    ];
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      // A newer publish (or dispose) since this frame wins.
+      if (!mounted || _publishedCatalogueSignature != signature) return;
+      DesktopCatalogueSwitch.publish(options, currentId: currentId);
+    });
+  }
+
+  /// A fresh Windows presentation consumes the existing data owners and route
+  /// callbacks. None of the phone/previous desktop presentation is composed.
+  ///
+  /// home-10: history drives this through [DesktopContinueStore], which only
+  /// notifies when Continue entries are added, removed or reordered (not on
+  /// every player position save), and refreshes when Home is uncovered.
+  Widget _buildNewDesktopHome() => DesktopContinueRefresher(
+    store: _continue,
+    child: BlocBuilder<ContentModeCubit, ContentMode>(
+    bloc: sl<ContentModeCubit>(),
+    builder: (context, mode) => BlocBuilder<HomeCubit, HomeState>(
+      // home-10: no history listener here. Only the Continue block (and the
+      // hero's play label) listen to the store via continueListenable, so a
+      // history change does not rebuild the shelves and downloads of Home.
+      builder: (context, state) => Builder(
+        builder: (context) {
+          Widget render(
+            List<HomeSection> sections, {
+            bool loading = false,
+            String? error,
+            String? sourceVerificationUrl,
+          }) {
+            // Direct-source failures belong to their own request, not the
+            // independently loaded metadata catalogue's challenge state.
+            final verificationUrl = _sourceCatalogueSelected
+                ? sourceVerificationUrl
+                : state.cloudflareUrl;
+            // home-10: lists and lookups come precomputed from the store.
+            final store = _continue;
+            final readType = mode == ContentMode.manga
+                ? ProviderType.manga
+                : ProviderType.novel;
+            final releaseRow = context.read<HomeCubit>().desktopReleaseRow;
+            final releases = releaseRow?.items ?? const <TrackerListItem>[];
+            // home-11 A: a source catalogue's banner titles are not repeated
+            // as the first shelf (see _desktopSourceShelves).
+            final featured = _sourceCatalogueSelected
+                ? _desktopSourceFeatured(sections)
+                : state.heroItems;
+            void open(MediaItem item) => _sourceCatalogueSelected
+                ? _openSourceCatalogueDetail(item)
+                : _openDetail(item);
+            // Map reads by show id / URL instead of a search per poster.
+            HistoryEntry? historyFor(MediaItem item) => store.historyFor(item);
+            ReadEntry? readingFor(MediaItem item) => store.readingFor(item);
+            void play(MediaItem item) {
+              final readingEntry = mode.isReading ? readingFor(item) : null;
+              final videoEntry = mode.isReading ? null : historyFor(item);
+              if (readingEntry != null) {
+                unawaited(_resumeReading(readingEntry));
+                return;
+              }
+              if (videoEntry != null) {
+                unawaited(_resume(videoEntry));
+                return;
+              }
+              if (_sourceCatalogueSelected) {
+                unawaited(_withSourceCatalogueItem(item, _playFeatured));
+              } else {
+                unawaited(_playFeatured(item));
+              }
+            }
+
+            void menu(MediaItem item) => unawaited(
+              showDesktopHomeMenu(
+                context,
+                title: item.title,
+                actions: [
+                  (
+                    label: mode.isReading ? 'Read' : 'Play',
+                    icon: mode.isReading ? 'book-open' : 'play',
+                    run: () => play(item),
+                  ),
+                  (label: 'Details', icon: 'info', run: () => open(item)),
+                  (
+                    label: _myList.contains(item)
+                        ? 'Remove from My List'
+                        : 'Add to My List',
+                    icon: 'bookmark',
+                    run: () => unawaited(_myList.toggle(item)),
+                  ),
+                ],
+              ),
+            );
+            // Catalogue choices for the hero's "Choose catalogue" menu; the
+            // same list feeds the shell's catalogue switch (home-6).
+            final catalogues = _desktopCatalogueChoices(mode);
+            _publishDesktopCatalogues(catalogues);
+            // Rebuilds when the saved-shows shelf changes or the offline state
+            // flips, so the shelf appears and disappears by itself. Download
+            // progress alone never rebuilds Home.
+            final feed = _downloadsFeed;
+            return ListenableBuilder(
+              listenable: Listenable.merge([
+                feed,
+                BootConnectivity.instance.offline,
+              ]),
+              builder: (context, _) => DesktopHomePage(
+              key: ValueKey(
+                'desktop-home:${mode.name}:${ZModePrefs.streamKind.name}:${_sourceCatalogueSelected ? _sourceCatalogueSourceId : 'catalogue'}',
+              ),
+              offline: BootConnectivity.instance.offline.value,
+              onDownloads: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(builder: (_) => const DownloadsScreen()),
+              ),
+              downloads: feed.cards(
+                // The shelf is only drawn then (see DesktopHomePage).
+                needed:
+                    BootConnectivity.instance.offline.value ||
+                    (featured.isEmpty && !loading),
+                reading: mode.isReading,
+                open: (collection) => Navigator.of(
+                  context,
+                ).push(desktopDownloadCollectionRoute(collection)),
+              ),
+              // Reauthentication preserves the cached account and library. Capture
+              // the data owner before awaiting a dialog that may outlive Home.
+              onReconnect:
+                  context.watch<AuthCubit>().state.isLoggedIn &&
+                      context.watch<AuthCubit>().state.needsReconnect
+                  ? () async {
+                      final cubit = context.read<HomeCubit>();
+                      final ok = await showReconnectDialog(context) ?? false;
+                      if (ok && mounted && !cubit.isClosed) {
+                        await cubit.load();
+                      }
+                    }
+                  : null,
+              reconnectLabel: context.l10n.reconnectToSync,
+              featured: featured,
+              // Windows: a banner title without a wide picture of its own
+              // borrows the same show's from catalogue data already held.
+              wideArt: (item) => _heldCatalogueTitles().wideArtFor(item),
+              sections: sections,
+              // Settings > Home rows: order, visibility and reset.
+              rows: _desktopHomeRows(state.rows, sections, mode),
+              reading: mode.isReading,
+              loading: loading,
+              onVerify: verificationUrl == null
+                  ? null
+                  : () async {
+                      final cubit = context.read<HomeCubit>();
+                      final sourceKey = _sourceCatalogueSelected
+                          ? _newDesktopSourceKey
+                          : null;
+                      await MihonExtensionService.solveCloudflare(
+                        verificationUrl,
+                      );
+                      if (!mounted) return;
+                      if (sourceKey != null) {
+                        // A user can switch source while verification is open.
+                        // Never invalidate or reload a different selection.
+                        if (_sourceCatalogueSelected &&
+                            _newDesktopSourceKey == sourceKey) {
+                          setState(() => _newDesktopSourceKey = null);
+                        }
+                      } else if (!_sourceCatalogueSelected && !cubit.isClosed) {
+                        await cubit.load(reset: true);
+                      }
+                    },
+              error: error,
+              meta: _heroMeta,
+              playLabel: (item) {
+                final video = historyFor(item);
+                final reading = readingFor(item);
+                if (mode.isReading) {
+                  return reading?.chapterNumber == null
+                      ? 'Read now'
+                      : 'Continue Ch. ${reading!.chapterNumber}';
+                }
+                return video?.episodeNumber == null
+                    ? 'Watch now'
+                    : 'Continue E${video!.episodeNumber!.toInt()}';
+              },
+              onOpen: open,
+              onPlay: play,
+              onMenu: menu,
+              onSection: (section) => _openSeeAll(
+                section,
+                sourceCatalogue: _sourceCatalogueSelected,
+              ),
+              onHistory: _openHistory,
+              onReleases: () => _openNewEpisodes(releases),
+              onRefresh: () async {
+                if (_sourceCatalogueSelected) {
+                  setState(() {
+                    _newDesktopSourceKey = null;
+                  });
+                } else {
+                  // No reset: a refresh keeps the rows on screen while it
+                  // fetches, and keeps them if the fetch fails (offline).
+                  await context.read<HomeCubit>().load();
+                }
+              },
+              // home-10: the Continue block rebuilds on its own when the
+              // store notifies and reads the fresh lists via resumeItems.
+              resume: const [],
+              continueListenable: store,
+              resumeItems: () => mode.isReading
+                  ? [
+                      for (final e in store.reading(readType))
+                        DesktopHomeResume(
+                          title: e.title,
+                          subtitle: e.chapterNumber == null
+                              ? 'Resume chapter'
+                              : 'Chapter ${e.chapterNumber}',
+                          image: e.cover,
+                          headers: e.coverHeaders,
+                          progress: e.total > 0 ? e.pos / e.total : 0,
+                          open: () => unawaited(_resumeReading(e)),
+                          menu: () => unawaited(
+                            showDesktopHomeMenu(
+                              context,
+                              title: e.title,
+                              actions: [
+                                (
+                                  label: 'Continue reading',
+                                  icon: 'book-open',
+                                  run: () => unawaited(_resumeReading(e)),
+                                ),
+                                // home-8 B: the same handy actions as video.
+                                (
+                                  label: context.l10n.details,
+                                  icon: 'info',
+                                  run: () => _openDetail(_continueReadItem(e)),
+                                ),
+                                (
+                                  label: context.l10n.readChapterFromStart,
+                                  icon: 'rotate-cw',
+                                  run: () => unawaited(_restartReading(e)),
+                                ),
+                                (
+                                  label: context.l10n.markChapterRead,
+                                  icon: 'check',
+                                  run: () => unawaited(_markReadingDone(e)),
+                                ),
+                                (
+                                  label: 'Remove from Continue',
+                                  icon: 'history',
+                                  // home-8 A: undoable.
+                                  run: () => unawaited(
+                                    _removeReadingFromContinue(e),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                    ]
+                  : [
+                      for (final e in store.watched)
+                        DesktopHomeResume(
+                          title: e.showTitle,
+                          subtitle: e.episodeNumber == null
+                              ? 'Resume playback'
+                              : 'Episode ${e.episodeNumber!.toInt()}',
+                          // The wide card picks the episode still first,
+                          // then the show's backdrop, then this poster.
+                          image: e.cover,
+                          still: e.thumbnail,
+                          backdrop: _heldBackdropFor(e),
+                          sourceId: e.sourceId,
+                          showId: e.showId,
+                          malId: e.malId,
+                          headers: e.coverHeaders,
+                          progress: e.progress,
+                          remaining: e.duration > e.position
+                              ? '${(e.duration - e.position).inMinutes}m left'
+                              : null,
+                          open: () => unawaited(_resume(e)),
+                          menu: () => unawaited(
+                            showDesktopHomeMenu(
+                              context,
+                              title: e.showTitle,
+                              actions: [
+                                (
+                                  label: 'Continue watching',
+                                  icon: 'play',
+                                  run: () => unawaited(_resume(e)),
+                                ),
+                                // home-8 B: Details, Restart and Mark watched.
+                                (
+                                  label: context.l10n.details,
+                                  icon: 'info',
+                                  run: () =>
+                                      _openDetail(_continueWatchItem(e)),
+                                ),
+                                (
+                                  label: context.l10n.restartEpisode,
+                                  icon: 'rotate-cw',
+                                  run: () => unawaited(_restartEpisode(e)),
+                                ),
+                                (
+                                  label: context.l10n.markEpisodeWatched,
+                                  icon: 'check',
+                                  run: () => unawaited(_markEpisodeWatched(e)),
+                                ),
+                                (
+                                  label: 'Remove from Continue',
+                                  icon: 'history',
+                                  // home-8 A: undoable.
+                                  run: () => unawaited(
+                                    _removeWatchFromContinue(e),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                    ],
+              // home-7: every fresh release is passed (the page shows five
+              // plus "+N more"), worded for the mode, with the poster menu.
+              releases: [
+                for (final entry in releases)
+                  DesktopHomeRelease(
+                    title: entry.item.title,
+                    subtitle: mode.isReading
+                        ? context.l10n.chapterNAvailable('${releasedCount(entry)}')
+                        : context.l10n.episodeNAvailable('${releasedCount(entry)}'),
+                    image: entry.item.cover,
+                    headers: entry.item.coverHeaders,
+                    open: () => _openTrackerEntry(entry),
+                    menu: () => unawaited(
+                      showDesktopHomeMenu(
+                        context,
+                        title: entry.item.title,
+                        actions: [
+                          (
+                            label: context.l10n.details,
+                            icon: 'info',
+                            run: () => _openTrackerEntry(entry),
+                          ),
+                          if (releaseRow != null)
+                            (
+                              label: context.l10n.openTrackerList(releaseRow.trackerName),
+                              icon: 'bookmark',
+                              run: () => _openTrackerList(
+                                releaseRow.trackerName,
+                                WatchStatus.watching,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+              ],
+              // Catalogue choice is accessed from the small hero overline.
+              onCatalogue: () => unawaited(
+                showDesktopHomeMenu(
+                  context,
+                  title: 'Choose catalogue',
+                  actions: [
+                    for (final choice in catalogues)
+                      (
+                        label: choice.label,
+                        icon: choice.icon,
+                        run: choice.run,
+                      ),
+                  ],
+                ),
+              ),
+              ),
+            );
+          }
+
+          if (_sourceCatalogueSelected) {
+            final future = _newDesktopSourceRows(mode);
+            return FutureBuilder<List<HomeSection>>(
+              future: future,
+              builder: (context, snap) => render(
+                // home-11 B: while a refresh of the same source loads, keep
+                // its last rows on screen (with the thin progress bar)
+                // instead of emptying the page.
+                snap.connectionState == ConnectionState.done
+                    ? (snap.data ?? const [])
+                    : (_lastDesktopSourceRows?.key == _newDesktopSourceKey
+                          ? _lastDesktopSourceRows!.sections
+                          : const []),
+                loading: snap.connectionState != ConnectionState.done,
+                sourceVerificationUrl: snap.error is CloudflareRequiredException
+                    ? (snap.error as CloudflareRequiredException).url
+                    : null,
+                error: snap.error is CloudflareRequiredException
+                    ? 'This source needs website verification.'
+                    : snap.hasError
+                    ? 'This source could not load. Refresh to try again.'
+                    : null,
+              ),
+            );
+          }
+          return render(
+            state.sections ?? const [],
+            loading: state.loading,
+            error: state.offline
+                ? 'You appear to be offline.'
+                : state.cloudflareUrl != null
+                ? 'This source needs website verification.'
+                : null,
+          );
+        },
+      ),
+    ),
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
     if (sl<AppMode>().isTv) return const HomeScreenTv();
@@ -1514,12 +2828,17 @@ class _HomeViewState extends State<_HomeView> {
       listener: (context, _) {
         if (!mounted) return;
         _metaCache.clear();
+        _bannerMeta.clear();
         _heroPrewarmed = false;
         // reset:true clears the old source's rows so the switch is visible
         // immediately (skeletons), even if the new source's home is slow.
         context.read<HomeCubit>().load(reset: true);
       },
-      child: Scaffold(
+      // Windows: the desktop Home layout; every other platform keeps this
+      // Scaffold unchanged.
+      child: _isDesktop
+          ? _buildNewDesktopHome()
+          : Scaffold(
         backgroundColor: AppColors.bg,
         // Extend content behind the status bar; the floating header handles
         // its own SafeArea(bottom: false).

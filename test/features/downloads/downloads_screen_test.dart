@@ -42,6 +42,10 @@ class _Manager extends ChangeNotifier implements DownloadManager {
   @override
   Future<void> pruneMissing() async {}
 
+  // On Windows the screen recovers app-owned files before pruning on open.
+  @override
+  Future<void> recoverLocalFiles() async {}
+
   @override
   Future<List<({String path, String label, bool removable})>>
   listDownloadVolumes() async => const [];

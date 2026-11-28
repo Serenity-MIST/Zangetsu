@@ -1,5 +1,7 @@
+import '../desktop/extension_runtime.dart';
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -19,7 +21,7 @@ import 'mihon_mapping.dart';
 import 'mihon_source_info.dart';
 
 /// Shared channel — matches the name registered in [MihonBridge.attach].
-const MethodChannel _mihonChannel = MethodChannel('zangetsu/mihon');
+const ExtensionChannel _mihonChannel = ExtensionChannel('zangetsu/mihon');
 
 /// Evicts the native OkHttp response cache that Mihon AND Aniyomi share, so a
 /// manual refresh re-hits the source instead of serving the 10-min-cached JSON.
@@ -277,7 +279,7 @@ class MihonProvider implements BaseProvider, ReadingProvider {
     final raw = await _safeInvoke('getPages', {
       'sourceId': info.id,
       'url': chapterUrl,
-    });
+    }, surfaceCloudflare: true);
     // null means the CALL failed — _safeInvoke swallows network errors, source
     // errors and Cloudflare challenges alike. Returning [] for that made a
     // failure indistinguishable from a chapter that genuinely has no pages,
@@ -297,6 +299,15 @@ class MihonProvider implements BaseProvider, ReadingProvider {
       throw ProviderException('getPages returned unreadable data: $e');
     }
     if (pages.isEmpty) return pages;
+    if (Platform.isWindows) {
+      return [
+        for (final page in pages)
+          PageImage(
+            url: page.url,
+            headers: {...?page.headers, 'x-mihon-src': '${info.id}'},
+          ),
+      ];
+    }
 
     // Attach the source's Cloudflare session (cf_clearance cookie + matching
     // UA) to each page so Flutter's image loader can fetch pages from a
@@ -324,8 +335,10 @@ class MihonProvider implements BaseProvider, ReadingProvider {
   /// native `imageCookie` (reads the WebView CookieManager the solve wrote to).
   Future<Map<String, String>> _imageCookieHeaders(String url) async {
     try {
-      final res = await _mihonChannel
-          .invokeMethod<Map<dynamic, dynamic>>('imageCookie', {'url': url});
+      final res = await _mihonChannel.invokeMethod<Map<dynamic, dynamic>>(
+        'imageCookie',
+        {'url': url},
+      );
       if (res == null) return const {};
       return res.map((k, v) => MapEntry(k.toString(), v.toString()));
     } catch (_) {
@@ -363,7 +376,9 @@ class MihonProvider implements BaseProvider, ReadingProvider {
     } on PlatformException catch (e) {
       if (surfaceCloudflare && e.code == 'CLOUDFLARE') {
         throw CloudflareRequiredException(
-          (e.message?.isNotEmpty ?? false) ? e.message! : info.baseUrl,
+          e.details is String && '${e.details}'.startsWith('http')
+              ? '${e.details}'
+              : info.baseUrl,
         );
       }
       debugPrint('[mihon] $method(sourceId=${info.id}) failed: $e');
@@ -431,7 +446,8 @@ class MihonProvider implements BaseProvider, ReadingProvider {
 List<Episode> sortChaptersAscending(List<Episode> chapters) {
   if (chapters.length < 2) return chapters;
   if (chapters.every((e) => e.number != null)) {
-    final sorted = [...chapters]..sort((a, b) => a.number!.compareTo(b.number!));
+    final sorted = [...chapters]
+      ..sort((a, b) => a.number!.compareTo(b.number!));
     return sorted;
   }
   return chapters.reversed.toList();

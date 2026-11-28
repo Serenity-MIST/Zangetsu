@@ -1,4 +1,10 @@
+import 'dart:async';
+import 'dart:io' show Platform;
+
+import 'package:flutter/foundation.dart';
+
 import '../anilist/anilist_service.dart';
+import '../boot_network.dart';
 import '../di/injector.dart';
 import '../mode/content_mode.dart';
 import '../models/watch_status.dart';
@@ -8,15 +14,61 @@ import 'mangabaka_service.dart';
 import 'tracker.dart';
 import 'simkl_service.dart';
 import 'simkl_playback_session.dart';
+import 'tracker_sync_queue.dart';
 
 /// Fans every list/progress write out to all connected trackers at once
 /// (AniList + MyAnimeList + Simkl). Each tracker self-gates (skips when
 /// disconnected / auto-sync off / type not applicable), and a failure in one
 /// never blocks the others.
 class TrackerHub {
-  TrackerHub(this.trackers);
+  /// [syncQueue] turns on the offline outbox (track-2). Left null, the
+  /// Windows app uses the shared [TrackerSyncQueue.instance] and starts it a
+  /// moment after launch; phone, TV and tests keep the old fire-and-forget
+  /// writes.
+  TrackerHub(this.trackers, {TrackerSyncQueue? syncQueue})
+    : syncQueue = syncQueue ?? (_windowsApp ? TrackerSyncQueue.instance : null) {
+    final queue = this.syncQueue;
+    if (queue == null) return;
+    if (syncQueue != null) {
+      // Injected (tests): wire it up straight away.
+      queue.attach(trackers, loginExpired: trackerNeedsSignIn);
+    } else {
+      // App start: give boot a few seconds before the first (launch) retry,
+      // so opening the box and the network calls never slow the splash.
+      Timer(
+        const Duration(seconds: 4),
+        () => queue.attach(trackers, loginExpired: trackerNeedsSignIn),
+      );
+    }
+  }
 
   final List<Tracker> trackers;
+
+  /// Bumped after every list edit routed through the hub (setStatus,
+  /// removeFromList, updateEntry) has finished, so screens such as the
+  /// desktop schedule can refresh even when the edit bypassed
+  /// ListStatusStore. Only listened to by Windows UI; harmless elsewhere.
+  final ValueNotifier<int> listWrites = ValueNotifier(0);
+
+  // Tells [listWrites] listeners that a list edit just completed.
+  void _bumpListWrites() => listWrites.value++;
+
+  /// For screens that write to ONE tracker directly instead of through the
+  /// hub (the per-tracker entry / list sheets): call this after the write so
+  /// [listWrites] listeners refresh too.
+  void noteListWrite() => _bumpListWrites();
+
+  /// Persistent outbox for failed writes, or null when it is off.
+  final TrackerSyncQueue? syncQueue;
+
+  // The real Windows app: not a widget test pretending to be Windows, and not
+  // a test host pretending to be a phone. The outbox is new Windows-only
+  // behaviour; phone keeps today's fire-and-forget writes.
+  static bool get _windowsApp =>
+      !kIsWeb &&
+      defaultTargetPlatform == TargetPlatform.windows &&
+      Platform.isWindows &&
+      !Platform.environment.containsKey('FLUTTER_TEST');
 
   Iterable<Tracker> get connected => trackers.where((t) => t.isConnected);
   bool get anyConnected => connected.isNotEmpty;
@@ -80,6 +132,15 @@ class TrackerHub {
     if (!_autoTrackOn) return;
     if (IncognitoMode.on) return; // incognito: pause auto-tracking
     await _fan(
+      TrackerSyncOp.markWatching,
+      (_) => TrackerSyncArgs.pack(
+        malId: malId,
+        title: title,
+        tmdbId: tmdbId,
+        tmdbIsTv: tmdbIsTv,
+        imdbId: imdbId,
+        kind: kind,
+      ),
       // [simklLive]: Simkl's own live session already marks it as watching once
       // playback really runs, so a list write at the first frame is skipped.
       (t) => simklLive && t is SimklService
@@ -114,6 +175,19 @@ class TrackerHub {
     if (auto && !_autoTrackOn) return;
     if (IncognitoMode.on) return; // incognito: pause auto-scrobble
     await _fan(
+      TrackerSyncOp.scrobble,
+      (_) => TrackerSyncArgs.pack(
+        malId: malId,
+        title: title,
+        tmdbId: tmdbId,
+        tmdbIsTv: tmdbIsTv,
+        imdbId: imdbId,
+        episode: episode,
+        season: season,
+        seasonEpisode: seasonEpisode,
+        kind: kind,
+        novel: novel,
+      ),
       (t) => auto && simklLive && t is SimklService
           ? Future<void>.value()
           : t.scrobble(
@@ -140,6 +214,16 @@ class TrackerHub {
     required WatchStatus status,
     MediaKind kind = MediaKind.anime,
   }) => _fan(
+    TrackerSyncOp.setStatus,
+    (_) => TrackerSyncArgs.pack(
+      malId: malId,
+      title: title,
+      tmdbId: tmdbId,
+      tmdbIsTv: tmdbIsTv,
+      imdbId: imdbId,
+      status: status,
+      kind: kind,
+    ),
     (t) => t.setStatus(
       malId: malId,
       title: title,
@@ -149,7 +233,7 @@ class TrackerHub {
       status: status,
       kind: kind,
     ),
-  );
+  ).whenComplete(_bumpListWrites); // list changed: notify listeners
 
   Future<void> removeFromList({
     int? malId,
@@ -159,6 +243,15 @@ class TrackerHub {
     String? imdbId,
     MediaKind kind = MediaKind.anime,
   }) => _fan(
+    TrackerSyncOp.removeFromList,
+    (_) => TrackerSyncArgs.pack(
+      malId: malId,
+      title: title,
+      tmdbId: tmdbId,
+      tmdbIsTv: tmdbIsTv,
+      imdbId: imdbId,
+      kind: kind,
+    ),
     (t) => t.removeFromList(
       malId: malId,
       title: title,
@@ -167,7 +260,7 @@ class TrackerHub {
       imdbId: imdbId,
       kind: kind,
     ),
-  );
+  ).whenComplete(_bumpListWrites); // list changed: notify listeners
 
   /// Read the user's entry for one title. Queries every connected tracker in
   /// parallel and returns the FIRST that has the title on the user's list —
@@ -236,8 +329,7 @@ class TrackerHub {
       }),
     );
     return [
-      for (final r in results)
-        if (r != null) r,
+      for (final r in results) ?r,
     ];
   }
 
@@ -267,9 +359,27 @@ class TrackerHub {
           kind: kind,
         );
       }
-      if (status == null && score == null && progress == null) return;
+      if (status == null && score == null && progress == null) {
+        _bumpListWrites(); // privacy-only edit still changed the entry
+        return;
+      }
     }
     await _fan(
+      TrackerSyncOp.updateEntry,
+      // Each tracker stores its own pinned id, so the replay hits the same
+      // entry the user picked.
+      (t) => TrackerSyncArgs.pack(
+        malId: malId,
+        title: title,
+        tmdbId: tmdbId,
+        tmdbIsTv: tmdbIsTv,
+        imdbId: imdbId,
+        pinnedId: pinnedIds?[t.displayName],
+        status: status,
+        score: score,
+        progress: progress,
+        kind: kind,
+      ),
       (t) => t.updateEntry(
         malId: malId,
         title: title,
@@ -282,7 +392,7 @@ class TrackerHub {
         progress: progress,
         kind: kind,
       ),
-    );
+    ).whenComplete(_bumpListWrites); // list changed: notify listeners
   }
 
   /// Candidate matches from every connected tracker (the match-fixer), in
@@ -303,13 +413,58 @@ class TrackerHub {
     return [for (final l in lists) ...l];
   }
 
-  Future<void> _fan(Future<void> Function(Tracker) op) async {
+  /// Runs [op] on every connected tracker at once; one tracker failing never
+  /// blocks the rest. With the outbox on, failures are no longer swallowed:
+  /// each tracker's outcome goes to [syncQueue], which keeps failed writes
+  /// (described by [op] and [args]) for retry and tracks needs-sign-in.
+  Future<void> _fan(
+    TrackerSyncOp op,
+    Map<String, dynamic> Function(Tracker t) args,
+    Future<void> Function(Tracker) call,
+  ) async {
+    final queue = syncQueue;
+    if (queue != null) {
+      // An AniList login that expired no longer counts as connected, so the
+      // write would vanish. Keep it and flag "needs sign-in" instead.
+      for (final t in trackers.where(trackerNeedsSignIn)) {
+        try {
+          await queue.record(
+            t,
+            op,
+            args(t),
+            TrackerWriteReport()
+              ..note(TrackerWriteProblem.auth, 'Sign-in expired'),
+          );
+        } catch (e) {
+          debugPrint('[trackers] could not queue for ${t.displayName}: $e');
+        }
+      }
+    }
     await Future.wait(
       connected.map((t) async {
+        if (queue == null) {
+          // Phone / TV / tests: the original best-effort behaviour.
+          try {
+            await call(t);
+          } catch (_) {/* one tracker failing must not block the rest */}
+          return;
+        }
+        // Known offline: don't wait out a timeout, just keep it for later.
+        if (BootConnectivity.instance.offline.value) {
+          await queue.queueOffline(t, op, args(t));
+          return;
+        }
+        final report = await TrackerWriteScope.run(() => call(t));
+        if (!report.ok) {
+          debugPrint(
+            '[trackers] ${t.displayName} ${op.name} failed '
+            '(${report.problem!.name}): ${report.detail}',
+          );
+        }
         try {
-          await op(t);
-        } catch (_) {
-          /* one tracker failing must not block the rest */
+          await queue.record(t, op, args(t), report);
+        } catch (e) {
+          debugPrint('[trackers] could not record sync outcome: $e');
         }
       }),
     );
@@ -324,3 +479,9 @@ class TrackerHub {
 /// tracker and every test fake to declare it, for one exception. If a second
 /// reading-only tracker ever lands, add it here.
 bool trackerSupportsVideo(Tracker t) => t is! MangaBakaService;
+
+/// Whether [t] was connected but its saved login has expired and can't be
+/// refreshed (AniList). MAL's dead refresh token is caught per write instead
+/// and shows up in [TrackerSyncQueue.healthOf].
+bool trackerNeedsSignIn(Tracker t) =>
+    t is AniListService && !t.isConnected && t.signInExpired;

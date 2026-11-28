@@ -1,6 +1,11 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/app_mode.dart';
+import '../../core/desktop/desktop_dialogs.dart';
+import '../../core/desktop/desktop_undo_toast.dart';
+import '../../core/mode/content_mode.dart';
+import '../../core/mode/content_mode_cubit.dart';
 import '../../core/di/injector.dart';
 import '../../core/playback/source_health_store.dart';
 import '../../core/theme/app_colors.dart';
@@ -8,11 +13,22 @@ import '../../core/theme/app_text.dart';
 import '../../core/tv/tv_focusable.dart';
 import '../../core/tv/tv_list_focusable.dart';
 import '../../core/ui/settings_widgets.dart';
+import '../../core/ui/desktop_settings_surface.dart';
+import 'desktop_source_priority_row.dart';
 import '../../core/ui/source_switcher.dart' show categorizedSources;
 import '../../core/zmode/source_order_prefs.dart';
 import '../../core/zmode/source_score_store.dart';
 import '../../core/zmode/zmode_ids.dart';
-import '../../core/zmode/zmode_module.dart' show sweepCandidates;
+import '../../core/zmode/zmode_source_prefs.dart';
+import '../../core/zmode/zmode_module.dart'
+    show
+        autoResolveExclusionsEnabled,
+        excludedForSweep,
+        priorityCandidates,
+        sweepCandidates;
+import 'desktop_settings_slider.dart';
+import 'manual_matches_screen.dart';
+import '../../l10n/l10n.dart';
 
 /// Why a source sits where it does, in one short line.
 ///
@@ -26,6 +42,55 @@ String? reasonForSource({required int plays, required SourceHealth health}) {
   // every row reading the same sentence — a wall of identical text carrying no
   // information, which buries the two or three rows that do state a fact.
   return plays == 0 ? null : 'played $plays times';
+}
+
+/// The saved pin list after a reorder: everything in [visible] down to
+/// [placedAt] is pinned, and pins on sources NOT in [visible] (filtered out of
+/// this pool by language, kind or because the runtime is not loaded) are kept.
+///
+/// Hidden pins keep their old place relative to the visible pin they followed
+/// instead of being appended after every visible one — appending demoted
+/// them a little further on every edit. One with no visible pin ahead of it
+/// stays at the front; one anchored to a source that is no longer pinned
+/// goes to the end.
+///
+/// [keepPinned]: also keep every visible source that was already pinned (the
+/// pinned prefix extends down to the lowest of them), so moving one row to
+/// the top never silently unpins the others. Used by the Windows page, whose
+/// rows show a Pinned badge; phone and TV keep the original rule.
+List<String> sourcePinsAfterReorder({
+  required List<String> visible,
+  required List<String> previous,
+  required int placedAt,
+  bool keepPinned = false,
+}) {
+  final visibleSet = visible.toSet();
+  var through = placedAt;
+  if (keepPinned) {
+    for (var i = 0; i < visible.length; i++) {
+      if (i > through && previous.contains(visible[i])) through = i;
+    }
+  }
+  final prefix = visible.take(through + 1).toList();
+  // Hidden pins grouped by the visible id they followed in [previous]; null
+  // collects the ones that had no visible id ahead of them.
+  final after = <String?, List<String>>{};
+  String? anchor;
+  for (final id in previous) {
+    if (visibleSet.contains(id)) {
+      anchor = id;
+    } else {
+      (after[anchor] ??= []).add(id);
+    }
+  }
+  final prefixSet = prefix.toSet();
+  return [
+    ...?after.remove(null),
+    for (final id in prefix) ...[id, ...?after.remove(id)],
+    // Anchors that are no longer pinned: their hidden followers go last.
+    for (final entry in after.entries)
+      if (!prefixSet.contains(entry.key)) ...entry.value,
+  ];
 }
 
 /// Reorder installed sources per content type. Auto Resolve (the default —
@@ -48,35 +113,70 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
   // One list. Anime and Movies/TV share the same installed pool, so two
   // orders of the same sources was twice the list to keep straight for a
   // distinction most people don't draw.
-  late List<({String id, String name})> _sources = _ordered(ZKind.anime);
-  late int _cap = _prefs.cap(ZKind.anime);
+  late ZKind _kind = _initialKind();
+  late List<({String id, String name})> _sources = _ordered(_kind);
+  late int _cap = _prefs.cap(_kind);
 
+  /// Open the reading bucket already selected in the dock. Video can then be
+  /// narrowed to Movies/TV, using exactly the resolver's eligible source pool.
+  ZKind _initialKind() => sl.isRegistered<ContentModeCubit>()
+      ? switch (sl<ContentModeCubit>().state) {
+          ContentMode.manga => ZKind.manga,
+          ContentMode.novel => ZKind.novel,
+          ContentMode.anime => ZKind.anime,
+        }
+      : ZKind.anime;
 
-  /// What Auto Resolve actually sweeps, in the order it walks them.
+  /// What Auto Resolve actually sweeps, in the order it walks them, plus (on
+  /// Windows) the rows switched off for it so their switch can be turned back
+  /// on.
   ///
-  /// This is [sweepCandidates] itself — the sweep's own function, uncapped —
-  /// rather than a second implementation that agrees with it by inspection.
-  /// The screen marks sources inside the current cap as tried; ranking a wider
-  /// pool here (one that still holds
-  /// sources the language filter narrows out, and on TV sources whose runtime
-  /// was never loaded) made that claim false for anyone with a language filter
-  /// set. One function, one answer.
+  /// This is [priorityCandidates] — the list [sweepCandidates] is filtered
+  /// from — rather than a second implementation that agrees with it by
+  /// inspection. The screen marks sources inside the current cap as tried;
+  /// ranking a wider pool here (one that still holds sources the language
+  /// filter narrows out, and on TV sources whose runtime was never loaded)
+  /// made that claim false for anyone with a language filter set. One
+  /// function, one answer.
   List<({String id, String name})> _ordered(ZKind kind) =>
-      sweepCandidates(kind);
+      priorityCandidates(kind);
 
   /// True once the user has pinned at least one source by dragging it.
   ///
   /// NOT a mode: pinned sources sit on top and everything below them stays
   /// auto-ranked. It only decides whether there is anything to undo.
-  bool get _hasPins => _prefs.get(ZKind.anime).isNotEmpty;
+  bool get _hasPins => _prefs.get(_kind).isNotEmpty;
 
+  /// Ids of the sources the user placed by hand in the current list (they
+  /// get the Pinned badge on Windows).
+  Set<String> get _pinnedIds => _prefs.get(_kind).toSet();
 
+  /// Sources the sweep skips for the current list (empty off Windows, where
+  /// the switch is not offered — see [excludedForSweep]).
+  Set<String> get _skipped => excludedForSweep(_kind);
+
+  /// Position of each id among the sources Auto Resolve really walks —
+  /// [sweepCandidates] order — so "tried" and the cut line skip the rows
+  /// that are switched off.
+  Map<String, int> get _sweepRank {
+    final skipped = _skipped;
+    final out = <String, int>{};
+    for (final s in _sources) {
+      if (!skipped.contains(s.id)) out[s.id] = out.length;
+    }
+    return out;
+  }
+
+  /// The Windows-only controls on this page (try-first preferred source
+  /// picker, Use in Auto Resolve switch, Unpin all confirmation, keyboard
+  /// moves). Phone and TV keep the existing screen.
+  bool get _windows => defaultTargetPlatform == TargetPlatform.windows;
 
   void _refresh(ZKind kind) => setState(() {
-    _sources = _ordered(ZKind.anime);
-    _cap = _prefs.cap(ZKind.anime);
+    _kind = kind;
+    _sources = _ordered(kind);
+    _cap = _prefs.cap(kind);
   });
-
 
   /// A one-word verdict from the health store, when it has one worth showing.
   /// Silent for a healthy source: a row of green "ok" labels is noise, and the
@@ -97,13 +197,21 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
     // Best-effort: a missing tag must never stop the screen from working.
     try {
       final b = categorizedSources();
-      for (final r in [...b.anime, ...b.movies, ...b.nsfw, ...b.manga, ...b.novel]) {
+      for (final r in [
+        ...b.anime,
+        ...b.movies,
+        ...b.nsfw,
+        ...b.manga,
+        ...b.novel,
+      ]) {
         out[r.id] = (
           label: r.label,
           repo: (r.repo?.isNotEmpty ?? false) ? r.repo : null,
         );
       }
-    } catch (_) {/* tags are cosmetic */}
+    } catch (_) {
+      /* tags are cosmetic */
+    }
     return out;
   }
 
@@ -189,9 +297,17 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
     ZKind kind,
     List<({String id, String name})> list, {
     required int placedAt,
-  }) => _prefs.set(kind, [
-    for (final s in list.take(placedAt + 1)) s.id,
-  ]);
+  }) => _prefs.set(
+    kind,
+    sourcePinsAfterReorder(
+      visible: [for (final source in list) source.id],
+      previous: _prefs.get(kind),
+      placedAt: placedAt,
+      // The Windows rows show which sources are pinned, so a move there must
+      // not quietly take the badge off the others.
+      keepPinned: _windows,
+    ),
+  );
 
   void _reorder(ZKind kind, int oldIndex, int newIndex) {
     final list = _sources;
@@ -218,57 +334,423 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
     _save(kind, list, placedAt: target > index ? target : index);
   }
 
+  /// Move to top / Move to bottom (right-click menu, Alt+Home / Alt+End).
+  void _moveTo(ZKind kind, int index, int target) {
+    final list = _sources;
+    if (target < 0 || target >= list.length || target == index) return;
+    setState(() {
+      final item = list.removeAt(index);
+      list.insert(target, item);
+    });
+    // Same rule as a drag: the row is pinned where it was dropped, together
+    // with everything above it (and, on Windows, every row already pinned).
+    _save(kind, list, placedAt: target);
+  }
+
+  /// Unpin one row: it leaves the saved order and goes back to being ranked
+  /// by what has worked. The other pins stay as they are.
+  Future<void> _unpin(ZKind kind, String id) async {
+    await _prefs.set(kind, [
+      for (final pinned in _prefs.get(kind))
+        if (pinned != id) pinned,
+    ]);
+    if (!mounted) return;
+    _refresh(kind);
+  }
+
+  /// The row's "Use in Auto Resolve" switch. Off: the sweep skips it, but it
+  /// stays installed and can still be picked for a title by hand.
+  Future<void> _setUsedByAutoResolve(ZKind kind, String id, bool on) async {
+    await (on ? _prefs.include(kind, id) : _prefs.exclude(kind, id));
+    if (!mounted) return;
+    _refresh(kind);
+  }
+
   /// Hand ranking back to the app.
   ///
   /// Clears the saved ORDER only. Which sources are switched off is a separate
   /// decision and stays put: someone who turned off three sources they never
   /// want tried has not asked for those back just because they want the
   /// remaining ones ranked automatically again.
+  ///
+  /// On the desktop page it asks first (one click used to wipe a hand-made
+  /// order) and then offers Undo, which puts the exact pins back.
   Future<void> _reset(ZKind kind) async {
+    final desktop = _windows && DesktopSettingsScope.contains(context);
+    final before = _prefs.get(kind);
+    if (desktop) {
+      final pinned = before.length;
+      final ok = await showDesktopConfirm(
+        context,
+        title: context.l10n.unpinAllSourcesQuestion,
+        message: context.l10n.unpinAllSourcesMessage(pinned),
+        confirmLabel: context.l10n.unpinAll,
+        destructive: true,
+      );
+      if (!ok || !mounted) return;
+    }
     await _prefs.clear(kind);
     if (!mounted) return;
     _refresh(kind);
+    if (desktop && before.isNotEmpty) {
+      showUndoToast(
+        context,
+        message: context.l10n.unpinnedAllSources,
+        onUndo: () async {
+          await _prefs.set(kind, before);
+          if (mounted && _kind == kind) _refresh(kind);
+        },
+      );
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar('Source Priority'),
       // No horizontal padding here on purpose: SettingsCard carries its own
       // 16px margin, so anything given an inset by this ListView ends up 12px
       // further in than the cards and the whole screen looks ragged.
-      body: ListView(
-        padding: const EdgeInsets.fromLTRB(0, 10, 0, 36),
-        children: [
-          _capControl(ZKind.anime),
-          _section(ZKind.anime, _sources),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
-            child: Text(
-              'Drag a source to keep it where you put it. Everything else is '
-              'sorted by what has actually worked for you. A title pinned from '
-              'its own Detail screen ignores this list.',
-              style: AppText.caption.copyWith(color: AppColors.textTertiary),
+      body: DesktopSettingsScope.contains(context)
+          ? _desktopBody()
+          : ListView(
+              padding: const EdgeInsets.fromLTRB(0, 10, 0, 36),
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+                  child: DropdownButtonFormField<ZKind>(
+                    key: const ValueKey('source-priority-kind'),
+                    initialValue: _kind,
+                    decoration: const InputDecoration(labelText: 'Media'),
+                    items: const [
+                      DropdownMenuItem(
+                        value: ZKind.anime,
+                        child: Text('Anime'),
+                      ),
+                      DropdownMenuItem(
+                        value: ZKind.movie,
+                        child: Text('Movies / TV'),
+                      ),
+                      DropdownMenuItem(
+                        value: ZKind.manga,
+                        child: Text('Manga'),
+                      ),
+                      DropdownMenuItem(
+                        value: ZKind.novel,
+                        child: Text('Novels'),
+                      ),
+                    ],
+                    onChanged: (kind) {
+                      if (kind != null) _refresh(kind);
+                    },
+                  ),
+                ),
+                _capControl(_kind),
+                _section(_kind, _sources),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
+                  child: Text(
+                    'Drag a source to keep it where you put it. Everything else is '
+                    'sorted by what has actually worked for you. A title pinned from '
+                    'its own Detail screen ignores this list.',
+                    style: AppText.caption.copyWith(
+                      color: AppColors.textTertiary,
+                    ),
+                  ),
+                ),
+                if (_hasPins)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 6, 0, 0),
+                    child: Align(
+                      alignment: AlignmentDirectional.centerStart,
+                      child: _resetButton(_kind),
+                    ),
+                  ),
+              ],
             ),
-          ),
-          if (_hasPins)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 6, 0, 0),
-              child: Align(
-                alignment: AlignmentDirectional.centerStart,
-                child: _resetButton(ZKind.anime),
-              ),
-            ),
-        ],
-      ),
     );
   }
+
+  /// Desktop settings retain the same resolver pool and state handlers, with
+  /// a wrapping media toolbar and explicit ordering instructions.
+  Widget _desktopBody() => ListView(
+    padding: const EdgeInsets.fromLTRB(0, 16, 0, 32),
+    children: [
+      GraphiteSettingsPanel(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Media', style: AppText.body),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final (kind, label) in const [
+                      (ZKind.anime, 'Anime'),
+                      (ZKind.movie, 'Movies / TV'),
+                      (ZKind.manga, 'Manga'),
+                      (ZKind.novel, 'Novels'),
+                    ])
+                      ChoiceChip(
+                        label: Text(label),
+                        selected: _kind == kind,
+                        onSelected: (_) => _refresh(kind),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                Text(
+                  _windows
+                      // Windows adds keyboard moves and the right-click menu.
+                      ? context.l10n.sourcePriorityWindowsHelp
+                      : 'Drag a handle or use Move up / Move down. Pinned sources stay '
+                            'ahead of the automatic ranking.',
+                  style: AppText.caption,
+                ),
+                if (_hasPins) ...[
+                  const SizedBox(height: 8),
+                  _resetButton(_kind),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+      const SizedBox(height: 16),
+      _preferredSourceCard(_kind),
+      const SizedBox(height: 16),
+      if (_windows) ...[_manualMatchesRow(), const SizedBox(height: 16)],
+      _capControl(_kind),
+      _section(_kind, _sources),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(22, 16, 22, 0),
+        child: Text(
+          'A source chosen on a title’s details page overrides this order.',
+          style: AppText.caption,
+        ),
+      ),
+    ],
+  );
+
+  /// The preferred source for [kind]: every title of that kind plays from it
+  /// first (a title's own choice still wins), or Auto Resolve walks the order
+  /// below. Anime has its own pick, separate from Movies / TV, so an anime
+  /// source and a movie source that also carries anime no longer fight.
+  ///
+  /// On Windows the preferred source is "try first": a title it does not have
+  /// still falls back to Auto Resolve (see SourceMatcher.preferredIsTryFirst),
+  /// and it is chosen from a searchable list instead of a plain dropdown of
+  /// every installed source.
+  Widget _preferredSourceCard(ZKind kind) {
+    final prefs = sl.isRegistered<ZSourcePrefs>() ? sl<ZSourcePrefs>() : null;
+    if (prefs == null) return const SizedBox.shrink();
+    final current = prefs.get(kind);
+    final known = _sources.any((s) => s.id == current);
+    if (_windows) {
+      return _preferredSourcePicker(kind, prefs, known ? current : null);
+    }
+    final label = switch (kind) {
+      ZKind.anime => 'Preferred source for anime',
+      ZKind.manga => 'Preferred source for manga',
+      ZKind.novel => 'Preferred source for novels',
+      _ => 'Preferred source for movies and TV',
+    };
+    return GraphiteSettingsPanel(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(label, style: AppText.body),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Titles open from this source first. Auto Resolve tries '
+                      'the sources below in order instead.',
+                      style: AppText.caption,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 16),
+              DropdownButton<String>(
+                key: ValueKey('preferred-source-${kind.name}'),
+                // A pick that is no longer installed reads as Auto Resolve,
+                // which is also what the resolver falls back to.
+                value: known ? current : '',
+                underline: const SizedBox.shrink(),
+                borderRadius: BorderRadius.circular(10),
+                items: [
+                  const DropdownMenuItem(
+                    value: '',
+                    child: Text('Auto Resolve'),
+                  ),
+                  for (final s in _sources)
+                    DropdownMenuItem(
+                      value: s.id,
+                      child: Text(_tags[s.id]?.label ?? s.name),
+                    ),
+                ],
+                onChanged: (id) async {
+                  if (id == null) return;
+                  if (id.isEmpty) {
+                    await prefs.clear(kind);
+                  } else {
+                    await prefs.set(kind, id);
+                  }
+                  if (mounted) setState(() {});
+                },
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Windows: the preferred source as one settings row that opens a
+  /// searchable picker. [current] is null for Auto Resolve (nothing set, or
+  /// the pick is no longer installed — which is also what the resolver does).
+  Widget _preferredSourcePicker(
+    ZKind kind,
+    ZSourcePrefs prefs,
+    String? current,
+  ) {
+    final title = switch (kind) {
+      ZKind.anime => context.l10n.preferredSourceAnime,
+      ZKind.manga => context.l10n.preferredSourceManga,
+      ZKind.novel => context.l10n.preferredSourceNovels,
+      _ => context.l10n.preferredSourceMoviesTv,
+    };
+    final currentLabel = current == null
+        ? context.l10n.autoResolve
+        : _tags[current]?.label ??
+              _sources.firstWhere((s) => s.id == current).name;
+    Future<void> pick() async {
+      final chosen = await showDesktopChoiceDialog<String>(
+        context,
+        title: title,
+        description: context.l10n.preferredSourceDescription,
+        options: [
+          ('', context.l10n.autoResolve),
+          for (final s in _sources) (s.id, _labelFor(s)),
+        ],
+        optionSubtitles: {
+          '': context.l10n.noPreferredSource,
+          for (final s in _sources)
+            s.id: ?_tags[s.id]?.repo,
+        },
+        current: current ?? '',
+        searchable: true,
+        searchHint: context.l10n.searchSources,
+      );
+      if (chosen == null || chosen == (current ?? '')) return;
+      if (chosen.isEmpty) {
+        await prefs.clear(kind);
+      } else {
+        await prefs.set(kind, chosen);
+      }
+      if (mounted) _refresh(kind);
+    }
+
+    return GraphiteSettingsPanel(
+      children: [
+        GraphiteSettingsControl(
+          key: ValueKey('preferred-source-${kind.name}'),
+          icon: Icons.star_outline_rounded,
+          title: title,
+          subtitle: context.l10n.preferredSourceSubtitle,
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 220),
+                child: Text(
+                  currentLabel,
+                  style: AppText.caption.copyWith(
+                    color: AppColors.textSecondary,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const SizedBox(width: 6),
+              Icon(
+                Icons.unfold_more_rounded,
+                size: 18,
+                color: AppColors.textTertiary,
+              ),
+            ],
+          ),
+          onTap: pick,
+        ),
+      ],
+    );
+  }
+
+  /// Windows: the way into the list of titles matched by hand with
+  /// "Wrong title?" (search, Reset to Auto, open source page).
+  Widget _manualMatchesRow() => GraphiteSettingsPanel(
+    children: [
+      GraphiteSettingsControl(
+        key: const ValueKey('source-priority-manual-matches'),
+        icon: Icons.link_rounded,
+        title: context.l10n.manualMatches,
+        subtitle: context.l10n.manualMatchesRowSubtitle,
+        trailing: Icon(
+          Icons.chevron_right_rounded,
+          color: AppColors.textTertiary,
+        ),
+        onTap: () => Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => const ManualMatchesScreen(),
+          ),
+        ),
+      ),
+    ],
+  );
 
   /// How many sources the sweep may try, and the one sentence explaining what
   /// that costs. The number is the whole setting — everything below it is just
   /// which sources, in what order.
-  Widget _capControl(ZKind kind) => SettingsCard(
+  Widget _capControl(ZKind kind) => DesktopSettingsScope.contains(context)
+      ? _desktopCapControl(kind)
+      : _phoneCapControl(kind);
+
+  /// Windows settings: the shared slider row (count, unit and default in the
+  /// subtitle). Saves once on release instead of on every tick.
+  Widget _desktopCapControl(ZKind kind) => GraphiteSettingsPanel(
+    children: [
+      DesktopSettingsSlider(
+        key: const ValueKey('source-priority-cap'),
+        sliderKey: const ValueKey('source-priority-cap-slider'),
+        icon: Icons.format_list_numbered_rounded,
+        title: 'Sources to try',
+        value: _cap.toDouble(),
+        min: SourceOrderPrefs.minCap.toDouble(),
+        max: kAutoResolveCap.toDouble(),
+        divisions: kAutoResolveCap - SourceOrderPrefs.minCap,
+        format: (v) => '${v.round()}',
+        unit: (v) => context.l10n.desktopSourcesUnit(v.round()),
+        defaultValue: kAutoResolveDefaultCap.toDouble(),
+        description:
+            'Auto Resolve tries them in order and stops at the first one '
+            'that has the title. Fewer means Play starts sooner when nothing '
+            'has it.',
+        onChangeEnd: (v) => _setCap(kind, v.round()),
+      ),
+    ],
+  );
+
+  Widget _phoneCapControl(ZKind kind) => SettingsCard(
     children: [
       Padding(
         padding: const EdgeInsets.fromLTRB(16, 14, 12, 0),
@@ -397,7 +879,12 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
   /// Same 16px gutter [SettingsCard] uses, so the tiles line up with the card
   /// above them instead of sitting 12px proud of it.
   Widget _listSurface(List<Widget> children) => Padding(
-    padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+    padding: EdgeInsets.fromLTRB(
+      DesktopSettingsScope.contains(context) ? 22 : 16,
+      14,
+      DesktopSettingsScope.contains(context) ? 22 : 16,
+      0,
+    ),
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: children,
@@ -420,26 +907,82 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
         ],
       );
     }
+    // Read once per build rather than per row.
+    final rank = _sweepRank;
+    final pinned = _windows ? _pinnedIds : const <String>{};
     return _listSurface([
-        if (_isTv)
-          Column(
-            children: [
-              for (var i = 0; i < list.length; i++)
-                _tvRow(kind, list[i], i, list.length),
-            ],
-          )
-        else
-          ReorderableListView(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            buildDefaultDragHandles: false,
-            onReorderItem: (oldIndex, newIndex) =>
-                _reorder(kind, oldIndex, newIndex),
-            children: [
-              for (var i = 0; i < list.length; i++) _row(kind, list[i], i),
-            ],
-          ),
+      if (_isTv)
+        Column(
+          children: [
+            for (var i = 0; i < list.length; i++)
+              _tvRow(kind, list[i], i, list.length),
+          ],
+        )
+      else
+        ReorderableListView(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          buildDefaultDragHandles: false,
+          onReorderItem: (oldIndex, newIndex) =>
+              _reorder(kind, oldIndex, newIndex),
+          children: [
+            for (var i = 0; i < list.length; i++)
+              if (DesktopSettingsScope.contains(context))
+                _desktopRow(kind, list, i, rank, pinned)
+              else
+                _row(kind, list[i], i),
+          ],
+        ),
     ]);
+  }
+
+  /// One desktop row. "Tried" and the cut line follow the row's place among
+  /// the sources Auto Resolve really walks ([rank]), so a switched-off row
+  /// neither counts toward the limit nor moves the line. The Windows extras
+  /// (Pinned badge, Unpin, Move to top / bottom, Use in Auto Resolve) are
+  /// only passed on Windows.
+  Widget _desktopRow(
+    ZKind kind,
+    List<({String id, String name})> list,
+    int i,
+    Map<String, int> rank,
+    Set<String> pinned,
+  ) {
+    final s = list[i];
+    final at = rank[s.id];
+    final tried = at != null && at < _cap;
+    final rawOff = _windows && _prefs.excluded(kind).contains(s.id);
+    return Column(
+      key: ValueKey(s.id),
+      children: [
+        DesktopSourcePriorityRow(
+          index: i,
+          count: list.length,
+          name: _labelFor(s),
+          repo: _tags[s.id]?.repo,
+          reason: _reasonFor(s.id),
+          health: _health(s.id),
+          tried: tried,
+          onMoveUp: () => _move(kind, i, -1),
+          onMoveDown: () => _move(kind, i, 1),
+          pinned: pinned.contains(s.id),
+          onUnpin: _windows ? () => _unpin(kind, s.id) : null,
+          onMoveToTop: _windows ? () => _moveTo(kind, i, 0) : null,
+          onMoveToBottom: _windows
+              ? () => _moveTo(kind, i, list.length - 1)
+              : null,
+          // Shows the stored switch. (A switched-off source that is also the
+          // preferred source is still tried — see excludedForSweep.)
+          usedByAutoResolve: !rawOff,
+          onUsedByAutoResolveChanged: autoResolveExclusionsEnabled
+              ? (on) => _setUsedByAutoResolve(kind, s.id, on)
+              : null,
+        ),
+        // Under the last row the sweep reaches (switched-off rows have no
+        // rank, so they never carry the line).
+        if (at != null && at == _cap - 1) _cutLine(),
+      ],
+    );
   }
 
   Widget _row(ZKind kind, ({String id, String name}) s, int index) {
@@ -526,41 +1069,50 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
     );
   }
 
-  Widget _cutLine() => Padding(
-    padding: const EdgeInsets.fromLTRB(2, 10, 2, 10),
-    child: Row(
-      children: [
-        Expanded(
-          child: Divider(
-            color: AppColors.accent.withValues(alpha: 0.35),
-            height: 1,
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8),
+  Widget _cutLine() => DesktopSettingsScope.contains(context)
+      ? Padding(
+          padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
           child: Text(
-            // Two things this line must not do. It must not imply these
-            // sources are broken (they are fine — just past the number set
-            // above), and it must not tell anyone to raise a number that is
-            // already at its maximum. Dragging one up works at every setting,
-            // so that is the action it names.
-            'Auto Resolve stops here · drag one up to use it',
-            style: AppText.caption.copyWith(
-              color: AppColors.accent.withValues(alpha: 0.9),
-              fontSize: 10.5,
-              letterSpacing: 0.3,
-            ),
+            'Auto Resolve stops here. Move a source above this line to include it.',
+            textAlign: TextAlign.center,
+            style: AppText.caption.copyWith(color: AppColors.accent),
           ),
-        ),
-        Expanded(
-          child: Divider(
-            color: AppColors.accent.withValues(alpha: 0.35),
-            height: 1,
+        )
+      : Padding(
+          padding: const EdgeInsets.fromLTRB(2, 10, 2, 10),
+          child: Row(
+            children: [
+              Expanded(
+                child: Divider(
+                  color: AppColors.accent.withValues(alpha: 0.35),
+                  height: 1,
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Text(
+                  // Two things this line must not do. It must not imply these
+                  // sources are broken (they are fine — just past the number set
+                  // above), and it must not tell anyone to raise a number that is
+                  // already at its maximum. Dragging one up works at every setting,
+                  // so that is the action it names.
+                  'Auto Resolve stops here · drag one up to use it',
+                  style: AppText.caption.copyWith(
+                    color: AppColors.accent.withValues(alpha: 0.9),
+                    fontSize: 10.5,
+                    letterSpacing: 0.3,
+                  ),
+                ),
+              ),
+              Expanded(
+                child: Divider(
+                  color: AppColors.accent.withValues(alpha: 0.35),
+                  height: 1,
+                ),
+              ),
+            ],
           ),
-        ),
-      ],
-    ),
-  );
+        );
 
   Widget _healthChip(({String label, Color color}) h) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
@@ -603,9 +1155,6 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
     );
   }
 
-
-
-
   /// TV row: up/down arrows instead of a drag handle — dragging isn't
   /// D-pad-drivable, so this is the only way to reorder with a remote.
   Widget _tvRow(
@@ -624,47 +1173,50 @@ class _SourcePriorityScreenState extends State<SourcePriorityScreen> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 22,
-            child: Text(
-              '${index + 1}',
-              style: AppText.caption.copyWith(
-                color: tried
-                    ? AppColors.textSecondary
-                    : AppColors.textTertiary,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 22,
+                child: Text(
+                  '${index + 1}',
+                  style: AppText.caption.copyWith(
+                    color: tried
+                        ? AppColors.textSecondary
+                        : AppColors.textTertiary,
+                  ),
+                ),
               ),
-            ),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Opacity(
-              opacity: tried ? 1 : 0.45,
-              child: _nameAndRepo(
-                s,
-                color: AppColors.textPrimary,
-                reason: _reasonFor(s.id),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Opacity(
+                  opacity: tried ? 1 : 0.45,
+                  child: _nameAndRepo(
+                    s,
+                    color: AppColors.textPrimary,
+                    reason: _reasonFor(s.id),
+                  ),
+                ),
               ),
-            ),
+              if (_health(s.id) case final h?) ...[
+                _healthChip(h),
+                const SizedBox(width: 4),
+              ],
+              _tvMoveButton(
+                icon: Icons.keyboard_arrow_up_rounded,
+                enabled: index > 0,
+                semanticLabel: 'Move ${_labelFor(s)} up',
+                onTap: () => _move(kind, index, -1),
+              ),
+              const SizedBox(width: 6),
+              _tvMoveButton(
+                icon: Icons.keyboard_arrow_down_rounded,
+                enabled: index < count - 1,
+                semanticLabel: 'Move ${_labelFor(s)} down',
+                onTap: () => _move(kind, index, 1),
+              ),
+            ],
           ),
-          if (_health(s.id) case final h?) ...[_healthChip(h), const SizedBox(width: 4)],
-          _tvMoveButton(
-            icon: Icons.keyboard_arrow_up_rounded,
-            enabled: index > 0,
-            semanticLabel: 'Move ${_labelFor(s)} up',
-            onTap: () => _move(kind, index, -1),
-          ),
-          const SizedBox(width: 6),
-          _tvMoveButton(
-            icon: Icons.keyboard_arrow_down_rounded,
-            enabled: index < count - 1,
-            semanticLabel: 'Move ${_labelFor(s)} down',
-            onTap: () => _move(kind, index, 1),
-          ),
-        ],
-      ),
         ),
         if (atCut) _cutLine(),
       ],

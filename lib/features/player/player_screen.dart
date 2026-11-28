@@ -1,11 +1,23 @@
 import 'dart:async';
 import 'dart:io';
+import '../../core/desktop/desktop_focus_repair.dart';
+import '../../core/desktop/desktop_context_menu.dart';
+import '../../core/desktop/desktop_player_input.dart';
+import '../../core/desktop/desktop_shortcuts.dart';
+import '../../core/desktop/desktop_window.dart';
+import '../../core/desktop/desktop_reveal.dart';
+import '../detail/desktop_single_download_dialog.dart';
+import '../detail/download_source_lookup.dart';
+import 'package:path/path.dart' as pathlib;
+import 'package:path_provider_windows/path_provider_windows.dart';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:media_kit/media_kit.dart' show Track;
+import 'package:flutter/gestures.dart' show kPrimaryMouseButton;
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show RenderProxyBox;
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:media_kit_video/media_kit_video.dart';
@@ -24,13 +36,20 @@ import '../../core/playback/filler_service.dart';
 import '../../core/repository/catalogue_repository.dart';
 import '../../core/repository/source_repository.dart';
 import '../../core/zmode/playback_resolver.dart';
+import '../../core/zmode/zmode_ids.dart';
 import '../../core/tracker/tracker_hub.dart';
 import '../../core/playback/external_player.dart';
 import '../../core/logging/app_logger.dart';
 import 'phone_playback_launch.dart';
+import 'desktop_buffering_gate.dart';
+import 'desktop_floating_player.dart';
+// Windows: keeps the Skip / Skip recap pill still under the mouse.
+import 'desktop_skip_pill.dart';
+import 'desktop_watch_page.dart' show desktopPlayerTip;
 import 'episode_player_route.dart';
 import 'in_app_mini_player.dart';
 import 'player_engine_fallback.dart';
+import 'player_error_view.dart';
 import '../../core/download/download_manager.dart';
 import '../../core/download/download_record.dart';
 import '../downloads/episode_download_icon.dart';
@@ -40,6 +59,7 @@ import 'subtitle_style.dart';
 import 'subtitle_font_service.dart';
 import 'player_lifecycle.dart';
 import '../../core/torrent/torrent_util.dart';
+import '../downloads/downloaded_episode_playback.dart';
 import '../../core/models/episode.dart';
 import '../../core/models/film.dart';
 import '../../core/models/episode_title.dart';
@@ -61,12 +81,17 @@ import '../../core/playback/watch_history.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/ui/app_dialog.dart';
+import '../../core/ui/desktop_docked_panel.dart' show DesktopPanelColors;
 import '../../core/ui/episode_unavailable_dialog.dart';
 import '../../core/ui/badge.dart';
 import 'playback_loading_title.dart';
 import '../../core/ui/frosted_surface.dart';
 import '../../core/ui/subtitle_language_picker.dart';
 import '../detail/cubit/detail_cubit.dart' show seasonOf, seasonsOf;
+import '../detail/detail_screen.dart' show DetailScreen;
+import '../../core/models/media_item.dart';
+import '../../core/models/provider_info.dart' show ProviderType;
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import '../../core/cast/cast_controller.dart';
 import '../../core/cast/cast_proxy.dart';
 import '../watch_together/watch_together_controller.dart';
@@ -75,6 +100,9 @@ import '../../core/app_mode.dart';
 import '../../core/tv/tv_focusable.dart';
 import '../settings/settings_screen.dart';
 import 'player_controller.dart';
+import 'desktop_ambient_frame.dart';
+import 'desktop_player_hud.dart';
+import 'desktop_video_click.dart';
 import 'player_watch_page.dart';
 import 'watch_page_motion.dart';
 import 'watch_page_info.dart';
@@ -152,12 +180,38 @@ PlayerPresentation initialPresentation({
   required bool isTv,
   required String orientation,
   required bool isLandscape,
+  bool windows = false,
 }) {
+  // Windows: playback always starts on the watch page; theatre mode and full
+  // screen are reached from there (and Back from them returns to it).
+  if (windows && !isTv) return PlayerPresentation.watchPage;
   if (isTv ||
       (orientation != 'portrait' && (orientation != 'system' || isLandscape))) {
     return PlayerPresentation.fullscreen;
   }
   return PlayerPresentation.watchPage;
+}
+
+/// Windows: the layout to show when the window goes in or out of full screen,
+/// and what to remember. Going full screen always shows the theatre layout
+/// ([PlayerPresentation.fullscreen]) and remembers where it came from (the
+/// first record wins); leaving full screen goes back to that layout and
+/// forgets it. With nothing remembered (full screen was already on when the
+/// player opened) the layout stays as it is.
+@visibleForTesting
+({PlayerPresentation presentation, PlayerPresentation? before})
+desktopFullScreenLayout({
+  required bool fullScreen,
+  required PlayerPresentation current,
+  PlayerPresentation? before,
+}) {
+  if (fullScreen) {
+    return (
+      presentation: PlayerPresentation.fullscreen,
+      before: before ?? current,
+    );
+  }
+  return (presentation: before ?? current, before: null);
 }
 
 /// True when [url] is already served by a local proxy (localhost / 127.0.0.1) —
@@ -195,6 +249,116 @@ bool isDashUrl(String url) =>
 /// is still opening. Restoring that would leave the video stopped with no
 /// obvious way back, so anything not positive falls back to normal speed.
 double rateToRestoreAfterHold(double current) => current > 0 ? current : 1.0;
+
+/// How Flutter samples the video texture when it stretches it to the screen.
+/// Windows uses the bicubic filter (sharper when a 720p or 480p episode is
+/// shown bigger than its own size); phone keeps media_kit's default.
+///
+/// A video above 1440p (a 4K film) on Windows goes back to media_kit's plain
+/// bilinear filter: its texture is already at least screen sized and only
+/// ever shrunk, where bicubic adds nothing visible but costs a weak iGPU a
+/// lot on every frame. [videoWidth]/[videoHeight] are mpv's video size, null
+/// while it is not known yet (then the normal Windows filter is used).
+@visibleForTesting
+FilterQuality videoFilterQuality({
+  required bool windows,
+  int? videoWidth,
+  int? videoHeight,
+}) {
+  if (!windows) return FilterQuality.low;
+  if (videoWidth != null &&
+      videoHeight != null &&
+      isAbove1440p(videoWidth, videoHeight)) {
+    return FilterQuality.low;
+  }
+  return FilterQuality.high;
+}
+
+/// Windows: the theater watch page shown while the player is still being set
+/// up (see `_desktopWatchPageLoadingShell` in [PlayerScreen]). The small
+/// player shows the dimmed cover with its loading spinner; the title,
+/// details and the episode list (when already known) sit where the real
+/// page puts them. Every button except Back does nothing yet.
+@visibleForTesting
+PlayerWatchPage desktopWatchLoadingPage({
+  required List<Episode> episodes,
+  required int startIndex,
+  required String? showTitle,
+  required String? showDescription,
+  required String? cover,
+  required Map<String, String>? coverHeaders,
+  required bool isMovie,
+  required bool autoplay,
+  required VoidCallback onBack,
+}) {
+  final idx = episodes.isEmpty ? 0 : startIndex.clamp(0, episodes.length - 1);
+  final episode = episodes.isEmpty
+      ? const Episode(id: '', title: '', url: '')
+      : episodes[idx];
+  final art = (cover ?? '').trim();
+  final thumb = (episode.thumbnail ?? '').trim();
+  void none() {}
+  return PlayerWatchPage(
+    key: const ValueKey('watch-loading-shell'),
+    // The cover, dimmed, where the video will be.
+    video: Stack(
+      fit: StackFit.expand,
+      children: [
+        if (art.isNotEmpty)
+          CachedNetworkImage(
+            imageUrl: art,
+            httpHeaders: coverHeaders,
+            fit: BoxFit.cover,
+            memCacheWidth: 1080,
+            errorWidget: (c, u, e) => const ColoredBox(color: Colors.black),
+            placeholder: (c, u) => const ColoredBox(color: Colors.black),
+          ),
+        const ColoredBox(color: Color(0x99000000)),
+      ],
+    ),
+    header: resolveWatchPageHeader(
+      episode: episode,
+      showTitle: showTitle,
+      showDescription: showDescription,
+      isMovie: isMovie,
+    ),
+    isMovie: isMovie,
+    showTitle: showTitle,
+    coverHeaders: coverHeaders,
+    coverUrl: thumb.isNotEmpty ? thumb : cover,
+    // The small player shows the loading state.
+    loading: true,
+    firstFrameStream: const Stream<int?>.empty(),
+    positionStream: const Stream<Duration>.empty(),
+    durationStream: const Stream<Duration?>.empty(),
+    playingStream: const Stream<bool>.empty(),
+    initialPlaying: false,
+    initialPosition: Duration.zero,
+    initialDuration: Duration.zero,
+    hasPrevious: false,
+    autoplay: autoplay,
+    episodes: watchPageEpisodes(
+      episodes: episodes,
+      currentIndex: idx,
+      isMovie: isMovie,
+      showTitle: showTitle,
+      coverFallback: cover,
+    ),
+    onTogglePlay: none,
+    onSeek: (_) {},
+    onPrevious: none,
+    onNext: none,
+    onFullscreen: none,
+    onBack: onBack,
+    onServer: none,
+    onAudio: none,
+    onSubtitles: none,
+    onMore: none,
+    onOpenEpisode: (_) {},
+    onComments: none,
+    onAutoplayChanged: (_) {},
+  );
+}
 
 class PlayerScreen extends StatefulWidget {
   const PlayerScreen({
@@ -235,7 +399,54 @@ class PlayerScreen extends StatefulWidget {
     this.onEngineChange,
     this.engineRecovery = false,
     bool? isMovie,
+    this.adopt,
   }) : _isMovie = isMovie;
+
+  /// Windows: a playback coming back from the floating mini player. The
+  /// page takes that live session over (same player, same position) instead
+  /// of resolving and opening the episode again. Null everywhere else.
+  final FloatingPlayback? adopt;
+
+  /// Windows: this page again, set up to take [playback] over from the
+  /// floating mini player (expand). A room join is not repeated.
+  PlayerScreen adopting(FloatingPlayback playback) => PlayerScreen(
+    sourceId: sourceId,
+    resume: resume,
+    resolveSources: resolveSources,
+    resolveDownloadedSources: resolveDownloadedSources,
+    localOnly: localOnly,
+    pollSources: pollSources,
+    episodes: episodes,
+    startIndex: startIndex,
+    episodesResolver: episodesResolver,
+    resumeEpisodeId: resumeEpisodeId,
+    resumeEpisodeNumber: resumeEpisodeNumber,
+    resumePosition: resumePosition,
+    history: history,
+    showTitle: showTitle,
+    showDescription: showDescription,
+    cover: cover,
+    coverHeaders: coverHeaders,
+    loadingLogo: loadingLogo,
+    loadingBackdrop: loadingBackdrop,
+    showUrl: showUrl,
+    downloadShowId: downloadShowId,
+    category: category,
+    malId: malId,
+    scrobbleTitle: scrobbleTitle,
+    tmdbId: tmdbId,
+    tmdbIsTv: tmdbIsTv,
+    imdbId: imdbId,
+    peek: peek,
+    availableCategories: availableCategories,
+    playerOverride: playerOverride,
+    initialSource: initialSource,
+    engineFallback: engineFallback,
+    onEngineChange: onEngineChange,
+    engineRecovery: engineRecovery,
+    isMovie: _isMovie,
+    adopt: playback,
+  );
 
   /// A mirror picked from the episode list's long-press menu, opened instead
   /// of the adaptive default. One-shot: the cubit clears it after the first
@@ -352,7 +563,9 @@ class PlayerScreen extends StatefulWidget {
     final preferred = stremioPlayerPackage(
       sourceId,
       initialSource,
-      playerOverride ?? sl<PlaybackPrefs>().externalPlayerPackage,
+      // P4: effective value = '' on Windows, so a phone backup's player id
+      // never redirects the Windows player; the phone reads the stored value.
+      playerOverride ?? sl<PlaybackPrefs>().effectiveExternalPlayerPackage,
     );
     // Not gated on autoPlayerFallback: a torrent must yield native→mpv even
     // with the toggle off (see tryOtherPlayer), and only this host actually
@@ -476,7 +689,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   String get _chosenPlayer => stremioPlayerPackage(
     widget.sourceId,
     widget.initialSource,
-    widget.playerOverride ?? sl<PlaybackPrefs>().externalPlayerPackage,
+    // P4: Windows ignores a stored phone player (see the getter's notes).
+    widget.playerOverride ?? sl<PlaybackPrefs>().effectiveExternalPlayerPackage,
   );
 
   late final PlayerEngineFallback _engineFallback =
@@ -567,26 +781,67 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   // User's preferred double-tap seek step (±5/10/15/30s), read once at session
   // start. Backed by PlaybackPrefs.doubleTapSeconds.
-  final int _seekSeconds = sl<PlaybackPrefs>().doubleTapSeconds;
+  //
+  // Windows reads these prefs live instead, so a change made in Settings
+  // during playback applies on return; phone and TV read them once at open.
+  final int _seekSecondsAtOpen = sl<PlaybackPrefs>().doubleTapSeconds;
+
+  /// Current seek step (live on Windows, read once elsewhere).
+  int get _seekSeconds => _windowsDesktopUi
+      ? sl<PlaybackPrefs>().doubleTapSeconds
+      : _seekSecondsAtOpen;
 
   // ── Brightness / volume swipe gestures ──────────────────────────────────
-  final bool _gesturesEnabled = sl<PlaybackPrefs>().gestureControls;
+  final bool _gesturesAtOpen = sl<PlaybackPrefs>().gestureControls;
+
+  /// Touch volume/brightness gestures apply only outside the Windows player.
+  bool get _gesturesEnabled => !Platform.isWindows && _gesturesAtOpen;
   // Horizontal drag-to-seek. Its own switch, not part of [_gesturesEnabled],
   // which only ever meant the vertical brightness/volume swipes.
-  final bool _swipeSeekEnabled = sl<PlaybackPrefs>().swipeSeek;
-  final bool _holdSpeedEnabled = sl<PlaybackPrefs>().holdSpeed;
-  final bool _skipIntroEnabled = sl<PlaybackPrefs>().skipIntro;
-  // Fields for the in-player info overlay (read once). Shown on demand via the
-  // ⓘ button in the top bar, NOT auto with the controls.
-  final List<String> _infoFields = sl<PlaybackPrefs>().playerInfoFields;
+  final bool _swipeSeekAtOpen = sl<PlaybackPrefs>().swipeSeek;
+
+  /// Touch swipe seeking; Windows uses the mouse and keyboard instead.
+  bool get _swipeSeekEnabled => !Platform.isWindows && _swipeSeekAtOpen;
+  final bool _holdSpeedAtOpen = sl<PlaybackPrefs>().holdSpeed;
+
+  /// Hold-to-speed, touch player only.
+  bool get _holdSpeedEnabled => !Platform.isWindows && _holdSpeedAtOpen;
+  final bool _skipIntroAtOpen = sl<PlaybackPrefs>().skipIntro;
+
+  /// The intro-skip setting (live on Windows, read once elsewhere).
+  bool get _skipIntroEnabled =>
+      _windowsDesktopUi ? sl<PlaybackPrefs>().skipIntro : _skipIntroAtOpen;
+  // Fields for the in-player info overlay (read once; live on Windows). Shown
+  // on demand via the ⓘ button in the top bar, NOT auto with the controls.
+  final List<String> _infoFieldsAtOpen = sl<PlaybackPrefs>().playerInfoFields;
+
+  /// Field selection for the on-demand information overlay.
+  List<String> get _infoFields => _windowsDesktopUi
+      ? sl<PlaybackPrefs>().playerInfoFields
+      : _infoFieldsAtOpen;
   bool _infoPanelOpen = false;
   bool _flashing = false; // brief white flash on screenshot capture
   // Always-on plain-text quality label (top-right), independent of the ⓘ panel.
-  final bool _alwaysShowQuality = sl<PlaybackPrefs>().alwaysShowQuality;
+  final bool _alwaysShowQualityAtOpen = sl<PlaybackPrefs>().alwaysShowQuality;
+
+  /// The quality label setting (live on Windows, read once elsewhere).
+  bool get _alwaysShowQuality => _windowsDesktopUi
+      ? sl<PlaybackPrefs>().alwaysShowQuality
+      : _alwaysShowQualityAtOpen;
   // MegaSkip — manual jump-forward button (Aniyomi-style). Read once at open
-  // (the player is recreated per session, like the other prefs above).
-  final bool _megaSkipEnabled = sl<PlaybackPrefs>().megaSkip;
-  final int _megaSkipSeconds = sl<PlaybackPrefs>().megaSkipSeconds;
+  // (the player is recreated per session, like the other prefs above); live
+  // on Windows.
+  final bool _megaSkipAtOpen = sl<PlaybackPrefs>().megaSkip;
+  final int _megaSkipSecondsAtOpen = sl<PlaybackPrefs>().megaSkipSeconds;
+
+  /// Whether MegaSkip shows (live on Windows, read once elsewhere).
+  bool get _megaSkipEnabled =>
+      _windowsDesktopUi ? sl<PlaybackPrefs>().megaSkip : _megaSkipAtOpen;
+
+  /// MegaSkip jump distance (live on Windows, read once elsewhere).
+  int get _megaSkipSeconds => _windowsDesktopUi
+      ? sl<PlaybackPrefs>().megaSkipSeconds
+      : _megaSkipSecondsAtOpen;
   bool _megaFlash = false; // brief "+Ns" flash shown right after a MegaSkip tap
   Timer? _megaFlashTimer;
   bool _dragIsBrightness = false; // left half = brightness, right half = volume
@@ -597,6 +852,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
   double _hudValue = 0;
   bool _hudIsBrightness = false;
   Timer? _hudTimer;
+
+  /// Windows: volume / seek feedback on the theater watch page (the full
+  /// player reuses [_AdjustHud] and [_SeekIndicator] above for the same).
+  final DesktopHudController _watchHud = DesktopHudController();
+
+  /// Windows: the 0-100 user volume (boost applied on top by the cubit),
+  /// for the theater page's volume button. Built once per session.
+  late final Stream<double> _userVolumeStream = _c.player.stream.volume.map(
+    _c.userVolumeFromMpv,
+  );
 
   // ── Lock / zoom / drag-seek / up-next ─────────────────────────────────────
   bool _locked = false; // controls + gestures disabled
@@ -682,9 +947,67 @@ class _PlayerScreenState extends State<PlayerScreen> {
     await Navigator.of(context).maybePop();
   }
 
+  /// Windows: whether the window was already fullscreen when the player
+  /// opened. Leaving the player puts the window back that way, so going
+  /// fullscreen for an episode never leaves the app stuck in fullscreen.
+  /// Null until the native answer arrives.
+  bool? _windowFullscreenOnOpen;
+
+  /// Windows: the playback this page takes over from the floating mini
+  /// player (expand), or null for a normal open.
+  FloatingPlayback? get _adopted => _windowsDesktopUi ? widget.adopt : null;
+
+  /// Windows: set once this page gave its playback to the floating mini
+  /// player. dispose() then leaves the player, its progress saving, the
+  /// room hook-up and the trailer lease running for the card.
+  bool _handedOff = false;
+
   @override
   void initState() {
     super.initState();
+    final adopted = _adopted;
+    if (adopted != null) {
+      // Read now, before going back to full screen below: leaving this page
+      // later should put the window back the way it is at this moment.
+      _windowFullscreenOnOpen = DesktopWindow.fullscreen.value;
+      if (adopted.fullScreen && !DesktopWindow.fullscreen.value) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          unawaited(
+            DesktopWindow.setFullscreen(true).catchError((Object _) {}),
+          );
+        });
+      }
+    } else if (Platform.isWindows) {
+      unawaited(
+        DesktopWindow.isFullscreen()
+            .then((v) => _windowFullscreenOnOpen = v)
+            .catchError((Object _) => _windowFullscreenOnOpen = false),
+      );
+    }
+    // Windows: follow the mini player / always-on-top state (the runner can
+    // also change it, e.g. Esc in the mini window).
+    if (_windowsDesktopUi) {
+      DesktopWindow.miniPlayer.addListener(_onDesktopWindowModeChanged);
+      DesktopWindow.alwaysOnTop.addListener(_onDesktopWindowModeChanged);
+      // Full screen from anywhere (F, F11, the buttons, double-click, the
+      // runner) switches the layout; leaving it goes back (see
+      // [_onDesktopFullScreenChanged]).
+      DesktopWindow.fullscreen.addListener(_onDesktopFullScreenChanged);
+      // The window may already be full screen when the player opens: no
+      // change fires then, so show the theatre layout once after the first
+      // frame (leaving full screen then returns to the watch page).
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (DesktopWindow.fullscreen.value) _showFullScreenLayoutOnOpen();
+      });
+      unawaited(
+        DesktopWindow.isFullscreen()
+            .then((full) {
+              if (full) _showFullScreenLayoutOnOpen();
+            })
+            .catchError((Object _) {}),
+      );
+    }
     // Refresh the "enhancement shaders downloaded?" flag so the in-player picker
     // gates correctly (they're fetched on demand from Settings). Fire-and-forget.
     unawaited(ShaderPresets.refreshDownloaded());
@@ -815,7 +1138,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
     final sw = Stopwatch()..start();
     try {
-      final bytes = await _c.player.screenshot();
+      // Windows: a tiny raw frame instead of a full-resolution JPEG (see
+      // [_grabSmallAmbientFrame]); phone keeps its JPEG grab.
+      final bytes = _windowsDesktopUi
+          ? await _grabSmallAmbientFrame()
+          : await _c.player.screenshot();
       sw.stop();
       if (!mounted) return;
       if (bytes == null || bytes.isEmpty) {
@@ -827,6 +1154,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
         return;
       }
       if (sw.elapsedMilliseconds > 800) _ambientSkip = 2;
+      // Windows: once a glow colour is up it only needs to drift with the
+      // scene, so sample every ~18s (two skipped 6s ticks) instead of 6s.
+      if (_windowsDesktopUi && _ambientGlowReady && _ambientSkip < 2) {
+        _ambientSkip = 2;
+      }
       _ambientMisses = 0;
       _ambientGlowReady = true;
       if (!_ambientFrames.isClosed) _ambientFrames.add(bytes);
@@ -835,6 +1167,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _ambientMisses++;
       AppLogger.instance.log('[watch-ambient] frame error: $e');
     }
+  }
+
+  /// Windows: a ~32px frame for the ambient glow. mpv hands over the raw
+  /// BGRA frame (no JPEG encode of a 1440p/4K picture, which was the
+  /// periodic stutter), it is point-sampled down here and wrapped as a tiny
+  /// BMP the watch page decodes for free. Falls back to the old JPEG grab
+  /// when the raw buffer does not match the reported video size.
+  Future<Uint8List?> _grabSmallAmbientFrame() async {
+    final raw = await _c.player.safeScreenshot(format: null);
+    if (raw == null || raw.isEmpty) return null;
+    final small = downscaleBgraToBmp(
+      raw,
+      _c.player.state.width ?? 0,
+      _c.player.state.height ?? 0,
+    );
+    return small ?? await _c.player.screenshot();
   }
 
   void _applyPlayerSystemUi() {
@@ -856,6 +1204,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   void _enterFullscreen({bool fromRotation = false}) {
     _stopAmbientSampler();
+    _desktopWatchViaBack = false;
     if (!fromRotation) _followSensor = false;
     _lastOrientation = MediaQuery.orientationOf(context);
     setState(() {
@@ -889,11 +1238,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final current = MediaQuery.orientationOf(context);
     if (_lastOrientation == null) {
       _lastOrientation = current;
-      final initial = initialPresentation(
-        isTv: false,
-        orientation: sl<PlaybackPrefs>().playerOrientation,
-        isLandscape: current == Orientation.landscape,
-      );
+      // Windows: back from the floating mini player, open in the layout
+      // the video was popped out of.
+      final initial =
+          _adopted?.layout ??
+          initialPresentation(
+            isTv: false,
+            orientation: sl<PlaybackPrefs>().playerOrientation,
+            isLandscape: current == Orientation.landscape,
+            windows: _windowsDesktopUi,
+          );
       _presentation = initial;
       _applyPlayerSystemUi();
       if (initial == PlayerPresentation.watchPage) {
@@ -903,6 +1257,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
       } else {
         _applyOrientationWhenCovered();
       }
+      return;
+    }
+    // Windows: a window snapped narrow is not a phone turned upright. Only
+    // "Match window shape" ('system', until a manual switch) follows it;
+    // "Watch page" / "Full window" keep the layout the user is in.
+    if (_windowsDesktopUi && !_followSensor) {
+      _lastOrientation = current;
       return;
     }
     final next = rotationPresentation(
@@ -918,11 +1279,135 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
+  /// Windows desktop UI (theater watch page, clickable show title). Uses the
+  /// target platform, not the host, so tests on a Windows host stay phone.
+  bool get _windowsDesktopUi => defaultTargetPlatform == TargetPlatform.windows;
+
+  /// Windows: the one-click show page action (clicking the title in the
+  /// player top bar), or null when there is no show to go to (local files,
+  /// links without a show URL); null leaves the title inert.
+  VoidCallback? get _showPageAction {
+    if (!_windowsDesktopUi) return null;
+    if (ModalRoute.of(context) is EpisodePlayerRoute) return _openShowPage;
+    if (widget.localOnly || (widget.showUrl?.trim().isEmpty ?? true)) {
+      return null;
+    }
+    return _openShowPage;
+  }
+
+  /// Windows: straight to the show's detail page in one go. Opened from
+  /// Detail (the only caller of [EpisodePlayerRoute]) it simply pops back
+  /// there; opened from Home / History / Search it swaps the player for the
+  /// show's detail page, so no stray player route is left underneath.
+  /// Bypasses the close confirmation on purpose: it is an explicit click.
+  /// Fullscreen is restored by [dispose] as on every other exit.
+  void _openShowPage() {
+    if (!mounted) return;
+    final nav = Navigator.of(context);
+    if (ModalRoute.of(context) is EpisodePlayerRoute) {
+      _leavePlayer();
+      return;
+    }
+    nav.pushReplacement(_showDetailRoute());
+  }
+
+  /// The show's detail page, built from the same stub [MediaItem] Home's
+  /// Continue Watching cards open. Only call it when [widget.showUrl] is set
+  /// (see [_showPageAction]).
+  Route<void> _showDetailRoute() {
+    final url = widget.showUrl!.trim();
+    return DetailScreen.route(
+      MediaItem(
+        id: widget.downloadShowId ?? url,
+        title: widget.showTitle ?? '',
+        cover: widget.cover,
+        coverHeaders: widget.coverHeaders,
+        url: url,
+        // Same stub shape Home uses for Continue Watching; Detail reloads
+        // the real type from the source.
+        type: widget.isMovie ? ProviderType.movie : ProviderType.anime,
+        sourceId: widget.sourceId,
+        malId: widget.malId,
+        tmdbId: widget.tmdbId,
+        imdbId: widget.imdbId,
+      ),
+    );
+  }
+
+  /// Windows watch page: the click on the episode title / show line under
+  /// the video. Null (title stays plain text) when there is no show to open
+  /// (local files, links without a show URL) or for a Watch Together viewer
+  /// who is not the host, since that viewer may not pop the video out.
+  VoidCallback? get _showWithMiniPlayerAction {
+    if (_showPageAction == null) return null;
+    if (_attached && _room.room != null && !_room.isHost) return null;
+    return _openShowPageWithMiniPlayer;
+  }
+
+  /// Windows: opens the show's detail page and, at the same time, sends the
+  /// playing video into the floating mini player so it keeps playing in the
+  /// corner. Opened from Detail, popping the player already lands there.
+  /// When the video cannot pop out (nothing under this page to go back to,
+  /// or the player is not ready yet) it falls back to the plain show page.
+  void _openShowPageWithMiniPlayer() {
+    if (!mounted || _handedOff) return;
+    final nav = Navigator.of(context);
+    final fromDetail = ModalRoute.of(context) is EpisodePlayerRoute;
+    // Built before the pop: this page's widget fields are read here.
+    final detail = fromDetail ? null : _showDetailRoute();
+    if (!_tryPopOutToFloatingPlayer()) {
+      _openShowPage();
+      return;
+    }
+    // The player route is gone now; the detail page goes on top of the
+    // page the player was opened from (Home, History, Search...).
+    if (detail != null) unawaited(nav.push(detail));
+  }
+
+  /// Windows Back from the theater watch page. The Back that brought the
+  /// viewer here already counts as the first press of "double back", so it
+  /// leaves at once; "confirm" still asks. Phone keeps [_handleCloseRequest].
+  ///
+  /// Opened straight on the watch page ("Player opens in: Watch page") no
+  /// Back has been pressed yet, so "double back" still needs two presses
+  /// there; only the full-window → watch-page Back counts as the first one.
+  void _handleDesktopWatchBack() {
+    final mode = sl<PlaybackPrefs>().closeConfirmation;
+    if (mode == 'confirm' || (mode == 'double_back' && !_desktopWatchViaBack)) {
+      _handleCloseRequest();
+      return;
+    }
+    _leavePlayer();
+  }
+
+  /// Windows: the theater watch page was reached by Back from the full
+  /// window (the first press of "double back"). Cleared on going full again.
+  bool _desktopWatchViaBack = false;
+
+  /// Back from the full window to the watch page; on Windows it remembers
+  /// that this was the first Back (see [_handleDesktopWatchBack]).
+  void _backToWatchPage() {
+    // Windows full screen: Back first leaves full screen; the layout goes
+    // back to where full screen started (see _onDesktopFullScreenChanged).
+    if (_windowsDesktopUi && DesktopWindow.fullscreen.value) {
+      unawaited(DesktopWindow.exitFullscreen().catchError((Object _) => false));
+      return;
+    }
+    _desktopWatchViaBack = _windowsDesktopUi;
+    _enterWatchPage();
+  }
+
   /// Fullscreen Back lands on the watch page instead of leaving the player;
   /// the page's own Back uses the normal close guard.
+  ///
+  /// Windows Back / Esc / mouse-back, in order: Esc first leaves window
+  /// fullscreen ([DesktopPlayerInput]); then the full player drops to the
+  /// theater watch page (or opens with it when the default orientation is
+  /// portrait); Back there leaves the player ([_handleDesktopWatchBack]).
+  /// Clicking the show title in the top bar skips all of that in one click.
   void _handlePlayerBack() {
     if (_watchPageEnabled && _presentation == PlayerPresentation.fullscreen) {
-      _enterWatchPage();
+      _backToWatchPage();
       return;
     }
     Navigator.of(context).maybePop();
@@ -931,7 +1416,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// Follow the device sensor instead of locking, when the saved default is
   /// 'system'. The ⟳ button still locks to one side for the session.
   StreamSubscription<dynamic>? _orientationTurns;
-  bool _followSensor = sl<PlaybackPrefs>().playerOrientation == 'system';
+  // Windows never follows the window shape: the layout only changes when the
+  // viewer picks theatre mode or full screen.
+  bool _followSensor =
+      sl<PlaybackPrefs>().playerOrientation == 'system' &&
+      defaultTargetPlatform != TargetPlatform.windows;
 
   /// The orientation this player holds right now. Single source of truth: the
   /// screen pins orientation in more than one place (open, and either side of
@@ -1033,6 +1522,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   void _initInApp() {
+    final adopted = _adopted;
+    if (adopted != null) {
+      // The floating card's "a player is alive" lease moves to this page.
+      _routeTeardownLease ??= adopted.takeLease();
+    } else if (_windowsDesktopUi) {
+      // Windows: a new playback replaces the floating mini player. Its
+      // progress is saved and it is stopped first, so two never play.
+      unawaited(DesktopFloatingPlayer.instance.close());
+    }
     _routeTeardownLease ??= playerRouteTeardownBarrier.acquire();
     if (!_watchPageEnabled) _applyOrientationWhenCovered();
     _applyPlayerSystemUi();
@@ -1049,7 +1547,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _prevCastState = sl<CastController>().state;
     sl<CastController>().removeListener(_onCastStateChanged); // idempotent
     sl<CastController>().addListener(_onCastStateChanged);
-    if (widget.episodesResolver != null && widget.episodes.isEmpty) {
+    if (adopted != null) {
+      // Same session, already playing: no resolve, no re-open.
+      _startSession(adopted.cubit.episodes, adopted.cubit.state.currentIndex);
+    } else if (widget.episodesResolver != null && widget.episodes.isEmpty) {
       _resolveThenStart(); // instant nav: resolve behind the branded loader
     } else {
       _startSession(widget.episodes, widget.startIndex);
@@ -1838,8 +2339,87 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return e.title.isNotEmpty ? e.title : null;
   }
 
+  /// Finds the finished download of [episode] so playback can fall back to it
+  /// when every online option fails. Matching is exact (episode url, then
+  /// catalogue ids plus episode number); a different show or audio cut is never
+  /// returned. Null when nothing suitable is saved.
+  Future<List<VideoSource>?> _findLocalDownload(Episode episode) async {
+    if (!sl.isRegistered<DownloadManager>()) return null;
+    final record = await sl<DownloadManager>().finishedForEpisode(
+      sourceId: widget.sourceId,
+      // The player does not know the show's own id, so the lookup relies on the
+      // episode url, catalogue ids and episode number instead.
+      showId: '',
+      episodeId: episode.id,
+      episodeUrl: episode.url,
+      malId: widget.malId,
+      tmdbId: widget.tmdbId,
+      tmdbIsTv: widget.tmdbIsTv,
+      episodeNumber: episode.number,
+      category: widget.category,
+      season: episode.season,
+    );
+    return record == null ? null : [downloadedVideoSource(record)];
+  }
+
+  /// Asks whether to switch to the downloaded copy (setting "ask").
+  Future<bool> _confirmLocalFallback() async {
+    if (!mounted) return false;
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (dialog) => AlertDialog(
+        title: const Text('Playback keeps failing'),
+        content: const Text(
+          'You have this episode downloaded. Play the downloaded copy instead?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialog, false),
+            child: const Text('Keep trying'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialog, true),
+            child: const Text('Play download'),
+          ),
+        ],
+      ),
+    );
+    return accepted ?? false;
+  }
+
   void _startSession(List<Episode> eps, int startIndex) {
-    _c = PlayerCubit(
+    final adopted = _adopted;
+    if (adopted != null) {
+      // Windows: take the floating mini player's live session over (expand)
+      // and point its page questions at this page.
+      // This page owns the playback now; the floating manager no longer
+      // has to close it if the page goes away early.
+      adopted.adopted = true;
+      _c = adopted.cubit
+        ..rebindScreenCallbacks(
+          onDrmSource: _handoffToNativeDrm,
+          localDownloadFinder: _findLocalDownload,
+          confirmLocalFallback: _confirmLocalFallback,
+        );
+      // Already playing: the length is known now, not only on the next
+      // duration change.
+      _duration = _c.player.state.duration;
+      // The card's video released its share of the wake lock as it went
+      // away; take it again on the next frame.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _c.isClosed) return;
+        _wakelockOn = false;
+        _syncWakelock();
+      });
+    } else {
+      _c = _newSession(eps, startIndex);
+    }
+    _wireSession();
+  }
+
+  /// A fresh player session for [eps], opening [startIndex].
+  PlayerCubit _newSession(List<Episode> eps, int startIndex) {
+    return PlayerCubit(
       sourceId: widget.sourceId,
       episodes: eps,
       resume: widget.resume,
@@ -1864,10 +2444,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
       initialResume: widget.resumePosition,
       initialSource: widget.initialSource,
       onDrmSource: _handoffToNativeDrm,
+      localDownloadFinder: _findLocalDownload,
+      confirmLocalFallback: _confirmLocalFallback,
       onSourceFailure: _canTryOtherPlayer ? _onMpvSourceFailure : null,
       engineFallback: _canTryOtherPlayer ? _engineFallback : null,
       forceInitialResume: widget.engineRecovery,
     )..init(startIndex);
+  }
+
+  /// Hooks this page up to its player session (new or taken over).
+  void _wireSession() {
+    // Windows (player-10): the media Stop key from the Windows media overlay
+    // closes the player, same as the focused Stop key below.
+    if (_windowsDesktopUi) _c.onDesktopMediaStop = _desktopMediaStop;
 
     // Bind the wake-lock to playback now that the player exists: on while
     // playing/buffering, released on pause. Set up here (not _initInApp) because
@@ -1878,6 +2467,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     });
     _bufferingSub = _c.player.stream.buffering.listen((_) => _syncWakelock());
     _syncWakelock();
+    // Anime4K switched itself off (mpv couldn't run the shaders): refresh the
+    // enhance control and tell the user on either layout.
+    _c.shaderFallbackRev.addListener(_onShaderFallback);
+    // Windows: episode names looked up in the background redraw the header.
+    if (_windowsDesktopUi) _c.episodeTitlesRev.addListener(_onEpisodeTitles);
 
     _room.attachPlayer(
       localPosition: () => _c.player.state.position,
@@ -1911,7 +2505,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       },
     );
     _wireRoom(_room);
-    if (widget.joinRoomCode != null) _room.join(widget.joinRoomCode!);
+    if (widget.joinRoomCode != null && _adopted == null) {
+      _room.join(widget.joinRoomCode!);
+    }
 
     // Drive the "Up next" card on episode completion (the controller no longer
     // auto-advances; we show a 5s countdown card instead).
@@ -1923,6 +2519,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _startAmbientSampler();
     }
     _scheduleHide();
+  }
+
+  /// Windows: episode names arrived after the player opened; rebuild so the
+  /// top bar and the watch page show them.
+  void _onEpisodeTitles() {
+    if (mounted) setState(() {});
+  }
+
+  /// The full player already shows the controller's toast; the watch page
+  /// has no toast layer, so it gets a snackbar instead.
+  void _onShaderFallback() {
+    if (!mounted) return;
+    setState(() {});
+    if (_presentation == PlayerPresentation.watchPage) {
+      ScaffoldMessenger.maybeOf(context)
+        ?..clearSnackBars()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(_c.shaderFallbackMessage),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+    }
   }
 
   void _wireRoom(WatchTogetherController room) {
@@ -2055,7 +2674,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
           ..clearSnackBars()
           ..showSnackBar(
             SnackBar(
-              content: Text(context.l10n.pressBackAgainToExit),
+              // A PC has no BACK key: name what it actually presses.
+              content: Text(
+                _windowsDesktopUi
+                    ? kWindowsPressAgainToClose
+                    : context.l10n.pressBackAgainToExit,
+              ),
               duration: Duration(seconds: 2),
               behavior: SnackBarBehavior.floating,
             ),
@@ -2067,6 +2691,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
   void dispose() {
     _fullscreenRotationPull.dispose();
     _minimizeRequests.dispose();
+    // Stop following full screen before the restore below changes it.
+    DesktopWindow.fullscreen.removeListener(_onDesktopFullScreenChanged);
+    // Windows: restore the window's fullscreen state from before the player
+    // (back button, end of playback, mouse back: every exit lands here).
+    // The native setter is idempotent, so this is safe when already windowed.
+    if (Platform.isWindows && _windowFullscreenOnOpen != true) {
+      unawaited(DesktopWindow.setFullscreen(false).catchError((Object _) {}));
+    }
+    // Windows: leaving the player from the mini window restores the normal
+    // window (size, place and the user's own always-on-top choice).
+    DesktopWindow.miniPlayer.removeListener(_onDesktopWindowModeChanged);
+    DesktopWindow.alwaysOnTop.removeListener(_onDesktopWindowModeChanged);
+    if (_windowsDesktopUi && DesktopWindow.miniPlayer.value) {
+      unawaited(DesktopWindow.exitMiniPlayer());
+    }
+    _watchHud.dispose();
     _orientationTurns?.cancel();
     AppLogger.instance.log(
       '[player-route] dispose ready=$_ready '
@@ -2079,7 +2719,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     // went on blocking a screen that no longer exists — see
     // [PlaybackResolver.abortSweeps]. A no-op when nothing is sweeping, which
     // is every normal exit.
-    if (sl.isRegistered<PlaybackResolver>()) {
+    // Windows: not when the video went to the floating mini player; its
+    // session may still be finding a source.
+    if (!_handedOff && sl.isRegistered<PlaybackResolver>()) {
       sl<PlaybackResolver>().abortSweeps();
     }
     _hideTimer?.cancel();
@@ -2096,6 +2738,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _stopAmbientSampler();
     _ambientFrames.close();
     _bufferingSub?.cancel();
+    if (_ready) {
+      // The cubit may already have disposed its notifier.
+      try {
+        _c.shaderFallbackRev.removeListener(_onShaderFallback);
+        if (_windowsDesktopUi) {
+          _c.episodeTitlesRev.removeListener(_onEpisodeTitles);
+        }
+      } catch (_) {}
+    }
     _pipSub?.cancel();
     for (final s in _pipStateSubs) {
       s.cancel();
@@ -2120,9 +2771,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
       // Re-enable the OS volume bar for the rest of the app.
       FlutterVolumeController.updateShowSystemUI(true);
     }
-    WakelockPlus.disable();
+    // Windows: a video handed to the floating mini player keeps playing, so
+    // its wake lock, session and lease stay with the card (it closes them).
+    if (!_handedOff) WakelockPlus.disable();
     final routeLease = _routeTeardownLease;
-    if (_ready) {
+    if (_handedOff) {
+      routeLease?.release(); // already moved to the card; null here
+    } else if (_ready) {
       _c.close();
       unawaited(
         _c.nativeTeardown.whenComplete(() {
@@ -2139,7 +2794,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     // closing the player keeps the party alive in the background.
     if (_attached) {
       _room.removeListener(_roomListener);
-      _room.detachPlayer();
+      // The floating card keeps the room following this playback.
+      if (!_handedOff) _room.detachPlayer();
     }
     // On TV the app is always landscape — restoring portrait here (correct for
     // phones) would squish the 10-foot layout into a narrow strip after exiting
@@ -2177,6 +2833,545 @@ class _PlayerScreenState extends State<PlayerScreen> {
   void _bumpControls() {
     if (!_controlsVisible) setState(() => _controlsVisible = true);
     _scheduleHide();
+  }
+
+  // ── Windows keyboard / wheel feedback ──────────────────────────────────
+
+  /// Windows: one volume step from Up/Down or the wheel over the video,
+  /// with the volume indicator so the change is visible even when the
+  /// controls are hidden.
+  void _desktopVolumeStep(double delta) {
+    if (!_ready || _c.isClosed) return;
+    // The cubit keeps the 0-100 user level and re-applies the boost.
+    _showDesktopVolume(_c.stepUserVolume(delta));
+  }
+
+  /// Windows (player-10): the media Stop key / overlay button. Closes the
+  /// player only while its route is on top; with a menu or dialog open over
+  /// it (or another page pushed above) a blind pop would close that instead,
+  /// so it just pauses then.
+  void _desktopMediaStop() {
+    if (!mounted || _c.isClosed) return;
+    if (ModalRoute.of(context)?.isCurrent ?? true) {
+      Navigator.of(context).maybePop();
+    } else if (_c.player.state.playing) {
+      _c.togglePlay();
+    }
+  }
+
+  /// Windows: M mutes, and unmutes back to the level from before.
+  void _desktopToggleMute() {
+    if (!_ready || _c.isClosed) return;
+    _showDesktopVolume(_c.toggleUserMute());
+  }
+
+  /// Shows [volume] (0..100): the watch page's pill there, the side-rail
+  /// volume HUD (the one the phone swipe uses) in the full player.
+  void _showDesktopVolume(double volume) {
+    if (!_windowsDesktopUi) return; // phone keeps its swipe-only HUD
+    if (_presentation == PlayerPresentation.watchPage) {
+      _watchHud.showVolume(volume);
+      return;
+    }
+    _hudTimer?.cancel();
+    setState(() {
+      _hudVisible = true;
+      // The HUD runs 0..200% (phone boost range); 100% volume = half.
+      _hudValue = (volume / 200).clamp(0.0, 1.0);
+      _hudIsBrightness = false;
+    });
+    _hudTimer = Timer(const Duration(milliseconds: 700), () {
+      if (mounted) setState(() => _hudVisible = false);
+    });
+  }
+
+  /// Windows: a keyboard / mouse-button seek, plus feedback: the watch
+  /// page's pill, or the full player's double-tap seek indicator with the
+  /// running total (−10s, −20s…) while presses keep coming.
+  void _desktopSeek(int seconds) {
+    if (!_ready || _c.isClosed || seconds == 0) return;
+    _c.seekBy(Duration(seconds: seconds));
+    if (!_windowsDesktopUi) return;
+    if (_presentation == PlayerPresentation.watchPage) {
+      _watchHud.showSeek(seconds);
+      return;
+    }
+    final dir = seconds.sign;
+    _seekLabelTimer?.cancel();
+    setState(() {
+      if (_seekSide != dir) _seekAccum = 0;
+      _seekSide = dir;
+      _seekAccum += seconds.abs();
+      _seekTick++; // re-key so the indicator replays per press
+    });
+    _seekLabelTimer = Timer(const Duration(milliseconds: 800), () {
+      if (mounted) {
+        setState(() {
+          _seekSide = 0;
+          _seekAccum = 0;
+        });
+      }
+    });
+  }
+
+  /// Windows S key: skips the AniSkip interval under the playhead (same
+  /// target as the Skip button); does nothing outside one.
+  void _desktopSkip() {
+    if (!_ready || _c.isClosed) return;
+    if (_c.skipCurrentInterval()) _bumpControls();
+  }
+
+  /// Windows [ / ] keys: one speed step slower / faster (remembered like a
+  /// pick from the speed menu), with a short toast naming the new rate.
+  void _desktopSpeedStep(int dir) {
+    if (!_ready || _c.isClosed) return;
+    final next = _c.stepSpeed(dir);
+    showAppToast(context, '${next}x');
+  }
+
+  /// Windows C key: subtitles on / off for this session, with a toast.
+  Future<void> _desktopToggleSubtitles() async {
+    if (!_ready || _c.isClosed) return;
+    final on = await _c.toggleSubtitles();
+    if (mounted) {
+      showAppToast(
+        context,
+        on ? context.l10n.subtitlesOn : context.l10n.subtitlesOff,
+      );
+    }
+  }
+
+  /// Windows G / H keys: subtitle delay one step earlier / later.
+  void _desktopSubtitleDelay(int dir) {
+    if (!_ready || _c.isClosed) return;
+    final ms = _c.nudgeSubtitleDelay(dir).inMilliseconds;
+    final sign = ms > 0 ? '+' : '';
+    showAppToast(context, context.l10n.subtitleDelayMs('$sign$ms'));
+  }
+
+  /// Title handed to an external player: show and episode, when known.
+  String? get _externalPlayerTitle {
+    final parts = [
+      widget.showTitle,
+      _c.currentEpisode.title,
+    ].whereType<String>().where((s) => s.trim().isNotEmpty).toList();
+    return parts.isEmpty ? null : parts.join(' • ');
+  }
+
+  /// Windows: opens the current stream (with its headers) in an installed
+  /// desktop player, and pauses the built-in one once that player started.
+  Future<void> _openInDesktopPlayer(DesktopExternalPlayerApp app) async {
+    final url = _c.previewUri;
+    if (url == null || url.trim().isEmpty) return;
+    final ok = await DesktopExternalPlayers.launch(
+      app,
+      url: url,
+      headers: _c.previewHeaders,
+      title: _externalPlayerTitle,
+    );
+    if (ok && !_c.isClosed && _c.player.state.playing) _c.togglePlay();
+    if (mounted) {
+      showAppToast(
+        context,
+        ok
+            ? context.l10n.openedInApp(app.label)
+            : context.l10n.couldNotStartApp(app.label),
+      );
+    }
+  }
+
+  // ── Windows mini player / always on top / context menu ─────────────────
+
+  /// Windows: the layout the viewer was in when the window went full screen
+  /// (watch page or theatre), so leaving full screen goes back to it. Null
+  /// while not in full screen, or when full screen was already on when the
+  /// player opened.
+  PlayerPresentation? _presentationBeforeFullScreen;
+
+  /// Windows: switches the layout without restarting playback. Before the
+  /// player session exists only the flag changes (nothing to resize yet).
+  void _applyDesktopLayout(PlayerPresentation next) {
+    if (!mounted || next == _presentation) return;
+    if (!_ready) {
+      setState(() => _presentation = next);
+      return;
+    }
+    if (next == PlayerPresentation.watchPage) {
+      _enterWatchPage();
+    } else {
+      _enterFullscreen();
+    }
+  }
+
+  /// Windows: the window went in or out of full screen, by any path (F,
+  /// F11, the buttons, double-click, Esc, the runner). Full screen always
+  /// shows the theatre layout; leaving it returns to the layout from before
+  /// (the watch page when full screen was started there).
+  void _onDesktopFullScreenChanged() {
+    if (!mounted || !_windowsDesktopUi) return;
+    final next = desktopFullScreenLayout(
+      fullScreen: DesktopWindow.fullscreen.value,
+      current: _presentation,
+      before: _presentationBeforeFullScreen,
+    );
+    _presentationBeforeFullScreen = next.before;
+    _applyDesktopLayout(next.presentation);
+    // Same layout (theatre <-> full screen): still redraw the bar's tips.
+    if (mounted) setState(() {});
+  }
+
+  /// Windows: the window was already full screen when the player opened.
+  /// Switches to the theatre layout and remembers the current one (the
+  /// watch page) for when full screen is left. Does nothing once a layout
+  /// has been remembered, so it runs at most once.
+  void _showFullScreenLayoutOnOpen() {
+    if (!mounted || !_windowsDesktopUi) return;
+    if (_presentationBeforeFullScreen != null) return;
+    if (_presentation == PlayerPresentation.fullscreen) return;
+    final next = desktopFullScreenLayout(
+      fullScreen: true,
+      current: _presentation,
+    );
+    _presentationBeforeFullScreen = next.before;
+    _applyDesktopLayout(next.presentation);
+    if (mounted) setState(() {});
+  }
+
+  /// Windows: full screen on / off from the watch page or theatre buttons.
+  /// The layout follows through [_onDesktopFullScreenChanged].
+  void _toggleDesktopFullScreen() {
+    if (!_windowsDesktopUi) return;
+    unawaited(DesktopWindow.toggleFullscreen().catchError((Object _) {}));
+  }
+
+  /// Windows: theatre mode on / off (the T key and the theatre buttons).
+  /// From full screen it leaves full screen and stays in theatre mode, so
+  /// Esc / T once more returns to the watch page.
+  void _toggleDesktopTheatre() {
+    if (!_windowsDesktopUi || !_ready) return;
+    if (DesktopWindow.fullscreen.value) {
+      // Leaving full screen should land in theatre, not further back.
+      _presentationBeforeFullScreen = PlayerPresentation.fullscreen;
+      unawaited(DesktopWindow.exitFullscreen().catchError((Object _) => false));
+      return;
+    }
+    if (_presentation == PlayerPresentation.watchPage) {
+      _enterFullscreen();
+    } else {
+      _enterWatchPage();
+    }
+    _bumpControls();
+  }
+
+  /// Windows: the mini player button (every layout), Ctrl+M and the menus.
+  /// Closes this page and keeps the SAME playback going in the small card
+  /// that floats above the app (desktop_floating_player.dart), so the viewer
+  /// can browse while it plays. Nothing restarts. Leaving the page puts a
+  /// full screen window back the way it was before the player (dispose).
+  ///
+  /// The old runner mini player (the whole window shrunk and pinned) is no
+  /// longer opened from anywhere; its window code stays but is unused.
+  void _popOutToFloatingPlayer() {
+    _tryPopOutToFloatingPlayer();
+  }
+
+  /// The body of [_popOutToFloatingPlayer]. Returns true when the video was
+  /// handed to the floating card and this page popped, false when it stayed
+  /// here (so [_openShowPageWithMiniPlayer] knows whether to fall back).
+  bool _tryPopOutToFloatingPlayer() {
+    if (!_windowsDesktopUi || !mounted || !_ready || _c.isClosed) return false;
+    if (_handedOff) return false;
+    final nav = Navigator.of(context);
+    final route = ModalRoute.of(context);
+    // Nothing under this page to go back to: keep playing here.
+    if (route == null || !route.isActive || route.isFirst) return false;
+    // A Watch Together viewer stays on the synced player: that page may
+    // only be left through Leave, and the room moves it around itself (it
+    // replaces or pops it when the host changes episode).
+    if (_attached && _room.room != null && !_room.isHost) return false;
+    // Close a menu or panel still open above this page first.
+    if (!route.isCurrent) nav.popUntil((r) => r == route);
+    // Leftovers of the old window mini player, should one still be open.
+    if (DesktopWindow.miniPlayer.value) {
+      unawaited(DesktopWindow.exitMiniPlayer().catchError((Object _) {}));
+    }
+    final fullScreen = DesktopWindow.fullscreen.value;
+    final layout = fullScreen
+        ? (_presentationBeforeFullScreen ?? _presentation)
+        : _presentation;
+    // The page's own end-of-episode jobs stop here; the card plays the next
+    // episode itself. A sleep timer does not carry over.
+    // The "Up next" countdown was already showing: the episode has ended
+    // and the card will not see that again, so move on to the next one now.
+    if (_upNext && _c.hasPlayableNext) unawaited(_c.playNext(auto: true));
+    _upNextTimer?.cancel();
+    _sleepTimer?.cancel();
+    _completedSub?.cancel();
+    _completedSub = null;
+    // This page is going away, so its questions go with it: a DRM source
+    // now fails the normal way (the card shows the error line) and the
+    // "play the download instead?" prompt is not asked. The download lookup
+    // only reads this page's settings, so it stays.
+    _c.rebindScreenCallbacks(
+      onDrmSource: null,
+      localDownloadFinder: _findLocalDownload,
+      confirmLocalFallback: null,
+    );
+    _handedOff = true;
+    final lease = _routeTeardownLease;
+    _routeTeardownLease = null;
+    unawaited(
+      DesktopFloatingPlayer.instance.adopt(
+        FloatingPlayback(
+          cubit: _c,
+          reopen: widget.adopting,
+          layout: layout,
+          fullScreen: fullScreen,
+          lease: lease,
+          roomAttached: _attached,
+          title: widget.showTitle ?? _episodeLabelOrNull(),
+        ),
+      ),
+    );
+    // pop(), not maybePop(): slips past the close confirmation (PopScope),
+    // which is about stopping the video, and this does not stop it.
+    nav.pop();
+    return true;
+  }
+
+  /// Windows: pins / unpins the window above other windows.
+  Future<void> _toggleAlwaysOnTop() =>
+      DesktopWindow.setAlwaysOnTop(!DesktopWindow.alwaysOnTop.value);
+
+  /// Rebuilds the player when the window mode changes (always on top, or
+  /// the old runner mini player should one still be left on). The floating
+  /// card replaced that mini player, so there is no layout to bring back.
+  void _onDesktopWindowModeChanged() {
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  /// The keys bound to a player shortcut, for the menu's hint column
+  /// (honours remaps); null when nothing is bound.
+  String? _shortcutHint(String id) {
+    final keys = DesktopShortcuts.activatorsFor(id);
+    return keys.isEmpty ? null : DesktopShortcuts.describe(keys.first);
+  }
+
+  /// Windows: right-click menu over the video, at the pointer, in both the
+  /// full player and the theater page. Replaces the old right-click that
+  /// paused and pushed the whole Settings screen.
+  Future<void> _showDesktopVideoMenu(Offset at) async {
+    if (!_windowsDesktopUi || !mounted || !_ready || _c.isClosed) return;
+    final l10n = context.l10n;
+    const rates = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0];
+    final rate = _c.player.state.rate;
+    final playing = _c.player.state.playing;
+    // The playable stream (what the More panel copies / hands on too).
+    final url = _c.previewUri;
+    final canCopy = url != null && url.trim().isNotEmpty;
+    // Installed mpv / VLC / MPC-HC; cached after the first look.
+    final players = canCopy
+        ? await DesktopExternalPlayers.detect()
+        : const <DesktopExternalPlayerApp>[];
+    if (!mounted || _c.isClosed) return;
+    await showDesktopContextMenu<void>(
+      context,
+      position: at,
+      items: [
+        DesktopMenuItem(
+          label: playing ? l10n.pause : l10n.play,
+          icon: playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
+          shortcut: _shortcutHint('player.playPause'),
+          onTap: _c.togglePlay,
+        ),
+        const DesktopMenuItem.divider(),
+        DesktopMenuItem(
+          label: l10n.playbackSpeed,
+          icon: Icons.speed_rounded,
+          submenu: [
+            for (final r in rates)
+              DesktopMenuItem(
+                label: r == 1.0 ? l10n.normalSpeed : '${r}x',
+                checked: (rate - r).abs() < 0.01,
+                onTap: () => _c.setRateRemembered(r),
+              ),
+          ],
+        ),
+        DesktopMenuItem(
+          label: l10n.audio,
+          icon: Icons.headphones_rounded,
+          onTap: () => _openAudioSubsSheet(focus: AudioSubsFocus.audio),
+        ),
+        DesktopMenuItem(
+          label: l10n.subtitles,
+          icon: Icons.closed_caption_rounded,
+          shortcut: _shortcutHint('player.subtitles'),
+          onTap: () => _openAudioSubsSheet(focus: AudioSubsFocus.subtitles),
+        ),
+        DesktopMenuItem(
+          label: context.l10n.aspectRatio,
+          icon: Icons.aspect_ratio_rounded,
+          submenu: [
+            for (var i = 0; i < _fits.length; i++)
+              DesktopMenuItem(
+                label: _fits[i].$2,
+                checked: i == _fitIndex,
+                onTap: () {
+                  if (mounted) setState(() => _fitIndex = i);
+                },
+              ),
+          ],
+        ),
+        const DesktopMenuItem.divider(),
+        DesktopMenuItem(
+          label: context.l10n.screenshot,
+          icon: Icons.photo_camera_outlined,
+          onTap: _captureScreenshot,
+        ),
+        DesktopMenuItem(
+          label: context.l10n.copyStreamLink,
+          icon: Icons.link_rounded,
+          enabled: canCopy,
+          onTap: canCopy
+              ? () => copyStreamLinkWithHeaders(context, url, _c.previewHeaders)
+              : null,
+        ),
+        DesktopMenuItem(
+          label: context.l10n.openInExternalPlayer,
+          icon: Icons.open_in_new_rounded,
+          enabled: canCopy,
+          submenu: [
+            for (final app in players)
+              DesktopMenuItem(
+                label: app.label,
+                onTap: () => _openInDesktopPlayer(app),
+              ),
+            if (players.isEmpty)
+              DesktopMenuItem(
+                label: context.l10n.noExternalPlayerFound,
+                enabled: false,
+              ),
+          ],
+        ),
+        DesktopMenuItem(
+          label: l10n.nextEpisode,
+          icon: Icons.skip_next_rounded,
+          shortcut: _shortcutHint('player.nextEpisode'),
+          enabled: _c.hasPlayableNext,
+          onTap: () => _c.playNext(),
+        ),
+        const DesktopMenuItem.divider(),
+        // Theatre mode: ticked while the player fills the app window.
+        DesktopMenuItem(
+          label: context.l10n.theatreMode,
+          icon: Icons.crop_7_5_rounded,
+          checked: _presentation == PlayerPresentation.fullscreen,
+          shortcut: _shortcutHint('player.theatre'),
+          onTap: _toggleDesktopTheatre,
+        ),
+        DesktopMenuItem(
+          label: context.l10n.shortcutPlayerMiniPlayer,
+          icon: Icons.picture_in_picture_alt_rounded,
+          shortcut: _shortcutHint('player.miniPlayer'),
+          onTap: _popOutToFloatingPlayer,
+        ),
+        DesktopMenuItem(
+          label: context.l10n.alwaysOnTop,
+          icon: Icons.push_pin_outlined,
+          checked: DesktopWindow.alwaysOnTop.value,
+          shortcut: _shortcutHint('player.alwaysOnTop'),
+          onTap: _toggleAlwaysOnTop,
+        ),
+        const DesktopMenuItem.divider(),
+        DesktopMenuItem(
+          label: context.l10n.playerSettings,
+          icon: Icons.settings_outlined,
+          onTap: _openSettings,
+        ),
+      ],
+    );
+  }
+
+  /// Windows mini player: hover-only controls sized for a 480x270 window
+  /// (restore, play / pause, seek bar). The full overlay does not fit there.
+  Widget _desktopMiniControls() {
+    Widget btn(
+      IconData icon,
+      String tip,
+      VoidCallback onTap, {
+      double size = 34,
+      Key? key,
+    }) => Tooltip(
+      message: tip,
+      child: Material(
+        color: Colors.black.withValues(alpha: 0.5),
+        shape: const CircleBorder(),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          key: key,
+          onTap: () {
+            onTap();
+            _bumpControls();
+          },
+          child: SizedBox.square(
+            dimension: size,
+            child: Icon(icon, color: Colors.white, size: size * 0.55),
+          ),
+        ),
+      ),
+    );
+    return AnimatedOpacity(
+      opacity: _controlsVisible ? 1 : 0,
+      duration: Duration(milliseconds: _controlsVisible ? 160 : 240),
+      child: IgnorePointer(
+        ignoring: !_controlsVisible,
+        child: Stack(
+          children: [
+            Positioned(
+              top: 6,
+              right: 6,
+              child: btn(
+                Icons.open_in_full_rounded,
+                context.l10n.restoreWithKey('Esc'),
+                DesktopWindow.exitMiniPlayer,
+                key: const ValueKey('mini-player-restore'),
+              ),
+            ),
+            Center(
+              child: StreamBuilder<bool>(
+                stream: _c.player.stream.playing,
+                initialData: _c.player.state.playing,
+                builder: (context, snap) {
+                  final on = snap.data ?? false;
+                  return btn(
+                    on ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                    on ? context.l10n.pause : context.l10n.play,
+                    _c.togglePlay,
+                    size: 46,
+                  );
+                },
+              ),
+            ),
+            Positioned(
+              left: 6,
+              right: 6,
+              bottom: 2,
+              child: StreamBuilder<Duration>(
+                stream: _c.player.stream.duration,
+                initialData: _c.player.state.duration,
+                builder: (context, d) => PlayerSeekBar(
+                  controller: _c,
+                  duration: d.data ?? Duration.zero,
+                  onInteract: _bumpControls,
+                  showTime: false,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   /// A tap landing on one of the three zones — sorts "toggle the controls" from
@@ -2425,6 +3620,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // their midpoint pans; releasing a finger ends it (snapping back to fit when
   // near 1×). The video is scaled by [_zoom]/[_zoomPan] in build(). ──────────
   void _onPointerDown(PointerDownEvent e) {
+    if (Platform.isWindows) return;
     _pointers[e.pointer] = e.position;
     if (_pointers.length > 1 && _fullscreenExitStartY != null) {
       _fullscreenExitStartY = double.infinity;
@@ -2501,7 +3697,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       top: p.playerBarTop ?? PlayerControlsConfig.defaultTop,
       left: p.playerBarLeft ?? PlayerControlsConfig.defaultLeft,
       right: p.playerBarRight ?? PlayerControlsConfig.defaultRight,
-    ).sanitised();
+      // Windows drops Cast / PiP, which never render there.
+    ).sanitised(unavailable: unavailablePlayerControls());
   }
 
   /// Settings, from the top bar. Pushed over the player rather than replacing
@@ -2512,6 +3709,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// and audio carrying on under a settings list reads as a bug. It resumes
   /// on return only if it was actually playing when you left.
   Future<void> _openSettings() async {
+    final previousSpeed = sl<PlaybackPrefs>().defaultSpeed;
+    final previousSubtitle = sl<PlaybackPrefs>().subtitlePreference;
     final wasPlaying = _c.player.state.playing;
     if (wasPlaying) _c.togglePlay();
     // Settings is built for portrait, but the player pins landscape and hides
@@ -2522,16 +3721,48 @@ class _PlayerScreenState extends State<PlayerScreen> {
     ]);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     if (!mounted) return;
-    await Navigator.of(
-      context,
-    ).push(MaterialPageRoute<void>(builder: (_) => const SettingsScreen()));
+    // Windows: Esc leaves Settings, and Settings knows it returns to the
+    // player. Phone pushes the plain screen as before.
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (settingsContext) => _windowsDesktopUi
+            ? CallbackShortcuts(
+                bindings: {
+                  const SingleActivator(LogicalKeyboardKey.escape): () =>
+                      Navigator.of(settingsContext).maybePop(),
+                },
+                child: const Focus(
+                  autofocus: true,
+                  child: SettingsScreen(returnToPlayer: true),
+                ),
+              )
+            : const SettingsScreen(),
+      ),
+    );
     if (!mounted) return;
     // Back to whichever orientation you were watching in — not landscape by
     // default, or a portrait session would end up sideways after a settings trip.
     await SystemChrome.setPreferredOrientations(_orientationLock);
     _applyPlayerSystemUi();
+    // Windows: apply what changed in Settings to the still-open player.
+    if (_windowsDesktopUi) {
+      await _c.applySavedPlaybackSettings();
+      if (!mounted) return;
+      // A language changed in app settings must reach the still-open episode;
+      // normal track restoration runs once per episode and will not retry
+      // itself.
+      if (sl<PlaybackPrefs>().subtitlePreference != previousSubtitle) {
+        _c.reapplyPreferredSubtitle();
+      }
+      if (sl<PlaybackPrefs>().defaultSpeed != previousSpeed) {
+        _c.setRate(sl<PlaybackPrefs>().defaultSpeed);
+      }
+      _syncWakelock();
+    }
     if (!mounted) return;
     if (wasPlaying && !_c.player.state.playing) _c.togglePlay();
+    // Windows: re-read controls, gesture and skip preferences on return.
+    if (_windowsDesktopUi) setState(() {});
     _bumpControls();
   }
 
@@ -2592,8 +3823,33 @@ class _PlayerScreenState extends State<PlayerScreen> {
     Future.delayed(const Duration(milliseconds: 130), () {
       if (mounted) setState(() => _flashing = false);
     });
-    await _c.captureScreenshot(); // saves to gallery + toasts the result
+    if (Platform.isWindows) {
+      await _captureScreenshotWindows();
+    } else {
+      await _c.captureScreenshot(); // saves to gallery + toasts the result
+    }
     _bumpControls();
+  }
+
+  /// Windows: gal writes into the Pictures library with no file path to show
+  /// and "gallery" wording, so the PNG goes to Pictures\Zangetsu here and the
+  /// notice offers Show in folder.
+  Future<void> _captureScreenshotWindows() async {
+    try {
+      final bytes = await _c.player.screenshot(format: 'image/png');
+      if (bytes == null || bytes.isEmpty) {
+        if (mounted) showAppToast(context, "Couldn't capture the frame");
+        return;
+      }
+      final file = await saveWindowsSnapshot(
+        bytes,
+        picturesDir: await windowsPicturesDirectory(),
+      );
+      if (mounted) showSnapshotSavedNotice(context, file.path);
+    } catch (e) {
+      AppLogger.instance.log('[snapshot] save failed: $e');
+      if (mounted) showAppToast(context, 'Screenshot failed');
+    }
   }
 
   void _onEpisodeComplete() {
@@ -2714,23 +3970,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
       context: context,
       barrierDismissible: true,
       barrierLabel: 'Episodes',
-      barrierColor: Colors.black54,
+      // Windows keeps the same light scrim as the other docked panels.
+      barrierColor: playerMenusDocked ? Colors.black26 : Colors.black54,
       transitionDuration: const Duration(milliseconds: 240),
-      pageBuilder: (ctx, _, _) => Align(
-        alignment: AlignmentDirectional.centerEnd,
-        child: _EpisodesPanel(
-          episodes: _c.episodes,
-          currentIndex: _c.state.currentIndex,
-          cover: widget.cover,
-          coverHeaders: widget.coverHeaders,
-          fillerEps: _c.fillerEpisodes.value,
-          onSelect: (i) {
-            Navigator.pop(ctx);
-            if (i != _c.state.currentIndex) _c.openEpisode(i);
-            _bumpControls();
-          },
-        ),
-      ),
+      pageBuilder: (ctx, _, _) {
+        final panel = Align(
+          alignment: AlignmentDirectional.centerEnd,
+          child: _EpisodesPanel(
+            episodes: _c.episodes,
+            currentIndex: _c.state.currentIndex,
+            cover: widget.cover,
+            coverHeaders: widget.coverHeaders,
+            fillerEps: _c.fillerEpisodes.value,
+            onSelect: (i) {
+              Navigator.pop(ctx);
+              if (i != _c.state.currentIndex) _c.openEpisode(i);
+              _bumpControls();
+            },
+          ),
+        );
+        // Windows: Esc closes the panel itself, ahead of the window-level Esc
+        // (leave fullscreen / go back), like the other docked panels.
+        return playerMenusDocked ? _EscCloses(child: panel) : panel;
+      },
       transitionBuilder: (ctx, anim, _, child) => SlideTransition(
         position: Tween(
           begin: const Offset(1, 0),
@@ -2821,6 +4083,25 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// covers it until the first frame decodes. Shared by fullscreen and the
   /// portrait watch page — the [Video] widget re-attaches to the same
   /// controller, so switching layouts never re-opens the stream.
+  /// The video picture itself.
+  Widget _videoView() => Video(
+    controller: _c.videoController,
+    controls: NoVideoControls,
+    fit: _fits[_fitIndex].$1,
+    // Windows: media_kit renders each frame at the video's own size and
+    // Flutter stretches it to the window, so this sampling IS the scaler
+    // (mpv's own scale setting never runs). media_kit's default (low = plain
+    // bilinear) made a 720p / 480p episode look soft and smeared on a bigger
+    // window; high uses a bicubic filter. A video above 1440p goes back to
+    // bilinear (see [videoFilterQuality]). Phone keeps media_kit's default.
+    filterQuality: videoFilterQuality(
+      windows: _windowsDesktopUi,
+      videoWidth: _c.player.state.width,
+      videoHeight: _c.player.state.height,
+    ),
+    subtitleViewConfiguration: const SubtitleViewConfiguration(visible: false),
+  );
+
   Widget _buildVideoSurface() {
     return Stack(
       fit: StackFit.expand,
@@ -2841,13 +4122,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 child: Stack(
                   fit: StackFit.expand,
                   children: [
-                    Video(
-                      controller: _c.videoController,
-                      controls: NoVideoControls,
-                      fit: _fits[_fitIndex].$1,
-                      subtitleViewConfiguration:
-                          const SubtitleViewConfiguration(visible: false),
-                    ),
+                    // Windows: rebuilt when the video size arrives, so a 4K
+                    // film can switch to the cheaper filter (see
+                    // [videoFilterQuality]). Phone builds the Video directly
+                    // as before.
+                    if (_windowsDesktopUi)
+                      StreamBuilder<int?>(
+                        stream: _c.player.stream.height,
+                        initialData: _c.player.state.height,
+                        builder: (context, _) => _videoView(),
+                      )
+                    else
+                      _videoView(),
                     if (!_c.styledSubtitlesOn)
                       StreamBuilder<List<String>>(
                         stream: _c.player.stream.subtitle,
@@ -3131,6 +4417,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
   );
 
   void _openComingSoonSheet() {
+    // Windows panel: the shared title row with a close button, no inner card.
+    if (playerMenusDocked) {
+      _sheet<void>(
+        Builder(
+          builder: (ctx) => Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _PanelTitleBar(title: ctx.l10n.watchComments),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+                child: Text(
+                  ctx.l10n.watchComingSoon,
+                  style: AppText.body.copyWith(color: AppColors.textSecondary),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+      return;
+    }
     _sheet<void>(
       _SheetSurface(
         child: SafeArea(
@@ -3183,10 +4491,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
       sleepActive: _sleepActive,
       onSleep: _openSleepSheet,
       onMinimize: _minimizeAction,
-      onPip: _pipSupported ? _enterPip : null,
+      onPip: _pipSupported
+          ? _enterPip
+          // Windows: the PiP control / More row opens the mini player.
+          : (_windowsDesktopUi ? _popOutToFloatingPlayer : null),
       onSwitchPlayer: _canSwitchToNative ? _switchToNativePlayer : null,
       ambientActive: sl<PlaybackPrefs>().ambientPlayer,
       onAmbientToggle: _toggleAmbientPlayer,
+      // Windows: the stream link for the Copy / external player rows.
+      controller: _c,
     );
   }
 
@@ -3363,42 +4676,117 @@ class _PlayerScreenState extends State<PlayerScreen> {
         EpisodeDownloadIcon.showDownloadMenu(context, manager, record);
         return;
       }
-      final choice = await showModalBottomSheet<SingleEpisodeDownloadChoice>(
-        context: context,
-        backgroundColor: AppColors.surface,
-        isScrollControlled: true,
-        shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-        ),
-        builder: (_) => EpisodeDownloadSourceSheet(
-          title: episode.title,
-          episode: episode,
-          category: category,
-          availableCategories: _c.categories,
-          resolveEpisodes: (cut) async {
-            final episodes = await sl<CatalogueRepository>().episodes(
-              widget.showUrl ?? widget.sourceId,
+      Future<Map<int, List<Episode>>> resolveEpisodes(String cut) async {
+        final episodes = await sl<CatalogueRepository>().episodes(
+          widget.showUrl ?? widget.sourceId,
+          sourceId: widget.sourceId,
+          category: cut,
+        );
+        return {
+          for (final season in episodes.map((ep) => seasonOf(ep) ?? 1).toSet())
+            season: episodes
+                .where((ep) => (seasonOf(ep) ?? 1) == season)
+                .toList(),
+        };
+      }
+
+      Future<List<VideoSource>> resolve(Episode ep) =>
+          sl.isRegistered<CatalogueRepository>()
+          ? sl<CatalogueRepository>().sources(
+              ep.url,
               sourceId: widget.sourceId,
-              category: cut,
-            );
-            return {
-              for (final season
-                  in episodes.map((ep) => seasonOf(ep) ?? 1).toSet())
-                season: episodes
-                    .where((ep) => (seasonOf(ep) ?? 1) == season)
-                    .toList(),
-            };
-          },
-          resolve: (ep) => sl.isRegistered<CatalogueRepository>()
-              ? sl<CatalogueRepository>().sources(
-                  ep.url,
-                  sourceId: widget.sourceId,
-                  fast: false,
-                )
-              : widget.resolveSources(ep.url),
-        ),
-      );
+              fast: false,
+            )
+          : widget.resolveSources(ep.url);
+
+      final SingleEpisodeDownloadChoice? choice;
+      // Real source the Windows dialog's links came from (catalogue titles).
+      String? watchResolveSourceId;
+      if (playerMenusDocked) {
+        // Windows: the same cut/server dialog as the show page, not a phone
+        // bottom sheet. The cut only changes which episode list is used.
+        final picked = await showDialog<DesktopSingleDownloadChoice>(
+          context: context,
+          builder: (_) => DesktopSingleDownloadDialog(
+            episode: episode,
+            season: seasonOf(episode) ?? 1,
+            initialCategory: category,
+            availableCategories: _c.categories,
+            resolveEpisodes: resolveEpisodes,
+            resolveSources: (ep, _) => resolve(ep),
+            // Same bounded fallback search as the show page; the source that
+            // is playing this episode right now is asked first.
+            searchSources: sl.isRegistered<CatalogueRepository>()
+                ? (ep, cut) => episodeDownloadSourceSearch(
+                    episode: ep,
+                    category: cut,
+                    sourceId: widget.sourceId,
+                    preferredSourceId: sl.isRegistered<PlaybackResolver>()
+                        ? sl<PlaybackResolver>().resolvedSourceId(
+                            ep.url,
+                            category: cut,
+                          )
+                        : null,
+                  )
+                : null,
+          ),
+        );
+        // Catalogue titles keep their record key; retries ask this source.
+        final picked0 = picked?.sourceId;
+        watchResolveSourceId =
+            picked0 != null &&
+                picked0.isNotEmpty &&
+                picked0 != widget.sourceId &&
+                ZmodeIds.isZ(picked!.episode.url)
+            ? picked0
+            : null;
+        choice = picked == null
+            ? null
+            : (
+                chosen: picked.chosen,
+                all: picked.all,
+                episode: picked.episode,
+                category: picked.category,
+              );
+      } else {
+        choice = await showModalBottomSheet<SingleEpisodeDownloadChoice>(
+          context: context,
+          backgroundColor: AppColors.surface,
+          isScrollControlled: true,
+          shape: const RoundedRectangleBorder(
+            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+          ),
+          builder: (_) => EpisodeDownloadSourceSheet(
+            title: episode.title,
+            episode: episode,
+            category: category,
+            availableCategories: _c.categories,
+            resolveEpisodes: resolveEpisodes,
+            resolve: resolve,
+          ),
+        );
+      }
       if (choice == null || !mounted) return;
+      final hinted = watchResolveSourceId;
+      if (hinted != null) {
+        manager.hintResolveSource(
+          sourceId: widget.sourceId,
+          showId: downloadShowId,
+          episodeIds: [choice.episode.id],
+          category: choice.category,
+          resolveSourceId: hinted,
+        );
+      }
+      if (playerMenusDocked) {
+        // Windows: the link was picked by hand in the server dialog, same as
+        // the show page, so retries stay on that server and SUB/DUB kind.
+        manager.hintPinnedServer(
+          sourceId: widget.sourceId,
+          showId: downloadShowId,
+          episodeId: choice.episode.id,
+          category: choice.category,
+        );
+      }
       await manager.enqueueSource(
         sourceId: widget.sourceId,
         showId: downloadShowId,
@@ -3529,7 +4917,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       onSelectSeason: (s) => setState(() => _watchSeason = s),
       serverName: _c.state.active?.label,
       onTogglePlay: _c.togglePlay,
-      onSeek: (d) => _c.player.seek(d),
+      // Windows: the same seek as the full player (clears the pending resume
+      // target, marks a user seek and reaches watch-party guests).
+      onSeek: (d) => _windowsDesktopUi ? _c.seekTo(d) : _c.player.seek(d),
       onSeekBy: _locked ? null : _c.seekBy,
       doubleTapSeconds: _seekSeconds,
       onHoldSpeedChanged: !_holdSpeedEnabled || _locked
@@ -3553,7 +4943,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
           : () => _minimize(morphed: !MediaQuery.disableAnimationsOf(context)),
       startMinimized: _restoredFromDock,
       minimizeRequests: _minimizeRequests,
-      onBack: _minimizeAction ?? _handleCloseRequest,
+      onBack: _windowsDesktopUi
+          ? _handleDesktopWatchBack
+          : (_minimizeAction ?? _handleCloseRequest),
+      // Windows theater page only; the phone page ignores these.
+      onShowPage: _showPageAction,
+      // Windows: clicking the episode title / show line under the video
+      // opens the show page with the video in the floating mini player.
+      onTitleTap: _showWithMiniPlayerAction,
+      showTitle: widget.showTitle,
+      episodeProgress: _windowsDesktopUi ? _watchEpisodeProgress : null,
+      skipButtonFor: _windowsDesktopUi && !_locked
+          ? (pos) => _skipButtonFor(pos, controlsVisible: true)
+          : null,
       onServer: _openSourceSheet,
       onAudio: () => _openAudioSubsSheet(focus: AudioSubsFocus.audio),
       onSubtitles: () => _openAudioSubsSheet(focus: AudioSubsFocus.subtitles),
@@ -3582,12 +4984,58 @@ class _PlayerScreenState extends State<PlayerScreen> {
       },
       onComments: _openComingSoonSheet,
       onAutoplayChanged: _setAutoplayNext,
+      // Windows theater page: the full player's seek bar, right-click menu,
+      // wheel volume over the video, input feedback, volume and speed.
+      seekBar: _windowsDesktopUi
+          ? StreamBuilder<Duration>(
+              stream: _c.player.stream.duration,
+              initialData: _c.player.state.duration,
+              builder: (context, d) => PlayerSeekBar(
+                controller: _c,
+                duration: d.data ?? Duration.zero,
+                onInteract: () {},
+                showTime: false,
+              ),
+            )
+          : null,
+      onContextMenu: _windowsDesktopUi ? _showDesktopVideoMenu : null,
+      onWheelVolume: _windowsDesktopUi
+          ? (step) => _desktopVolumeStep(step * 5.0)
+          : null,
+      hud: _windowsDesktopUi ? _watchHud : null,
+      volumeStream: _windowsDesktopUi ? _userVolumeStream : null,
+      initialVolume: _windowsDesktopUi ? _c.userVolume : 100,
+      onVolumeChanged: _windowsDesktopUi ? _c.setUserVolume : null,
+      onToggleMute: _windowsDesktopUi ? _desktopToggleMute : null,
+      rateStream: _c.player.stream.rate,
+      initialRate: _c.player.state.rate,
+      onSpeed: _windowsDesktopUi ? _openSpeedSheet : null,
+      // Windows: full screen and mini player buttons in the page's bar.
+      onFullScreen: _windowsDesktopUi ? _toggleDesktopFullScreen : null,
+      onMiniPlayer: _windowsDesktopUi ? _popOutToFloatingPlayer : null,
     );
+  }
+
+  /// Saved progress (0..1) for an episode row on the Windows theater page.
+  /// Null when nothing was watched yet or the length is unknown.
+  double? _watchEpisodeProgress(int index) {
+    if (index < 0 || index >= _c.episodes.length) return null;
+    final mark = widget.resume.get(
+      widget.sourceId,
+      widget.showUrl ?? widget.sourceId,
+      _c.episodes[index].id,
+    );
+    if (mark == null || mark.duration.inMilliseconds <= 0) return null;
+    return mark.position.inMilliseconds / mark.duration.inMilliseconds;
   }
 
   // ── Sheets ──────────────────────────────────────────────────────────────
 
   Future<T?> _sheet<T>(Widget child) {
+    // Windows: every in-player menu docks right like Subtitle style.
+    if (playerMenusDocked) {
+      return showDesktopPlayerPanel<T>(context, builder: (_) => child);
+    }
     final portraitMotion =
         _presentation == PlayerPresentation.watchPage &&
         MediaQuery.orientationOf(context) == Orientation.portrait;
@@ -3644,12 +5092,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// decoder in place, so a stuttering/green/black stream can be fixed without
   /// leaving the video.
   void _openDecoderSheet() {
-    const modes = [
-      ('copy', 'Hardware+ (recommended)'),
-      ('direct', 'Hardware (faster)'),
-      ('sw', 'Software (most compatible)'),
-      ('auto', 'Auto'),
-    ];
+    // Windows names the D3D11 path, the same wording as Settings there.
+    final modes = _windowsDesktopUi
+        ? kWindowsDecoderOptions
+        : const [
+            ('copy', 'Hardware+ (recommended)'),
+            ('direct', 'Hardware (faster)'),
+            ('sw', 'Software (most compatible)'),
+            ('auto', 'Auto'),
+          ];
     final current = _c.decoderMode;
     _sheet<void>(
       _SheetColumn(
@@ -3675,6 +5126,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// selection without closing). Portrait chips pass [focus] to open on one
   /// column; fullscreen passes nothing and keeps the pair.
   void _openAudioSubsSheet({bool castMode = false, AudioSubsFocus? focus}) {
+    if (playerMenusDocked) {
+      // Two columns need a wider panel than the single-list menus.
+      showDesktopPlayerPanel<void>(
+        context,
+        width: focus == null ? 640 : 440,
+        builder: (_) => _audioSubsSheetBody(castMode: castMode, focus: focus),
+      );
+      return;
+    }
     final portraitMotion =
         _presentation == PlayerPresentation.watchPage &&
         MediaQuery.orientationOf(context) == Orientation.portrait;
@@ -3693,35 +5153,40 @@ class _PlayerScreenState extends State<PlayerScreen> {
           borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
           child: SafeArea(
             top: false,
-            child: _AudioSubsSheet(
-              controller: _c,
-              focus: focus,
-              onInteract: _bumpControls,
-              castMode: castMode,
-              onSoftSubPicked: (s) => _castSubtitle = s,
-              onSubtitlesOff: () => _castSubtitle = null,
-              onAfterChange: () {
-                unawaited(_maybeRecast());
-              },
-              onLoadFile: () {
-                Navigator.pop(context);
-                _loadSubtitleFromFile();
-              },
-              onSearchOnline: () {
-                Navigator.pop(context);
-                _openOnlineSubtitleSheet();
-              },
-              onTranslate: () {
-                Navigator.pop(context);
-                _openTranslateSheet();
-              },
-            ),
+            child: _audioSubsSheetBody(castMode: castMode, focus: focus),
           ),
         );
         return portraitMotion ? WatchPageMenuEntrance(child: surface) : surface;
       },
     );
   }
+
+  /// The Audio | Subtitles menu body, shared by the phone sheet and the
+  /// Windows docked panel.
+  Widget _audioSubsSheetBody({required bool castMode, AudioSubsFocus? focus}) =>
+      _AudioSubsSheet(
+        controller: _c,
+        focus: focus,
+        onInteract: _bumpControls,
+        castMode: castMode,
+        onSoftSubPicked: (s) => _castSubtitle = s,
+        onSubtitlesOff: () => _castSubtitle = null,
+        onAfterChange: () {
+          unawaited(_maybeRecast());
+        },
+        onLoadFile: () {
+          Navigator.pop(context);
+          _loadSubtitleFromFile();
+        },
+        onSearchOnline: () {
+          Navigator.pop(context);
+          _openOnlineSubtitleSheet();
+        },
+        onTranslate: () {
+          Navigator.pop(context);
+          _openTranslateSheet();
+        },
+      );
 
   // ── Translate the active subtitle into a chosen language ──────────────────
   void _openTranslateSheet() {
@@ -3774,6 +5239,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final initialQuery = (widget.showTitle?.trim().isNotEmpty ?? false)
         ? widget.showTitle!.trim()
         : (widget.scrobbleTitle?.trim() ?? '');
+    // Windows: the same search, docked right like the other player menus.
+    if (playerMenusDocked) {
+      showDesktopPlayerPanel<void>(
+        context,
+        width: 520,
+        builder: (_) => _OnlineSubtitleSheet(
+          initialQuery: initialQuery,
+          // Default the manual search to the preferred language, falling
+          // back to English when no preference is set.
+          initialLanguage:
+              sl<PlaybackPrefs>().preferredSubtitleLanguage.isEmpty
+              ? 'en'
+              : sl<PlaybackPrefs>().preferredSubtitleLanguage,
+          imdbId: widget.imdbId,
+          tmdbId: widget.tmdbId,
+          isTv: widget.tmdbIsTv,
+          season: _c.currentEpisode.season,
+          episode: _c.currentEpisode.number?.toInt(),
+          onApply: (path) async {
+            await _c.setSubtitleFromFile(path);
+            _bumpControls();
+          },
+        ),
+      );
+      return;
+    }
     showOnlineSubtitleSheet(
       context,
       initialQuery: initialQuery,
@@ -3939,7 +5430,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return secs <= 0 ? null : '${(fw - prev) / secs}';
   }
 
-  Widget _loadingBackdropBody(String label, {String? thumb}) {
+  /// The startup loader: artwork, title and status.
+  ///
+  /// [onBack] (Windows only) adds the overlay-style back arrow top-left plus
+  /// Esc / mouse back, so a slow or stuck resolve can always be left.
+  /// [handleMouseBack] is false inside DesktopPlayerInput, which already maps
+  /// the mouse back button (two handlers would pop twice).
+  Widget _loadingBackdropBody(
+    String label, {
+    String? thumb,
+    VoidCallback? onBack,
+    bool handleMouseBack = false,
+  }) {
     final backdrop = (widget.loadingBackdrop ?? '').trim();
     final cover = (widget.cover ?? '').trim();
     final thumbnail = (thumb ?? '').trim();
@@ -3968,7 +5470,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         ),
       ),
     );
-    return Stack(
+    final body = Stack(
       fit: StackFit.expand,
       children: [
         background,
@@ -3996,7 +5498,76 @@ class _PlayerScreenState extends State<PlayerScreen> {
           status: label,
           speed: _ready ? _loadingSpeed : null,
         ),
+        if (onBack != null)
+          Positioned(
+            top: 0,
+            left: 0,
+            child: PlayerBackButton(onPressed: onBack),
+          ),
       ],
+    );
+    if (onBack == null) return body;
+    return PlayerBackScope(
+      onBack: onBack,
+      handleMouseBack: handleMouseBack,
+      onEscape: _stateEscape,
+      child: body,
+    );
+  }
+
+  /// Windows: back from a player state without the controls overlay
+  /// (loading, error). Same as the player's Esc / mouse back: the mini
+  /// player restores the window first, otherwise the player closes.
+  void _stateBack() {
+    if (!mounted) return;
+    if (DesktopWindow.miniPlayer.value) {
+      unawaited(DesktopWindow.exitMiniPlayer());
+      return;
+    }
+    Navigator.of(context).maybePop();
+  }
+
+  /// Windows: Esc on those states. Leaves fullscreen first, then
+  /// [_stateBack], exactly like the player's own Esc ('player.exit').
+  void _stateEscape() {
+    unawaited(() async {
+      if (await DesktopWindow.exitFullscreen()) return;
+      _stateBack();
+    }());
+  }
+
+  /// [_stateBack] on Windows, null (no back affordance) on phone.
+  VoidCallback? get _desktopStateBack => _windowsDesktopUi ? _stateBack : null;
+
+  /// Windows: the theater watch page while the player is still being set up
+  /// (episode list resolving, no cubit yet). It used to be a full-window
+  /// "Loading…" cover that only then turned into the watch page. Now the
+  /// page itself opens at once: header, the small player showing the cover
+  /// with its loading spinner, the title and details, and the episode list
+  /// when it is already known. Nothing here touches the not-yet-built cubit;
+  /// the buttons do nothing until the real page takes over.
+  Widget _desktopWatchPageLoadingShell() {
+    final page = desktopWatchLoadingPage(
+      episodes: widget.episodes,
+      startIndex: widget.startIndex,
+      showTitle: widget.showTitle,
+      showDescription: widget.showDescription,
+      cover: widget.cover,
+      coverHeaders: widget.coverHeaders,
+      isMovie: widget.isMovie,
+      autoplay: sl<PlaybackPrefs>().autoplayNext,
+      onBack: _stateBack,
+    );
+    return Scaffold(
+      backgroundColor: Colors.black,
+      // Built before DesktopPlayerInput exists, so this state handles Esc
+      // and the mouse back button itself.
+      body: PlayerBackScope(
+        onBack: _stateBack,
+        handleMouseBack: true,
+        onEscape: _stateEscape,
+        child: page,
+      ),
     );
   }
 
@@ -4121,32 +5692,42 @@ class _PlayerScreenState extends State<PlayerScreen> {
     // A Watch Together join that couldn't resolve the room's source — explain
     // it clearly instead of a blank/bouncing screen.
     if (_loadError != null) {
-      return Scaffold(
-        backgroundColor: Colors.black,
-        body: SafeArea(
-          child: Center(
-            child: Padding(
-              padding: const EdgeInsets.all(28),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.cloud_off, color: Colors.white54, size: 44),
-                  const SizedBox(height: 14),
-                  Text(
-                    _loadError!,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(color: Colors.white70, height: 1.4),
-                  ),
-                  const SizedBox(height: 18),
-                  FilledButton(
-                    onPressed: () => Navigator.of(context).maybePop(),
-                    child: Text(context.l10n.back),
-                  ),
-                ],
-              ),
+      final errorBody = SafeArea(
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(28),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.cloud_off, color: Colors.white54, size: 44),
+                const SizedBox(height: 14),
+                Text(
+                  _loadError!,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white70, height: 1.4),
+                ),
+                const SizedBox(height: 18),
+                FilledButton(
+                  onPressed: () => Navigator.of(context).maybePop(),
+                  child: Text(context.l10n.back),
+                ),
+              ],
             ),
           ),
         ),
+      );
+      return Scaffold(
+        backgroundColor: Colors.black,
+        // Windows: Esc / mouse back leave too (built outside
+        // DesktopPlayerInput, so the player's own handling is absent; the
+        // scope also keeps the app-wide handlers from acting a second time).
+        body: _windowsDesktopUi
+            ? PlayerBackScope(
+                onBack: _stateBack,
+                onEscape: _stateEscape,
+                child: errorBody,
+              )
+            : errorBody,
       );
     }
     // Still resolving the episode list (instant-nav path) — the portrait
@@ -4154,17 +5735,34 @@ class _PlayerScreenState extends State<PlayerScreen> {
     // cover interlude), the branded loader otherwise. Either way we never
     // touch the not-yet-created cubit.
     if (!_ready) {
-      if (_watchPageEnabled) return _watchPageLoadingShell();
+      // Windows skips the phone portrait shell. Opening on the watch page,
+      // it shows the real theater layout straight away (see
+      // [_desktopWatchPageLoadingShell]); the full window layout keeps the
+      // branded loader.
+      if (_watchPageEnabled &&
+          _windowsDesktopUi &&
+          _presentation == PlayerPresentation.watchPage) {
+        return _desktopWatchPageLoadingShell();
+      }
+      if (_watchPageEnabled && !_windowsDesktopUi) {
+        return _watchPageLoadingShell();
+      }
       return Scaffold(
         backgroundColor: Colors.black,
-        body: _loadingBackdropBody('Loading…'),
+        // Built before DesktopPlayerInput exists, so this state handles the
+        // mouse back button itself (Windows).
+        body: _loadingBackdropBody(
+          'Loading…',
+          onBack: _desktopStateBack,
+          handleMouseBack: true,
+        ),
       );
     }
     // One tooltip style for everything in the player, set here rather than on
     // each Tooltip: the top bar's stock IconButtons build their own from the
     // `tooltip:` property, so per-widget styling would leave those on Material's
     // default grey while ours were dark. Theming the whole subtree catches both.
-    final scaffold = TooltipTheme(
+    final tooltipScaffold = TooltipTheme(
       data: TooltipThemeData(
         decoration: BoxDecoration(
           // Same family as the control chips, just opaque enough to stay
@@ -4220,14 +5818,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
             // loader screen, and the header is already the new episode
             // (the cubit emits the index before resolving). Torrent progress
             // stays in the miniplayer; errors keep their screen below.
+            // Windows mini player always shows the plain video: a theater
+            // page cannot fit a 480x270 window.
+            final mini = _windowsDesktopUi && DesktopWindow.miniPlayer.value;
             if (_presentation == PlayerPresentation.watchPage &&
-                state.error == null) {
+                state.error == null &&
+                !mini) {
               return _buildWatchPage(state);
             }
             if (state.loadingSources) {
               return _loadingBackdropBody(
                 'Finding streams…',
                 thumb: _c.currentEpisode.thumbnail,
+                onBack: _desktopStateBack,
               );
             }
             // Torrent source buffering: "Finding peers…" / "Buffering N%".
@@ -4235,9 +5838,21 @@ class _PlayerScreenState extends State<PlayerScreen> {
               return _loadingBackdropBody(
                 state.torrentPhase!,
                 thumb: _c.currentEpisode.thumbnail,
+                onBack: _desktopStateBack,
               );
             }
             if (state.error != null) {
+              // Windows adds a back arrow + Esc; phone keeps the view below.
+              // DesktopPlayerInput already maps the mouse back button.
+              if (_windowsDesktopUi) {
+                return PlayerErrorView(
+                  message: state.error!,
+                  onRetry: () => _c.openEpisode(state.currentIndex),
+                  onBack: _desktopStateBack,
+                  onEscape: _stateEscape,
+                  handleMouseBack: false,
+                );
+              }
               return Center(
                 child: Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 32),
@@ -4290,8 +5905,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
             }
             // Passive Listener tracks raw pointers for pinch-to-zoom so it never
             // competes with the 1-finger gesture detector inside the Stack.
-            return Listener(
+            final surface = Listener(
               onPointerDown: _onPointerDown,
+              // Windows: moving the mouse shows the controls.
+              onPointerHover: _windowsDesktopUi ? (_) => _bumpControls() : null,
               onPointerMove: _onPointerMove,
               onPointerUp: _onPointerUp,
               onPointerCancel: _onPointerUp,
@@ -4444,6 +6061,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           // All three carry a bare onTap (no double-tap recognizer,
                           // which would hold the arena and stall every single tap by
                           // 300ms); _tapZone sorts toggle from seek itself.
+                          //
+                          // Windows: play / pause on the first click with no
+                          // double-click wait; a quick second click undoes it
+                          // and toggles fullscreen (restores the window in the
+                          // mini player). Right-click opens the player menu at
+                          // the pointer, and dragging the mini player moves its
+                          // window.
+                          if (_windowsDesktopUi)
+                            Positioned.fill(
+                              child: DesktopVideoPointer(
+                                key: const ValueKey('player-video-click'),
+                                onToggle: _c.togglePlay,
+                                onDoubleClick: mini
+                                    ? DesktopWindow.exitMiniPlayer
+                                    : DesktopWindow.toggleFullscreen,
+                                onContextMenu: _showDesktopVideoMenu,
+                                onDragStart: mini
+                                    ? (_) => DesktopWindow.startDrag()
+                                    : null,
+                              ),
+                            )
+                          else
                           Row(
                             children: [
                               Expanded(
@@ -4652,7 +6291,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     ),
 
                   // 6. Controls overlay (phone only — TV uses PlayerTvControls above).
-                  if (!sl<AppMode>().isTv && !_locked)
+                  // Windows mini player: compact hover-only controls.
+                  if (mini)
+                    Positioned.fill(child: _desktopMiniControls())
+                  else if (!sl<AppMode>().isTv && !_locked)
                     AnimatedOpacity(
                       opacity: _controlsVisible ? 1 : 0,
                       // Snappy pop-in, gentle fade-out; eased so it reads as fast.
@@ -4667,6 +6309,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           state: state,
                           visible: _controlsVisible,
                           showTitle: widget.showTitle,
+                          // Windows: a film (one item) shows only its title,
+                          // no "E1" line. Phone: always false.
+                          isMovie:
+                              _windowsDesktopUi &&
+                              widget.isMovie &&
+                              _c.episodes.length <= 1,
                           duration: _duration,
                           zoomLabel: _fits[_fitIndex].$2,
                           onDurationChanged: (d) {
@@ -4678,6 +6326,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           onRotate: _toggleOrientation,
                           portraitMode: _portraitMode,
                           onBack: _handlePlayerBack,
+                          onShowPage: _showPageAction,
+                          // Windows: on-screen back / forward buttons that
+                          // seek by the arrow-key step and show the same seek
+                          // indicator. Null on phone (no buttons).
+                          onSeekStep: _windowsDesktopUi ? _desktopSeek : null,
+                          seekStepSeconds: sl<PlaybackPrefs>().tvSeekSeconds,
                           onSpeed: _openSpeedSheet,
                           onAudioSubs: _openAudioSubsSheet,
                           onQuality: _openQualitySheet,
@@ -4687,7 +6341,24 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           barConfig: _barConfig,
                           onZoom: _cycleFit,
                           onMinimize: _minimizeAction,
-                          onPip: _pipSupported ? _enterPip : null,
+                          onPip: _pipSupported
+                              ? _enterPip
+                              // Windows: the PiP control / More row opens the
+                              // mini player.
+                              : (_windowsDesktopUi
+                                    ? _popOutToFloatingPlayer
+                                    : null),
+                          // Windows: theatre and mini player buttons in the
+                          // bottom bar (theatre and full screen).
+                          onTheatre: _windowsDesktopUi
+                              ? _toggleDesktopTheatre
+                              : null,
+                          onMiniPlayer: _windowsDesktopUi
+                              ? _popOutToFloatingPlayer
+                              : null,
+                          fullScreen:
+                              _windowsDesktopUi &&
+                              DesktopWindow.fullscreen.value,
                           onSwitchPlayer: _canSwitchToNative
                               ? _switchToNativePlayer
                               : null,
@@ -4800,6 +6471,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           controlsVisible: _controlsVisible,
                         );
                         if (btn == null) return const SizedBox.shrink();
+                        // Windows: the controls show on mouse move and hide
+                        // when it stops, which moved the pill out from under a
+                        // parked mouse right before the click. The host holds
+                        // it still while hovered, at one fixed spot above the
+                        // controls' measured height, shown or not.
+                        if (_windowsDesktopUi) {
+                          return ValueListenableBuilder<double>(
+                            valueListenable: _controlsBottomBlockHeight,
+                            builder: (context, block, child) {
+                              final inset = MediaQuery.paddingOf(context).bottom;
+                              return DesktopSkipPillHost(
+                                key: const ValueKey('theatre-skip-pill'),
+                                right: 44,
+                                bottom: block > 0
+                                    ? inset + block + 14 + 12
+                                    : inset + 72,
+                                child: child!,
+                              );
+                            },
+                            child: btn,
+                          );
+                        }
                         // Sit low (Netflix-style) while watching; slide up above the
                         // seek bar when the controls are showing so they never clash.
                         return AnimatedAlign(
@@ -4874,7 +6567,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         right: false,
                         child: RoomChatPanel(
                           controller: _room,
-                          onClose: () => setState(() => _chatOpen = false),
+                          onClose: () {
+                            setState(() => _chatOpen = false);
+                            // Windows: closing chat removes its focused field;
+                            // give the keys back to the player after.
+                            DesktopFocusRepair.schedule();
+                          },
                         ),
                       ),
                     ),
@@ -4907,9 +6605,68 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 ],
               ),
             );
+            // Windows: the wheel changes volume over the video only (this
+            // whole surface in the full player), with the volume HUD.
+            return DesktopVideoWheel(
+              enabled: _windowsDesktopUi,
+              onStep: (step) => _desktopVolumeStep(step * 5.0),
+              child: surface,
+            );
           },
         ),
       ),
+    );
+    // Windows keyboard, mouse-button and media-key input for the player.
+    final scaffold = DesktopPlayerInput(
+      // The theater watch page manages its own cursor over the video; never
+      // hide it over the side panel because the full player's bar timed out.
+      hideCursor:
+          !_controlsVisible && _presentation != PlayerPresentation.watchPage,
+      seekSeconds: sl<PlaybackPrefs>().tvSeekSeconds,
+      onPlayPause: () {
+        _bumpControls();
+        _c.togglePlay();
+      },
+      // Windows: every keyboard / mouse-button seek and volume change shows
+      // the matching indicator (see _desktopSeek / _showDesktopVolume).
+      onSeek: _desktopSeek,
+      onVolume: _desktopVolumeStep,
+      onMute: _desktopToggleMute,
+      // Esc / mouse Back in the mini player restores the window first.
+      onBack: () {
+        if (_windowsDesktopUi && DesktopWindow.miniPlayer.value) {
+          unawaited(DesktopWindow.exitMiniPlayer());
+          return;
+        }
+        Navigator.of(context).maybePop();
+      },
+      // Windows: Ctrl+M mini player, Ctrl+T always on top (remappable).
+      onMiniPlayer: _windowsDesktopUi ? _popOutToFloatingPlayer : null,
+      // Windows: T switches theatre mode on / off.
+      onTheatre: _windowsDesktopUi ? _toggleDesktopTheatre : null,
+      onAlwaysOnTop: _windowsDesktopUi ? _toggleAlwaysOnTop : null,
+      // N / P and the media keys: next / previous episode. Always wired on
+      // Windows: this widget is built outside the cubit's BlocBuilder, so a
+      // build-time "has next / previous" check would go stale after an
+      // episode change. playNext / playPrevious do nothing at either end.
+      onNextEpisode: _windowsDesktopUi ? () => _c.playNext() : null,
+      onPreviousEpisode: _windowsDesktopUi ? () => _c.playPrevious() : null,
+      // S: skip the intro / ending / recap under the playhead.
+      onSkip: _windowsDesktopUi ? _desktopSkip : null,
+      // 0-9: jump to that tenth of the episode.
+      onJumpToFraction: _windowsDesktopUi ? _c.jumpToFraction : null,
+      // [ and ]: one speed step slower / faster.
+      onSpeedStep: _windowsDesktopUi ? _desktopSpeedStep : null,
+      // C: subtitles on / off; G / H: subtitle delay; , / .: frame step.
+      onToggleSubtitles: _windowsDesktopUi ? _desktopToggleSubtitles : null,
+      onSubtitleDelayStep: _windowsDesktopUi ? _desktopSubtitleDelay : null,
+      onFrameStep: _windowsDesktopUi ? (dir) => _c.frameStep(dir) : null,
+      // Media Stop key (while focused): close the player (player-10).
+      onStop: _windowsDesktopUi ? _desktopMediaStop : null,
+      // Windows: the wheel changes volume over the video only, handled by
+      // DesktopVideoWheel / the watch page (player-13); phones keep it here.
+      wheelVolume: !_windowsDesktopUi,
+      child: tooltipScaffold,
     );
     // On TV: wrap with a PopScope so the first Back press hides the bar
     // (and only the second press pops the route). On phone this is unchanged.
@@ -4943,7 +6700,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
         if (didPop) return;
         if (_presentation == PlayerPresentation.fullscreen &&
             _watchPageEnabled) {
-          _enterWatchPage();
+          _backToWatchPage();
+          return;
+        }
+        // Windows theater page: see [_handlePlayerBack] for the order.
+        if (_windowsDesktopUi &&
+            _presentation == PlayerPresentation.watchPage) {
+          _handleDesktopWatchBack();
           return;
         }
         final minimize = _minimizeAction;
@@ -4989,4 +6752,77 @@ class _ShellBar extends StatelessWidget {
       ),
     );
   }
+}
+
+// ── Windows snapshot saving ────────────────────────────────────────────────
+
+/// The user's Pictures folder (follows OneDrive / folder redirection), or
+/// %USERPROFILE%\Pictures when the shell lookup fails.
+Future<String> windowsPicturesDirectory() async {
+  try {
+    // FOLDERID_Pictures; the WindowsKnownFolder constants are not visible
+    // through the package's conditional export when analysing (the analyser
+    // sees the stub, whose getPath is non-null; the real one can be null).
+    final Future<String?> Function(String) lookup =
+        PathProviderWindows().getPath;
+    final known = await lookup('{33E28130-4E1E-4676-835A-98395C3BC3BB}');
+    if (known != null && known.isNotEmpty) return known;
+  } catch (_) {}
+  final home = Platform.environment['USERPROFILE'] ?? '';
+  return pathlib.windows.join(home, 'Pictures');
+}
+
+/// File name for a snapshot taken at [now], for example
+/// `Zangetsu 2026-11-17 14.03.22.png` (Windows file names forbid colons).
+@visibleForTesting
+String windowsSnapshotName(DateTime now) {
+  String two(int v) => v.toString().padLeft(2, '0');
+  return 'Zangetsu ${now.year}-${two(now.month)}-${two(now.day)} '
+      '${two(now.hour)}.${two(now.minute)}.${two(now.second)}.png';
+}
+
+/// Writes [bytes] to `<picturesDir>\Zangetsu`, creating the folder, and never
+/// overwrites: a second snapshot in the same second gets " (2)", " (3)"...
+@visibleForTesting
+Future<File> saveWindowsSnapshot(
+  List<int> bytes, {
+  required String picturesDir,
+  DateTime? now,
+}) async {
+  final dir = Directory(pathlib.join(picturesDir, 'Zangetsu'));
+  await dir.create(recursive: true);
+  final name = windowsSnapshotName(now ?? DateTime.now());
+  final stem = name.substring(0, name.length - '.png'.length);
+  var file = File(pathlib.join(dir.path, name));
+  for (var n = 2; await file.exists(); n++) {
+    file = File(pathlib.join(dir.path, '$stem ($n).png'));
+  }
+  return file.writeAsBytes(bytes, flush: true);
+}
+
+/// "Screenshot saved" notice with a Show in folder action that selects the
+/// file in Explorer. Falls back to the plain toast without a Scaffold.
+@visibleForTesting
+void showSnapshotSavedNotice(BuildContext context, String path) {
+  const message = r'Screenshot saved to Pictures\Zangetsu';
+  final messenger = ScaffoldMessenger.maybeOf(context);
+  if (messenger == null) {
+    showAppToast(context, message);
+    return;
+  }
+  messenger
+    ..hideCurrentSnackBar()
+    ..showSnackBar(
+      SnackBar(
+        key: const ValueKey('snapshot-saved'),
+        behavior: SnackBarBehavior.floating,
+        width: 460,
+        duration: const Duration(seconds: 6),
+        content: const Text(message),
+        action: SnackBarAction(
+          label: 'Show in folder',
+          onPressed: () => unawaited(revealInExplorer(path)),
+        ),
+      ),
+    );
 }

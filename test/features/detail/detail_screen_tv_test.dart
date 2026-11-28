@@ -211,8 +211,9 @@ class _FakeDownloadManager extends ChangeNotifier implements DownloadManager {
   DownloadRecord? recordFor(
     String sourceId,
     String showId,
-    String episodeId,
-  ) =>
+    String episodeId, {
+    String? category,
+  }) =>
       null;
 
   @override
@@ -222,7 +223,12 @@ class _FakeDownloadManager extends ChangeNotifier implements DownloadManager {
     required String episodeId,
     String? episodeUrl,
     int? malId,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    int? anilistId,
     double? episodeNumber,
+    String? category,
+    int? season,
   }) async =>
       null;
 }

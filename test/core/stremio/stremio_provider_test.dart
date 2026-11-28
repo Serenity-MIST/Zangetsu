@@ -1069,10 +1069,7 @@ void main() {
     expect(StremioRef.parse(live.url).videoId, isNull);
     final sources = await provider.getVideoSources(live.url);
     expect(sources, isNotEmpty);
-    expect(
-      server.requests.any((u) => u.path.contains('/stream/')),
-      isTrue,
-    );
+    expect(server.requests.any((u) => u.path.contains('/stream/')), isTrue);
   });
 
   test('removed origin installation falls back for a verified id', () async {

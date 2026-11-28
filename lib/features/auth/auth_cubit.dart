@@ -6,8 +6,10 @@ import 'package:equatable/equatable.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:hive/hive.dart';
 import 'package:supabase_flutter/supabase_flutter.dart'
-    show AuthException, UserAttributes;
+    show AuthException, AuthRetryableFetchException, UserAttributes;
+import 'package:flutter/foundation.dart';
 
+import '../../core/boot_network.dart';
 import '../../core/supabase/auth_user.dart';
 import '../../core/supabase/supabase_service.dart';
 
@@ -98,20 +100,52 @@ class AuthCubit extends Cubit<AuthState> {
   /// - network error → keep whatever we have ([hasLiveSession]) so being offline
   ///   doesn't nag for a password.
   Future<bool> ensureFreshSession() async {
-    if (_sb.client.auth.currentSession == null)
+    _lastRefreshWasNetworkError = false;
+    if (_sb.client.auth.currentSession == null) {
       return false; // nothing to refresh
+    }
     try {
-      final res = await _sb.client.auth.refreshSession();
+      // Windows: bounded. With no connection the library retries with back-off
+      // for about half a minute before it gives up, and everything waiting on
+      // this froze. Phone and TV keep the library's own wait.
+      final refresh = _sb.client.auth.refreshSession();
+      final res = await (_offlineAware
+          ? refresh.timeout(const Duration(seconds: 8))
+          : refresh);
       final ok = res.session != null;
-      if (ok && state.needsReconnect)
+      if (ok && state.needsReconnect) {
         emit(state.copyWith(needsReconnect: false));
+      }
       return ok;
+    } on AuthRetryableFetchException catch (_) {
+      // Phone and TV treat this like any other AuthException.
+      if (!_offlineAware) return false;
+      // Windows: the refresh never reached the server. That is no connection,
+      // NOT a dead session; it must not raise "session expired / reconnect".
+      _lastRefreshWasNetworkError = true;
+      return hasLiveSession;
+    } on TimeoutException catch (_) {
+      _lastRefreshWasNetworkError = true;
+      return hasLiveSession;
     } on AuthException catch (_) {
+      // A real answer from the server: the refresh token is dead.
       return false;
-    } catch (_) {
+    } catch (e) {
+      _lastRefreshWasNetworkError = _offlineAware && isNetworkFailure(e);
       return hasLiveSession;
     }
   }
+
+  /// Windows: tells "no connection" apart from "session expired" so being
+  /// offline never raises the reconnect prompt. Uses the target platform so
+  /// phone tests run on a Windows host keep the phone rules.
+  static bool get _offlineAware =>
+      defaultTargetPlatform == TargetPlatform.windows;
+
+  /// True when the last [ensureFreshSession] failed only because the network
+  /// was unreachable. Lets callers tell "you are offline" from "sign in again".
+  bool get lastRefreshWasNetworkError => _lastRefreshWasNetworkError;
+  bool _lastRefreshWasNetworkError = false;
 
   bool _revalidating = false;
   DateTime? _lastRevalidate;
@@ -276,6 +310,10 @@ class AuthCubit extends Cubit<AuthState> {
 
   /// Confirm the Supabase session while preserving cached access when offline.
   Future<void> _validate({required bool hadCache}) async {
+    // Windows: no connection is not a verdict on the session, so leave
+    // everything as it is. The reconnect task runs restore() again when the
+    // network is back, and that validates for real.
+    if (_offlineAware && BootConnectivity.instance.offline.value) return;
     try {
       // Auto-heal: FORCE a fresh token. The stored session can look fine
       // (currentUser set, not clock-expired) yet be unusable — only an actual
@@ -296,6 +334,10 @@ class AuthCubit extends Cubit<AuthState> {
         );
         return;
       }
+
+      // Windows: the refresh failed only because the network dropped
+      // mid-check: no verdict, so do not flag the session as dead.
+      if (_lastRefreshWasNetworkError) return;
 
       if (hadCache) {
         // Keep the user logged-in from cache, but flag that the session is dead

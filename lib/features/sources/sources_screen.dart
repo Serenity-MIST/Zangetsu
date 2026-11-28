@@ -1,8 +1,5 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
-import 'package:hive/hive.dart';
 
 import '../../core/repository/source_actions.dart' as source_actions;
 import '../../core/aniyomi/aniyomi_extension_service.dart';
@@ -15,6 +12,7 @@ import '../../core/state/active_source_cubit.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import 'providers_hub_screen.dart';
+import 'sources_desktop_kit.dart';
 import '../../core/ui/app_dialog.dart';
 import '../../l10n/l10n.dart';
 
@@ -27,7 +25,9 @@ class SourcesScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const ProvidersHubScreen();
+    // Windows: the desktop settings look from any entry point (src-3 A);
+    // a pass-through inside the settings workspace and off Windows.
+    return const DesktopProviderScope(child: ProvidersHubScreen());
   }
 }
 
@@ -212,21 +212,21 @@ class _AniSourceRowState extends State<_AniSourceRow> {
     );
     if (ok != true) return;
 
-    final aniProvider =
-        widget.source is AniyomiProvider ? widget.source as AniyomiProvider : null;
+    final aniProvider = widget.source is AniyomiProvider
+        ? widget.source as AniyomiProvider
+        : null;
     final pkg = aniProvider?.info.pkg;
 
-    const boxName = 'aniyomi_installed';
-    if (pkg != null && Hive.isBoxOpen(boxName)) {
-      final box = Hive.box<dynamic>(boxName);
-      final apkPath = box.get(pkg) as String?;
-      if (apkPath != null) {
-        try {
-          final f = File(apkPath);
-          if (await f.exists()) await f.delete();
-        } catch (_) {}
+    if (pkg != null) {
+      final failure = await AniyomiExtensionService.uninstall(pkg);
+      if (failure != null) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(context.l10n.uninstallFailed(failure))),
+          );
+        }
+        return;
       }
-      await box.delete(pkg);
     }
 
     if (pkg != null) {
@@ -242,7 +242,9 @@ class _AniSourceRowState extends State<_AniSourceRow> {
     if (context.mounted) {
       ScaffoldMessenger.of(context)
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(content: Text(context.l10n.uninstalledName(name))));
+        ..showSnackBar(
+          SnackBar(content: Text(context.l10n.uninstalledName(name))),
+        );
     }
   }
 
@@ -254,11 +256,15 @@ class _AniSourceRowState extends State<_AniSourceRow> {
       await apply(update);
       messenger
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(content: Text(context.l10n.updatedName(update.name))));
+        ..showSnackBar(
+          SnackBar(content: Text(context.l10n.updatedName(update.name))),
+        );
     } catch (e) {
       messenger
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(content: Text(context.l10n.updateFailed('$e'))));
+        ..showSnackBar(
+          SnackBar(content: Text(context.l10n.updateFailed('$e'))),
+        );
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -268,8 +274,10 @@ class _AniSourceRowState extends State<_AniSourceRow> {
     // installFromRepo never throws — it returns an empty list on failure —
     // so a failed download must be surfaced here rather than silently
     // reported as a success that clears the update badge.
-    final providers = await AniyomiExtensionService()
-        .installFromRepo(update.entry, manager: sl<AniyomiManager>());
+    final providers = await AniyomiExtensionService().installFromRepo(
+      update.entry,
+      manager: sl<AniyomiManager>(),
+    );
     if (providers.isEmpty) throw Exception('Update failed to install');
     sl<AniyomiManager>().clearUpdatesForPkg(update.pkg);
   }
@@ -281,7 +289,8 @@ class _AniSourceRowState extends State<_AniSourceRow> {
     final lang = source is AniyomiProvider ? source.info.lang : '';
     final nameColor = active ? AppColors.accent : AppColors.textPrimary;
     final aniProvider = source is AniyomiProvider ? source : null;
-    final lookup = widget.updateLookupFn ??
+    final lookup =
+        widget.updateLookupFn ??
         (String pkg) => sl<AniyomiManager>().updateFor(pkg);
 
     Widget updateButton() {
@@ -298,10 +307,13 @@ class _AniSourceRowState extends State<_AniSourceRow> {
             elevation: 0,
             visualDensity: VisualDensity.compact,
             padding: const EdgeInsets.symmetric(horizontal: 12),
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
           ),
-          child: Text(context.l10n.updateArrowVersion('${update.availableVersion}')),
+          child: Text(
+            context.l10n.updateArrowVersion('${update.availableVersion}'),
+          ),
         ),
       );
     }
@@ -312,7 +324,9 @@ class _AniSourceRowState extends State<_AniSourceRow> {
         ScaffoldMessenger.of(context)
           ..clearSnackBars()
           ..showSnackBar(
-            SnackBar(content: Text(context.l10n.activeSourceColon(source.displayName))),
+            SnackBar(
+              content: Text(context.l10n.activeSourceColon(source.displayName)),
+            ),
           );
       },
       child: Padding(
@@ -375,10 +389,9 @@ Widget debugAniSourceRow({
   required String activeId,
   AniyomiUpdate? Function(String pkg)? updateLookupFn,
   Future<void> Function(AniyomiUpdate update)? applyUpdateFn,
-}) =>
-    _AniSourceRow(
-      source: source,
-      activeId: activeId,
-      updateLookupFn: updateLookupFn,
-      applyUpdateFn: applyUpdateFn,
-    );
+}) => _AniSourceRow(
+  source: source,
+  activeId: activeId,
+  updateLookupFn: updateLookupFn,
+  applyUpdateFn: applyUpdateFn,
+);

@@ -10,6 +10,25 @@ String? legacyVideoOutput({required bool isTv, required String shaderStyle}) =>
 void main() {
   const shaderStyles = ['off', 'a', 'b', 'c'];
 
+  test(
+    'Windows keeps video embedded for saved renderers and enhancement modes',
+    () {
+      for (final vo in ['auto', 'gpu', 'gpu-next', 'mediacodec_embed']) {
+        for (final style in shaderStyles) {
+          expect(
+            resolveVideoOutput(
+              isTv: false,
+              isWindows: true,
+              choice: vo,
+              shaderStyle: style,
+            ),
+            'libmpv',
+          );
+        }
+      }
+    },
+  );
+
   group('auto is byte-identical to the old hardcoded behaviour', () {
     test('every isTv x shaderStyle combination matches the old expression', () {
       for (final isTv in [true, false]) {

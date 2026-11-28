@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/theme/app_colors.dart';
@@ -13,6 +14,7 @@ class LibraryTab {
     required this.count,
     required this.test,
     this.onLongPress,
+    this.onContextMenu,
   });
 
   /// Stable across rebuilds, so the selected tab survives the list changing
@@ -25,6 +27,11 @@ class LibraryTab {
   final int count;
   final bool Function(MyListEntry) test;
   final VoidCallback? onLongPress;
+
+  /// Windows (home-3): right-click on the tab, with the global pointer
+  /// position, so the owner can open a context menu at the cursor. Null means
+  /// the tab has no menu. Phone ignores it and keeps the long-press.
+  final ValueChanged<Offset>? onContextMenu;
 }
 
 /// The status row and the grid it filters, as a real [TabBar]/[TabBarView]
@@ -179,6 +186,12 @@ class LibraryTabsState extends State<LibraryTabs>
       height: 42,
       child: GestureDetector(
         onLongPress: t.onLongPress,
+        // Windows only: right-click opens the tab's menu at the cursor.
+        onSecondaryTapUp:
+            defaultTargetPlatform == TargetPlatform.windows &&
+                t.onContextMenu != null
+            ? (details) => t.onContextMenu!(details.globalPosition)
+            : null,
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [

@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:zangetsu_source_bridge/stremio.dart';
 
 import '../../core/app_mode.dart';
@@ -15,6 +17,11 @@ import '../../core/stremio/stremio_ref.dart';
 import '../../core/stremio/stremio_stream_mapping.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
+import '../../core/ui/app_toast.dart';
+import '../../core/ui/desktop_docked_panel.dart';
+import '../../core/desktop/desktop_context_menu.dart';
+import 'stremio_link_filters.dart';
+import '../../l10n/l10n.dart';
 
 /// Stremio-owned titles bypass the normal extension resolver: Play, Resume
 /// and episode taps open this grouped links sheet instead.
@@ -23,6 +30,9 @@ bool usesStremioLinks(String sourceId, {VideoSource? initialSource}) =>
 
 /// Links grouped by addon, ordered by installation. Returns the exact chosen
 /// source (with its headers) or null when dismissed.
+///
+/// [onDownloadLink] (Windows only) adds "Download this link" to a link's
+/// right-click menu; the panel closes and the chosen source is handed to it.
 Future<VideoSource?> showStremioEpisodeLinksSheet(
   BuildContext context, {
   required StremioManager manager,
@@ -31,7 +41,27 @@ Future<VideoSource?> showStremioEpisodeLinksSheet(
   List<StremioStream> inlineStreams = const [],
   String? bannerUrl,
   Map<String, String>? bannerHeaders,
+  ValueChanged<VideoSource>? onDownloadLink,
 }) {
+  // Windows: the right-docked graphite panel used by the player menus (Esc
+  // and click-outside close), not a phone bottom sheet.
+  if (desktopPanelsEnabled) {
+    return showDesktopDockedPanel<VideoSource>(
+      context,
+      width: 520,
+      dialogKey: const ValueKey('stremio-links-desktop-panel'),
+      builder: (_) => _StremioLinksSheet(
+        manager: manager,
+        ref: ref,
+        title: title,
+        inlineStreams: inlineStreams,
+        bannerUrl: bannerUrl,
+        bannerHeaders: bannerHeaders,
+        desktop: true,
+        onDownloadLink: onDownloadLink,
+      ),
+    );
+  }
   return showModalBottomSheet<VideoSource>(
     context: context,
     isScrollControlled: true,
@@ -58,6 +88,8 @@ class _StremioLinksSheet extends StatefulWidget {
     required this.inlineStreams,
     this.bannerUrl,
     this.bannerHeaders,
+    this.desktop = false,
+    this.onDownloadLink,
   });
 
   final StremioManager manager;
@@ -65,9 +97,15 @@ class _StremioLinksSheet extends StatefulWidget {
   final String title;
   final List<StremioStream> inlineStreams;
 
+  /// Windows docked panel: no drag handle, banner melts into the panel fill.
+  final bool desktop;
+
   /// Wide header art. Display-only; null keeps the plain text header.
   final String? bannerUrl;
   final Map<String, String>? bannerHeaders;
+
+  /// Windows: target of the right-click "Download this link" entry.
+  final ValueChanged<VideoSource>? onDownloadLink;
 
   @override
   State<_StremioLinksSheet> createState() => _StremioLinksSheetState();
@@ -119,7 +157,140 @@ class _StremioLinksSheetState extends State<_StremioLinksSheet> {
     _dismissed = true;
     _subscription?.cancel();
     _session?.dispose();
+    _searchController.dispose();
     super.dispose();
+  }
+
+  // Windows panel filters (show-9). Phones never show the controls, so
+  // these stay at their "show everything in addon order" defaults there.
+  StremioLinkQuality? _quality;
+  String _query = '';
+  StremioLinkSort _sort = StremioLinkSort.addonOrder;
+  final TextEditingController _searchController = TextEditingController();
+
+  /// True while any Windows filter or sort changes what the list shows.
+  bool get _filtering =>
+      widget.desktop &&
+      (_quality != null ||
+          _query.trim().isNotEmpty ||
+          _sort != StremioLinkSort.addonOrder);
+
+  /// The group's playable links after the Windows quality/search filters.
+  List<StremioLinkChoice> _shown(StremioLinkGroup group) {
+    final playable = _playable(group);
+    if (!widget.desktop) return playable;
+    return filterStremioLinks(
+      playable,
+      quality: _quality,
+      query: _query,
+      addonName: (_) => group.installation.name,
+    );
+  }
+
+  /// Resets every Windows filter back to "everything, addon order".
+  void _clearFilters() {
+    _searchController.clear();
+    setState(() {
+      _quality = null;
+      _query = '';
+      _sort = StremioLinkSort.addonOrder;
+    });
+  }
+
+  /// Builds the playable source for [choice], or null when the session moved
+  /// on (it then restarts) or the link can't play here.
+  VideoSource? _sourceFor(StremioLinkChoice choice) {
+    if (_session?.isCurrent(choice) != true) {
+      setState(_start);
+      return null;
+    }
+    return stremioVideoSource(
+      choice,
+      streamAddonName: widget.manager.byId(choice.installationId)?.name,
+      allowTorrent: _allowTorrent,
+    );
+  }
+
+  /// Windows right-click menu for a link (show-9): Play, Copy link, Copy
+  /// title, Open in browser and, when the caller supports it, Download.
+  Future<void> _showLinkMenu(StremioLinkChoice choice, Offset position) {
+    final url = stremioVideoSource(choice)?.url;
+    final webUrl = url != null && url.startsWith(RegExp('https?://'))
+        ? url
+        : null;
+    return showDesktopContextMenu<void>(
+      context,
+      position: position,
+      items: [
+        DesktopMenuItem(
+          label: context.l10n.play,
+          icon: Icons.play_arrow_rounded,
+          onTap: () => _choose(choice),
+        ),
+        if (widget.onDownloadLink != null)
+          DesktopMenuItem(
+            label: context.l10n.downloadThisLink,
+            icon: Icons.file_download_outlined,
+            onTap: () => _download(choice),
+          ),
+        const DesktopMenuItem.divider(),
+        DesktopMenuItem(
+          label: context.l10n.copyLink,
+          icon: Icons.link_rounded,
+          enabled: url != null && url.isNotEmpty,
+          onTap: () => _copyChoiceLink(context, choice),
+        ),
+        DesktopMenuItem(
+          label: context.l10n.copyTitle,
+          icon: Icons.content_copy_rounded,
+          onTap: () => _copyTitle(choice),
+        ),
+        DesktopMenuItem(
+          label: context.l10n.openInBrowser,
+          icon: Icons.open_in_new_rounded,
+          enabled: webUrl != null,
+          onTap: () => _openInBrowser(webUrl!),
+        ),
+      ],
+    );
+  }
+
+  /// Hands the link to the caller's download path and closes the panel.
+  void _download(StremioLinkChoice choice) {
+    final onDownload = widget.onDownloadLink;
+    if (onDownload == null || _picked || _dismissed) return;
+    final source = _sourceFor(choice);
+    if (source == null) return;
+    _picked = true;
+    // Close first (returning no source, so nothing plays), then download.
+    Navigator.of(context).pop();
+    onDownload(source);
+  }
+
+  /// Copies the link's name/description, e.g. to search a release group.
+  Future<void> _copyTitle(StremioLinkChoice choice) async {
+    try {
+      await Clipboard.setData(ClipboardData(text: stremioLinkTitle(choice)));
+      if (mounted) showAppToast(context, context.l10n.titleCopied);
+    } on PlatformException {
+      if (mounted) showAppToast(context, context.l10n.couldNotCopyTitle);
+    }
+  }
+
+  /// Opens a direct http(s) link in the default browser.
+  Future<void> _openInBrowser(String url) async {
+    final uri = Uri.tryParse(url);
+    var opened = false;
+    if (uri != null) {
+      try {
+        opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      } catch (_) {
+        opened = false;
+      }
+    }
+    if (!opened && mounted) {
+      showAppToast(context, context.l10n.couldNotOpenLink);
+    }
   }
 
   bool get _allowTorrent =>
@@ -161,14 +332,143 @@ class _StremioLinksSheetState extends State<_StremioLinksSheet> {
         choice,
   ];
 
+  /// Windows filter bar: search field + sort dropdown, then resolution chips
+  /// with how many links each would leave. Chips with no links are hidden
+  /// unless selected, so a short list doesn't sprout empty filters.
+  Widget _desktopFilterBar(Map<StremioLinkQuality, int> counts) {
+    final sortLabel = stremioLinkSortLabel(_sort);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 2),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: SizedBox(
+                  height: 34,
+                  child: TextField(
+                    key: const ValueKey('stremio-links-search'),
+                    controller: _searchController,
+                    onChanged: (v) => setState(() => _query = v),
+                    style: AppText.body,
+                    decoration: InputDecoration(
+                      isDense: true,
+                      hintText: context.l10n.searchLinksHint,
+                      hintStyle: AppText.caption.copyWith(
+                        color: AppColors.textTertiary,
+                      ),
+                      prefixIcon: const Icon(Icons.search_rounded, size: 18),
+                      prefixIconConstraints: const BoxConstraints(
+                        minWidth: 34,
+                      ),
+                      suffixIcon: _query.isEmpty
+                          ? null
+                          : IconButton(
+                              tooltip: context.l10n.clearSearch,
+                              iconSize: 16,
+                              icon: const Icon(Icons.close_rounded),
+                              onPressed: () {
+                                _searchController.clear();
+                                setState(() => _query = '');
+                              },
+                            ),
+                      filled: true,
+                      fillColor: AppColors.surface2,
+                      contentPadding: const EdgeInsets.symmetric(vertical: 8),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        borderSide: BorderSide.none,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              // Sort dropdown: a compact menu anchored below the button.
+              Builder(
+                builder: (anchor) => Tooltip(
+                  message: context.l10n.sortLinks,
+                  child: InkWell(
+                    key: const ValueKey('stremio-links-sort'),
+                    borderRadius: BorderRadius.circular(8),
+                    onTap: () => showDesktopContextMenu<StremioLinkSort>(
+                      context,
+                      anchor: anchor,
+                      items: [
+                        for (final sort in StremioLinkSort.values)
+                          DesktopMenuItem(
+                            label: stremioLinkSortLabel(sort),
+                            value: sort,
+                            checked: sort == _sort,
+                            onTap: () {
+                              if (mounted) setState(() => _sort = sort);
+                            },
+                          ),
+                      ],
+                    ),
+                    child: Container(
+                      height: 34,
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      decoration: BoxDecoration(
+                        color: AppColors.surface2,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.sort_rounded, size: 16),
+                          const SizedBox(width: 6),
+                          Text(sortLabel, style: AppText.caption),
+                          const Icon(Icons.arrow_drop_down_rounded, size: 18),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          SizedBox(
+            height: 32,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              children: [
+                _FilterChip(
+                  id: 'quality:any',
+                  label: context.l10n.anyQuality,
+                  selected: _quality == null,
+                  onTap: () => setState(() => _quality = null),
+                ),
+                for (final quality in StremioLinkQuality.values)
+                  if ((counts[quality] ?? 0) > 0 || _quality == quality)
+                    _FilterChip(
+                      id: 'quality:${quality.name}',
+                      label:
+                          '${stremioLinkQualityLabel(quality)} '
+                          '${counts[quality] ?? 0}',
+                      selected: _quality == quality,
+                      // Clicking the selected chip again clears it.
+                      onTap: () => setState(
+                        () => _quality = _quality == quality ? null : quality,
+                      ),
+                    ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     // Groups only ever resolve in place, so the tab index can't dangle —
     // clamp anyway so a removed addon can't point past the end.
     final tab = _tab.clamp(0, _groups.length);
-    final visible = tab == 0
-        ? _groups
-        : [_groups[tab - 1]];
+    final visible = tab == 0 ? _groups : [_groups[tab - 1]];
     // One flat row list for a single virtualized ListView: headers, cards,
     // placeholders and footers are all items, so a 300-link addon still only
     // builds what's on screen.
@@ -177,8 +477,26 @@ class _StremioLinksSheetState extends State<_StremioLinksSheet> {
       for (final group in visible)
         for (final choice in _playable(group)) choice,
     ];
-    // Best match first.
-    if (playable.isNotEmpty && tab == 0) {
+    // Windows filters: what survives quality chips + search, for the
+    // "nothing matches" row and the chip counts.
+    final shownCount = _filtering
+        ? visible.fold<int>(0, (n, group) => n + _shown(group).length)
+        : playable.length;
+    // Search narrows the counts, quality doesn't, so a chip shows how many
+    // links it would leave for the current search.
+    final qualityCounts = widget.desktop
+        ? countStremioLinkQualities([
+            for (final group in visible)
+              ...filterStremioLinks(
+                _playable(group),
+                query: _query,
+                addonName: (_) => group.installation.name,
+              ),
+          ])
+        : const <StremioLinkQuality, int>{};
+    // Best match first (hidden while Windows filters reorder the list, since
+    // the addon's first link may not even match them).
+    if (playable.isNotEmpty && tab == 0 && !_filtering) {
       final first = playable.first;
       rows.add(
         _BestRow(
@@ -190,32 +508,68 @@ class _StremioLinksSheetState extends State<_StremioLinksSheet> {
         ),
       );
     }
-    for (final group in visible) {
-      rows.add(_HeaderRow(group: group, count: _playable(group).length));
-      final choices = _playable(group);
-      if (group.state == StremioLinkGroupState.pending && choices.isEmpty) {
-        rows.add(const _PendingRow());
-      }
-      if ((group.state == StremioLinkGroupState.error ||
-              group.state == StremioLinkGroupState.stale) &&
-          choices.isEmpty) {
-        rows.add(_ErrorRow(group: group));
-      }
-      for (final choice in choices) {
+    final sortBySize = widget.desktop && _sort != StremioLinkSort.addonOrder;
+    if (sortBySize) {
+      // Windows size sort: one flat list across the visible addons, each
+      // card still naming its addon. Addons still loading or failed keep
+      // their header + placeholder/error rows underneath.
+      final groupOf = {for (final g in visible) g.installation.id: g};
+      final sorted = sortStremioLinks([
+        for (final group in visible) ..._shown(group),
+      ], _sort);
+      for (final choice in sorted) {
         rows.add(
           _CardRow(
-            group: group,
+            group: groupOf[choice.installationId]!,
             choice: choice,
             key: ValueKey('link:${choice.installationId}:${choice.label}'),
           ),
         );
       }
-      if (choices.isEmpty &&
-          group.state != StremioLinkGroupState.pending &&
-          group.state != StremioLinkGroupState.error &&
-          group.state != StremioLinkGroupState.stale) {
-        rows.add(const _EmptyRow());
+      for (final group in visible) {
+        if (_playable(group).isNotEmpty) continue;
+        final pending = group.state == StremioLinkGroupState.pending;
+        final failed =
+            group.state == StremioLinkGroupState.error ||
+            group.state == StremioLinkGroupState.stale;
+        if (!pending && !failed) continue;
+        rows.add(_HeaderRow(group: group, count: 0));
+        rows.add(pending ? const _PendingRow() : _ErrorRow(group: group));
       }
+    } else {
+      for (final group in visible) {
+        final all = _playable(group);
+        // Windows filters may hide some of the group's links.
+        final choices = _filtering ? _shown(group) : all;
+        rows.add(_HeaderRow(group: group, count: choices.length));
+        if (group.state == StremioLinkGroupState.pending && all.isEmpty) {
+          rows.add(const _PendingRow());
+        }
+        if ((group.state == StremioLinkGroupState.error ||
+                group.state == StremioLinkGroupState.stale) &&
+            all.isEmpty) {
+          rows.add(_ErrorRow(group: group));
+        }
+        for (final choice in choices) {
+          rows.add(
+            _CardRow(
+              group: group,
+              choice: choice,
+              key: ValueKey('link:${choice.installationId}:${choice.label}'),
+            ),
+          );
+        }
+        if (all.isEmpty &&
+            group.state != StremioLinkGroupState.pending &&
+            group.state != StremioLinkGroupState.error &&
+            group.state != StremioLinkGroupState.stale) {
+          rows.add(const _EmptyRow());
+        }
+      }
+    }
+    // Windows: links exist but the filters hide all of them.
+    if (_filtering && playable.isNotEmpty && shownCount == 0) {
+      rows.add(const _FilteredEmptyRow());
     }
     if (_done && playable.isEmpty) {
       // An error row already carries its own retry; the footer button is
@@ -233,7 +587,9 @@ class _StremioLinksSheetState extends State<_StremioLinksSheet> {
         height: MediaQuery.sizeOf(context).height * 0.8,
         child: Column(
           children: [
-            if (widget.bannerUrl == null || widget.bannerUrl!.isEmpty) ...[
+            // Drag handle only on phones; the Windows panel has none.
+            if (!widget.desktop &&
+                (widget.bannerUrl == null || widget.bannerUrl!.isEmpty)) ...[
               const SizedBox(height: 10),
               Center(
                 child: Container(
@@ -246,13 +602,15 @@ class _StremioLinksSheetState extends State<_StremioLinksSheet> {
                 ),
               ),
             ],
-            if (widget.bannerUrl != null &&
-                widget.bannerUrl!.isNotEmpty)
+            if (widget.bannerUrl != null && widget.bannerUrl!.isNotEmpty)
               _BannerHeader(
                 bannerUrl: widget.bannerUrl!,
                 bannerHeaders: widget.bannerHeaders,
                 title: widget.title,
                 subtitle: _countsLine(playable.length, _groups.length),
+                fade: widget.desktop
+                    ? DesktopPanelColors.surface
+                    : AppColors.surface,
                 onClose: () {
                   _dismissed = true;
                   Navigator.of(context).pop();
@@ -319,6 +677,8 @@ class _StremioLinksSheetState extends State<_StremioLinksSheet> {
                 ],
               ),
             ),
+            // Windows: search, sort and resolution chips (show-9).
+            if (widget.desktop) _desktopFilterBar(qualityCounts),
             Expanded(
               child: ListView.builder(
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
@@ -333,6 +693,9 @@ class _StremioLinksSheetState extends State<_StremioLinksSheet> {
                           choice: choice,
                           installationName: installationName,
                           onTap: () => _choose(choice),
+                          onContextMenu: widget.desktop
+                              ? (at) => _showLinkMenu(choice, at)
+                              : null,
                         ),
                       );
                     case _HeaderRow(:final group, :final count):
@@ -385,7 +748,26 @@ class _StremioLinksSheetState extends State<_StremioLinksSheet> {
                           choice: choice,
                           installationName: group.installation.name,
                           onTap: () => _choose(choice),
+                          onContextMenu: widget.desktop
+                              ? (at) => _showLinkMenu(choice, at)
+                              : null,
                         ),
+                      );
+                    case _FilteredEmptyRow():
+                      // Windows: the filters hide every link; offer a reset.
+                      return Column(
+                        key: const ValueKey('stremio-links-filtered-empty'),
+                        children: [
+                          const SizedBox(height: 12),
+                          Text(
+                            context.l10n.noLinksMatchFilters,
+                            style: AppText.caption,
+                          ),
+                          TextButton(
+                            onPressed: _clearFilters,
+                            child: Text(context.l10n.clearFilters),
+                          ),
+                        ],
                       );
                     case _EmptyRow():
                       return Padding(
@@ -461,6 +843,11 @@ class _DoneEmptyRow extends _SheetRow {
   final bool showRetry;
 }
 
+/// Windows: every link is hidden by the quality/search filters.
+class _FilteredEmptyRow extends _SheetRow {
+  const _FilteredEmptyRow();
+}
+
 /// One-shot entrance: fade + slight rise, staggered by row index.
 /// Stable keys keep rebuilds from replaying it; always settles.
 class _Entrance extends StatelessWidget {
@@ -510,6 +897,7 @@ class _FilterChip extends StatelessWidget {
     required this.selected,
     required this.onTap,
     this.icon,
+    this.id,
   });
 
   final Widget? icon;
@@ -517,13 +905,16 @@ class _FilterChip extends StatelessWidget {
   final bool selected;
   final VoidCallback onTap;
 
+  /// Stable key part when [label] carries a changing count; defaults to it.
+  final String? id;
+
   @override
   Widget build(BuildContext context) {
     final foreground = selected ? AppColors.accent : AppColors.textPrimary;
     return Padding(
       padding: const EdgeInsets.only(right: 8),
       child: InkWell(
-        key: ValueKey('filter-chip:$label'),
+        key: ValueKey('filter-chip:${id ?? label}'),
         borderRadius: BorderRadius.circular(999),
         onTap: onTap,
         child: Container(
@@ -562,23 +953,29 @@ class _BestCard extends StatelessWidget {
     required this.choice,
     required this.installationName,
     required this.onTap,
+    this.onContextMenu,
   });
 
   final StremioLinkChoice choice;
   final String installationName;
   final VoidCallback onTap;
 
+  /// Windows: opens the link menu at this global position (right-click).
+  final ValueChanged<Offset>? onContextMenu;
+
   @override
   Widget build(BuildContext context) {
+    final menu = onContextMenu;
     return Padding(
       padding: const EdgeInsets.only(top: 8),
       child: InkWell(
         borderRadius: BorderRadius.circular(16),
         onTap: onTap,
-        onLongPress: () {
-          final source = stremioVideoSource(choice);
-          if (source != null) copyPlaybackLink(context, source.url);
-        },
+        onLongPress: () => _copyChoiceLink(context, choice),
+        // Windows: right-click opens the link menu (Play, Copy, ...).
+        onSecondaryTapUp: menu == null
+            ? null
+            : (details) => menu(details.globalPosition),
         child: Container(
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
@@ -742,8 +1139,7 @@ class _Shine extends StatefulWidget {
   State<_Shine> createState() => _ShineState();
 }
 
-class _ShineState extends State<_Shine>
-    with SingleTickerProviderStateMixin {
+class _ShineState extends State<_Shine> with SingleTickerProviderStateMixin {
   static const _maxSweeps = 4;
   late final AnimationController _controller = AnimationController(
     duration: const Duration(milliseconds: 1000),
@@ -782,8 +1178,7 @@ class _ShineState extends State<_Shine>
         shaderCallback: (rect) {
           // A soft white band sliding across a window wider than the card
           // so it enters and exits cleanly.
-          final slide =
-              -rect.width + _controller.value * rect.width * 3;
+          final slide = -rect.width + _controller.value * rect.width * 3;
           return LinearGradient(
             begin: Alignment.centerLeft,
             end: Alignment.centerRight,
@@ -793,9 +1188,7 @@ class _ShineState extends State<_Shine>
               Colors.white.withValues(alpha: 0),
             ],
             stops: const [0.0, 0.5, 1.0],
-          ).createShader(
-            Rect.fromLTWH(slide, 0, rect.width, rect.height),
-          );
+          ).createShader(Rect.fromLTWH(slide, 0, rect.width, rect.height));
         },
         child: child,
       ),
@@ -810,14 +1203,19 @@ class _LinkCard extends StatelessWidget {
     required this.choice,
     required this.installationName,
     required this.onTap,
+    this.onContextMenu,
   });
 
   final StremioLinkChoice choice;
   final String installationName;
   final VoidCallback onTap;
 
+  /// Windows: opens the link menu at this global position (right-click).
+  final ValueChanged<Offset>? onContextMenu;
+
   @override
   Widget build(BuildContext context) {
+    final menu = onContextMenu;
     final stream = choice.stream;
     final headline = stream.name?.trim().isNotEmpty == true
         ? stream.name!
@@ -828,10 +1226,11 @@ class _LinkCard extends StatelessWidget {
       child: InkWell(
         borderRadius: BorderRadius.circular(14),
         onTap: onTap,
-        onLongPress: () {
-          final source = stremioVideoSource(choice);
-          if (source != null) copyPlaybackLink(context, source.url);
-        },
+        onLongPress: () => _copyChoiceLink(context, choice),
+        // Windows: right-click opens the link menu (Play, Copy, ...).
+        onSecondaryTapUp: menu == null
+            ? null
+            : (details) => menu(details.globalPosition),
         child: Container(
           padding: const EdgeInsets.all(12),
           decoration: BoxDecoration(
@@ -858,14 +1257,19 @@ class _LinkCard extends StatelessWidget {
                 Align(
                   alignment: Alignment.centerLeft,
                   child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 9,
+                      vertical: 3,
+                    ),
                     decoration: BoxDecoration(
                       borderRadius: BorderRadius.circular(7),
                       color: AppColors.surface,
                     ),
                     child: Text(
                       'SIZE ${_formatStreamSize(stream.videoSize!)}',
-                      style: AppText.caption.copyWith(fontWeight: FontWeight.w800),
+                      style: AppText.caption.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
                     ),
                   ),
                 ),
@@ -876,6 +1280,12 @@ class _LinkCard extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Copies a link row's playback URL (long-press, or the Windows link menu).
+void _copyChoiceLink(BuildContext context, StremioLinkChoice choice) {
+  final source = stremioVideoSource(choice);
+  if (source != null) copyPlaybackLink(context, source.url);
 }
 
 String _countsLine(int links, int addons) =>
@@ -890,6 +1300,7 @@ class _BannerHeader extends StatelessWidget {
     required this.title,
     required this.subtitle,
     required this.onClose,
+    required this.fade,
     this.bannerHeaders,
   });
 
@@ -899,9 +1310,12 @@ class _BannerHeader extends StatelessWidget {
   final String subtitle;
   final VoidCallback onClose;
 
+  /// Fill the art melts into: the sheet or the Windows panel surface.
+  final Color fade;
+
   @override
   Widget build(BuildContext context) {
-    final surface = AppColors.surface;
+    final surface = fade;
     // Explicit top rounding: the banner bleeds to the sheet's top edge, so
     // it must carry the sheet's own corner radius itself.
     return ClipRRect(
@@ -911,79 +1325,78 @@ class _BannerHeader extends StatelessWidget {
         child: Stack(
           fit: StackFit.expand,
           children: [
-          Image.network(
-            bannerUrl,
-            headers: bannerHeaders,
-            fit: BoxFit.cover,
-            errorBuilder: (_, _, _) =>
-                ColoredBox(color: AppColors.surface2),
-          ),
-          // Legibility scrim up top, then a melt into the sheet background
-          // along the bottom edge — no line where the image ends.
-          DecoratedBox(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [
-                  Colors.black.withValues(alpha: 0.25),
-                  Colors.black.withValues(alpha: 0.45),
-                  surface.withValues(alpha: 0.85),
-                  surface,
+            Image.network(
+              bannerUrl,
+              headers: bannerHeaders,
+              fit: BoxFit.cover,
+              errorBuilder: (_, _, _) => ColoredBox(color: AppColors.surface2),
+            ),
+            // Legibility scrim up top, then a melt into the sheet background
+            // along the bottom edge — no line where the image ends.
+            DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    Colors.black.withValues(alpha: 0.25),
+                    Colors.black.withValues(alpha: 0.45),
+                    surface.withValues(alpha: 0.85),
+                    surface,
+                  ],
+                  stops: const [0.0, 0.55, 0.85, 1.0],
+                ),
+              ),
+            ),
+            Positioned(
+              top: 10,
+              right: 10,
+              child: Tooltip(
+                message: 'Close',
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(999),
+                  onTap: onClose,
+                  child: Container(
+                    width: 30,
+                    height: 30,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: Colors.black.withValues(alpha: 0.45),
+                    ),
+                    child: const Icon(
+                      Icons.close_rounded,
+                      color: Colors.white,
+                      size: 16,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              left: 16,
+              right: 16,
+              bottom: 16,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    title,
+                    style: AppText.headline.copyWith(color: Colors.white),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  Text(
+                    subtitle,
+                    style: AppText.caption.copyWith(
+                      color: Colors.white.withValues(alpha: 0.75),
+                    ),
+                  ),
                 ],
-                stops: const [0.0, 0.55, 0.85, 1.0],
               ),
             ),
-          ),
-          Positioned(
-            top: 10,
-            right: 10,
-            child: Tooltip(
-              message: 'Close',
-              child: InkWell(
-                borderRadius: BorderRadius.circular(999),
-                onTap: onClose,
-                child: Container(
-                  width: 30,
-                  height: 30,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: Colors.black.withValues(alpha: 0.45),
-                  ),
-                  child: const Icon(
-                    Icons.close_rounded,
-                    color: Colors.white,
-                    size: 16,
-                  ),
-                ),
-              ),
-            ),
-          ),
-          Positioned(
-            left: 16,
-            right: 16,
-            bottom: 16,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  title,
-                  style: AppText.headline.copyWith(color: Colors.white),
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                Text(
-                  subtitle,
-                  style: AppText.caption.copyWith(
-                    color: Colors.white.withValues(alpha: 0.75),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
+          ],
+        ),
       ),
     );
   }

@@ -62,6 +62,30 @@ bool hasNewEpisode(TrackerListItem e, ZKind kind) {
   return true;
 }
 
+/// How recent the newest episode must be to count as "new" on the desktop row.
+const Duration kFreshReleaseWindow = Duration(days: 14);
+
+/// Desktop "New from your list": only shows whose newest episode actually came
+/// out recently AND that you have not watched yet, newest release first. A
+/// long-finished show is never "new" just because it sits on your Watching
+/// list. Entries without a release date (trackers that do not send one) are
+/// left out rather than guessed at.
+List<TrackerListItem> freshReleases(
+  List<TrackerListItem> items,
+  ZKind kind, {
+  DateTime? now,
+}) {
+  final cutoff = (now ?? DateTime.now()).subtract(kFreshReleaseWindow);
+  final out = [
+    for (final e in items)
+      if (hasNewEpisode(e, kind) &&
+          e.latestReleaseAt != null &&
+          e.latestReleaseAt!.isAfter(cutoff))
+        e,
+  ]..sort((a, b) => b.latestReleaseAt!.compareTo(a.latestReleaseAt!));
+  return out;
+}
+
 int _byUpdatedDesc(TrackerListItem a, TrackerListItem b) =>
     (b.updatedAt?.millisecondsSinceEpoch ?? 0).compareTo(
       a.updatedAt?.millisecondsSinceEpoch ?? 0,

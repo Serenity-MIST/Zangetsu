@@ -28,12 +28,19 @@ void main() {
   test('a set region wins over the locale, and survives', () async {
     await StreamingPrefs.setRegion('us');
     expect(StreamingPrefs.region, 'US', reason: 'normalised to upper case');
+    await Hive.close();
+    Hive.init(dir.path);
+    await StreamingPrefs.init();
+    expect(StreamingPrefs.region, 'US', reason: 'Persisted across reopening');
   });
 
-  test('a junk stored region falls back rather than reaching the API', () async {
-    Hive.box(StreamingPrefs.boxName).put('region', 'not-a-country');
-    expect(StreamingPrefs.region, 'IN');
-  });
+  test(
+    'a junk stored region falls back rather than reaching the API',
+    () async {
+      Hive.box(StreamingPrefs.boxName).put('region', 'not-a-country');
+      expect(StreamingPrefs.region, 'IN');
+    },
+  );
 
   test('writing bumps the revision so Home can reload', () async {
     final before = StreamingPrefs.revision.value;

@@ -5799,4 +5799,2590 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get portraitVideoEdgeToEdge => 'Edge-to-edge portrait video';
+
+  @override
+  String get noChaptersAvailableFromThisSource =>
+      'No chapters available from this source';
+
+  @override
+  String get selectShort => 'Select';
+
+  @override
+  String get cloudStreamEngine => 'CloudStream engine';
+
+  @override
+  String get trayStillRunningTitle => 'Zangetsu is still running';
+
+  @override
+  String get trayStillRunningBusy =>
+      'Downloads keep going in the background. Open the app again from the tray icon.';
+
+  @override
+  String get trayStillRunningIdle => 'Open the app again from the tray icon.';
+
+  @override
+  String closeDownloadsInProgress(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count downloads in progress',
+      one: '1 download in progress',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get closeQuitStopsDownloads =>
+      'Quitting stops them. Keep Zangetsu running in the tray to let them finish.';
+
+  @override
+  String get quit => 'Quit';
+
+  @override
+  String get keepRunningInTray => 'Keep running in tray';
+
+  @override
+  String get verifyCheckingWebsite => 'Checking the website…';
+
+  @override
+  String get verifyLoadingWebsite => 'Loading the website…';
+
+  @override
+  String get verifyCompleteCheckBelow =>
+      'Complete the check below. This window closes by itself once the site opens.';
+
+  @override
+  String get verifySignInBelow => 'Sign in below, then press Continue.';
+
+  @override
+  String verifyHost(String host) {
+    return 'Verify $host';
+  }
+
+  @override
+  String get checkingEllipsis => 'Checking…';
+
+  @override
+  String get reload => 'Reload';
+
+  @override
+  String shortcutAppSection(int n) {
+    return 'Go to sidebar item $n';
+  }
+
+  @override
+  String shortcutAppMode(int n) {
+    return 'Switch to mode $n';
+  }
+
+  @override
+  String shortcutShowTab(int n) {
+    return 'Go to tab $n';
+  }
+
+  @override
+  String get shortcutAppSettings => 'Open Settings';
+
+  @override
+  String get shortcutAppBack => 'Go back';
+
+  @override
+  String get shortcutAppFullscreen => 'Toggle full screen';
+
+  @override
+  String get shortcutAppHelp => 'Show keyboard shortcuts';
+
+  @override
+  String get shortcutAppLockProfile => 'Lock profile now';
+
+  @override
+  String get shortcutAppContextMenu => 'Open the menu for the focused item';
+
+  @override
+  String get shortcutHomeFirst => 'First item in the row';
+
+  @override
+  String get shortcutHomeLast => 'Last item in the row';
+
+  @override
+  String get shortcutHomeOpen => 'Open the focused title';
+
+  @override
+  String get shortcutShowPlay => 'Play or continue';
+
+  @override
+  String get shortcutShowDownload => 'Download the focused episode';
+
+  @override
+  String get shortcutShowFilter => 'Search episodes';
+
+  @override
+  String get shortcutShowSelectAll => 'Select all episodes';
+
+  @override
+  String get shortcutShowClearSelection => 'Clear the selection';
+
+  @override
+  String get shortcutPlayerPlayPause => 'Play / pause';
+
+  @override
+  String get shortcutPlayerSeekBack => 'Seek back';
+
+  @override
+  String get shortcutPlayerSeekForward => 'Seek forward';
+
+  @override
+  String get shortcutPlayerSeekBackLong => 'Seek back 1 minute';
+
+  @override
+  String get shortcutPlayerSeekForwardLong => 'Seek forward 1 minute';
+
+  @override
+  String get shortcutPlayerVolumeUp => 'Volume up';
+
+  @override
+  String get shortcutPlayerVolumeDown => 'Volume down';
+
+  @override
+  String get shortcutPlayerMute => 'Mute';
+
+  @override
+  String get shortcutPlayerExit => 'Leave full screen or the player';
+
+  @override
+  String get shortcutPlayerSkip => 'Skip intro or ending';
+
+  @override
+  String get shortcutPlayerSpeedDown => 'Slower';
+
+  @override
+  String get shortcutPlayerSpeedUp => 'Faster';
+
+  @override
+  String get shortcutPlayerSubtitles => 'Subtitles on / off';
+
+  @override
+  String get shortcutPlayerJumpPercent => 'Jump to 0-90%';
+
+  @override
+  String get shortcutPlayerFrameBack => 'Previous frame';
+
+  @override
+  String get shortcutPlayerFrameForward => 'Next frame';
+
+  @override
+  String get shortcutPlayerSubDelayDown => 'Subtitles earlier';
+
+  @override
+  String get shortcutPlayerSubDelayUp => 'Subtitles later';
+
+  @override
+  String get shortcutPlayerMiniPlayer => 'Mini player';
+
+  @override
+  String get shortcutPlayerAlwaysOnTop => 'Keep on top';
+
+  @override
+  String get shortcutReaderNextPage => 'Next page';
+
+  @override
+  String get shortcutReaderPreviousPage => 'Previous page';
+
+  @override
+  String get shortcutReaderFirstPage => 'First page';
+
+  @override
+  String get shortcutReaderLastPage => 'Last page';
+
+  @override
+  String get shortcutReaderChapterList => 'Chapter list';
+
+  @override
+  String get shortcutReaderToggleBars => 'Show or hide the bars';
+
+  @override
+  String get shortcutReaderBack => 'Leave the reader';
+
+  @override
+  String get shortcutReaderZoomIn => 'Zoom in';
+
+  @override
+  String get shortcutReaderZoomOut => 'Zoom out';
+
+  @override
+  String get shortcutReaderZoomReset => 'Reset zoom';
+
+  @override
+  String get shortcutReaderShiftSpread => 'Shift two-page spread';
+
+  @override
+  String get shortcutDownloadsDelete => 'Delete selected';
+
+  @override
+  String get shortcutDownloadsOpen => 'Open the focused download';
+
+  @override
+  String get shortcutListsSearch => 'Search the list';
+
+  @override
+  String get shortcutListsPreviousDay => 'Previous day';
+
+  @override
+  String get shortcutListsNextDay => 'Next day';
+
+  @override
+  String get shortcutSettingsNextSection => 'Next section';
+
+  @override
+  String get shortcutSettingsPreviousSection => 'Previous section';
+
+  @override
+  String get shortcutAppBackDescription =>
+      'The mouse Back button also goes back';
+
+  @override
+  String get shortcutWhilePaused => 'While paused';
+
+  @override
+  String get shortcutListsSearchDescription => 'History and My List';
+
+  @override
+  String get noMatches => 'No matches';
+
+  @override
+  String get undo => 'Undo';
+
+  @override
+  String get catalogue => 'Catalogue';
+
+  @override
+  String get chooseCatalogue => 'Choose catalogue';
+
+  @override
+  String catalogueNamed(String name) {
+    return 'Catalogue: $name';
+  }
+
+  @override
+  String get open => 'Open';
+
+  @override
+  String get pauseAllDownloads => 'Pause all downloads';
+
+  @override
+  String get previous => 'Previous';
+
+  @override
+  String get shortcutNotSet => 'Not set';
+
+  @override
+  String extensionsFailedToLoad(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count extensions or plugins failed to load',
+      one: '1 extension or plugin failed to load',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get someExtensionsDidNotLoad => 'Some extensions did not load';
+
+  @override
+  String get extensionSourcesMissingUntilLoad =>
+      'Their sources are missing until they load.';
+
+  @override
+  String get everythingLoaded => 'Everything loaded.';
+
+  @override
+  String get sourceTimedOutSlow =>
+      'Source timed out. It may be slow or down right now.';
+
+  @override
+  String get sourceTimedOutTitle => 'Source timed out';
+
+  @override
+  String get sourceTookTooLong =>
+      'The source took too long to answer. It may be slow or down right now.';
+
+  @override
+  String get extensionEngine => 'Extension engine';
+
+  @override
+  String get installedExtensions => 'Installed extensions';
+
+  @override
+  String get startupEntry => 'Startup';
+
+  @override
+  String get aniyomiMihonEngine => 'Aniyomi / Mihon engine';
+
+  @override
+  String get extensionEngineNotFound =>
+      'Extension engine not found. Re-extract the app folder.';
+
+  @override
+  String get downloadFinished => 'Download finished';
+
+  @override
+  String downloadNameIsReady(String name) {
+    return '$name is ready';
+  }
+
+  @override
+  String get downloadsFinished => 'Downloads finished';
+
+  @override
+  String downloadsAreReady(int count) {
+    return '$count downloads are ready';
+  }
+
+  @override
+  String downloadNameFailed(String name) {
+    return '$name failed';
+  }
+
+  @override
+  String downloadsCountFailed(int count) {
+    return '$count downloads failed';
+  }
+
+  @override
+  String downloadsFailedAndFinished(String failed, int count) {
+    return '$failed, $count finished';
+  }
+
+  @override
+  String get downloadFailed => 'Download failed';
+
+  @override
+  String get downloadsFailedTitle => 'Downloads failed';
+
+  @override
+  String episodeNumberLabel(String number) {
+    return 'Episode $number';
+  }
+
+  @override
+  String timeLeftSeconds(int seconds) {
+    return '$seconds s left';
+  }
+
+  @override
+  String timeLeftMinutes(int minutes) {
+    return '$minutes min left';
+  }
+
+  @override
+  String timeLeftHours(int hours) {
+    return '$hours h left';
+  }
+
+  @override
+  String timeLeftHoursMinutes(int hours, int minutes) {
+    return '$hours h $minutes min left';
+  }
+
+  @override
+  String chapterIsOut(String number) {
+    return 'Chapter $number is out';
+  }
+
+  @override
+  String episodeIsOut(String number) {
+    return 'Episode $number is out';
+  }
+
+  @override
+  String get streamLinkAndHeadersCopied => 'Stream link and headers copied';
+
+  @override
+  String get streamLinkCopied => 'Stream link copied';
+
+  @override
+  String get couldNotCopyLink => 'Could not copy link';
+
+  @override
+  String get installFailNoSource =>
+      'The extension installed but no source loaded';
+
+  @override
+  String get downloadCancelled => 'Download cancelled';
+
+  @override
+  String get installFailTimedOut =>
+      'Download timed out: the connection is slow or blocked';
+
+  @override
+  String get installFailBlocked => 'Download blocked by network';
+
+  @override
+  String get installFailCertificate =>
+      'Download blocked: the server certificate was rejected';
+
+  @override
+  String get installFailNotFound =>
+      'Extension file not found in the repository (HTTP 404)';
+
+  @override
+  String installFailRefused(String status) {
+    return 'Download refused by the server (HTTP $status)';
+  }
+
+  @override
+  String installFailServerError(String status) {
+    return 'Repository server error (HTTP $status)';
+  }
+
+  @override
+  String get installFailEngineNotRunning => 'Extension engine not running';
+
+  @override
+  String get installFailNewerApp => 'Extension needs a newer app version';
+
+  @override
+  String get installFailEngineSlow =>
+      'The extension engine took too long to load it';
+
+  @override
+  String get installFailNotLoaded => 'The extension could not be loaded';
+
+  @override
+  String get installFailDisk =>
+      'Could not save the extension file (disk error)';
+
+  @override
+  String get installFailedPlain => 'Install failed';
+
+  @override
+  String trackerNeedsSignInSaved(String tracker) {
+    return '$tracker needs you to sign in again. Updates are saved and will sync after you reconnect.';
+  }
+
+  @override
+  String trackerSyncFailedRetry(String tracker) {
+    return '$tracker sync failed. Updates are saved and will retry automatically.';
+  }
+
+  @override
+  String get colourHex => 'Hex';
+
+  @override
+  String enterColourLike(String example) {
+    return 'Enter a colour like $example';
+  }
+
+  @override
+  String get pasteColour => 'Paste colour';
+
+  @override
+  String get whereToWatch => 'Where to watch';
+
+  @override
+  String get showInFolder => 'Show in folder';
+
+  @override
+  String get markAsUnread => 'Mark as unread';
+
+  @override
+  String get markAsUnwatched => 'Mark as unwatched';
+
+  @override
+  String get markAsWatched => 'Mark as watched';
+
+  @override
+  String get markThisAndAboveRead => 'Mark this and all above as read';
+
+  @override
+  String get markAllAboveWatched => 'Mark all above as watched';
+
+  @override
+  String get selectSourceText => 'Select source';
+
+  @override
+  String get rightClickToPinSource =>
+      'Right-click a source, or hover it and click the pin, to keep it on top';
+
+  @override
+  String get hidePassword => 'Hide password';
+
+  @override
+  String get showPassword => 'Show password';
+
+  @override
+  String get couldNotReadImageFile => 'Could not read that image file.';
+
+  @override
+  String get logOutLibraryStays =>
+      'Log out? Your library stays in your account.';
+
+  @override
+  String logOutOfEmailLibraryStays(String email) {
+    return 'Log out of $email? Your library stays in your account.';
+  }
+
+  @override
+  String get everyDay => 'Every day';
+
+  @override
+  String get everyWeek => 'Every week';
+
+  @override
+  String get chooseAutoBackupFolder =>
+      'Choose where automatic backups are saved';
+
+  @override
+  String get folderNoLongerExists => 'That folder no longer exists';
+
+  @override
+  String get howOften => 'How often';
+
+  @override
+  String get keepLabel => 'Keep';
+
+  @override
+  String get olderAutoBackupsDeleted => 'Older automatic backups are deleted.';
+
+  @override
+  String lastNBackups(int count) {
+    return 'Last $count backups';
+  }
+
+  @override
+  String get noAutoBackupYet => 'No automatic backup yet';
+
+  @override
+  String lastBackupAt(String when) {
+    return 'Last backup: $when';
+  }
+
+  @override
+  String get automaticBackups => 'Automatic backups';
+
+  @override
+  String get backUpAutomatically => 'Back up automatically';
+
+  @override
+  String get saveBackupOnSchedule => 'Save a backup to a folder on a schedule';
+
+  @override
+  String get notChosen => 'Not chosen';
+
+  @override
+  String get openFolder => 'Open folder';
+
+  @override
+  String lastN(int count) {
+    return 'Last $count';
+  }
+
+  @override
+  String get yourCloudBackup => 'Your cloud backup';
+
+  @override
+  String get backupFile => 'Backup file';
+
+  @override
+  String get restoreUndone =>
+      'Restore undone. Your library and settings are back as they were.';
+
+  @override
+  String get restartNow => 'Restart now';
+
+  @override
+  String get savedBackups => 'Saved backups';
+
+  @override
+  String get noBackupsInFoldersYet => 'No backups in your backup folders yet.';
+
+  @override
+  String get lookingForBackups => 'Looking for backups…';
+
+  @override
+  String get automaticBackup => 'Automatic backup';
+
+  @override
+  String get safetyCopyBeforeRestore => 'Safety copy before a restore';
+
+  @override
+  String get backupKind => 'Backup';
+
+  @override
+  String get restore => 'Restore';
+
+  @override
+  String get backupIntroWindows =>
+      'Save your sources, list and settings — to a file on this PC or to your Zangetsu account. Restoring adds your library back without deleting anything, replaces app settings, and saves a safety copy first so you can undo it.';
+
+  @override
+  String get sourcesAndReposText => 'Sources and repos';
+
+  @override
+  String backupCountSources(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count sources',
+      one: '1 source',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String backupCountRepos(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count repos',
+      one: '1 repo',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String backupCountListItems(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count list items',
+      one: '1 list item',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String backupCountContinueWatching(int count) {
+    return '$count in Continue Watching';
+  }
+
+  @override
+  String backupCountReadingHistory(int count) {
+    return '$count reading history';
+  }
+
+  @override
+  String backupCountCategories(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count categories',
+      one: '1 category',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String backupCountResumePoints(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count resume points',
+      one: '1 resume point',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String backupCountSettingGroups(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count setting groups',
+      one: '1 setting group',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String backupCountTitleMatches(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count hand-made title matches',
+      one: '1 hand-made title match',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String restoredParts(String parts) {
+    return 'Restored: $parts';
+  }
+
+  @override
+  String couldntReinstall(String items) {
+    return 'Couldn\'t reinstall:\n$items';
+  }
+
+  @override
+  String safetyCopyOfPreviousData(String path) {
+    return 'Safety copy of your previous data: $path';
+  }
+
+  @override
+  String get restartToSeeRestored =>
+      'Restart Zangetsu to see the restored library and sources everywhere.';
+
+  @override
+  String get undoRestore => 'Undo restore';
+
+  @override
+  String get nothingSavedInPart => 'Nothing saved in this part';
+
+  @override
+  String get restoreThisBackup => 'Restore this backup?';
+
+  @override
+  String backupSourceDateUnknown(String source) {
+    return '$source · date unknown';
+  }
+
+  @override
+  String backupSourceMadeOn(String source, String date) {
+    return '$source · made $date';
+  }
+
+  @override
+  String get chooseWhatToRestore => 'Choose what to restore';
+
+  @override
+  String get settingsWillBeReplaced =>
+      'Your current app settings will be replaced by the ones in this backup.';
+
+  @override
+  String get safetyCopySourcesNoUndo =>
+      'A safety copy of your current library and settings is saved first, so you can undo those. Restored sources can\'t be undone.';
+
+  @override
+  String get safetyCopyUndoRestore =>
+      'A safety copy of your current library and settings is saved first, so you can undo this restore.';
+
+  @override
+  String get notInThisBackup => 'Not in this backup';
+
+  @override
+  String markedChaptersAsUnread(int count) {
+    return 'Marked $count chapters as unread';
+  }
+
+  @override
+  String markedEpisodesAsUnwatched(int count) {
+    return 'Marked $count episodes as unwatched';
+  }
+
+  @override
+  String get filterChapters => 'Filter chapters';
+
+  @override
+  String noChaptersMatchQuery(String query) {
+    return 'No chapters match \"$query\"';
+  }
+
+  @override
+  String noEpisodesMatchQuery(String query) {
+    return 'No episodes match \"$query\"';
+  }
+
+  @override
+  String get selectChapters => 'Select chapters';
+
+  @override
+  String get clearFilter => 'Clear filter';
+
+  @override
+  String get clearSelectionEsc => 'Clear selection (Esc)';
+
+  @override
+  String countSelected(int count) {
+    return '$count selected';
+  }
+
+  @override
+  String get markRead => 'Mark read';
+
+  @override
+  String get markWatched => 'Mark watched';
+
+  @override
+  String get markUnread => 'Mark unread';
+
+  @override
+  String get markUnwatched => 'Mark unwatched';
+
+  @override
+  String get playTrailer => 'Play trailer';
+
+  @override
+  String get pauseTrailer => 'Pause trailer';
+
+  @override
+  String get unmute => 'Unmute';
+
+  @override
+  String tryAgainInSeconds(int seconds) {
+    return 'Try again in ${seconds}s';
+  }
+
+  @override
+  String get linkCopied => 'Link copied';
+
+  @override
+  String get copyTitle => 'Copy title';
+
+  @override
+  String get titleCopied => 'Title copied';
+
+  @override
+  String get openSourcePage => 'Open source page';
+
+  @override
+  String get shareViaWindows => 'Share via Windows';
+
+  @override
+  String sourceDoesntHaveTitle(String source) {
+    return '$source doesn\'t have this title';
+  }
+
+  @override
+  String get deleteDownloadQuestion => 'Delete download?';
+
+  @override
+  String downloadedFileWillBeDeleted(String label) {
+    return 'The downloaded file for \"$label\" will be deleted.';
+  }
+
+  @override
+  String get downloadDeleted => 'Download deleted';
+
+  @override
+  String get playOffline => 'Play offline';
+
+  @override
+  String get couldntFindDownloadedFile => 'Couldn\'t find the downloaded file';
+
+  @override
+  String get downloadAgain => 'Download again';
+
+  @override
+  String get dubbed => 'Dubbed';
+
+  @override
+  String get subbed => 'Subbed';
+
+  @override
+  String get existingDownloadedEpisodes => 'Existing downloaded episodes';
+
+  @override
+  String recoveredFilesQuestion(int count, String label) {
+    return '$count selected episodes already have recovered local files. Their audio language is unknown. Use those files, or download the selected $label version?';
+  }
+
+  @override
+  String get downloadSelectedVersion => 'Download selected version';
+
+  @override
+  String get useExistingFiles => 'Use existing files';
+
+  @override
+  String retryInSeconds(int seconds) {
+    return 'Retry in ${seconds}s';
+  }
+
+  @override
+  String get downloadThisLink => 'Download this link';
+
+  @override
+  String get couldNotCopyTitle => 'Could not copy title';
+
+  @override
+  String get couldNotOpenLink => 'Could not open the link';
+
+  @override
+  String get searchLinksHint => 'Search links (release, codec, addon)';
+
+  @override
+  String get clearSearch => 'Clear search';
+
+  @override
+  String get sortLinks => 'Sort links';
+
+  @override
+  String get anyQuality => 'Any quality';
+
+  @override
+  String get noLinksMatchFilters => 'No links match these filters';
+
+  @override
+  String get otherQuality => 'Other';
+
+  @override
+  String get addonOrder => 'Addon order';
+
+  @override
+  String get largestFirst => 'Largest first';
+
+  @override
+  String get smallestFirst => 'Smallest first';
+
+  @override
+  String sourceTookTooLongNamed(String source) {
+    return '$source took too long to answer. It may be slow or down right now.';
+  }
+
+  @override
+  String sourceBlockedByCloudflare(String source) {
+    return '$source blocked the search with a Cloudflare check. Open it from Sources to pass the check, then try again.';
+  }
+
+  @override
+  String couldntReachSource(String source) {
+    return 'Couldn\'t reach $source. Check your connection or try another source.';
+  }
+
+  @override
+  String get couldntLoadMoreResults => 'Couldn\'t load more results.';
+
+  @override
+  String get loadMore => 'Load more';
+
+  @override
+  String retryFailedCount(int count) {
+    return 'Retry failed ($count)';
+  }
+
+  @override
+  String get movedToRecycleBin => 'Moved to the Recycle Bin';
+
+  @override
+  String queueCountDownloading(int count) {
+    return '$count downloading';
+  }
+
+  @override
+  String queueCountWaiting(int count) {
+    return '$count waiting';
+  }
+
+  @override
+  String queueCountPaused(int count) {
+    return '$count paused';
+  }
+
+  @override
+  String queueCountFailed(int count) {
+    return '$count failed';
+  }
+
+  @override
+  String get downloadQueue => 'Download queue';
+
+  @override
+  String get pauseAll => 'Pause all';
+
+  @override
+  String get resumeAll => 'Resume all';
+
+  @override
+  String get retryFailed => 'Retry failed';
+
+  @override
+  String episodeShort(String number) {
+    return 'E$number';
+  }
+
+  @override
+  String get finishingUp => 'Finishing up';
+
+  @override
+  String get findingASource => 'Finding a source';
+
+  @override
+  String get waitingToRetry => 'Waiting to retry';
+
+  @override
+  String get waitingForFreeSlot => 'Waiting for a free slot';
+
+  @override
+  String get downloadNext => 'Download next';
+
+  @override
+  String bulkDeleteShows(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count shows',
+      one: '1 show',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String bulkDeleteDownloads(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count downloads',
+      one: '1 download',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String bulkDeleteAtLeast(String size) {
+    return ' (at least $size)';
+  }
+
+  @override
+  String bulkDeleteActiveCanceled(int count) {
+    return ' $count still downloading will be canceled.';
+  }
+
+  @override
+  String bulkDeleteRecycle(
+    String shows,
+    String items,
+    String size,
+    String active,
+  ) {
+    return 'Delete $shows and all $items$size from this PC? Finished files go to the Recycle Bin; unfinished downloads are removed.$active';
+  }
+
+  @override
+  String bulkDeletePermanent(
+    String shows,
+    String items,
+    String size,
+    String active,
+  ) {
+    return 'Delete $shows and all $items$size from this PC? The saved files are removed and this cannot be undone.$active';
+  }
+
+  @override
+  String get sortRecent => 'Recent';
+
+  @override
+  String get sortMostUnwatched => 'Most unwatched';
+
+  @override
+  String storageUsed(String size) {
+    return '$size used';
+  }
+
+  @override
+  String storageUsedFree(String used, String free) {
+    return '$used - $free free';
+  }
+
+  @override
+  String storageUsedFreeOnDrive(String used, String free, String drive) {
+    return '$used - $free free on $drive';
+  }
+
+  @override
+  String get showInExplorer => 'Show in Explorer';
+
+  @override
+  String get openShowPage => 'Open show page';
+
+  @override
+  String deleteNShows(int count) {
+    return 'Delete $count shows';
+  }
+
+  @override
+  String get deleteSelectedDownloadsRecycle =>
+      'Delete the selected downloads? Finished files go to the Recycle Bin. Active downloads will be canceled.';
+
+  @override
+  String get deleteSelectedDownloadsPermanent =>
+      'Delete the selected downloads and their saved files? Active downloads will be canceled.';
+
+  @override
+  String get notifyDownloadsFinishOrFail =>
+      'Notify when downloads finish or fail';
+
+  @override
+  String get notifyDownloadsSubtitle =>
+      'A Windows notification when a batch completes or something goes wrong.';
+
+  @override
+  String get taskbarProgressTitle =>
+      'Show download progress on the taskbar button';
+
+  @override
+  String get taskbarProgressSubtitle =>
+      'Fills the Zangetsu taskbar button and turns red if a download fails.';
+
+  @override
+  String get desktopParallelDownloadsNote =>
+      'Applies right away: raising it starts waiting episodes now, and the rest of a season joins as each episode\'s source is found. Lowering it lets running downloads finish first.';
+
+  @override
+  String get desktopConnectionsPerDownloadNote =>
+      'Direct-file and HLS episodes and manga pages use it. Hosts that can\'t split a file, DASH episodes and novel chapter images use one. Applies to downloads that start after the change.';
+
+  @override
+  String get dropFolderToImport => 'Drop a folder to import downloads from it.';
+
+  @override
+  String get scanningEllipsis => 'Scanning…';
+
+  @override
+  String scanningNFolders(int count) {
+    return 'Scanning $count folders…';
+  }
+
+  @override
+  String get folderNoLongerOnDisk => 'This folder is no longer on disk.';
+
+  @override
+  String get dropFoldersToImport => 'Drop folders to import their downloads';
+
+  @override
+  String get showFoldersAddedOrReconnected =>
+      'Zangetsu show folders inside are added or reconnected.';
+
+  @override
+  String playEpisodeShort(int number) {
+    return 'Play E$number';
+  }
+
+  @override
+  String removedFromHistory(String title) {
+    return 'Removed \"$title\" from History';
+  }
+
+  @override
+  String get changeListStatusEllipsis => 'Change list status…';
+
+  @override
+  String get addToMyListEllipsis => 'Add to My List…';
+
+  @override
+  String get markAsFinished => 'Mark as finished';
+
+  @override
+  String get searchHistoryCtrlF => 'Search history (Ctrl+F)';
+
+  @override
+  String nothingInTabMatches(String query) {
+    return 'Nothing in this tab matches \"$query\".';
+  }
+
+  @override
+  String get previousFeature => 'Previous feature';
+
+  @override
+  String plusNMore(int count) {
+    return '+$count more';
+  }
+
+  @override
+  String refreshWithKeys(String keys) {
+    return 'Refresh ($keys)';
+  }
+
+  @override
+  String featuredTitleNofM(int index, int count) {
+    return 'Featured title $index of $count';
+  }
+
+  @override
+  String trackerNeedsSignInOpenSettings(String name) {
+    return '$name needs you to sign in again. Open its settings to reconnect.';
+  }
+
+  @override
+  String trackerLastSyncFailedRetry(String name) {
+    return 'Last $name sync failed. It will retry automatically.';
+  }
+
+  @override
+  String trackerUpdatesWaiting(int count, String name) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count updates waiting to sync to $name.',
+      one: '1 update waiting to sync to $name.',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String browseNGenres(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'Browse $count genres',
+      one: 'Browse 1 genre',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get removedFromContinueWatching => 'Removed from Continue watching';
+
+  @override
+  String get couldntRemoveFromContinueWatching =>
+      'Couldn\'t remove from Continue Watching';
+
+  @override
+  String get removedFromContinueReading => 'Removed from Continue reading';
+
+  @override
+  String get couldntRemoveFromContinueReading =>
+      'Couldn\'t remove from Continue Reading';
+
+  @override
+  String get cataloguesGroup => 'Catalogues';
+
+  @override
+  String get extensionsGroup => 'Extensions';
+
+  @override
+  String get readChapterFromStart => 'Read chapter from the start';
+
+  @override
+  String get markChapterRead => 'Mark chapter read';
+
+  @override
+  String get restartEpisode => 'Restart episode';
+
+  @override
+  String get markEpisodeWatched => 'Mark episode watched';
+
+  @override
+  String chapterNAvailable(String number) {
+    return 'Chapter $number available';
+  }
+
+  @override
+  String episodeNAvailable(String number) {
+    return 'Episode $number available';
+  }
+
+  @override
+  String openTrackerList(String tracker) {
+    return 'Open $tracker list';
+  }
+
+  @override
+  String get refreshF5 => 'Refresh (F5)';
+
+  @override
+  String get couldntLoadThisList => 'Couldn\'t load this list.';
+
+  @override
+  String get changeStatusEllipsis => 'Change status…';
+
+  @override
+  String get categoriesEllipsis => 'Categories…';
+
+  @override
+  String editOnTracker(String tracker) {
+    return 'Edit on $tracker…';
+  }
+
+  @override
+  String get trackerFallbackName => 'tracker';
+
+  @override
+  String get recentSearchesCleared => 'Recent searches cleared';
+
+  @override
+  String get fillInSearchBox => 'Fill in search box';
+
+  @override
+  String get noNewEpisodes => 'No new episodes';
+
+  @override
+  String get markAllRead => 'Mark all read';
+
+  @override
+  String get newEpisodesHeader => 'New episodes';
+
+  @override
+  String newChaptersCount(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count new chapters',
+      one: '1 new chapter',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String newEpisodesCount(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count new episodes',
+      one: '1 new episode',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get muted => 'Muted';
+
+  @override
+  String unmuteWithKey(String key) {
+    return 'Unmute · $key';
+  }
+
+  @override
+  String muteWithKey(String key) {
+    return 'Mute · $key';
+  }
+
+  @override
+  String get volumeTooltipKeys => 'Volume · ↑ / ↓   M to mute';
+
+  @override
+  String get keyboardShortcutsWithKey => 'Keyboard shortcuts · ?';
+
+  @override
+  String get subtitlesOn => 'Subtitles on';
+
+  @override
+  String get subtitlesOff => 'Subtitles off';
+
+  @override
+  String subtitleDelayMs(String delay) {
+    return 'Subtitle delay ${delay}ms';
+  }
+
+  @override
+  String openedInApp(String app) {
+    return 'Opened in $app';
+  }
+
+  @override
+  String couldNotStartApp(String app) {
+    return 'Could not start $app';
+  }
+
+  @override
+  String get aspectRatio => 'Aspect ratio';
+
+  @override
+  String get screenshot => 'Screenshot';
+
+  @override
+  String get copyStreamLink => 'Copy stream link';
+
+  @override
+  String get openInExternalPlayer => 'Open in external player';
+
+  @override
+  String get noExternalPlayerFound => 'No external player found';
+
+  @override
+  String get alwaysOnTop => 'Always on top';
+
+  @override
+  String get playerSettings => 'Player settings';
+
+  @override
+  String restoreWithKey(String key) {
+    return 'Restore · $key';
+  }
+
+  @override
+  String get installExternalPlayerHint =>
+      'Install mpv, VLC or MPC-HC, then look again.';
+
+  @override
+  String get lookAgain => 'Look again';
+
+  @override
+  String get playerMayNotPlayHeaders =>
+      'May not play: cannot send the headers this stream needs';
+
+  @override
+  String get uploadImageEllipsis => 'Upload image…';
+
+  @override
+  String get uploadGifEllipsis => 'Upload GIF…';
+
+  @override
+  String get searchGifsEllipsis => 'Search GIFs…';
+
+  @override
+  String get avatarGifTooLarge =>
+      'This GIF is too large to optimize safely. Try a smaller file.';
+
+  @override
+  String get avatarImageTooLarge =>
+      'This image is too large. Try a smaller file.';
+
+  @override
+  String get linkIsNotImage => 'That link is not an image.';
+
+  @override
+  String get couldNotDownloadImage => 'Could not download that image.';
+
+  @override
+  String get dropAvatarImageTypes => 'Drop a PNG, JPG, WebP or GIF image.';
+
+  @override
+  String get copyImageFirst => 'Copy an image first, then paste it here.';
+
+  @override
+  String get dropToUseAsAvatar => 'Drop to use as avatar';
+
+  @override
+  String get setPinToLock =>
+      'Set a PIN for this profile to be able to lock it.';
+
+  @override
+  String get profileLockNeedsInternet =>
+      'Connect to the internet to manage this profile lock. The PIN set on this PC keeps protecting it until then.';
+
+  @override
+  String get editProfile => 'Edit profile';
+
+  @override
+  String get changePinEllipsis => 'Change PIN…';
+
+  @override
+  String get setPinEllipsis => 'Set PIN…';
+
+  @override
+  String get deleteProfile => 'Delete profile';
+
+  @override
+  String selectProfileNamed(String name) {
+    return 'Select profile $name';
+  }
+
+  @override
+  String get kidsProfile => 'Kids profile';
+
+  @override
+  String get pinProtected => 'PIN protected';
+
+  @override
+  String pressNToChoose(int key) {
+    return 'Press $key to choose';
+  }
+
+  @override
+  String get changeAvatarDropPaste =>
+      'Change avatar (or drop / paste an image)';
+
+  @override
+  String get donate => 'Donate';
+
+  @override
+  String lockProfileWithKeys(String keys) {
+    return 'Lock profile ($keys)';
+  }
+
+  @override
+  String chapterNumberTitle(String number) {
+    return 'Chapter $number';
+  }
+
+  @override
+  String get markReadUpToHere => 'Mark read up to here';
+
+  @override
+  String get goToChapterOrSearch => 'Go to chapter or search titles';
+
+  @override
+  String get noChaptersMatch => 'No chapters match';
+
+  @override
+  String get spreadsShifted => 'Spreads shifted by one page';
+
+  @override
+  String get spreadsNotShifted => 'Spreads not shifted';
+
+  @override
+  String pageWidthPx(int width) {
+    return 'Page width $width px';
+  }
+
+  @override
+  String get noPreviousChapter => 'No previous chapter';
+
+  @override
+  String get noNextChapter => 'No next chapter';
+
+  @override
+  String pageNOfCount(int page, int count) {
+    return 'Page $page / $count';
+  }
+
+  @override
+  String chapterXOfY(String current, String total) {
+    return '$current of $total';
+  }
+
+  @override
+  String get markedReadUpToHere => 'Marked read up to here';
+
+  @override
+  String get shiftSpreadByOnePage => 'Shift spread by one page';
+
+  @override
+  String get pageWidthLongStrip => 'Page width (long strip)';
+
+  @override
+  String get copyImage => 'Copy image';
+
+  @override
+  String get saveToPictures => 'Save to Pictures';
+
+  @override
+  String get imageCopied => 'Image copied';
+
+  @override
+  String get copyFailed => 'Copy failed';
+
+  @override
+  String get filterByNumberOrTitle => 'Filter by number or title';
+
+  @override
+  String fontSerifNamed(String font) {
+    return 'Serif ($font)';
+  }
+
+  @override
+  String get searchFonts => 'Search fonts';
+
+  @override
+  String get searchTheWeb => 'Search the web';
+
+  @override
+  String get translate => 'Translate';
+
+  @override
+  String get finishedCaps => 'FINISHED';
+
+  @override
+  String get noNextChapterYet => 'No next chapter yet';
+
+  @override
+  String get upNextCaps => 'UP NEXT';
+
+  @override
+  String get clickToTurnPages => 'Click to turn pages';
+
+  @override
+  String scheduleSavedUpdating(String when) {
+    return 'Showing saved schedule from $when · updating…';
+  }
+
+  @override
+  String scheduleOfflineCopy(String when) {
+    return 'Offline copy · showing saved schedule from $when';
+  }
+
+  @override
+  String scheduleCouldntRefresh(String when) {
+    return 'Couldn\'t refresh · showing saved schedule from $when';
+  }
+
+  @override
+  String get couldntLoadSchedule => 'Couldn\'t load the schedule';
+
+  @override
+  String get scheduleServiceNoAnswer =>
+      'The schedule service did not answer. Try again in a moment.';
+
+  @override
+  String get unpinSource => 'Unpin source';
+
+  @override
+  String get pinSource => 'Pin source';
+
+  @override
+  String searchAllSourcesFor(String query) {
+    return 'Search all sources for \"$query\"';
+  }
+
+  @override
+  String get moveToTop => 'Move to top';
+
+  @override
+  String get moveUp => 'Move up';
+
+  @override
+  String get moveDown => 'Move down';
+
+  @override
+  String get moveToBottom => 'Move to bottom';
+
+  @override
+  String get useInAutoResolve => 'Use in Auto Resolve';
+
+  @override
+  String unpinNamed(String name) {
+    return 'Unpin $name';
+  }
+
+  @override
+  String moveNamedUp(String name) {
+    return 'Move $name up';
+  }
+
+  @override
+  String moveNamedDown(String name) {
+    return 'Move $name down';
+  }
+
+  @override
+  String autoResolveSearchesNamed(String name) {
+    return 'Auto Resolve searches $name';
+  }
+
+  @override
+  String autoResolveSkipsNamed(String name) {
+    return 'Auto Resolve skips $name. You can still pick it for a title.';
+  }
+
+  @override
+  String dragToReorderNamed(String name) {
+    return 'Drag to reorder $name';
+  }
+
+  @override
+  String get skippedByAutoResolve => 'Skipped by Auto Resolve';
+
+  @override
+  String namePinned(String name) {
+    return '$name, pinned';
+  }
+
+  @override
+  String get pinnedStaysHereTooltip =>
+      'Pinned: stays here. Unpinned sources below are sorted by what has worked.';
+
+  @override
+  String get someSpace => 'some space';
+
+  @override
+  String bucketCleared(String name) {
+    return '$name cleared';
+  }
+
+  @override
+  String bucketClearedFreed(String name, String size) {
+    return '$name cleared ($size freed)';
+  }
+
+  @override
+  String appUsesStorage(String size) {
+    return 'Zangetsu uses $size on this PC, not counting downloads.';
+  }
+
+  @override
+  String get measuringStorage => 'Measuring storage…';
+
+  @override
+  String get measuringEllipsis => 'Measuring…';
+
+  @override
+  String get storagePostersTitle => 'Posters and artwork';
+
+  @override
+  String get storagePostersDescription =>
+      'Cover images. They download again when shown.';
+
+  @override
+  String get storageTempTitle => 'Video and reading cache';
+
+  @override
+  String get storageTempDescription =>
+      'Temporary player, subtitle and manga page files. Posters are cleared too.';
+
+  @override
+  String get storageScriptsTitle => 'Source scripts';
+
+  @override
+  String get storageScriptsDescription =>
+      'Downloaded provider scripts that sources run.';
+
+  @override
+  String get storageScriptsConfirmTitle => 'Clear source scripts?';
+
+  @override
+  String storageScriptsConfirmMessage(String size) {
+    return 'This frees $size. Sources download their scripts again the next time you use them, so they will not work offline until then.';
+  }
+
+  @override
+  String get storageExtensionsTitle => 'Extension data';
+
+  @override
+  String get storageExtensionsDescription =>
+      'Installed extensions and their data. Clear removes only their cache; extensions and settings stay.';
+
+  @override
+  String get storageExtensionsConfirmTitle => 'Clear extension cache?';
+
+  @override
+  String storageExtensionsConfirmMessage(String size) {
+    return 'Cached pages and images saved by extensions are removed. Installed extensions and their settings are kept. Extension data uses $size in total.';
+  }
+
+  @override
+  String get storageLogsTitle => 'Logs';
+
+  @override
+  String get storageLogsDescription => 'Diagnostic logs used for bug reports.';
+
+  @override
+  String get storageLogsConfirmTitle => 'Clear logs?';
+
+  @override
+  String storageLogsConfirmMessage(String size) {
+    return 'This frees $size. If something goes wrong right after, a bug report will have less to go on.';
+  }
+
+  @override
+  String get storageDownloadsDescription => 'Downloaded episodes and chapters.';
+
+  @override
+  String get manage => 'Manage';
+
+  @override
+  String get discordOnlyWhileWatching => 'Only while watching';
+
+  @override
+  String get discordOnlyWhileWatchingSubtitle =>
+      'Hide Browsing and Looking at. Your status also clears after 5 minutes away or while Zangetsu is minimised, but never during a video.';
+
+  @override
+  String get shortcutScopeEverywhere => 'Everywhere';
+
+  @override
+  String get shortcutScopeShowPage => 'Show page';
+
+  @override
+  String get shortcutScopeLists => 'History, My List and Schedule';
+
+  @override
+  String get resetAllShortcutsQuestion => 'Reset all shortcuts?';
+
+  @override
+  String get resetAllShortcutsMessage =>
+      'Every changed shortcut goes back to its default key.';
+
+  @override
+  String get resetAll => 'Reset all';
+
+  @override
+  String get keyboardShortcuts => 'Keyboard shortcuts';
+
+  @override
+  String get noShortcutsMatch => 'No shortcuts match';
+
+  @override
+  String get searchShortcuts => 'Search shortcuts';
+
+  @override
+  String get changedFromDefault => 'Changed from default';
+
+  @override
+  String get changeShortcut => 'Change shortcut';
+
+  @override
+  String get pressNewKeyCombination => 'Press the new key combination';
+
+  @override
+  String currentShortcut(String keys) {
+    return 'Current: $keys';
+  }
+
+  @override
+  String shortcutAlreadyUsedBy(String action, String scope) {
+    return 'Already used by \"$action\" ($scope). Saving keeps both on this key.';
+  }
+
+  @override
+  String get customise => 'Customise';
+
+  @override
+  String titleBackOnAutoResolve(String title) {
+    return '\"$title\" is back on Auto Resolve';
+  }
+
+  @override
+  String titlesBackOnAutoResolve(int count) {
+    return '$count titles are back on Auto Resolve';
+  }
+
+  @override
+  String get couldntOpenSourcePage => 'Couldn\'t open this source\'s page';
+
+  @override
+  String resetNToAuto(int count) {
+    return 'Reset $count to Auto';
+  }
+
+  @override
+  String get resetToAuto => 'Reset to Auto';
+
+  @override
+  String get manualMatches => 'Manual matches';
+
+  @override
+  String get manualMatchesIntro =>
+      'Titles you matched by hand with \"Wrong title?\". Reset one to let Auto Resolve choose its source again.';
+
+  @override
+  String get searchManualMatches => 'Search manual matches';
+
+  @override
+  String get clearSelection => 'Clear selection';
+
+  @override
+  String get noManualMatchesYet =>
+      'No manual matches yet. Fix a match with \"Wrong title?\" on a title and it shows up here.';
+
+  @override
+  String get noManualMatchesForSearch => 'No manual matches match your search.';
+
+  @override
+  String get readerFullscreenWindowsSubtitle =>
+      'When on, manga and novels open borderless full screen. Esc leaves it and F or F11 toggles it';
+
+  @override
+  String get clickToTurnPagesSubtitle =>
+      'In paged reading, click the left or right side of the page to turn it and the middle to show the bars. The mouse Back and Forward buttons always turn pages';
+
+  @override
+  String get clickZones => 'Click zones';
+
+  @override
+  String get clickZonesSubtitle =>
+      'What clicking each part of a page does when Click to turn pages is on';
+
+  @override
+  String get cacheAndStorage => 'Cache and storage';
+
+  @override
+  String get cacheAndStorageSubtitle =>
+      'Sizes and clearing for every cache are in Storage';
+
+  @override
+  String get windowAndSystem => 'Window & system';
+
+  @override
+  String get windowAndSystemSubtitle =>
+      'Launch at sign-in, close button, window size, start page';
+
+  @override
+  String get keyboardShortcutsSubtitle =>
+      'See every shortcut and change the player keys';
+
+  @override
+  String get searchResults => 'Search results';
+
+  @override
+  String get tapZonesWindowsNote =>
+      'On Windows these zones answer left clicks in paged reading while Click to turn pages is on. Right-to-left reading swaps the page-turn sides.';
+
+  @override
+  String get launchAtSignIn => 'Launch at sign-in';
+
+  @override
+  String get closeButton => 'Close button';
+
+  @override
+  String get rememberWindowSizePosition => 'Remember window size and position';
+
+  @override
+  String get startPage => 'Start page';
+
+  @override
+  String get autoLockAfterIdle => 'Auto-lock after idle';
+
+  @override
+  String get lockWhenWindowsLocks => 'Lock when Windows locks';
+
+  @override
+  String get unpinAllSourcesQuestion => 'Unpin all sources?';
+
+  @override
+  String unpinAllSourcesMessage(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other:
+          'The $count pinned sources go back to the automatic ranking. Sources switched off for Auto Resolve stay off.',
+      one:
+          'The 1 pinned source goes back to the automatic ranking. Sources switched off for Auto Resolve stay off.',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get unpinAll => 'Unpin all';
+
+  @override
+  String get unpinnedAllSources => 'Unpinned all sources';
+
+  @override
+  String get sourcePriorityWindowsHelp =>
+      'Drag a handle, use Move up / Move down, or press Alt+Up / Alt+Down on a selected row. Right-click a row for Move to top. Moving a source pins it: pinned sources keep their place, the rest are sorted by what has worked.';
+
+  @override
+  String get preferredSourceAnime => 'Preferred source for anime';
+
+  @override
+  String get preferredSourceManga => 'Preferred source for manga';
+
+  @override
+  String get preferredSourceNovels => 'Preferred source for novels';
+
+  @override
+  String get preferredSourceMoviesTv => 'Preferred source for movies and TV';
+
+  @override
+  String get autoResolve => 'Auto Resolve';
+
+  @override
+  String get preferredSourceDescription =>
+      'Tried first for every title without its own source. If it does not have a title, Auto Resolve tries the sources below.';
+
+  @override
+  String get noPreferredSource => 'No preferred source: just the order below';
+
+  @override
+  String get preferredSourceSubtitle =>
+      'Tried first. If it does not have a title, Auto Resolve tries the sources below.';
+
+  @override
+  String get manualMatchesRowSubtitle =>
+      'Titles you matched by hand with Wrong title? They ignore the order on this page.';
+
+  @override
+  String trackerUpToDate(String name) {
+    return '$name is up to date';
+  }
+
+  @override
+  String trackerStillUnreachable(String name) {
+    return 'Still could not reach $name. Will keep retrying.';
+  }
+
+  @override
+  String trackerUpdatesSavedSuffix(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: ' $count updates are saved and will sync automatically.',
+      one: ' 1 update is saved and will sync automatically.',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String trackerLastTrySuffix(String when) {
+    return ' Last try $when.';
+  }
+
+  @override
+  String trackerNeedsSignIn(String name) {
+    return '$name needs you to sign in again';
+  }
+
+  @override
+  String get lastSyncFailed => 'Last sync failed';
+
+  @override
+  String get updatesWaitingToSync => 'Updates waiting to sync';
+
+  @override
+  String get loginExpiredOrRevoked => 'The login expired or was revoked.';
+
+  @override
+  String get noConnectionDot => 'No connection.';
+
+  @override
+  String get justNow => 'just now';
+
+  @override
+  String minutesAgoShort(int minutes) {
+    return '$minutes min ago';
+  }
+
+  @override
+  String hoursAgoShort(int hours) {
+    return '$hours h ago';
+  }
+
+  @override
+  String get signInExpired => 'Sign-in expired';
+
+  @override
+  String connectedToName(String name) {
+    return 'Connected to $name';
+  }
+
+  @override
+  String get closeAskWhenDownloading => 'Ask when downloads are running';
+
+  @override
+  String get closeTrayWhileDownloading =>
+      'Keep running in the tray while downloading';
+
+  @override
+  String get closeAlwaysTray => 'Always keep running in the tray';
+
+  @override
+  String get closeAskDescription =>
+      'Closing quits, but asks first if downloads would stop.';
+
+  @override
+  String get closeTrayWhileDownloadingDescription =>
+      'Hides to the tray until downloads finish; otherwise quits.';
+
+  @override
+  String get closeAlwaysTrayDescription =>
+      'Closing hides the window. Quit from the tray icon menu.';
+
+  @override
+  String get closeQuitDescription =>
+      'Closing always quits, stopping any downloads.';
+
+  @override
+  String get startPageLastUsed => 'Where I left off';
+
+  @override
+  String afterNMinutes(int minutes) {
+    return 'After $minutes minutes';
+  }
+
+  @override
+  String get windowsSignInSettingRefused =>
+      'Windows didn\'t allow changing the sign-in setting';
+
+  @override
+  String get couldntSaveWindowSetting => 'Couldn\'t save the window setting';
+
+  @override
+  String get closeButtonDescription =>
+      'What the X button, Alt+F4 and the taskbar Close do.';
+
+  @override
+  String get startPageDescription =>
+      'The page Zangetsu opens on. Applies the next time you start the app.';
+
+  @override
+  String get autoLockDescription =>
+      'Lock a PIN-protected profile again when nobody has used the app for a while.';
+
+  @override
+  String get windowSection => 'Window';
+
+  @override
+  String get launchAtSignInSubtitle =>
+      'Start Zangetsu when you sign in to Windows';
+
+  @override
+  String get rememberWindowSubtitle =>
+      'Reopen where you left it, on the same screen. Off opens centred.';
+
+  @override
+  String get startPageSubtitle => 'The page shown when the app opens';
+
+  @override
+  String get newEpisodeAlertsWindowsSubtitle =>
+      'Show a Windows notification when a show you follow gets a new episode or chapter';
+
+  @override
+  String get autoLockSubtitle =>
+      'Locks a PIN-protected profile after no activity';
+
+  @override
+  String get lockWhenWindowsLocksSubtitle =>
+      'Win+L or the screen lock also locks your profile';
+
+  @override
+  String get keyboardSection => 'Keyboard';
+
+  @override
+  String get collapseSidebar => 'Collapse sidebar';
+
+  @override
+  String get expandSidebar => 'Expand sidebar';
+
+  @override
+  String get syncingListProgress => 'Syncing your list and progress…';
+
+  @override
+  String get synced => 'Synced';
+
+  @override
+  String syncedAtClickToSync(String when) {
+    return 'Synced at $when. Click to sync now';
+  }
+
+  @override
+  String get syncOfflineTooltip =>
+      'Offline: changes will sync when you are back online';
+
+  @override
+  String get signInToSyncListProgress =>
+      'Sign in to sync your list and progress';
+
+  @override
+  String get syncFailedClickRetry => 'Sync failed. Click to retry';
+
+  @override
+  String syncFailedErrorClickRetry(String error) {
+    return 'Sync failed: $error. Click to retry';
+  }
+
+  @override
+  String get syncNow => 'Sync now';
+
+  @override
+  String lastSyncedAtClickToSync(String when) {
+    return 'Last synced at $when. Click to sync now';
+  }
+
+  @override
+  String get connectionSettingsUnavailable => 'Connection settings unavailable';
+
+  @override
+  String get connectToInternetTryAgain =>
+      'Connect to the internet and try again.';
+
+  @override
+  String get clearSearchEsc => 'Clear search (Esc)';
+
+  @override
+  String sourceNoSiteToVerify(String name) {
+    return '$name has no site to verify';
+  }
+
+  @override
+  String verificationFailedError(String error) {
+    return 'Verification failed: $error';
+  }
+
+  @override
+  String get verificationNotCompleted => 'Verification was not completed';
+
+  @override
+  String verifiedTestingAgain(String name) {
+    return 'Verified. Testing $name again…';
+  }
+
+  @override
+  String get openSitePassCheckTestAgain =>
+      'Open the site, pass its check, then test again';
+
+  @override
+  String get verify => 'Verify';
+
+  @override
+  String get refreshRepositoriesF5 => 'Refresh repositories (F5)';
+
+  @override
+  String get disable => 'Disable';
+
+  @override
+  String get collapse => 'Collapse';
+
+  @override
+  String get expand => 'Expand';
+
+  @override
+  String get eachCategorySavedSeparately =>
+      'Each category is saved separately.';
+
+  @override
+  String get addAddon => 'Add addon';
+
+  @override
+  String get searchAddons => 'Search addons';
+
+  @override
+  String get addonUrl => 'Addon URL';
+
+  @override
+  String get openAppFolder => 'Open app folder';
+
+  @override
+  String get makeActiveSource => 'Make active source';
+
+  @override
+  String get installedUseMenu =>
+      'Installed. Use the ... menu to update or uninstall';
+
+  @override
+  String get moreActions => 'More actions';
+
+  @override
+  String get installingEllipsis => 'Installing…';
+
+  @override
+  String updatedDoneOfTotal(int done, int total, int failed) {
+    return 'Updated $done of $total. $failed failed';
+  }
+
+  @override
+  String get updatesThatFailed => 'Updates that failed';
+
+  @override
+  String extensionsNotUpdated(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count extensions not updated',
+      one: '1 extension not updated',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get filledFromClipboard => 'Filled in from your clipboard';
+
+  @override
+  String get noRepoLinkInDrop => 'No repository link found in what you dropped';
+
+  @override
+  String get linkTakenFromDrop => 'Link taken from what you dropped';
+
+  @override
+  String get dropLinkHere => 'Drop the link here';
+
+  @override
+  String get youCanAlsoDragLink =>
+      'You can also drag a link or a .json file here';
+
+  @override
+  String get appDataCouldNotOpen => 'Your app data could not be opened';
+
+  @override
+  String get appDataCouldNotOpenBody =>
+      'Your previous files have been kept. Make sure the previous data folder or drive is available and there is enough free space, then try again.';
+
+  @override
+  String get windowMinimize => 'Minimize';
+
+  @override
+  String get windowMaximize => 'Maximize';
+
+  @override
+  String downloadedEpisodesCount(int count) {
+    return 'Downloaded episodes ($count)';
+  }
+
+  @override
+  String get someDownloadsNotRemoved =>
+      'Some downloads could not be removed. Please try again.';
+
+  @override
+  String get selectShowsToDelete => 'Select shows to delete';
+
+  @override
+  String selectNamed(String name) {
+    return 'Select $name';
+  }
+
+  @override
+  String get savedEpisodes => 'Saved episodes';
+
+  @override
+  String countActive(int count) {
+    return '$count active';
+  }
+
+  @override
+  String otherFilesAndAttempts(int count) {
+    return 'Other files and previous attempts ($count)';
+  }
+
+  @override
+  String get eachFileKeepsSource =>
+      'Each file keeps its original source and audio information.';
+
+  @override
+  String get nextFeature => 'Next feature';
+
+  @override
+  String get newFromYourList => 'New from your list';
+
+  @override
+  String seeAllNamed(String title) {
+    return 'See all $title';
+  }
+
+  @override
+  String get openDownloads => 'Open downloads';
+
+  @override
+  String get verifyWebsite => 'Verify website';
+
+  @override
+  String get airingToday => 'Airing today';
+
+  @override
+  String get openTheShowPage => 'Open the show page';
+
+  @override
+  String get fullPlayer => 'Full player';
+
+  @override
+  String get fullPlayerDoubleClick => 'Full player · double-click';
+
+  @override
+  String get theatreMode => 'Theatre mode';
+
+  @override
+  String get exitTheatreMode => 'Exit theatre mode';
+
+  @override
+  String get fullScreenMode => 'Full screen';
+
+  @override
+  String get episodeRangeText => 'Episode range';
+
+  @override
+  String get searchTitlesEllipsis => 'Search titles...';
+
+  @override
+  String get checkingExtensionsForUpdates => 'Checking extensions for updates…';
+
+  @override
+  String get profilesAndAccount => 'Profiles & account';
+
+  @override
+  String watchingAsNameStatus(String name, String status) {
+    return 'Watching as $name · $status';
+  }
+
+  @override
+  String get sourcePriority => 'Source Priority';
+
+  @override
+  String get sourcePrioritySubtitle => 'Order Auto Resolve tries sources in';
+
+  @override
+  String get switchProfile => 'Switch profile';
+
+  @override
+  String get closePlayerToSwitchProfiles =>
+      'Close the player to switch profiles.';
+
+  @override
+  String get clickProfileToWatchAs =>
+      'Click a profile to watch as it. Locked profiles ask for their PIN.';
+
+  @override
+  String get windowsUpdates => 'Windows updates';
+
+  @override
+  String get windowsUpdatesSubtitle =>
+      'Opens the latest Windows build changes on GitHub';
+
+  @override
+  String get playerOpensIn => 'Player opens in';
+
+  @override
+  String get playDownloadedCopyIfFails =>
+      'Play downloaded copy if streaming fails';
+
+  @override
+  String get switchAutomatically => 'Switch automatically';
+
+  @override
+  String get askFirst => 'Ask first';
+
+  @override
+  String get adaptiveColour => 'Adaptive colour';
+
+  @override
+  String get appBackgroundColour => 'Background colour';
+
+  @override
+  String get titleLogoOnDetail => 'Title logo on Detail';
+
+  @override
+  String get appFont => 'App font';
+
+  @override
+  String get reverseEpisodeListAlwaysOn => 'Reverse episode list always on';
+
+  @override
+  String get openAppDataFolder => 'Open app data folder';
+
+  @override
+  String get openInFileExplorer => 'Open in File Explorer';
+
+  @override
+  String get appFontSubtitle => 'Everything in the app is drawn in this';
+
+  @override
+  String desktopSortChip(Object value) {
+    return 'Sort: $value';
+  }
+
+  @override
+  String get desktopMoreFilters => 'More filters';
+
+  @override
+  String desktopMoreFiltersCount(Object count) {
+    return 'More filters ($count)';
+  }
+
+  @override
+  String get desktopLibraryFiltersTooltip =>
+      'Filters: season, minimum score, tags';
+
+  @override
+  String get desktopSourceFiltersTooltip => 'Filters: audio, sources to search';
+
+  @override
+  String get desktopQuickSearchResults => 'Quick search results';
+
+  @override
+  String get desktopAddRepoSubtitle => 'Works for every extension ecosystem';
+
+  @override
+  String get desktopRepoLinkLabel => 'Repository link';
+
+  @override
+  String get desktopRepoLinkHint => 'https://…';
+
+  @override
+  String get desktopMoreOptions => 'More options…';
+
+  @override
+  String get desktopEcosystemLabel => 'Ecosystem';
+
+  @override
+  String desktopOpenEcosystemManager(Object ecosystem) {
+    return 'Open $ecosystem manager';
+  }
+
+  @override
+  String desktopOpenEcosystemManagerMenu(Object ecosystem) {
+    return 'Open $ecosystem manager…';
+  }
+
+  @override
+  String get desktopManageSourcesInSettings => 'Manage in Settings';
+
+  @override
+  String get desktopSourcesManagedInSettings =>
+      'Sources and their repositories are managed in Settings > Sources. Install some there and they will show up here.';
+
+  @override
+  String get desktopAllEcosystemsMenu => 'All ecosystems…';
+
+  @override
+  String get desktopSearchThisRepository => 'Search this repository';
+
+  @override
+  String get desktopSearchTitlesInSources => 'Search titles in these sources';
+
+  @override
+  String desktopSourceHasNoSettings(Object name) {
+    return '$name has no settings';
+  }
+
+  @override
+  String desktopPopularOn(Object source) {
+    return 'Popular on $source';
+  }
+
+  @override
+  String get desktopCouldntLoadRepository => 'Couldn\'t load this repository.';
+
+  @override
+  String get playerHardwareDecodeRetrying =>
+      'Hardware decoding failed. Retrying in software.';
+
+  @override
+  String get floatingPlayerExpand => 'Open the full player';
+
+  @override
+  String get floatingPlayerClose => 'Close the mini player';
+
+  @override
+  String desktopSourceLacksTitleStayAuto(String source) {
+    return '$source doesn\'t have this title, so it stays on Auto Resolve';
+  }
+
+  @override
+  String desktopDownloadedCut(String cut) {
+    return 'Downloaded · $cut';
+  }
+
+  @override
+  String desktopPlayingDownloadedCut(String cut) {
+    return 'Playing your downloaded $cut copy';
+  }
+
+  @override
+  String desktopSliderDefaultValue(String value) {
+    return 'Default: $value';
+  }
+
+  @override
+  String get desktopDownloadsAtOnceUnit => 'at once';
+
+  @override
+  String desktopConnectionsUnit(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'connections',
+      one: 'connection',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String desktopPagesAheadUnit(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'pages ahead',
+      one: 'page ahead',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String desktopSecondsUnit(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'seconds',
+      one: 'second',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String desktopSourcesUnit(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'sources',
+      one: 'source',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get desktopEpisodesAlreadyDownloaded =>
+      'These episodes are already downloaded.';
+
+  @override
+  String get desktopApproveInBrowserHint =>
+      'Approve in your browser, then choose \"Open Zangetsu\". Click here to cancel.';
 }

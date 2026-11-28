@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../core/desktop/desktop_sheet.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/zmode/metadata_filters.dart';
@@ -21,10 +22,13 @@ Future<MetaFilters?> showMetaFilterSheet(
   ZKind kind,
   MetaFilters current, {
   bool showStatus = true,
-}) => showModalBottomSheet<MetaFilters>(
-  context: context,
+}) => showAdaptiveSheet<MetaFilters>(
+  // Phone: the same bottom sheet as before. Windows: a centred, width-capped
+  // graphite dialog instead of a full-width strip (search-4).
+  context,
   backgroundColor: Colors.transparent,
   isScrollControlled: true,
+  desktopWidth: 560,
   builder: (_) =>
       _MetaFilterSheet(kind: kind, initial: current, showStatus: showStatus),
 );
@@ -70,7 +74,14 @@ class _MetaFilterSheetState extends State<_MetaFilterSheet> {
 
   @override
   Widget build(BuildContext context) {
-    final l10n = context.l10n;
+    // Windows dialog (search-4): no drag-to-resize sheet, just a body of a
+    // fixed, window-relative height inside the centred graphite dialog.
+    if (DesktopSheetScope.of(context)) {
+      return SizedBox(
+        height: (MediaQuery.sizeOf(context).height * 0.7).clamp(240.0, 620.0),
+        child: _content(context, null, desktop: true),
+      );
+    }
     return DraggableScrollableSheet(
       initialChildSize: 0.5,
       minChildSize: 0.32,
@@ -81,194 +92,201 @@ class _MetaFilterSheetState extends State<_MetaFilterSheet> {
           color: AppColors.defaultBg,
           borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
         ),
-        child: Column(
-          children: [
-            const SizedBox(height: 10),
-            Container(
-              width: 36,
-              height: 4,
-              decoration: BoxDecoration(
-                color: AppColors.surface2,
-                borderRadius: BorderRadius.circular(2),
-              ),
+        child: _content(context, scroll, desktop: false),
+      ),
+    );
+  }
+
+  /// The sheet's header, filter grid and Apply button. [desktop] drops the
+  /// phone drag handle (the Windows dialog cannot be dragged).
+  Widget _content(
+    BuildContext context,
+    ScrollController? scroll, {
+    required bool desktop,
+  }) {
+    final l10n = context.l10n;
+    return Column(
+      children: [
+        if (!desktop) ...[
+          const SizedBox(height: 10),
+          Container(
+            width: 36,
+            height: 4,
+            decoration: BoxDecoration(
+              color: AppColors.surface2,
+              borderRadius: BorderRadius.circular(2),
             ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 14, 12, 6),
-              child: Row(
-                children: [
-                  Expanded(child: Text(l10n.filters, style: AppText.barTitle)),
-                  // Only when there IS something to reset — a permanently
-                  // visible one reads as an action you forgot to take.
-                  if (_count > 0)
-                    TextButton(
-                      onPressed: () => setState(() => _f = const MetaFilters()),
-                      child: Text(l10n.reset),
-                    ),
-                ],
-              ),
-            ),
-            Expanded(
-              child: ListView(
-                controller: scroll,
-                padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
-                children: [
-                  // Two per row: these are short label/value pairs, and one
-                  // per line pushed half of them below the fold of a half
-                  // sheet — the thing the list format was meant to fix.
-                  _pair(
-                    _cell(
-                      l10n.sortBy,
-                      _sortLabel(context, _f.sort),
-                      true,
-                      () => _pick<MetaSort>(
-                        l10n.sortBy,
-                        MetaSort.values,
-                        _f.sort,
-                        (v) => _sortLabel(context, v),
-                        (v) => setState(() => _f = _f.copyWith(sort: v)),
-                      ),
-                    ),
-                    _cell(
-                      l10n.year,
-                      _f.year?.toString() ?? l10n.any,
-                      _f.year != null,
-                      () => _pick<int>(
-                        l10n.year,
-                        [
-                          for (
-                            var y = DateTime.now().year;
-                            y > DateTime.now().year - 25;
-                            y--
-                          )
-                            y,
-                        ],
-                        _f.year,
-                        (y) => '$y',
-                        (v) => setState(
-                          () => _f = _f.year == v
-                              ? _f.copyWith(clearYear: true)
-                              : _f.copyWith(year: v),
-                        ),
-                      ),
-                    ),
+          ),
+        ],
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 14, 12, 6),
+          child: Row(
+            children: [
+              Expanded(child: Text(l10n.filters, style: AppText.barTitle)),
+              // Only when there IS something to reset — a permanently
+              // visible one reads as an action you forgot to take.
+              if (_count > 0)
+                TextButton(
+                  onPressed: () => setState(() => _f = const MetaFilters()),
+                  child: Text(l10n.reset),
+                ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: ListView(
+            controller: scroll,
+            padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
+            children: [
+              // Two per row: these are short label/value pairs, and one
+              // per line pushed half of them below the fold of a half
+              // sheet — the thing the list format was meant to fix.
+              _pair(
+                _cell(
+                  l10n.sortBy,
+                  _sortLabel(context, _f.sort),
+                  true,
+                  () => _pick<MetaSort>(
+                    l10n.sortBy,
+                    MetaSort.values,
+                    _f.sort,
+                    (v) => _sortLabel(context, v),
+                    (v) => setState(() => _f = _f.copyWith(sort: v)),
                   ),
-                  _pair(
-                    widget.showStatus
-                        ? _cell(
-                            l10n.status,
-                            _f.status == null
-                                ? l10n.any
-                                : _statusLabel(_f.status!),
-                            _f.status != null,
-                            () => _pick<MetaStatus>(
-                              l10n.status,
-                              MetaStatus.values,
-                              _f.status,
-                              _statusLabel,
-                              (v) => setState(
-                                () => _f = _f.status == v
-                                    ? _f.copyWith(clearStatus: true)
-                                    : _f.copyWith(status: v),
-                              ),
-                            ),
-                          )
-                        : null,
-                    _cell(
-                      l10n.minimumScore,
-                      _f.minScore == null ? l10n.any : '${_f.minScore}+',
-                      _f.minScore != null,
-                      () => _pick<int>(
-                        l10n.minimumScore,
-                        const [50, 60, 70, 80, 90],
-                        _f.minScore,
-                        (v) => '$v+',
-                        (v) => setState(
-                          () => _f = _f.minScore == v
-                              ? _f.copyWith(clearScore: true)
-                              : _f.copyWith(minScore: v),
-                        ),
-                      ),
+                ),
+                _cell(
+                  l10n.year,
+                  _f.year?.toString() ?? l10n.any,
+                  _f.year != null,
+                  () => _pick<int>(
+                    l10n.year,
+                    [
+                      for (
+                        var y = DateTime.now().year;
+                        y > DateTime.now().year - 25;
+                        y--
+                      )
+                        y,
+                    ],
+                    _f.year,
+                    (y) => '$y',
+                    (v) => setState(
+                      () => _f = _f.year == v
+                          ? _f.copyWith(clearYear: true)
+                          : _f.copyWith(year: v),
                     ),
-                  ),
-                  // Season is an anime idea; TMDB has no equivalent, so it
-                  // would be a control that silently does nothing there.
-                  _pair(
-                    !_isVideo
-                        ? _cell(
-                            l10n.season,
-                            _f.season == null
-                                ? l10n.any
-                                : _seasonLabel(_f.season!),
-                            _f.season != null,
-                            () => _pick<MetaSeason>(
-                              l10n.season,
-                              MetaSeason.values,
-                              _f.season,
-                              _seasonLabel,
-                              (v) => setState(
-                                () => _f = _f.season == v
-                                    ? _f.copyWith(clearSeason: true)
-                                    : _f.copyWith(season: v),
-                              ),
-                            ),
-                          )
-                        : null,
-                    _formats().isEmpty
-                        ? null
-                        : _cell(
-                            l10n.format,
-                            _f.format == null
-                                ? l10n.any
-                                : _formatLabel(_f.format!),
-                            _f.format != null,
-                            () => _pick<MetaFormat>(
-                              l10n.format,
-                              _formats(),
-                              _f.format,
-                              _formatLabel,
-                              (v) => setState(
-                                () => _f = _f.format == v
-                                    ? _f.copyWith(clearFormat: true)
-                                    : _f.copyWith(format: v),
-                              ),
-                            ),
-                          ),
-                  ),
-                  // Genres is the multi-select and its value is the longest,
-                  // so it takes the full width rather than being truncated
-                  // into half of one.
-                  _cell(
-                    l10n.genres,
-                    _f.genres.isEmpty ? l10n.any : _f.genres.join(', '),
-                    _f.genres.isNotEmpty,
-                    _pickGenres,
-                  ),
-                ],
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 6, 20, 14),
-              child: SizedBox(
-                width: double.infinity,
-                height: 48,
-                child: FilledButton(
-                  style: FilledButton.styleFrom(
-                    backgroundColor: AppColors.accent,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                  ),
-                  onPressed: () => Navigator.of(context).pop(_f),
-                  child: Text(
-                    _count == 0 ? l10n.apply : '${l10n.apply} ($_count)',
-                    style: AppText.button.copyWith(color: Colors.white),
                   ),
                 ),
               ),
-            ),
-          ],
+              _pair(
+                widget.showStatus
+                    ? _cell(
+                        l10n.status,
+                        _f.status == null ? l10n.any : _statusLabel(_f.status!),
+                        _f.status != null,
+                        () => _pick<MetaStatus>(
+                          l10n.status,
+                          MetaStatus.values,
+                          _f.status,
+                          _statusLabel,
+                          (v) => setState(
+                            () => _f = _f.status == v
+                                ? _f.copyWith(clearStatus: true)
+                                : _f.copyWith(status: v),
+                          ),
+                        ),
+                      )
+                    : null,
+                _cell(
+                  l10n.minimumScore,
+                  _f.minScore == null ? l10n.any : '${_f.minScore}+',
+                  _f.minScore != null,
+                  () => _pick<int>(
+                    l10n.minimumScore,
+                    const [50, 60, 70, 80, 90],
+                    _f.minScore,
+                    (v) => '$v+',
+                    (v) => setState(
+                      () => _f = _f.minScore == v
+                          ? _f.copyWith(clearScore: true)
+                          : _f.copyWith(minScore: v),
+                    ),
+                  ),
+                ),
+              ),
+              // Season is an anime idea; TMDB has no equivalent, so it
+              // would be a control that silently does nothing there.
+              _pair(
+                !_isVideo
+                    ? _cell(
+                        l10n.season,
+                        _f.season == null ? l10n.any : _seasonLabel(_f.season!),
+                        _f.season != null,
+                        () => _pick<MetaSeason>(
+                          l10n.season,
+                          MetaSeason.values,
+                          _f.season,
+                          _seasonLabel,
+                          (v) => setState(
+                            () => _f = _f.season == v
+                                ? _f.copyWith(clearSeason: true)
+                                : _f.copyWith(season: v),
+                          ),
+                        ),
+                      )
+                    : null,
+                _formats().isEmpty
+                    ? null
+                    : _cell(
+                        l10n.format,
+                        _f.format == null ? l10n.any : _formatLabel(_f.format!),
+                        _f.format != null,
+                        () => _pick<MetaFormat>(
+                          l10n.format,
+                          _formats(),
+                          _f.format,
+                          _formatLabel,
+                          (v) => setState(
+                            () => _f = _f.format == v
+                                ? _f.copyWith(clearFormat: true)
+                                : _f.copyWith(format: v),
+                          ),
+                        ),
+                      ),
+              ),
+              // Genres is the multi-select and its value is the longest,
+              // so it takes the full width rather than being truncated
+              // into half of one.
+              _cell(
+                l10n.genres,
+                _f.genres.isEmpty ? l10n.any : _f.genres.join(', '),
+                _f.genres.isNotEmpty,
+                _pickGenres,
+              ),
+            ],
+          ),
         ),
-      ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 6, 20, 14),
+          child: SizedBox(
+            width: double.infinity,
+            height: 48,
+            child: FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: AppColors.accent,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              onPressed: () => Navigator.of(context).pop(_f),
+              child: Text(
+                _count == 0 ? l10n.apply : '${l10n.apply} ($_count)',
+                style: AppText.button.copyWith(color: Colors.white),
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -357,8 +375,12 @@ class _MetaFilterSheetState extends State<_MetaFilterSheet> {
     String Function(T) label,
     void Function(T) onPicked,
   ) async {
-    final v = await showModalBottomSheet<T>(
-      context: context,
+    // Opened from the filter dialog on Windows this becomes a small centred
+    // dialog over it (never a second stacked sheet); phone is unchanged.
+    final v = await showAdaptiveSheet<T>(
+      context,
+      title: title,
+      desktopWidth: 380,
       backgroundColor: AppColors.bg,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
@@ -367,11 +389,14 @@ class _MetaFilterSheetState extends State<_MetaFilterSheet> {
         child: ListView(
           shrinkWrap: true,
           children: [
-            const SizedBox(height: 14),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 20),
-              child: Text(title, style: AppText.barTitle),
-            ),
+            // The Windows dialog already shows [title] in its title bar.
+            if (!DesktopSheetScope.of(sheet)) ...[
+              const SizedBox(height: 14),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: Text(title, style: AppText.barTitle),
+              ),
+            ],
             const SizedBox(height: 6),
             for (final v in values)
               ListTile(
@@ -393,8 +418,12 @@ class _MetaFilterSheetState extends State<_MetaFilterSheet> {
   /// Genres are the one multi-select, so they get chips of their own rather
   /// than a single-value list.
   Future<void> _pickGenres() async {
-    final picked = await showModalBottomSheet<List<String>>(
-      context: context,
+    // Same rule as [_pick]: a centred dialog over the filter dialog on
+    // Windows, the unchanged bottom sheet on phone.
+    final picked = await showAdaptiveSheet<List<String>>(
+      context,
+      title: context.l10n.genres,
+      desktopWidth: 560,
       backgroundColor: AppColors.bg,
       isScrollControlled: true,
       shape: const RoundedRectangleBorder(
@@ -402,63 +431,73 @@ class _MetaFilterSheetState extends State<_MetaFilterSheet> {
       ),
       builder: (sheet) {
         var sel = [..._f.genres];
+        // Windows: title lives in the dialog's title bar and the chips
+        // scroll, since a long genre list can be taller than the dialog.
+        final desktop = DesktopSheetScope.of(sheet);
+        Widget scrollable(Widget chips) => desktop
+            ? Flexible(child: SingleChildScrollView(child: chips))
+            : chips;
         return StatefulBuilder(
           builder: (sheet2, setSheet) => SafeArea(
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(20, 14, 20, 14),
+              padding: EdgeInsets.fromLTRB(20, desktop ? 4 : 14, 20, 14),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(context.l10n.genres, style: AppText.barTitle),
-                  const SizedBox(height: 14),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: [
-                      // Follows the 18+ switch rather than Settings: the
-                      // toggle sits right beside this sheet, and offering the
-                      // adult genre while it is off would select a genre the
-                      // query then filters out — an empty grid and no reason
-                      // given. Turn 18+ on and it appears here.
-                      for (final g in metaGenresFor(
-                        widget.kind,
-                        adult: _f.adult,
-                      ))
-                        GestureDetector(
-                          onTap: () => setSheet(() {
-                            sel.contains(g) ? sel.remove(g) : sel.add(g);
-                          }),
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 14,
-                              vertical: 8,
-                            ),
-                            decoration: BoxDecoration(
-                              color: sel.contains(g)
-                                  ? AppColors.accent.withValues(alpha: 0.16)
-                                  : AppColors.surface,
-                              borderRadius: BorderRadius.circular(20),
-                              border: Border.all(
-                                color: sel.contains(g)
-                                    ? AppColors.accent
-                                    : Colors.transparent,
+                  if (!desktop) ...[
+                    Text(context.l10n.genres, style: AppText.barTitle),
+                    const SizedBox(height: 14),
+                  ],
+                  scrollable(
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        // Follows the 18+ switch rather than Settings: the
+                        // toggle sits right beside this sheet, and offering the
+                        // adult genre while it is off would select a genre the
+                        // query then filters out — an empty grid and no reason
+                        // given. Turn 18+ on and it appears here.
+                        for (final g in metaGenresFor(
+                          widget.kind,
+                          adult: _f.adult,
+                        ))
+                          GestureDetector(
+                            onTap: () => setSheet(() {
+                              sel.contains(g) ? sel.remove(g) : sel.add(g);
+                            }),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                                vertical: 8,
                               ),
-                            ),
-                            child: Text(
-                              g,
-                              style: AppText.caption.copyWith(
+                              decoration: BoxDecoration(
                                 color: sel.contains(g)
-                                    ? AppColors.accent
-                                    : AppColors.textPrimary,
-                                fontWeight: sel.contains(g)
-                                    ? FontWeight.w700
-                                    : FontWeight.w500,
+                                    ? AppColors.accent.withValues(alpha: 0.16)
+                                    : AppColors.surface,
+                                borderRadius: BorderRadius.circular(20),
+                                border: Border.all(
+                                  color: sel.contains(g)
+                                      ? AppColors.accent
+                                      : Colors.transparent,
+                                ),
+                              ),
+                              child: Text(
+                                g,
+                                style: AppText.caption.copyWith(
+                                  color: sel.contains(g)
+                                      ? AppColors.accent
+                                      : AppColors.textPrimary,
+                                  fontWeight: sel.contains(g)
+                                      ? FontWeight.w700
+                                      : FontWeight.w500,
+                                ),
                               ),
                             ),
                           ),
-                        ),
-                    ],
+                      ],
+                    ),
                   ),
                   const SizedBox(height: 18),
                   SizedBox(

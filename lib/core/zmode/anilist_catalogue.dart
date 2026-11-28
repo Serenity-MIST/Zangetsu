@@ -1,9 +1,11 @@
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform;
 
 import '../models/episode.dart';
 import '../models/home_section.dart';
 import '../models/media_detail.dart';
-import '../anilist/anilist_network_policy.dart';
+
 import '../anilist/anilist_title.dart';
 import '../models/media_item.dart';
 import '../models/provider_info.dart';
@@ -33,35 +35,32 @@ class AniListCatalogue implements AnimeCatalogue {
 
   static const _endpoint = 'https://graphql.anilist.co';
 
-  /// Production transport. Same shape as `AiringService`.
+  /// Production transport. Provider failures must escape so the repository can
+  /// try its backup instead of reporting an outage as a successful empty search.
   static Gql dioGql(Dio dio) => (query, variables) async {
-    try {
-      final res = await dio.post<dynamic>(
-        _endpoint,
-        data: {'query': query, 'variables': variables},
-        options: Options(
-          headers: const {'Accept': 'application/json'},
-          validateStatus: (s) => s != null && s < 500,
-        ),
+    final res = await dio.post<dynamic>(
+      _endpoint,
+      data: {'query': query, 'variables': variables},
+      options: Options(
+        headers: const {'Accept': 'application/json'},
+        validateStatus: (s) => s != null && s < 500,
+      ),
+    );
+    final body = res.data;
+    final errors = body is Map ? body['errors'] : null;
+    if ((res.statusCode ?? 500) >= 400 ||
+        (errors is List && errors.isNotEmpty) ||
+        body is! Map ||
+        body['data'] is! Map) {
+      throw DioException(
+        requestOptions: res.requestOptions,
+        response: res,
+        type: DioExceptionType.badResponse,
+        message: 'AniList catalogue request failed',
       );
-      final data = res.data;
-      if (data is Map && data['data'] is Map) {
-        return Map<String, dynamic>.from(data['data'] as Map);
-      }
-    } on DioException catch (e) {
-      // A transport failure is not "no data". Swallowing it left the caller
-      // holding an empty list it could not tell apart from a quiet catalogue,
-      // so Home could never distinguish an offline phone from a provider
-      // outage — and told people with no network to switch metadata provider.
-      //
-      // A response that DID arrive still returns null: a 4xx/5xx with a body,
-      // or a GraphQL error envelope, is the server answering, and every caller
-      // already handles that as "nothing came back".
-      if (e.response == null || aniListRateLimitOf(e) != null) rethrow;
-    } catch (_) {}
-    return null;
+    }
+    return Map<String, dynamic>.from(body['data'] as Map);
   };
-
   static const _fields =
       'id idMal title{romaji english native} coverImage{large extraLarge} '
       'bannerImage episodes chapters status genres description(asHtml:false) '
@@ -84,6 +83,11 @@ class AniListCatalogue implements AnimeCatalogue {
       // One int, for the poster's score badge. The rest of the detail fields
       // stay out for the reason above; this one is a number, not a payload.
       'averageScore genres';
+
+  /// Whether the Home banner row carries each title's synopsis (Windows
+  /// only; see [home]). Tests may flip it.
+  static bool homeBannerDescriptions =
+      defaultTargetPlatform == TargetPlatform.windows;
 
   static String _type(ZKind k) => k == ZKind.anime ? 'ANIME' : 'MANGA';
   static String _format(ZKind k) => switch (k) {
@@ -179,8 +183,15 @@ class AniListCatalogue implements AnimeCatalogue {
     final rows = _rows(kind);
     final query = rows.indexed
         .map((e) {
-          final (i, (_, args)) = e;
-          return 'r$i: Page(perPage:30){ media(type:${_type(kind)}$_adultExclusion${_format(kind)},$args){ $_listFields } }';
+          final (i, (title, args)) = e;
+          // Windows: the banner row (Trending) also asks for the synopsis in
+          // this same request, so the banner can show a short description
+          // without loading each show's details. Only that one row pays for
+          // it; every other row keeps the lean list fields.
+          final fields = homeBannerDescriptions && title == 'Trending'
+              ? '$_listFields description(asHtml:false)'
+              : _listFields;
+          return 'r$i: Page(perPage:30){ media(type:${_type(kind)}$_adultExclusion${_format(kind)},$args){ $fields } }';
         })
         .join(' ');
     final data = await _gql('query{ $query }', const {});
@@ -217,6 +228,33 @@ class AniListCatalogue implements AnimeCatalogue {
 
   Future<List<MediaItem>> search(String q, ZKind kind) =>
       searchFiltered(q, kind);
+
+  /// The few fields the Windows Home banner needs to describe a source
+  /// catalogue title: its names (to check it really is the same show) and
+  /// its synopsis. Nothing else, so the answer stays tiny.
+  static const _bannerFields =
+      'id title{romaji english native} synonyms description(asHtml:false) '
+      'genres episodes seasonYear';
+
+  /// Windows Home banner: the single best AniList hit for [title] (an anime,
+  /// or a manga / novel when [manga] is true) as the raw media map, or null
+  /// when AniList has nothing. One small request, no detail, no episode
+  /// list. Transport errors (including HTTP 429) are NOT swallowed here, so
+  /// the caller can back off; it decides what to show.
+  Future<Map<String, dynamic>?> bannerLookup(
+    String title, {
+    required bool manga,
+  }) async {
+    final data = await _gql(
+      'query(\$q:String){Page(perPage:1){media(search:\$q,'
+      'type:${manga ? 'MANGA' : 'ANIME'}$_adultExclusion){$_bannerFields}}}',
+      {'q': title},
+    );
+    final page = data?['Page'];
+    final media = page is Map ? page['media'] : null;
+    if (media is! List || media.isEmpty || media.first is! Map) return null;
+    return Map<String, dynamic>.from(media.first as Map);
+  }
 
   /// AniList's own genre vocabulary.
   ///
@@ -466,6 +504,8 @@ class AniListCatalogue implements AnimeCatalogue {
       englishTitle: aniListAltTitle(t, aniListTitle(t, titleLanguagePref)),
       cover: (m['coverImage'] as Map?)?['large'] as String?,
       banner: m['bannerImage'] as String?,
+      // Only present on the Windows banner row (see [home]).
+      description: m['description'] as String?,
       url: ZmodeIds.showUrl(c),
       type: _providerType(kind),
       sourceId: ZmodeIds.sourceId,

@@ -1,6 +1,6 @@
 import 'package:flutter/foundation.dart';
+import 'library_repair.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
-import 'package:watch_app/core/hive/hive_key.dart';
 import 'package:hive/hive.dart';
 
 import '../models/media_item.dart';
@@ -31,7 +31,7 @@ class ListStatusStore {
   final ValueNotifier<int> revision = ValueNotifier<int>(0);
 
   String keyOf(MediaItem m) =>
-      profileScopedKey(_profileId, hiveKey('${m.sourceId}::${m.id}'));
+      profileScopedKey(_profileId, libraryStorageKey(m));
 
   WatchStatus? statusOf(MediaItem m) =>
       watchStatusFromName(_box.get(keyOf(m)) as String?);
@@ -39,14 +39,23 @@ class ListStatusStore {
   WatchStatus? statusOfKey(String key) =>
       watchStatusFromName(_box.get(key) as String?);
 
+  /// Called after every [setStatus] / [setStatusKey] with the stored key and
+  /// new status. The auto Paused/Dropped runner hooks this so a manual move
+  /// restarts that title's idle clock at once, even if the status is changed
+  /// back before the next sweep. Null (no listener) on most platforms.
+  static void Function(String key, WatchStatus status)? onStatusSet;
+
   Future<void> setStatus(MediaItem m, WatchStatus status) async {
-    await _box.put(keyOf(m), status.name);
+    final key = keyOf(m);
+    await _box.put(key, status.name);
     revision.value++;
+    onStatusSet?.call(key, status);
   }
 
   Future<void> setStatusKey(String key, WatchStatus status) async {
     await _box.put(key, status.name);
     revision.value++;
+    onStatusSet?.call(key, status);
   }
 
   Future<void> remove(MediaItem m) async {

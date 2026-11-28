@@ -107,6 +107,7 @@ class HistoryCanonicalMerge {
               cover: e.cover,
               coverHeaders: e.coverHeaders,
               thumbnail: e.thumbnail,
+              backdrop: e.backdrop,
               showUrl: showUrl,
               category: e.category,
               episodeId: '$ep',

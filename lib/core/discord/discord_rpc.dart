@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'dart:math';
 
 import 'package:app_links/app_links.dart';
@@ -8,8 +9,12 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
 import 'package:hive/hive.dart';
 
+import '../boot_network.dart';
 import '../platform/apple_tv.dart';
+import '../desktop/desktop_oauth.dart';
+import '../desktop/desktop_prefs.dart';
 import '../privacy/incognito_mode.dart';
+import 'discord_activity_watch.dart';
 import 'discord_auth.dart';
 import 'discord_config.dart';
 import 'discord_gateway.dart';
@@ -63,6 +68,68 @@ class DiscordRpc {
   /// lets the next [setWatching] cancel it.
   static const Duration playerExitClearDelay = Duration(seconds: 2);
 
+  // ── Windows connection upkeep ─────────────────────────────────────────────
+
+  /// Whether the Windows-only connection rules apply (SDK transport with the
+  /// raw gateway as fallback, shared refresh, retries). Phone and TV keep
+  /// their own behaviour.
+  static bool get _isWindows =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.windows;
+
+  /// Set when the SDK loaded but could not start after all; the raw gateway
+  /// is used for the rest of this run of the app.
+  bool _sdkUnavailable = false;
+
+  /// The login the current gateway was last given.
+  String? _gatewayToken;
+
+  /// The refresh in flight, shared by everyone who needs one. Discord swaps
+  /// the refresh token on every use, so a second one at the same time would
+  /// use up a token that is already spent.
+  Future<String?>? _refreshing;
+
+  /// When the last refresh worked, and how long after it a rejected login may
+  /// be refreshed again. Grows while Discord keeps rejecting fresh logins.
+  DateTime? _refreshedAt;
+  static const Duration _firstRefreshGap = Duration(minutes: 5);
+  Duration _refreshGap = _firstRefreshGap;
+
+  /// When the last refresh failed without ending the login (no network, a
+  /// server fault). The next one waits at least [_refreshRetryGap], so window
+  /// focus or a status change cannot hammer Discord.
+  DateTime? _refreshFailedAt;
+  static const Duration _refreshRetryGap = Duration(seconds: 10);
+
+  /// Goes up whenever the login ends or is replaced, so the answer to an older
+  /// refresh cannot bring the old login back.
+  int _loginEpoch = 0;
+
+  /// Whether [at] is less than [gap] ago. A clock that was set back counts as
+  /// long ago.
+  bool _within(DateTime? at, Duration gap) {
+    if (at == null) return false;
+    final passed = debugNow().difference(at);
+    return !passed.isNegative && passed < gap;
+  }
+
+  /// The rejected-login handling in flight; a second report joins it.
+  Future<void>? _authFailure;
+
+  /// Retries connecting while there is no gateway because the login could not
+  /// be refreshed (for example no network at launch).
+  Timer? _connectRetry;
+  static const Duration _firstConnectRetry = Duration(seconds: 30);
+  Duration _connectRetryWait = _firstConnectRetry;
+
+  /// Builds the raw gateway; tests replace it so no real socket opens.
+  @visibleForTesting
+  DiscordGateway Function(String token, Future<void> Function() onAuthFailure)?
+  debugRawGateway;
+
+  /// Clock, replaceable so tests can fake time.
+  @visibleForTesting
+  DateTime Function() debugNow = DateTime.now;
+
   bool get enabled => _enabled;
   bool get loggedIn => _accessToken != null && _accessToken!.isNotEmpty;
 
@@ -101,13 +168,100 @@ class DiscordRpc {
       'configured=${DiscordConfig.configured} incognito=${IncognitoMode.on} '
       'foreground=$_foreground → $_skipReason',
     );
-    if (_canRun) unawaited(_connect());
+    // Windows: start watching input and the window state so an idle or
+    // minimised app stops advertising itself (track-12). Skipped under
+    // `flutter test`, whose fake binding would keep its timer pending; tests
+    // attach their own watch through [debugAttachActivityWatch].
+    if (_showsIdlePresence &&
+        !Platform.environment.containsKey('FLUTTER_TEST')) {
+      debugAttachActivityWatch(
+        DiscordActivityWatch(onChanged: refreshVisibility)..install(),
+      );
+    }
+    if (_isWindows) {
+      BootConnectivity.instance.offline.addListener(_onOfflineChanged);
+    }
+    if (_canRun) {
+      unawaited(_connect());
+      // Windows: show "Browsing" from launch rather than an empty profile.
+      if (_current == null && _showsIdlePresence) unawaited(setBrowsing());
+    }
+  }
+
+  // ── Away / "only while watching" (track-12, Windows) ──────────────────────
+
+  /// Idle / minimised watcher; null off Windows and in tests.
+  DiscordActivityWatch? _watch;
+
+  /// The presence hidden state last pushed, so a flip sends exactly once.
+  bool _sentHidden = false;
+
+  /// Installs [watch] as the away detector (the app uses a real one; tests
+  /// pass one they drive by hand). Replaces and disposes any previous one.
+  @visibleForTesting
+  void debugAttachActivityWatch(DiscordActivityWatch? watch) {
+    if (identical(_watch, watch)) return;
+    _watch?.dispose();
+    _watch = watch;
+  }
+
+  /// "Only while watching" (Windows): no Browsing / Looking at status at all.
+  bool get _onlyWhileWatching =>
+      _showsIdlePresence && DesktopPrefs.discordOnlyWhileWatching;
+
+  /// Whether the current presence should be hidden from Discord right now.
+  /// A playing video is never hidden; a paused one counts as watching for
+  /// "only while watching" but is hidden when the person is away.
+  bool get presenceHidden {
+    if (!_showsIdlePresence) return false;
+    final kind = _lastPresenceKind;
+    if (kind == _PresenceKind.playing) return false;
+    if (_onlyWhileWatching && kind != _PresenceKind.paused) return true;
+    final w = _watch;
+    return w != null && (w.idle || w.minimised);
+  }
+
+  /// What Discord should show: the current activity, or nothing while hidden.
+  DiscordActivity? get _visible => presenceHidden ? null : _current;
+
+  /// Re-sends presence after the away state or the "only while watching"
+  /// setting changed: clears it when it should be hidden, restores the kept
+  /// activity when it may show again. Cheap no-op when nothing flipped.
+  void refreshVisibility() {
+    final hidden = presenceHidden;
+    if (hidden == _sentHidden) return;
+    debugPrint('[discord] presence ${hidden ? 'hidden (away)' : 'restored'}');
+    if (_canRun && _gateway != null) _queuePresenceSend();
+  }
+
+  /// Windows: the network came back, so try at once instead of waiting out a
+  /// retry that may be minutes away.
+  void _onOfflineChanged() {
+    if (!_isWindows || BootConnectivity.instance.offline.value || !_canRun) {
+      return;
+    }
+    final g = _gateway;
+    if (g != null) {
+      g.retryNow();
+      return;
+    }
+    _cancelConnectRetry();
+    _refreshFailedAt = null;
+    unawaited(_connect());
   }
 
   void _onIncognitoChanged() {
     debugPrint('[discord] incognito=${IncognitoMode.on}');
     if (_canRun) {
       unawaited(_connect());
+      // Windows: nothing kept to show (incognito was already on at launch, or
+      // the video was closed meanwhile), so show Browsing again. Not over a
+      // paused video that "show when paused" keeps off the profile.
+      if (_showsIdlePresence &&
+          _current == null &&
+          _lastPresenceKind != _PresenceKind.paused) {
+        unawaited(setBrowsing());
+      }
     } else {
       unawaited(_disconnect());
     }
@@ -118,12 +272,23 @@ class DiscordRpc {
     await _box.put('enabled', value);
     debugPrint('[discord] setEnabled $value');
     if (_canRun) {
-      unawaited(_connect());
+      _refreshFailedAt = null; // the person asked: try at once
+      unawaited(_connect(restartStopped: true));
+      // Windows: turning presence on from Settings should show something on
+      // the profile straight away, not only after the next title page.
+      if (value && _current == null && _showsIdlePresence) {
+        unawaited(setBrowsing());
+      }
     } else {
       if (!value) _current = null;
       unawaited(_disconnect());
     }
   }
+
+  /// Desktop shows a plain "Browsing" activity whenever nothing more specific
+  /// is set; phone/TV keep their original event-driven behaviour.
+  bool get _showsIdlePresence =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.windows;
 
   // ── OAuth login ─────────────────────────────────────────────────────────
   // Browser flow (external application, never a WebView): the
@@ -178,6 +343,16 @@ class DiscordRpc {
         state: state,
         challenge: DiscordAuth.codeChallenge(verifier),
       );
+      // Windows: the browser can only hand discord-<appId>:/authorize/callback
+      // back to us once that scheme points at this exe (Android/iOS declare
+      // it in the manifest/plist instead).
+      final callbackError = await DesktopOAuth.ensureBrowserCallback(
+        scheme: DiscordAuth.redirectScheme(DiscordConfig.applicationId),
+      );
+      if (callbackError != null) {
+        lastAuthError = callbackError;
+        return false;
+      }
       // Discord's Android app handles its action URI, not the web OAuth path.
       var opened = false;
       if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
@@ -199,7 +374,9 @@ class DiscordRpc {
       // The redirect can arrive before launchUrl finishes; retain this future.
       return await pending.future.timeout(const Duration(minutes: 3));
     } on TimeoutException {
-      lastAuthError = 'Discord login timed out. Please try connecting again.';
+      lastAuthError = DesktopOAuth.usesRegisteredCallback
+          ? DesktopOAuth.noCallbackMessage('Discord')
+          : 'Discord login timed out. Please try connecting again.';
       return false;
     } catch (_) {
       lastAuthError ??= 'Could not start Discord login. Please try again.';
@@ -212,6 +389,16 @@ class DiscordRpc {
       }
       if (!pending.isCompleted) pending.complete(false);
     }
+  }
+
+  /// Abandons a browser login still waiting for its redirect; [connect] then
+  /// returns false and clears the stored verifier/state so a late callback
+  /// is ignored.
+  void cancelConnect() {
+    final pending = _pendingAuth;
+    if (pending == null || pending.isCompleted || _handlingRedirect) return;
+    lastAuthError = 'Discord login cancelled.';
+    pending.complete(false);
   }
 
   void _onLink(Uri uri) {
@@ -278,11 +465,12 @@ class DiscordRpc {
             : 'Discord could not complete login (HTTP ${res.statusCode}${error == null ? '' : ': $error'}).';
         return false;
       }
+      _loginEpoch++; // a refresh of the previous login no longer counts
       await _storeSession(d);
       await _fetchAccount();
       _accessToken = _box.get('accessToken') as String?;
       debugPrint('[discord] oauth login stored');
-      if (_canRun) unawaited(_connect());
+      if (_canRun) unawaited(_connect(restartStopped: true));
       return true;
     } catch (e) {
       debugPrint('[discord] code exchange failed: $e');
@@ -291,6 +479,10 @@ class DiscordRpc {
   }
 
   Future<void> _storeSession(Map<dynamic, dynamic> d) async {
+    if (_isWindows) {
+      await _storeSessionAtOnce(d);
+      return;
+    }
     await _box.put('accessToken', '${d['access_token']}');
     final refresh = d['refresh_token'];
     if (refresh != null && '$refresh'.isNotEmpty) {
@@ -303,6 +495,22 @@ class DiscordRpc {
           ? DateTime.now().millisecondsSinceEpoch + expiresIn * 1000
           : 0,
     );
+  }
+
+  /// Windows: the same values in a single write, which takes effect before this
+  /// returns its future. A sign-out or a new login can come before or after it,
+  /// but never in the middle.
+  Future<void> _storeSessionAtOnce(Map<dynamic, dynamic> d) {
+    final refresh = d['refresh_token'];
+    final expiresIn = (d['expires_in'] as num?)?.toInt() ?? 0;
+    _refreshFailedAt = null;
+    return _box.putAll({
+      'accessToken': '${d['access_token']}',
+      if (refresh != null && '$refresh'.isNotEmpty) 'refreshToken': '$refresh',
+      'expiresAt': expiresIn > 0
+          ? DateTime.now().millisecondsSinceEpoch + expiresIn * 1000
+          : 0,
+    });
   }
 
   /// A valid access token, refreshing first when it expires within 60s. This
@@ -321,9 +529,26 @@ class DiscordRpc {
 
   /// Force a refresh (gateway invalid-session, or expiry). Null when the
   /// session is dead — the caller logs out and the settings show login again.
-  Future<String?> _refreshNow() async {
+  Future<String?> _refreshNow() {
+    if (!_isWindows) return _refreshOnce();
+    // Windows: one refresh at a time, shared by expiry and a rejected login.
+    final running = _refreshing;
+    if (running != null) return running;
+    if (_within(_refreshFailedAt, _refreshRetryGap)) {
+      return Future<String?>.value();
+    }
+    return _refreshing = _refreshOnce().whenComplete(() {
+      _refreshing = null;
+    });
+  }
+
+  Future<String?> _refreshOnce() async {
     final refresh = _box.get('refreshToken') as String?;
-    if (refresh == null || refresh.isEmpty) return null;
+    if (refresh == null || refresh.isEmpty) {
+      if (_isWindows) await _loginDead('no refresh possible');
+      return null;
+    }
+    final epoch = _loginEpoch;
     try {
       final res = await _dio.post<dynamic>(
         DiscordAuth.tokenEndpoint,
@@ -338,15 +563,49 @@ class DiscordRpc {
         ),
       );
       final d = res.data;
-      if (d is! Map || d['access_token'] == null) return null;
+      if (_isWindows &&
+          (epoch != _loginEpoch || _box.get('refreshToken') != refresh)) {
+        // Signed out (or in again) while waiting: this answer belongs to a
+        // login that is gone and must not bring it back.
+        debugPrint('[discord] login changed during refresh — ignored');
+        return _accessToken;
+      }
+      if (d is! Map || d['access_token'] == null) {
+        if (_isWindows) {
+          final error = d is Map ? d['error'] : null;
+          if (error == 'invalid_grant') {
+            await _loginDead('invalid_grant');
+          } else {
+            debugPrint(
+              '[discord] login refresh refused (HTTP ${res.statusCode}) — '
+              'kept, trying again later',
+            );
+            _refreshFailedAt = debugNow();
+          }
+        }
+        return null;
+      }
       await _storeSession(d);
+      // Signed out while this was being saved: the box is empty again, and so
+      // is the login.
       _accessToken = _box.get('accessToken') as String?;
-      debugPrint('[discord] token refreshed');
+      if (_isWindows && epoch != _loginEpoch) return _accessToken;
+      _refreshedAt = debugNow();
+      debugPrint('[discord] login refreshed');
       return _accessToken;
     } catch (e) {
       debugPrint('[discord] refresh failed: $e');
+      if (_isWindows && epoch == _loginEpoch) _refreshFailedAt = debugNow();
       return null;
     }
+  }
+
+  /// Windows: Discord will never accept this login again, so sign out and let
+  /// the settings offer a new one. Nothing else (no network, a server fault,
+  /// a rate limit) may end a login.
+  Future<void> _loginDead(String why) async {
+    debugPrint('[discord] login is no longer valid ($why) — signing out');
+    await logout();
   }
 
   Future<void> _fetchAccount() async {
@@ -379,19 +638,37 @@ class DiscordRpc {
   /// Log out: drop the session + tokens and disconnect. The account is
   /// untouched — reconnecting is one browser tap.
   Future<void> logout() async {
-    await setEnabled(false);
-    for (final k in const [
+    const keys = [
       'accessToken',
       'refreshToken',
       'expiresAt',
       'username',
       'displayName',
       'avatarUrl',
-    ]) {
-      await _box.delete(k);
+    ];
+    Future<void>? gone;
+    if (_isWindows) {
+      // All of it at once, before anything else: a refresh answer that arrives
+      // during the waits below finds the login gone and is ignored.
+      _loginEpoch++;
+      _accessToken = null;
+      gone = _box.deleteAll(keys);
+    }
+    await setEnabled(false);
+    if (gone != null) {
+      await gone;
+    } else {
+      for (final k in keys) {
+        await _box.delete(k);
+      }
     }
     _accessToken = null;
     _current = null;
+    _gatewayToken = null;
+    _refreshedAt = null;
+    _refreshGap = _firstRefreshGap;
+    _refreshFailedAt = null;
+    _cancelConnectRetry();
     debugPrint('[discord] logged out');
   }
 
@@ -400,6 +677,8 @@ class DiscordRpc {
     _foreground = true;
     debugPrint('[discord] foreground');
     if (_canRun) unawaited(_connect());
+    // Windows: the person is back, so do not sit out a long retry wait.
+    if (_canRun && _isWindows) _gateway?.retryNow();
   }
 
   /// Flutter `paused` — keep the gateway. Native video surfaces trigger this
@@ -447,6 +726,28 @@ class DiscordRpc {
     }
     await _box.put(key, value);
     if (key == 'presenceStatus' && _canRun) _queuePresenceSend();
+    // Windows: make the visible presence follow the toggle at once instead of
+    // waiting for the next title page or player event. Phone and TV keep
+    // their event-driven behaviour.
+    final replay = _lastPresence;
+    if (_isWindows &&
+        replay != null &&
+        ((key == 'showPaused' && _lastPresenceKind == _PresenceKind.paused) ||
+            (key == 'browsingTitle' &&
+                _lastPresenceKind == _PresenceKind.browsing))) {
+      await replay();
+    }
+  }
+
+  /// Last presence request, replayed when a preference that shapes it changes.
+  /// Only browsing and paused watching are replayed: their content is static,
+  /// whereas a playing call carries a position that is already stale.
+  Future<void> Function()? _lastPresence;
+  _PresenceKind? _lastPresenceKind;
+
+  void _rememberPresence(Future<void> Function() replay, _PresenceKind kind) {
+    _lastPresence = replay;
+    _lastPresenceKind = kind;
   }
 
   Future<void> setWatching({
@@ -460,13 +761,31 @@ class DiscordRpc {
     // Null omits the button — same payload as before.
     String? openUrl,
   }) async {
+    // Remember this call so a settings toggle can re-render it (see above).
+    // A playing one is only replayed when Windows swaps the transport; the
+    // video has moved on since, so its position does too.
+    final asked = debugNow();
+    Future<void> replay() => setWatching(
+      title: title,
+      episodeLabel: episodeLabel,
+      posterUrl: posterUrl,
+      position: playing ? position + debugNow().difference(asked) : position,
+      duration: duration,
+      playing: playing,
+      openUrl: openUrl,
+    );
     if (!_allowed) {
       return;
     }
     if (!playing && !showWhenPaused) {
       clear();
+      _rememberPresence(replay, _PresenceKind.paused);
       return;
     }
+    _rememberPresence(
+      replay,
+      playing ? _PresenceKind.playing : _PresenceKind.paused,
+    );
     _cancelScheduledClear();
     final revision = ++_presenceRevision;
     final ts = discordPlaybackTimestamps(
@@ -532,6 +851,10 @@ class DiscordRpc {
       debugPrint('[discord] setBrowsing skipped ($_skipReason)');
       return;
     }
+    _rememberPresence(
+      () => setBrowsing(title: title, posterUrl: posterUrl),
+      _PresenceKind.browsing,
+    );
     _cancelScheduledClear();
     final revision = ++_presenceRevision;
     final large = await _resolveLarge(posterUrl);
@@ -564,8 +887,17 @@ class DiscordRpc {
   void _queuePresenceSend() {
     _presenceSendTimer?.cancel();
     _presenceSendTimer = Timer(const Duration(milliseconds: 400), () {
-      if (_canRun) _gateway?.setPresence(_current, status: presenceStatus);
+      if (_canRun) _pushVisible();
     });
+  }
+
+  /// Sends [_visible] (nothing while away / not watching on Windows) and
+  /// remembers which state was sent for [refreshVisibility].
+  void _pushVisible() {
+    final g = _gateway;
+    if (g == null) return;
+    _sentHidden = presenceHidden;
+    g.setPresence(_visible, status: presenceStatus);
   }
 
   /// Drop the current activity. [delay] is for player teardown: Android
@@ -574,13 +906,21 @@ class DiscordRpc {
   /// (no follow-up presence) still clears after the delay.
   void clear({Duration delay = Duration.zero}) {
     _presenceRevision++;
+    _lastPresence = null;
+    _lastPresenceKind = null;
     _clearTimer?.cancel();
     if (delay <= Duration.zero) {
       _applyClear();
       return;
     }
     debugPrint('[discord] clear scheduled in ${delay.inMilliseconds}ms');
-    _clearTimer = Timer(delay, _applyClear);
+    _clearTimer = Timer(delay, () {
+      _applyClear();
+      // Windows: after leaving the player, fall back to Browsing instead of
+      // an empty profile. The usual rules (incognito, away, only while
+      // watching) still decide whether it shows.
+      if (_isWindows && _allowed) unawaited(setBrowsing());
+    });
   }
 
   void _cancelScheduledClear() {
@@ -600,18 +940,33 @@ class DiscordRpc {
   }
 
   // ── Internals ───────────────────────────────────────────────────────────
-  Future<void> _connect() async {
+  /// [restartStopped]: a settings change (toggle, fresh login) replaces a
+  /// Windows gateway that stopped retrying after repeated failures, so the
+  /// person gets a new attempt; other callers leave it stopped.
+  Future<void> _connect({bool restartStopped = false}) async {
+    final stopped = _gateway;
+    if (restartStopped && stopped != null && stopped.gaveUp) {
+      debugPrint('[discord] settings changed — retrying stopped gateway');
+      _gateway = null;
+      await stopped.close();
+      if (_isWindows && !_canRun) return;
+    }
     if (_gateway != null) {
       debugPrint(
         '[discord] already connected — re-push current=${_current?.name}',
       );
       _presenceSendTimer?.cancel();
-      _gateway!.setPresence(_current, status: presenceStatus);
+      _pushVisible();
       return;
     }
     final token = await getValidAccessToken();
     if (token == null || token.isEmpty) {
       debugPrint('[discord] connect skipped (no valid token)');
+      _scheduleConnectRetry();
+      return;
+    }
+    if (_isWindows) {
+      await _connectWindows(token);
       return;
     }
     debugPrint('[discord] connecting gateway');
@@ -620,13 +975,176 @@ class DiscordRpc {
               ? DiscordSdkGateway(token, onAuthFailure: _onAuthFailure)
               : DiscordGateway('Bearer $token', onAuthFailure: _onAuthFailure))
           ..connect();
-    _gateway!.setPresence(_current, status: presenceStatus);
+    _pushVisible();
+  }
+
+  /// Windows: the Social SDK when this build and PC can use it, else the raw
+  /// gateway. Everything may have changed during the waits before this (a
+  /// second connect finished first, incognito, sign-out, a new login), so it
+  /// is checked again with no wait between the check and the new gateway.
+  Future<void> _connectWindows(String token) async {
+    if (!_canRun) return;
+    final sdk = await _usesSdk();
+    if (_gateway != null || !_canRun) return;
+    if (token != _accessToken) {
+      // Another login took over while waiting; connect with that one soon.
+      _scheduleConnectRetry();
+      return;
+    }
+    _cancelConnectRetry();
+    debugPrint('[discord] connecting gateway (${sdk ? 'SDK' : 'raw'})');
+    // Log which scopes this saved login really has, once per connect, so a
+    // login without the presence scope shows up in the log instead of only as
+    // gateway close codes. Never blocks or logs out.
+    unawaited(_logGrantedScopes(token));
+    _gatewayToken = token;
+    final DiscordGateway gateway;
+    if (sdk) {
+      late final DiscordSdkGateway native;
+      native = DiscordSdkGateway(
+        token,
+        onAuthFailure: _onAuthFailure,
+        onUnavailable: () => _onSdkUnavailable(native),
+      );
+      gateway = native;
+    } else {
+      final bearer = 'Bearer $token';
+      gateway =
+          debugRawGateway?.call(bearer, _onAuthFailure) ??
+          DiscordGateway(bearer, onAuthFailure: _onAuthFailure);
+    }
+    _gateway = gateway..connect();
+    _pushVisible();
+  }
+
+  /// Which transport the presence goes through. On Windows the running
+  /// gateway decides; without one the native side is asked (once).
+  Future<bool> _usesSdk() async {
+    if (!_isWindows) return supportsNativeDiscordPresence;
+    final g = _gateway;
+    if (g != null) return g is DiscordSdkGateway;
+    if (_sdkUnavailable) return false;
+    return DiscordSdkGateway.isAvailable();
+  }
+
+  /// Windows: the SDK could not start. Use the raw gateway from here on, and
+  /// build the presence again because the raw one needs other image keys.
+  void _onSdkUnavailable(DiscordSdkGateway gateway) {
+    _sdkUnavailable = true;
+    if (!identical(_gateway, gateway)) return;
+    debugPrint('[discord] SDK could not start — using the raw gateway');
+    _gateway = null;
+    unawaited(gateway.close());
+    unawaited(_connectAfterSdk());
+  }
+
+  Future<void> _connectAfterSdk() async {
+    if (_canRun) await _connect();
+    if (_canRun) await _lastPresence?.call();
+  }
+
+  /// Windows: no gateway because there is no usable login right now. Tries
+  /// again after 30s, doubling to 5 minutes.
+  void _scheduleConnectRetry() {
+    if (!_isWindows || !_canRun || _gateway != null) return;
+    // An attempt in between (the window was focused) neither restarts nor
+    // lengthens the wait that is already running.
+    if (_connectRetry != null) return;
+    final wait = _connectRetryWait;
+    final next = wait * 2;
+    const longest = Duration(minutes: 5);
+    _connectRetryWait = next > longest ? longest : next;
+    debugPrint('[discord] connect again in ${wait.inSeconds}s');
+    _connectRetry = Timer(wait, () {
+      _connectRetry = null;
+      if (_canRun && _gateway == null) unawaited(_connect());
+    });
+  }
+
+  void _cancelConnectRetry() {
+    _connectRetry?.cancel();
+    _connectRetry = null;
+    _connectRetryWait = _firstConnectRetry;
+  }
+
+  /// Windows diagnostics: asks Discord which scopes [token] carries
+  /// (`GET /oauth2/@me`) and logs them. The token itself is never logged.
+  /// A missing `sdk.social_layer_presence` is only reported; the user is
+  /// not signed out, so existing logins keep working as before.
+  Future<void> _logGrantedScopes(String token) async {
+    try {
+      final res = await _dio.get<dynamic>(
+        'https://discord.com/api/oauth2/@me',
+        options: Options(
+          headers: {'Authorization': 'Bearer $token'},
+          validateStatus: (s) => s != null && s < 500,
+        ),
+      );
+      final d = res.data;
+      final scopes = d is Map && d['scopes'] is List
+          ? (d['scopes'] as List).map((e) => '$e').toList()
+          : const <String>[];
+      debugPrint(
+        '[discord] login scopes (HTTP ${res.statusCode}): ${scopes.join(' ')}',
+      );
+      if (res.statusCode == 200 &&
+          !scopes.contains('sdk.social_layer_presence')) {
+        debugPrint(
+          '[discord] login lacks sdk.social_layer_presence — presence needs '
+          'a new Discord login',
+        );
+      }
+    } catch (e) {
+      debugPrint('[discord] scope check failed: $e');
+    }
   }
 
   /// Gateway rejected the session (op 9): refresh once and resume on the same
   /// socket; a dead refresh token means logout and the settings show login.
-  Future<void> _onAuthFailure() async {
-    debugPrint('[discord] session rejected — refreshing');
+  Future<void> _onAuthFailure() {
+    if (!_isWindows) return _refreshAfterReject();
+    // Windows: the SDK can report one bad login several times in a row.
+    return _authFailure ??= _onWindowsAuthFailure().whenComplete(() {
+      _authFailure = null;
+    });
+  }
+
+  /// Windows: refresh at most once per 5 minutes, and less often (down to once
+  /// an hour) while Discord keeps rejecting what it just issued. Such a login
+  /// is not fixed by another one, and it is never a reason to sign out; the
+  /// gateway keeps its own growing waits.
+  Future<void> _onWindowsAuthFailure() async {
+    if (_gateway == null) return; // a gateway on its way out
+    if (_within(_refreshedAt, _refreshGap)) {
+      final current = _accessToken;
+      if (current != null && current.isNotEmpty && current != _gatewayToken) {
+        // Refreshed elsewhere, but this gateway still uses the old login.
+        _gatewayToken = current;
+        _gateway?.updateToken('Bearer $current');
+        return;
+      }
+      debugPrint(
+        '[discord] login rejected again right after a refresh — waiting',
+      );
+      return;
+    }
+    debugPrint('[discord] login rejected — refreshing');
+    // A dead login signs out inside the refresh; anything else keeps it.
+    // Rejected again within two hours of a refresh: the same trouble goes on.
+    final again = _within(_refreshedAt, const Duration(hours: 2));
+    final token = await _refreshNow();
+    if (token == null || token.isEmpty) return;
+    const longest = Duration(hours: 1);
+    final longer = _refreshGap * 2;
+    _refreshGap = !again
+        ? _firstRefreshGap
+        : (longer > longest ? longest : longer);
+    _gatewayToken = token;
+    _gateway?.updateToken('Bearer $token');
+  }
+
+  Future<void> _refreshAfterReject() async {
+    debugPrint('[discord] login rejected — refreshing');
     final token = await _refreshNow();
     if (token == null || token.isEmpty) {
       debugPrint('[discord] refresh dead — logging out');
@@ -638,6 +1156,11 @@ class DiscordRpc {
 
   Future<void> _disconnect() async {
     _presenceRevision++;
+    _cancelConnectRetry();
+    // Windows: a clear still waiting after leaving the player takes effect now.
+    // Only cancelling it would bring the closed video back on the profile when
+    // presence resumes (incognito off again).
+    if (_isWindows && _clearTimer != null) _current = null;
     final g = _gateway;
     _gateway = null;
     if (g == null) return;
@@ -670,6 +1193,14 @@ class DiscordRpc {
   Future<String?> _externalAsset(String url) async {
     // The native SDK resolves artwork URLs itself.
     if (supportsNativeDiscordPresence) return url;
+    if (_isWindows) {
+      // Nothing is loaded or asked once the presence may not run. A cover
+      // saved on this PC (downloaded shows) means nothing to Discord either
+      // way; null brings the app logo.
+      if (!_allowed || !discordIsWebUrl(url)) return null;
+      if (await _usesSdk()) return discordSdkImageOk(url) ? url : null;
+      if (!_allowed) return null;
+    }
     final cached = _assetCache[url];
     if (cached != null) return cached;
     final token = await getValidAccessToken();
@@ -695,3 +1226,7 @@ class DiscordRpc {
     }
   }
 }
+
+/// What the last presence request showed; decides whether a preference
+/// change can safely replay it (see [DiscordRpc.setPresencePref]).
+enum _PresenceKind { browsing, playing, paused }

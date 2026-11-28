@@ -15,6 +15,8 @@ import 'package:watch_app/core/state/active_source_cubit.dart';
 import 'package:watch_app/features/search/browse_source_screen.dart';
 
 class _FakeRepo implements SourceRepository {
+  @override
+  bool hasSource(String id) => true;
   _FakeRepo({this.baseUrls = const {}});
   final Map<String, String> baseUrls;
 

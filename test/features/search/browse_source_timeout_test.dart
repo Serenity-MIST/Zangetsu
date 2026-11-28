@@ -7,6 +7,7 @@ import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:watch_app/core/models/home_section.dart';
+import 'package:watch_app/core/playback/source_health_store.dart';
 import 'package:watch_app/core/models/media_item.dart';
 import 'package:watch_app/core/repository/catalogue_repository.dart';
 import 'package:watch_app/features/search/cubit/browse_source_cubit.dart';
@@ -26,6 +27,12 @@ class _HangingRepo implements CatalogueRepository {
     String category = 'sub',
     String? sourceId,
   }) => Completer<List<MediaItem>>().future;
+  @override
+  Future<({List<MediaItem> items,SourceOutcome outcome})> searchStatus(
+    String query,{String category='sub',String? sourceId,String? filtersJson,
+    bool cache=false,int page=1}) =>
+      Completer<({List<MediaItem> items,SourceOutcome outcome})>().future;
+
 }
 
 void main() {
@@ -34,6 +41,12 @@ void main() {
     sourceId: 'cs:Stuck',
     timeout: const Duration(milliseconds: 60),
   );
+
+  test('a hanging filter releases its busy state', () async {
+    final c=cubit(); await c.applyFilters('[fixture]');
+    expect(c.state.searching,isFalse); expect(c.state.searchFailed,isTrue);
+    await c.close();
+  });
 
   test('a source that never answers ends up failed, not spinning', () async {
     final c = cubit();

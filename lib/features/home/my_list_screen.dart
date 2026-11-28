@@ -1,10 +1,19 @@
+import '../../core/ui/nav_prefs.dart';
 import 'dart:async';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import '../../core/zmode/zmode_prefs.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
 import '../../core/tracker/tracker_item_url.dart';
+import 'package:flutter/services.dart';
+import '../../core/desktop/desktop_context_menu.dart';
+import '../../core/desktop/desktop_dialogs.dart';
+import '../../core/desktop/desktop_sheet.dart';
+import '../../core/desktop/desktop_shortcuts.dart';
+import '../../core/ui/category_picker_sheet.dart';
 import '../../core/zmode/metadata_provider_prefs.dart';
 import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
@@ -172,7 +181,28 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
   /// the app's ContentMode, so you can see your manga list without switching
   /// the whole app into manga mode. Tracker screens ignore it — a tracker
   /// answers for one kind already.
-  ContentMode _kind = sl<ContentModeCubit>().state;
+  ContentMode _localKind = sl<ContentModeCubit>().state;
+
+  /// Enables desktop list preferences only on Windows.
+  bool get _desktop => defaultTargetPlatform == TargetPlatform.windows;
+
+  /// Whether this list should follow the dock rather than its local filter.
+  bool get _followDock =>
+      _desktop &&
+      sl.isRegistered<NavPrefs>() &&
+      sl<NavPrefs>().myListStyle == 'new';
+
+  /// Effective content filter, preserving Classic's independently chosen kind.
+  ContentMode get _kind =>
+      _followDock ? sl<ContentModeCubit>().state : _localKind;
+  StreamSubscription<ContentMode>? _modeChanges;
+
+  /// Drops a stale category restriction when navigation preferences change.
+  void _dockChanged() {
+    if (!mounted) return;
+    setState(() => _categoryFilter = null);
+  }
+
   bool _sortDesc = ListSortPrefs.descending;
   VoidCallback? _shuffleAction;
 
@@ -277,6 +307,13 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    if (_desktop) {
+      if (sl.isRegistered<NavPrefs>()) sl<NavPrefs>().addListener(_dockChanged);
+      _modeChanges = sl<ContentModeCubit>().stream.listen(
+        (_) => _dockChanged(),
+      );
+      ZModePrefs.revision.addListener(_dockChanged);
+    }
     final cats = _cats;
     if (cats != null && !sl<AppMode>().isTv) {
       _categoryCounts = LibraryCategoryCounts(cats);
@@ -289,6 +326,11 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    if (sl.isRegistered<NavPrefs>()) {
+      sl<NavPrefs>().removeListener(_dockChanged);
+    }
+    _modeChanges?.cancel();
+    ZModePrefs.revision.removeListener(_dockChanged);
     WidgetsBinding.instance.removeObserver(this);
     _categoryCounts?.store.revision.removeListener(_onCategoriesChanged);
     // Screen popped mid-dissolve: the delete was already confirmed, so commit
@@ -299,6 +341,8 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
     _pendingCommits.clear();
     _exiting.clear();
     _searchController.dispose();
+    _searchFocus.dispose();
+    _pageFocus.dispose();
     super.dispose();
   }
 
@@ -346,7 +390,7 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
         }
       });
     }
-    return Scaffold(
+    final scaffold = Scaffold(
       backgroundColor: AppColors.bg,
       // bottom: false — the shell's floating dock overlays the content
       // (extendBody); a full SafeArea would clip the grid at the dock's top
@@ -360,7 +404,8 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
               children: [
                 _header(context),
                 if (_searching) _searchField(context),
-                if (widget.pinnedTracker == null) _kindTabs(context),
+                if (!_followDock && widget.pinnedTracker == null)
+                  _kindTabs(context),
                 Expanded(
                   child: tlState.isMyList
                       ? _myListBody(context)
@@ -372,7 +417,79 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
         ),
       ),
     );
+    if (!_desktop) return scaffold;
+    // Windows (home-4): F5 / Ctrl+R refresh the list on screen and Ctrl+F
+    // opens the title filter. The page focus node catches the keys even
+    // before anything inside has been clicked.
+    return CallbackShortcuts(
+      bindings: _desktopShortcutBindings(
+        DesktopShortcuts.bindings({
+          'app.refresh': _refreshShownList,
+          'lists.search': _openSearch,
+        }),
+      ),
+      child: Focus(
+        focusNode: _pageFocus,
+        autofocus: true,
+        child: scaffold,
+      ),
+    );
   }
+
+  /// Windows: focus target for the page shortcuts (not a tab stop).
+  final _pageFocus = FocusNode(debugLabel: 'my-list', skipTraversal: true);
+
+  /// The registered shortcut map, or the stock keys when the shortcut
+  /// catalogue is not registered (widget tests that skip DesktopPrefs.init).
+  Map<ShortcutActivator, VoidCallback> _desktopShortcutBindings(
+    Map<ShortcutActivator, VoidCallback> registered,
+  ) {
+    if (registered.isNotEmpty) return registered;
+    return {
+      const SingleActivator(LogicalKeyboardKey.f5): _refreshShownList,
+      const SingleActivator(LogicalKeyboardKey.keyR, control: true):
+          _refreshShownList,
+      const SingleActivator(LogicalKeyboardKey.keyF, control: true):
+          _openSearch,
+    };
+  }
+
+  /// Windows (home-4): refreshes whichever list is on screen — your own list
+  /// from the cloud, or the selected tracker's library. Shows the header
+  /// spinner while it runs.
+  Future<void> _refreshShownList() async {
+    if (!mounted || _refreshing) return;
+    setState(() => _refreshing = true);
+    try {
+      final tracker = context.read<TrackerListCubit>();
+      if (tracker.state.isMyList) {
+        if (sl.isRegistered<MyListStore>()) {
+          await sl<MyListStore>().pullFromCloud();
+        }
+      } else {
+        await tracker.refresh();
+      }
+    } catch (_) {
+      // The list keeps what it had; the error state offers another try.
+    } finally {
+      if (mounted) setState(() => _refreshing = false);
+    }
+  }
+
+  /// True while a Windows Refresh started here is running.
+  bool _refreshing = false;
+
+  /// Windows Ctrl+F: show the title filter (and focus it).
+  void _openSearch() {
+    if (_searching) {
+      _searchFocus.requestFocus();
+      return;
+    }
+    _toggleSearch();
+  }
+
+  /// Focus of the title filter, so Ctrl+F can jump back into it.
+  final _searchFocus = FocusNode(debugLabel: 'my-list-search');
 
   double _cellW(BuildContext context) => posterGridCellWidth(context);
 
@@ -414,6 +531,7 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
           Expanded(
             child: TextField(
               controller: _searchController,
+              focusNode: _searchFocus,
               autofocus: true,
               style: AppText.body.copyWith(color: AppColors.textPrimary),
               cursorColor: AppColors.accent,
@@ -509,6 +627,16 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
               padding: const EdgeInsets.fromLTRB(10, 6, 8, 6),
               child: Row(
                 children: [
+                  // Windows: opened from another page (e.g. Schedule and
+                  // lists) there is no system back, so offer one here.
+                  if (_desktop && Navigator.of(context).canPop()) ...[
+                    _pillIcon(
+                      Icons.arrow_back_rounded,
+                      MaterialLocalizations.of(context).backButtonTooltip,
+                      () => Navigator.of(context).maybePop(),
+                    ),
+                    const SizedBox(width: 8),
+                  ],
                   // The account this list belongs to, round and leading —
                   // a tracker's own avatar, or yours on My List.
                   _headerAvatar(context, active),
@@ -548,6 +676,24 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
                   ),
                   const SizedBox(width: 8),
                   _libraryOptionsButton(context),
+                  // Windows (home-4): a mouse cannot pull to refresh.
+                  if (_desktop) ...[
+                    const SizedBox(width: 8),
+                    _refreshing
+                        ? const SizedBox(
+                            width: 36,
+                            height: 36,
+                            child: Padding(
+                              padding: EdgeInsets.all(10),
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          )
+                        : _pillIcon(
+                            Icons.refresh_rounded,
+                            context.l10n.refreshF5,
+                            () => unawaited(_refreshShownList()),
+                          ),
+                  ],
                   if (widget.pinnedTracker == null &&
                       hub.connected.isNotEmpty) ...[
                     const SizedBox(width: 8),
@@ -772,31 +918,13 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
   /// reading the same would be indistinguishable), so say so rather than
   /// failing silently.
   Future<void> _createCategory(BuildContext context) async {
-    final controller = TextEditingController();
-    final name = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppColors.surface,
-        title: Text(context.l10n.newCategory, style: AppText.title),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          style: AppText.body.copyWith(color: AppColors.textPrimary),
-          decoration: InputDecoration(hintText: context.l10n.personaGym),
-          onSubmitted: (v) => Navigator.pop(ctx, v),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: Text(context.l10n.cancel),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text),
-            style: FilledButton.styleFrom(backgroundColor: AppColors.accent),
-            child: Text(context.l10n.create),
-          ),
-        ],
-      ),
+    // Windows: graphite text prompt; phone: the same AlertDialog as before.
+    final name = await showAdaptiveTextPrompt(
+      context,
+      title: context.l10n.newCategory,
+      hint: context.l10n.personaGym,
+      cancelLabel: context.l10n.cancel,
+      confirmLabel: context.l10n.create,
     );
     if (name == null || !mounted) return;
     // Stamped with the mode it was made in, so it stops appearing as an empty
@@ -816,9 +944,15 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
 
   /// Rename or delete a category (long-press its tab). Deleting keeps every
   /// title — it only drops the label.
+  ///
+  /// Windows (home-3): shown as a centred graphite dialog instead of a bottom
+  /// sheet (showAdaptiveSheet); a right-click on the tab opens
+  /// [_categoryMenu] at the cursor instead.
   Future<void> _manageCategory(BuildContext context, ListCategory c) async {
-    final action = await showModalBottomSheet<String>(
-      context: context,
+    final action = await showAdaptiveSheet<String>(
+      context,
+      // Desktop: the dialog's title bar names the category.
+      title: c.name,
       backgroundColor: AppColors.surface,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
@@ -827,13 +961,15 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 18, 20, 6),
-              child: Align(
-                alignment: AlignmentDirectional.centerStart,
-                child: Text(c.name, style: AppText.title),
+            // Phone heading; the desktop dialog already has a title bar.
+            if (!DesktopSheetScope.of(ctx))
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 18, 20, 6),
+                child: Align(
+                  alignment: AlignmentDirectional.centerStart,
+                  child: Text(c.name, style: AppText.title),
+                ),
               ),
-            ),
             ListTile(
               leading: const Icon(
                 Icons.edit_outlined,
@@ -860,7 +996,39 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
       ),
     );
     if (action == null || !mounted) return;
+    await _applyCategoryAction(c, action);
+  }
 
+  /// Windows (home-3): right-click menu of a category tab, at the cursor.
+  Future<void> _categoryMenu(
+    BuildContext context,
+    ListCategory c,
+    Offset at,
+  ) async {
+    final action = await showDesktopContextMenu<String>(
+      context,
+      position: at,
+      items: [
+        DesktopMenuItem(
+          label: context.l10n.rename,
+          icon: Icons.edit_outlined,
+          value: 'rename',
+        ),
+        DesktopMenuItem(
+          label: context.l10n.deleteCategory,
+          icon: Icons.delete_outline_rounded,
+          value: 'delete',
+          destructive: true,
+        ),
+      ],
+    );
+    if (action == null || !mounted) return;
+    await _applyCategoryAction(c, action);
+  }
+
+  /// Runs a category action picked from the sheet or the desktop menu:
+  /// 'delete' drops the label (titles stay), 'rename' asks for a new name.
+  Future<void> _applyCategoryAction(ListCategory c, String action) async {
     if (action == 'delete') {
       await sl<CategoryStore>().delete(c.id);
       if (!mounted) return;
@@ -871,30 +1039,14 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
       return;
     }
 
-    final controller = TextEditingController(text: c.name);
-    final name = await showDialog<String>(
-      context: this.context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppColors.surface,
-        title: Text(context.l10n.renameCategory, style: AppText.title),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          style: AppText.body.copyWith(color: AppColors.textPrimary),
-          onSubmitted: (v) => Navigator.pop(ctx, v),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: Text(context.l10n.cancel),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text),
-            style: FilledButton.styleFrom(backgroundColor: AppColors.accent),
-            child: Text(context.l10n.rename),
-          ),
-        ],
-      ),
+    // Windows: graphite text prompt prefilled with the current name; phone:
+    // the same AlertDialog as before.
+    final name = await showAdaptiveTextPrompt(
+      context,
+      title: context.l10n.renameCategory,
+      initialValue: c.name,
+      cancelLabel: context.l10n.cancel,
+      confirmLabel: context.l10n.rename,
     );
     if (name == null || !mounted) return;
     final ok = await sl<CategoryStore>().rename(c.id, name);
@@ -1042,7 +1194,9 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
                             if (selected.isReading != k.isReading) {
                               _customListFilter = null;
                             }
-                            _kind = k;
+                            // Our Classic list keeps its own kind; New-style
+                            // desktop lists derive it from the dock instead.
+                            _localKind = k;
                             _dropCategoryForeignTo(k);
                             context.read<TrackerListCubit>().selectKind(k);
                           }),
@@ -1099,11 +1253,15 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
           context,
           entries,
           onTap: (item) => _openItem(context, item),
-          onMore: (entry) => showListStatusSheet(
-            context,
-            item: entry.item,
-            onRemove: (item, commit) => _animatedRemove(entry, commit),
-          ),
+          // Windows (home-3): right-click opens a menu at the cursor; the
+          // status editor then opens as a centred dialog.
+          onMore: (entry) => _desktop
+              ? _myListPosterMenu(context, entry)
+              : showListStatusSheet(
+                  context,
+                  item: entry.item,
+                  onRemove: (item, commit) => _animatedRemove(entry, commit),
+                ),
         );
         return RefreshIndicator(
           color: AppColors.accent,
@@ -1127,10 +1285,19 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
         );
       case TrackerListStatus.error:
         _shuffleAction = null;
-        content = EmptyState(
-          icon: Icons.cloud_off_rounded,
-          message: context.l10n.couldnTLoadPullToRefresh,
-        );
+        // Windows (home-4): a mouse cannot pull, so say so plainly and give
+        // a Refresh button instead.
+        content = _desktop
+            ? EmptyState(
+                icon: Icons.cloud_off_rounded,
+                message: context.l10n.couldntLoadThisList,
+                actionLabel: context.l10n.refresh,
+                onAction: () => unawaited(_refreshShownList()),
+              )
+            : EmptyState(
+                icon: Icons.cloud_off_rounded,
+                message: context.l10n.couldnTLoadPullToRefresh,
+              );
       case TrackerListStatus.idle:
       case TrackerListStatus.ready:
         if (tlState.entries.isEmpty) _shuffleAction = null;
@@ -1143,20 +1310,11 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
                 context,
                 tlState.entries,
                 onTap: (item) => _openTrackerItem(context, item),
-                onMore: (entry) => showTrackerEntrySheet(
-                  context,
-                  tracker: tlState.tracker!,
-                  item: entry.item,
-                  status: entry.status,
-                  progress: entry.progress,
-                  score: entry.score,
-                  tmdbIsTv: entry.tmdbIsTv,
-                  customLists: entry.customLists,
-                  isPrivate: entry.isPrivate,
-                  onRemove: (item, commit) => _animatedRemove(entry, commit),
-                  onFind: () => _openTrackerItem(context, entry.item),
-                  onChanged: () => context.read<TrackerListCubit>().refresh(),
-                ),
+                // Windows (home-3): menu at the cursor first; the editor
+                // then opens as a centred dialog.
+                onMore: (entry) => _desktop
+                    ? _trackerPosterMenu(context, tlState, entry)
+                    : _editTrackerEntry(context, tlState, entry),
               );
     }
 
@@ -1179,6 +1337,85 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
             ),
     );
   }
+
+  /// The per-card tracker editor (status, progress, score) for [entry].
+  Future<void> _editTrackerEntry(
+    BuildContext context,
+    TrackerListState tlState,
+    MyListEntry entry,
+  ) => showTrackerEntrySheet(
+    context,
+    tracker: tlState.tracker!,
+    item: entry.item,
+    status: entry.status,
+    progress: entry.progress,
+    score: entry.score,
+    tmdbIsTv: entry.tmdbIsTv,
+    customLists: entry.customLists,
+    isPrivate: entry.isPrivate,
+    onRemove: (item, commit) => _animatedRemove(entry, commit),
+    onFind: () => _openTrackerItem(context, entry.item),
+    onChanged: () => context.read<TrackerListCubit>().refresh(),
+  );
+
+  /// Windows (home-3): right-click menu of a poster on your own list, at the
+  /// cursor (DesktopPointer's last right-click).
+  Future<void> _myListPosterMenu(BuildContext context, MyListEntry entry) =>
+      showDesktopContextMenu<void>(
+        context,
+        items: [
+          DesktopMenuItem(
+            label: context.l10n.details,
+            icon: Icons.info_outline_rounded,
+            onTap: () => _openItem(context, entry.item),
+          ),
+          DesktopMenuItem(
+            label: context.l10n.changeStatusEllipsis,
+            icon: Icons.bookmark_border_rounded,
+            onTap: () => unawaited(
+              showListStatusSheet(
+                context,
+                item: entry.item,
+                onRemove: (item, commit) => _animatedRemove(entry, commit),
+              ),
+            ),
+          ),
+          if (_cats != null)
+            DesktopMenuItem(
+              label: context.l10n.categoriesEllipsis,
+              icon: Icons.folder_outlined,
+              onTap: () => unawaited(showCategoryPicker(context, entry.item)),
+            ),
+          const DesktopMenuItem.divider(),
+          DesktopMenuItem(
+            label: context.l10n.removeFromMyList,
+            icon: Icons.delete_outline_rounded,
+            destructive: true,
+            onTap: () => unawaited(removeFromListEverywhere(entry.item)),
+          ),
+        ],
+      );
+
+  /// Windows (home-3): right-click menu of a poster on a tracker list.
+  Future<void> _trackerPosterMenu(
+    BuildContext context,
+    TrackerListState tlState,
+    MyListEntry entry,
+  ) => showDesktopContextMenu<void>(
+    context,
+    items: [
+      DesktopMenuItem(
+        label: context.l10n.details,
+        icon: Icons.info_outline_rounded,
+        onTap: () => _openTrackerItem(context, entry.item),
+      ),
+      DesktopMenuItem(
+        label: context.l10n.editOnTracker(tlState.tracker?.displayName ?? context.l10n.trackerFallbackName),
+        icon: Icons.edit_outlined,
+        onTap: () => unawaited(_editTrackerEntry(context, tlState, entry)),
+      ),
+    ],
+  );
 
   // ── Shared grid: status tabs (with counts) + poster grid ──────────────────
 
@@ -1230,9 +1467,10 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
     // tabs is seeing all three without leaving the mode you're browsing in.
     // A tracker screen has no tabs and keeps following the app mode.
     final mode = _selectedKind(context);
-    final modeEntries = live
-        .where((e) => mode.matchesProvider(e.item.type))
-        .toList();
+    // New-style desktop lists also split Streaming into anime vs movie/TV.
+    final modeEntries = _followDock
+        ? libraryEntriesForDock(live, mode, ZModePrefs.streamKind)
+        : live.where((e) => mode.matchesProvider(e.item.type)).toList();
 
     final presentStatuses = tabOrder
         .where((s) => modeEntries.any((e) => e.status == s))
@@ -1290,6 +1528,8 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
             count: categoryCounts[c.id] ?? 0,
             test: (e) => _cats?.isIn(e.item, c.id) ?? false,
             onLongPress: () => _manageCategory(context, c),
+            // Windows (home-3): right-click menu at the cursor.
+            onContextMenu: (at) => _categoryMenu(context, c, at),
           ),
       // AniList's own custom lists. Only ever non-empty on that tab — MAL and
       // Simkl have no such concept, and My List uses categories instead.
@@ -1373,12 +1613,9 @@ class _MyListViewState extends State<_MyListView> with WidgetsBindingObserver {
             MediaQuery.paddingOf(context).bottom,
           ),
           physics: const AlwaysScrollableScrollPhysics(),
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: posterGridColumns(context),
-            childAspectRatio: posterGridAspect(context),
-            crossAxisSpacing: 12,
-            mainAxisSpacing: 16,
-          ),
+          // Windows keeps the adaptive desktop poster grid; elsewhere this is
+          // the same fixed-column delegate as before.
+          gridDelegate: posterGridDelegate(context),
           itemBuilder: (context, i, entry, slide) {
             // Keyed by entry: the whole card (image element included) travels
             // to its new slot instead of a fresh card remounting there with

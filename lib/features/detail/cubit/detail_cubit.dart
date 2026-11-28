@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'package:equatable/equatable.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+
+import '../../../core/boot_network.dart';
 
 import '../../../core/di/injector.dart';
 import '../../../core/provider/provider_manager.dart';
@@ -15,8 +18,10 @@ import '../../../core/metadata/title_badges.dart';
 import '../../../core/models/episode.dart';
 import '../../../core/models/episode_title.dart';
 import '../../../core/models/media_detail.dart';
+import '../../../core/models/media_item.dart';
 import '../../../core/models/media_extras.dart';
 import '../../../core/models/provider_info.dart';
+import '../../../core/playback/list_auto_status.dart';
 import '../../../core/playback/playback_prefs.dart';
 import '../../../core/playback/title_prefs.dart';
 import '../../../core/repository/catalogue_repository.dart';
@@ -149,26 +154,34 @@ class DetailCubit extends Cubit<DetailState> {
     TitlePrefsStore? prefs,
     int? seedMalId,
     ProviderType? seedType,
+    this.seedItem,
     this.prefer,
+    Future<MediaDetail> Function()? localDetail,
+    String? localCategory,
   }) : _repo = repo,
        _url = url,
        _sourceId = sourceId,
        _prefs = prefs ?? sl<TitlePrefsStore>(),
+       _localDetail = localDetail,
        // Seed the INITIAL category from the per-title remembered choice so the
        // Sub/Dub toggle reflects the saved value on the very first render (no
        // flash from 'sub' → remembered). Else Settings › Default audio, else
        // 'sub'. Must match openPlayer's launchCategory so Z Mode's remembered
        // cut (set on detail fetch) agrees with the player category — otherwise
        // Default audio = Dub still resolved the sub list.
+       // A downloaded show page uses the cut its files were saved in.
        super(
          DetailState(
            category:
+               localCategory ??
                (prefs ?? sl<TitlePrefsStore>()).category(sourceId ?? '', url) ??
                (sl.isRegistered<PlaybackPrefs>()
                    ? sl<PlaybackPrefs>().defaultCategory
                    : 'sub'),
          ),
        ) {
+    // A downloaded show page never goes online, so nothing to warm up.
+    if (localDetail != null) return;
     // Prefetch episode metadata using the MAL id we already know from the
     // tapped item, so the AniZip call overlaps the detail fetch and episodes
     // render already-enriched instead of popping in ~0.3s later. Fire-and-
@@ -177,9 +190,110 @@ class DetailCubit extends Cubit<DetailState> {
     if (seedType == ProviderType.anime && seedMalId != null) {
       sl<EpisodeMetadataService>().animeEpisodeMeta(seedMalId);
     }
+    _listenForReconnect();
+  }
+
+  /// Windows downloaded show page (opened from Downloads): builds the detail
+  /// from what was saved with the downloads instead of fetching it, so the
+  /// page works offline. Null for the normal online page.
+  final Future<MediaDetail> Function()? _localDetail;
+
+  /// True when this page shows downloaded content only (see [_localDetail]).
+  bool get isLocal => _localDetail != null;
+
+  /// Local load for [isLocal]: one emit, no network, no enrichment.
+  Future<void> _loadLocal() async {
+    emit(state.copyWith(status: DetailStatus.loading));
+    try {
+      final detail = await _localDetail!();
+      if (isClosed) return;
+      emit(state.copyWith(
+        status: DetailStatus.success,
+        detail: detail,
+        episodesLoading: false,
+      ));
+    } catch (e, st) {
+      if (isClosed) return;
+      AppLogger.instance.logError(e, st);
+      emit(state.copyWith(
+        status: DetailStatus.error,
+        error: 'load_failed',
+        episodesLoading: false,
+      ));
+    }
+  }
+
+  /// Windows only: the detail page follows the app-wide connection state, so
+  /// a fetch never sits on its skeleton after the network is gone, and a page
+  /// that failed because it was offline reloads by itself once it is back.
+  static bool get _followsConnection =>
+      defaultTargetPlatform == TargetPlatform.windows;
+  VoidCallback? _reconnectListener;
+
+  void _listenForReconnect() {
+    if (!_followsConnection) return;
+    final net = BootConnectivity.instance.offline;
+    _reconnectListener = () {
+      if (!net.value && !isClosed &&
+          state.status == DetailStatus.error && state.error == 'offline') {
+        unawaited(load());
+      }
+    };
+    net.addListener(_reconnectListener!);
+  }
+
+  /// Fails [work] with [_AppOffline] the moment the app is (or goes) offline,
+  /// instead of waiting out every source's own timeout. Windows only.
+  Future<T> _unlessOffline<T>(Future<T> work) {
+    if (!_followsConnection) return work;
+    final net = BootConnectivity.instance.offline;
+    if (net.value) {
+      work.ignore();
+      return Future<T>.error(const _AppOffline());
+    }
+    final dropped = Completer<T>();
+    void listener() {
+      if (net.value && !dropped.isCompleted) {
+        dropped.completeError(const _AppOffline());
+      }
+    }
+    net.addListener(listener);
+    return Future.any([work, dropped.future])
+        .whenComplete(() => net.removeListener(listener));
+  }
+
+  /// Offline check for a failure: the app's own offline signal is already
+  /// confirmed, anything else gets the usual DNS confirmation.
+  static Future<bool> _offlineConfirmed(Object e) async =>
+      e is _AppOffline || await isOfflineErrorConfirmed(e);
+
+  @override
+  Future<void> close() {
+    final l = _reconnectListener;
+    if (l != null) BootConnectivity.instance.offline.removeListener(l);
+    return super.close();
   }
 
   final CatalogueRepository _repo;
+
+  /// Retains the clicked card's identity when an extension returns chapters
+  /// with incomplete detail fields (for example after a metadata-only error).
+  final MediaItem? seedItem;
+
+  /// Fill only missing identity/artwork; a source's fresh nonempty values win.
+  MediaDetail _retainSeed(MediaDetail detail) {
+    final seed = seedItem;
+    if (seed == null) return detail;
+    final missingCover = detail.cover?.trim().isEmpty ?? true;
+    return detail.copyWith(
+      id: detail.id.trim().isEmpty ? seed.id : detail.id,
+      title: detail.title.trim().isEmpty ? seed.title : detail.title,
+      url: detail.url.trim().isEmpty ? seed.url : detail.url,
+      sourceId: detail.sourceId.isEmpty ? seed.sourceId : detail.sourceId,
+      cover: missingCover ? seed.cover : detail.cover,
+      coverHeaders: missingCover ? seed.coverHeaders : detail.coverHeaders,
+    );
+  }
 
   /// Read this title from a specific metadata catalogue — set when it was
   /// opened from a tracker that has one, so an AniList library entry opens
@@ -190,6 +304,11 @@ class DetailCubit extends Cubit<DetailState> {
   /// no opinion about providers, so a preference goes straight to the
   /// repository that does.
   Future<MediaDetail> _fetchDetail({
+    required String category,
+    void Function(MediaDetail partial)? onPartial,
+  }) => _unlessOffline(_fetchDetailFromSource(category: category, onPartial: onPartial));
+
+  Future<MediaDetail> _fetchDetailFromSource({
     required String category,
     void Function(MediaDetail partial)? onPartial,
   }) {
@@ -250,6 +369,8 @@ class DetailCubit extends Cubit<DetailState> {
   /// Initial fetch. Emits loading then success/error for the current
   /// [DetailState.category] (the per-title remembered choice, else 'sub').
   Future<void> load() async {
+    // Downloaded show page: read the saved details, never the network.
+    if (isLocal) return _loadLocal();
     final sw = Stopwatch()..start();
     _log(
       'load start url=$_url sourceId=${_sourceId ?? "active"} '
@@ -271,7 +392,7 @@ class DetailCubit extends Cubit<DetailState> {
           );
           emit(state.copyWith(
             status: DetailStatus.success,
-            detail: partial,
+            detail: _retainSeed(partial),
             episodesLoading: !_zmVideoDetail,
           ));
           // Cast and Relations run off malId/tmdbId/title, all of which are
@@ -295,7 +416,8 @@ class DetailCubit extends Cubit<DetailState> {
       // Pick the URL up from the same latch Home reads — only when nothing
       // useful actually came back, so a genuinely empty (if odd) title never
       // gets mistaken for a block.
-      final latched = detail.title.isEmpty ? NovelCloudflare.pendingUrl : null;
+      final latched = detail.type == ProviderType.novel && detail.title.isEmpty
+          ? NovelCloudflare.pendingUrl : null;
       if (latched != null) {
         _log('load cloudflare latched ${sw.elapsedMilliseconds}ms', level: 'W');
         emit(state.copyWith(
@@ -312,7 +434,7 @@ class DetailCubit extends Cubit<DetailState> {
       );
       // Keep AniZip/TMDB episode names that already painted on the catalogue
       // partial — the matched source's "Episode N" list must not wipe them.
-      final carried = detail.copyWith(
+      final carried = _retainSeed(detail).copyWith(
         episodes: carryEpisodeDisplayMeta(
           state.detail?.episodes,
           detail.episodes,
@@ -323,6 +445,10 @@ class DetailCubit extends Cubit<DetailState> {
         detail: carried,
         episodesLoading: false,
       ));
+      // Windows: lets the player move this show between list statuses
+      // (start -> Watching, finale -> Completed). No-op elsewhere.
+      final seed = seedItem;
+      if (seed != null) ListAutoStatus.instance.rememberShow(seed, carried);
       _enrich(carried);
     } on CloudflareRequiredException catch (e) {
       // The last emit in here without one: a catch is not covered by the
@@ -346,7 +472,7 @@ class DetailCubit extends Cubit<DetailState> {
       // it passes on its own, and saying how long is the whole difference
       // between waiting and hunting a fault.
       final limited = aniListRateLimitOf(e);
-      final offline = limited == null && await isOfflineErrorConfirmed(e);
+      final offline = limited == null && await _offlineConfirmed(e);
       if (isClosed) return; // that await can outlive the screen too
       _log(
         'load failed offline=$offline limited=${limited?.seconds} '
@@ -377,6 +503,8 @@ class DetailCubit extends Cubit<DetailState> {
   /// skip it. A match change makes that mandatory — the episode list is new,
   /// so its per-episode metadata has to be fetched again.
   Future<void> refresh({bool dropCache = true}) async {
+    // Downloaded show page: re-read the saved details only.
+    if (isLocal) return _loadLocal();
     if (isClosed) return;
     final revision = ++_categoryRevision;
     bool stale() => isClosed || revision != _categoryRevision;
@@ -413,14 +541,15 @@ class DetailCubit extends Cubit<DetailState> {
       if (stale()) return;
       // Same novel-latch fallback as load() — a swallowed fetch failure
       // surfaces as an empty detail, not an exception.
-      final latched = fresh.title.isEmpty ? NovelCloudflare.pendingUrl : null;
+      final latched = fresh.type == ProviderType.novel && fresh.title.isEmpty
+          ? NovelCloudflare.pendingUrl : null;
       if (latched != null) {
         _log('refresh cloudflare latched ${sw.elapsedMilliseconds}ms', level: 'W');
         emit(state.copyWith(cloudflareUrl: latched, episodesLoading: false));
         return;
       }
       NovelCloudflare.clear();
-      final merged = fresh.copyWith(
+      final merged = _retainSeed(fresh).copyWith(
         malId: fresh.malId ?? previous?.malId,
         tmdbId: fresh.tmdbId ?? previous?.tmdbId,
         episodes: carryEpisodeDisplayMeta(
@@ -460,7 +589,7 @@ class DetailCubit extends Cubit<DetailState> {
       // banner keeps a countdown that expired minutes ago and a reason that
       // may no longer be the reason.
       final limited = aniListRateLimitOf(e);
-      final offline = limited == null && await isOfflineErrorConfirmed(e);
+      final offline = limited == null && await _offlineConfirmed(e);
       if (stale()) return;
       emit(state.copyWith(
         error: limited != null
@@ -802,6 +931,11 @@ class DetailCubit extends Cubit<DetailState> {
         cat == state.category) {
       return true;
     }
+    // Downloaded show page: nothing to fetch, only the shown cut changes.
+    if (isLocal) {
+      emit(state.copyWith(category: cat));
+      return true;
+    }
     _switchingCategory = true;
     final revision = ++_categoryRevision;
     bool stale() => isClosed || revision != _categoryRevision;
@@ -894,8 +1028,19 @@ List<Episode> episodesInSeason(List<Episode> eps, int season) => [
     if ((seasonOf(e) ?? 1) == season) e,
 ];
 
-/// Whether this anime offers both episode versions.
-bool showSubDubFor(MediaDetail detail) =>
-    detail.type == ProviderType.anime &&
-    (detail.subCount ?? 0) > 0 &&
-    (detail.dubCount ?? 0) > 0;
+/// Whether this anime offers both episode versions. The Windows desktop page
+/// keeps its Sub/Dub toggle whenever either version exists.
+bool showSubDubFor(MediaDetail detail) {
+  if (detail.type != ProviderType.anime) return false;
+  final hasSub = (detail.subCount ?? 0) > 0;
+  final hasDub = (detail.dubCount ?? 0) > 0;
+  if (defaultTargetPlatform == TargetPlatform.windows) return hasSub || hasDub;
+  return hasSub && hasDub;
+}
+
+/// The app's connection monitor says the network is gone (Windows only).
+class _AppOffline implements Exception {
+  const _AppOffline();
+  @override
+  String toString() => 'offline (app connection monitor)';
+}

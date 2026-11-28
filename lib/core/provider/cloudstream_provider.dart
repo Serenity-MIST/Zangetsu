@@ -19,12 +19,59 @@ import 'base_provider.dart';
 import 'cf_solve_needed.dart';
 import 'link_patience.dart';
 import 'cs_repo_url.dart';
+import '../desktop/cloudstream_catalog.dart';
+import '../desktop/cloudstream_runtime.dart';
 
-/// Native MethodChannel bridging to the CloudStream plugin host. All methods
-/// are async, Android-only, and return JSON-shaped collections. Every call is
-/// guarded by [Platform.isAndroid] at the call site; the channel itself never
-/// throws past the guards below (failures degrade to empty/safe values).
-const MethodChannel _csChannel = MethodChannel('zangetsu/cloudstream');
+/// Bridge to the CloudStream plugin host: the native MethodChannel on Android,
+/// the desktop companion on Windows. All methods are async and return
+/// JSON-shaped collections. Every call is guarded by [_csSupported] at the call
+/// site; the host itself never throws past the guards below (failures degrade
+/// to empty/safe values).
+final _csChannel = _CloudStreamHost();
+
+/// Replaces only the platform transport in isolated provider contract tests.
+/// Production leaves this null and always uses its real native/desktop host.
+@visibleForTesting
+Future<dynamic> Function(String method, dynamic arguments)?
+cloudStreamHostOverride;
+
+/// Platforms with an installed native or companion CloudStream host.
+bool get _csSupported => Platform.isAndroid || Platform.isWindows;
+
+/// Selects the Android method channel or Windows companion without changing
+/// the provider-facing method names or callback payloads.
+class _CloudStreamHost {
+  static const native = MethodChannel('zangetsu/cloudstream');
+
+  /// Forwards an operation and preserves its expected channel result type.
+  Future<T?> invokeMethod<T>(String method, [dynamic args]) async {
+    final override = cloudStreamHostOverride;
+    if (override != null) return (await override(method, args)) as T?;
+    if (Platform.isWindows) {
+      return (await DesktopCloudStream.instance.call(method, args)) as T?;
+    }
+    return native.invokeMethod<T>(method, args);
+  }
+
+  /// Attaches app callbacks to the active platform host's event stream.
+  void setMethodCallHandler(Future<dynamic> Function(MethodCall)? handler) {
+    if (Platform.isWindows) {
+      DesktopCloudStream.instance.onEvent = handler;
+    } else {
+      native.setMethodCallHandler(handler);
+    }
+  }
+}
+
+/// Desktop-era name for [csMainPageCategoryId]; both encode the same JSON
+/// pair, so this simply delegates to upstream's codec.
+String encodeCloudStreamCategory(String name, String data) =>
+    csMainPageCategoryId(name, data);
+
+/// Desktop-era name for [csMainPageCategory] (same format, incl. older
+/// space-delimited links).
+({String name, String data}) decodeCloudStreamCategory(String value) =>
+    csMainPageCategory(value);
 
 /// Keeps the provider's category name and opaque data intact for pagination.
 String csMainPageCategoryId(String name, String data) =>
@@ -53,7 +100,7 @@ String csMainPageCategoryId(String name, String data) =>
 /// (the plugin's `openSettings`, e.g. AnimePahe's server picker). Android-only;
 /// any failure degrades to `false`.
 Future<bool> csPluginHasSettings(String apiName) async {
-  if (!Platform.isAndroid) return false;
+  if (!_csSupported) return false;
   try {
     return await _csChannel.invokeMethod<bool>('hasPluginSettings', {
           'name': apiName,
@@ -68,7 +115,7 @@ Future<bool> csPluginHasSettings(String apiName) async {
 /// activity (the plugin renders its bottom sheet / dialog). Android-only; safe
 /// no-op on failure or other platforms.
 Future<void> csPluginOpenSettings(String apiName) async {
-  if (!Platform.isAndroid) return;
+  if (!_csSupported) return;
   try {
     await _csChannel.invokeMethod('openPluginSettings', {'name': apiName});
   } catch (_) {}
@@ -80,7 +127,7 @@ Future<void> csPluginOpenSettings(String apiName) async {
 /// platform, so a caller can tell "nothing to clear" and "couldn't clear"
 /// apart from a genuine success.
 Future<bool> csPluginResetData(String apiName) async {
-  if (!Platform.isAndroid) return false;
+  if (!_csSupported) return false;
   try {
     return await _csChannel.invokeMethod<bool>('resetPluginData', {
           'name': apiName,
@@ -202,8 +249,7 @@ class CloudStreamProvider implements BaseProvider {
   /// ambiguous — we send `"<fileId><name>"` and the host matches BOTH,
   /// landing on the exact source. Sources with no file id (unique `cs:<name>`
   /// sources) fall back to the bare name, which the host still accepts.
-  String get hostKey =>
-      (sourcePlugin != null && sourcePlugin!.isNotEmpty)
+  String get hostKey => (sourcePlugin != null && sourcePlugin!.isNotEmpty)
       ? '${sourcePlugin!}$keySep$name'
       : name;
 
@@ -246,6 +292,11 @@ class CloudStreamProvider implements BaseProvider {
   /// home source switcher.
   ProviderType get providerType => _providerType;
 
+  /// Mixed providers must remain eligible for films even when anime is their
+  /// coarse default type. Empty declarations remain unknown and usable.
+  bool get supportsMovies =>
+      types.isEmpty || types.any((type) => !_kAnimeTypes.contains(type));
+
   /// Item-level type. An anime-ONLY source (every advertised type is anime)
   /// serves nothing but anime, so a coarse per-item TvType — many plugins tag
   /// anime as "TvSeries"/"Movie" — must not downgrade it to movie. Mixed and
@@ -272,11 +323,13 @@ class CloudStreamProvider implements BaseProvider {
     int page, {
     String category = '',
   }) async {
-    if (!Platform.isAndroid) return const [];
+    if (!_csSupported) return const [];
     try {
       final raw = await _csChannel.invokeMethod<List<dynamic>>('search', {
         'name': hostKey,
         'query': query,
+        // The Windows companion pages search results; Android ignores pages.
+        if (Platform.isWindows) 'page': page,
       });
       return (raw ?? const []).map(_mediaItemFromMap).toList();
     } catch (e) {
@@ -295,7 +348,7 @@ class CloudStreamProvider implements BaseProvider {
   Future<({List<MediaItem> items, String? error})> searchWithStatus(
     String query,
   ) async {
-    if (!Platform.isAndroid) return (items: const <MediaItem>[], error: null);
+    if (!_csSupported) return (items: const <MediaItem>[], error: null);
     final raw = await _csChannel.invokeMethod<Map<dynamic, dynamic>>(
       'searchStatus',
       {'name': hostKey, 'query': query},
@@ -312,7 +365,7 @@ class CloudStreamProvider implements BaseProvider {
 
   @override
   Future<MediaDetail> getDetail(String url, {String category = 'sub'}) async {
-    if (!Platform.isAndroid) {
+    if (!_csSupported) {
       return MediaDetail(
         id: url,
         title: '',
@@ -456,7 +509,7 @@ class CloudStreamProvider implements BaseProvider {
     String episodeUrl, {
     bool fast = false,
   }) async {
-    if (!Platform.isAndroid) return const [];
+    if (!_csSupported) return const [];
     final key = '$hostKey|$episodeUrl';
     _inFlightLinks.add(key);
     try {
@@ -494,17 +547,17 @@ class CloudStreamProvider implements BaseProvider {
   /// idempotent: unknown/finished keys are a no-op there, and a hunt that
   /// answers between the send and the cancel simply resolves normally.
   static Future<void> cancelInFlightLinks() async {
-    if (!Platform.isAndroid || _inFlightLinks.isEmpty) return;
+    if (!_csSupported || _inFlightLinks.isEmpty) return;
     final keys = _inFlightLinks.toList();
     _inFlightLinks.clear();
     for (final key in keys) {
       final sep = key.indexOf('|');
       if (sep <= 0) continue;
       try {
-        await _csChannel.invokeMethod(
-          'cancelLinks',
-          {'name': key.substring(0, sep), 'data': key.substring(sep + 1)},
-        );
+        await _csChannel.invokeMethod('cancelLinks', {
+          'name': key.substring(0, sep),
+          'data': key.substring(sep + 1),
+        });
       } catch (_) {
         // Best-effort: a failed cancel just lets that hunt run its cap out.
       }
@@ -522,7 +575,7 @@ class CloudStreamProvider implements BaseProvider {
   Future<({List<VideoSource> sources, bool done})> pollVideoSources(
     String episodeUrl,
   ) async {
-    if (!Platform.isAndroid) {
+    if (!_csSupported) {
       return (sources: const <VideoSource>[], done: true);
     }
     final raw = await _csChannel.invokeMethod<Map<dynamic, dynamic>>(
@@ -669,7 +722,7 @@ class CloudStreamProvider implements BaseProvider {
       jsonDecode(s) as List<dynamic>;
 
   Future<List<HomeSection>?> _fetchHome() async {
-    if (!Platform.isAndroid) return null;
+    if (!_csSupported) return null;
     // Native returns the feed as a JSON STRING (serialized on its background
     // thread). Handing Flutter a nested List<Map> would make the platform
     // channel encode it on the UI thread — which skips frames on big feeds like
@@ -718,7 +771,7 @@ class CloudStreamProvider implements BaseProvider {
   /// produced in [_fetchHome]; [page] is 1-based. Android-only; returns `[]` on
   /// any error (never throws) so a failed page just stops the scroll.
   Future<List<MediaItem>> browseMainPage(String categoryId, int page) async {
-    if (!Platform.isAndroid) return const [];
+    if (!_csSupported) return const [];
     final (:name, :data) = csMainPageCategory(categoryId);
     try {
       final raw = await _csChannel.invokeMethod<List<dynamic>>(
@@ -1052,7 +1105,7 @@ class CloudStreamManager extends ChangeNotifier {
     final files = <String>[
       for (final f in (repo['files'] as List? ?? const [])) '$f',
     ];
-    if (Platform.isAndroid && files.isNotEmpty) {
+    if (_csSupported && files.isNotEmpty) {
       try {
         final raw = await _csChannel.invokeMethod<List<dynamic>>('deleteRepo', {
           'files': files,
@@ -1072,7 +1125,7 @@ class CloudStreamManager extends ChangeNotifier {
   /// natively). Updates the persisted record + rebuilds. Returns the number of
   /// plugins ACTUALLY updated (0 = already up to date). No-op on non-Android.
   Future<int> updateRepo(String url) async {
-    if (!Platform.isAndroid) return 0;
+    if (!_csSupported) return 0;
     try {
       final repo = await _csChannel.invokeMethod<Map<dynamic, dynamic>>(
         'updateRepo',
@@ -1098,7 +1151,7 @@ class CloudStreamManager extends ChangeNotifier {
   /// or plugin-state mutation). Updates [_updates] for this repo + notifies.
   /// Returns the outdated list (empty off Android or on any error — never throws).
   Future<List<CsUpdate>> checkRepoUpdates(String url) async {
-    if (!Platform.isAndroid || url.isEmpty) return const [];
+    if (!_csSupported || url.isEmpty) return const [];
     try {
       final res = await _csChannel.invokeMethod<Map<dynamic, dynamic>>(
         'checkRepoUpdates',
@@ -1127,7 +1180,7 @@ class CloudStreamManager extends ChangeNotifier {
   /// per [_updatesTtl] unless [force]. Returns the total number of updates found.
   /// Best-effort — a repo that fails to check is skipped. No-op off Android.
   Future<int> checkAllUpdates({bool force = false}) async {
-    if (!Platform.isAndroid) return 0;
+    if (!_csSupported) return 0;
     final last = _lastUpdateCheck;
     if (!force &&
         last != null &&
@@ -1149,7 +1202,7 @@ class CloudStreamManager extends ChangeNotifier {
   /// the new `.cs3`, repo-scoped via [repoUrl]). On success the plugin is dropped
   /// from [_updates]. Rebuilds + notifies. No-op off Android; rethrows on failure.
   Future<void> updatePlugin(CsUpdate update, {required String repoUrl}) async {
-    if (!Platform.isAndroid) return;
+    if (!_csSupported) return;
     try {
       final raw = await _csChannel.invokeMethod<List<dynamic>>('updatePlugin', {
         'url': update.url,
@@ -1276,7 +1329,7 @@ class CloudStreamManager extends ChangeNotifier {
   /// SAME plugin installed from two repos lands in two files. Rebuilds. No-op
   /// off Android.
   Future<void> installPlugin(CsPluginMeta plugin, {String repoUrl = ''}) async {
-    if (!Platform.isAndroid) return;
+    if (!_csSupported) return;
     try {
       final raw = await _csChannel
           .invokeMethod<List<dynamic>>('installPlugin', {
@@ -1299,7 +1352,7 @@ class CloudStreamManager extends ChangeNotifier {
     CsPluginMeta plugin, {
     String repoUrl = '',
   }) async {
-    if (!Platform.isAndroid) return;
+    if (!_csSupported) return;
     try {
       final raw = await _csChannel.invokeMethod<List<dynamic>>(
         'uninstallPlugin',
@@ -1320,7 +1373,7 @@ class CloudStreamManager extends ChangeNotifier {
   /// Lazily fetches a repo's catalog if it isn't loaded yet (e.g. a repo added
   /// before per-plugin install existed). Best-effort; safe to call repeatedly.
   Future<void> ensureCatalog(String url) async {
-    if (!Platform.isAndroid || url.isEmpty) return;
+    if (!_csSupported || url.isEmpty) return;
     final repo = _repos.firstWhere(
       (r) => (r['url'] ?? '').toString() == url,
       orElse: () => const {},
@@ -1362,7 +1415,7 @@ class CloudStreamManager extends ChangeNotifier {
   /// [installPlugin]. Returns the number of installable plugins the repo
   /// advertises. No-op on non-Android.
   Future<int> addRepo(String rawUrl) async {
-    if (!Platform.isAndroid) return 0;
+    if (!_csSupported) return 0;
     // Tidy the paste first: a link copied out of chat or a browser arrives
     // wrapped in <>/quotes, with a trailing full stop, or with no scheme at
     // all — and the native fetch rejects anything java.net.URL won't parse.
@@ -1568,7 +1621,18 @@ class CloudStreamManager extends ChangeNotifier {
   /// are swallowed so a missing native channel can't break startup.
   Future<void> loadInstalled() async {
     _loadRepos();
-    if (!Platform.isAndroid) {
+    // Windows ships with the Megix repo listed once, so a fresh PC install
+    // has CloudStream sources to pick from.
+    if (Platform.isWindows && _box?.get('megixPresetAdded') != true) {
+      if (!_repos.any((repo) => repo['url'] == megixRepoUrl)) {
+        _upsertRepo({
+          'url': megixRepoUrl,
+          'name': 'Megix Repo (Hindi & English)',
+        }, fallbackUrl: megixRepoUrl);
+      }
+      await _box?.put('megixPresetAdded', true);
+    }
+    if (!_csSupported) {
       notifyListeners();
       return;
     }

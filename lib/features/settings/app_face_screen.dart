@@ -9,6 +9,7 @@ import '../../core/theme/app_text.dart';
 import '../../core/ui/app_dialog.dart';
 import '../../core/ui/banner_style.dart';
 import '../../core/ui/settings_widgets.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import '../../core/ui/splash_style.dart';
 import '../../l10n/l10n.dart';
 
@@ -26,7 +27,33 @@ class AppFaceScreen extends StatefulWidget {
   State<AppFaceScreen> createState() => _AppFaceScreenState();
 }
 
-class _AppFaceScreenState extends State<AppFaceScreen> {
+class _AppFaceScreenState extends State<AppFaceScreen>
+    with SingleTickerProviderStateMixin {
+  AnimationController? _desktopSplash;
+
+  /// Created only by the desktop preview; mobile keeps its own existing cards.
+  AnimationController get _desktopAnimation =>
+      _desktopSplash ??= AnimationController(
+        vsync: this,
+        value: 1,
+        duration: const Duration(milliseconds: 1600),
+      );
+
+  @override
+  void dispose() {
+    _desktopSplash?.dispose();
+    super.dispose();
+  }
+
+  /// Preview once, without leaving idle repeating animations on a settings page.
+  void _playDesktopSplash() {
+    if (MediaQuery.disableAnimationsOf(context)) {
+      _desktopAnimation.value = 1;
+    } else {
+      _desktopAnimation.forward(from: 0);
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -36,36 +63,141 @@ class _AppFaceScreenState extends State<AppFaceScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: AppColors.bg,
-      appBar: settingsAppBar('Icon, splash & banner'),
-      body: ListView(
-        padding: const EdgeInsets.only(top: 4, bottom: 32),
-        children: [
-          // ── App icon ──────────────────────────────────────────────────────
-          // Android-only: iOS has an unrelated API and TV has no icon picker.
-          if (_icons.supported) ...[
-            SettingsSectionLabel(context.l10n.appIcon),
-            _blurb(context.l10n.appIconBlurb),
-            const SizedBox(height: 10),
-            _iconPicker(),
-          ],
+      backgroundColor: settingsPageBackground(context),
+      // Windows (desktop settings) shows only the splash picker, so the page
+      // is named for it, matching the "Splash screen" row that opens it.
+      appBar: settingsAppBar(
+        DesktopSettingsScope.contains(context)
+            ? 'Splash screen'
+            : 'Icon, splash & banner',
+      ),
+      body: DesktopSettingsScope.contains(context)
+          ? _desktopBody()
+          : ListView(
+              padding: const EdgeInsets.only(top: 4, bottom: 32),
+              children: [
+                // ── App icon ──────────────────────────────────────────────────────
+                // Android-only: iOS has an unrelated API and TV has no icon picker.
+                if (_icons.supported) ...[
+                  SettingsSectionLabel(context.l10n.appIcon),
+                  _blurb(context.l10n.appIconBlurb),
+                  const SizedBox(height: 10),
+                  _iconPicker(),
+                ],
 
-          // ── Splash ────────────────────────────────────────────────────────
-          // Every platform: this one is drawn by us, with no OS involvement.
-          SettingsSectionLabel(context.l10n.splashStyle),
-          _blurb(context.l10n.splashStyleBlurb),
-          const SizedBox(height: 10),
-          _splashPicker(),
+                // ── Splash ────────────────────────────────────────────────────────
+                // Every platform: this one is drawn by us, with no OS involvement.
+                SettingsSectionLabel(context.l10n.splashStyle),
+                _blurb(context.l10n.splashStyleBlurb),
+                const SizedBox(height: 10),
+                _splashPicker(),
 
-          // ── Home banner ───────────────────────────────────────────────────
-          // Phone only: the TV home draws its own banner and doesn't read this.
-          if (!sl<AppMode>().isTv) ...[
-            SettingsSectionLabel('Home banner'),
-            _blurb('How the featured title shows on Home.'),
-            const SizedBox(height: 10),
-            _bannerPicker(),
-          ],
-        ],
+                // ── Home banner ───────────────────────────────────────────────────
+                // Phone only: the TV home draws its own banner and doesn't read this.
+                if (!sl<AppMode>().isTv) ...[
+                  SettingsSectionLabel('Home banner'),
+                  _blurb('How the featured title shows on Home.'),
+                  const SizedBox(height: 10),
+                  _bannerPicker(),
+                ],
+              ],
+            ),
+    );
+  }
+
+  /// Desktop body: the splash picker only. Windows has no launcher-icon
+  /// switch, and its Home always draws its own hero, so the icon note and the
+  /// Home banner picker (which changed nothing there) are not shown.
+  Widget _desktopBody() {
+    final splash = GraphiteSettingsPanel(
+      margin: EdgeInsets.zero,
+      children: [
+        Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(context.l10n.splashStyle, style: AppText.headline),
+              const SizedBox(height: 8),
+              Text(
+                '${context.l10n.splashStyleBlurb} Your choice plays the next '
+                'time Zangetsu starts.',
+                style: AppText.caption,
+              ),
+              const SizedBox(height: 16),
+              Container(
+                width: double.infinity,
+                height: 150,
+                decoration: BoxDecoration(
+                  // The real splash paints the app background, so the preview
+                  // does too (custom background and pure black included).
+                  color: AppColors.bg,
+                  border: Border.all(color: AppColors.hairline),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: AnimatedBuilder(
+                  animation: _desktopAnimation,
+                  builder: (context, _) {
+                    final progress = MediaQuery.disableAnimationsOf(context)
+                        ? 1.0
+                        : _desktopAnimation.value;
+                    return Center(
+                      child: SplashStyle.selectedId == 'bankai'
+                          ? BankaiSplash(progress: progress, size: 120)
+                          : Opacity(
+                              opacity: progress,
+                              child: Image.asset(
+                                'assets/icon/wordmark.png',
+                                width: 220,
+                                fit: BoxFit.contain,
+                              ),
+                            ),
+                    );
+                  },
+                ),
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                key: const ValueKey('desktop-splash-preview'),
+                onPressed: _playDesktopSplash,
+                icon: const Icon(Icons.play_arrow_rounded),
+                label: const Text('Preview animation'),
+              ),
+            ],
+          ),
+        ),
+        for (final option in SplashStyle.options)
+          Semantics(
+            checked: SplashStyle.selectedId == option.id,
+            inMutuallyExclusiveGroup: true,
+            child: GraphiteSettingsControl(
+              key: ValueKey('desktop-splash-${option.id}'),
+              icon: SplashStyle.selectedId == option.id
+                  ? Icons.radio_button_checked_rounded
+                  : Icons.radio_button_unchecked_rounded,
+              title: option.label,
+              subtitle: option.id == 'bankai'
+                  ? 'Animated crest reveal'
+                  : 'Animated wordmark reveal',
+              onTap: () async {
+                await SplashStyle.select(option.id);
+                if (!mounted) return;
+                setState(() {});
+                _playDesktopSplash();
+              },
+            ),
+          ),
+      ],
+    );
+    // One panel, capped so the preview stays a sensible size at 1920 wide.
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(22),
+      child: Align(
+        alignment: AlignmentDirectional.topStart,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 760),
+          child: splash,
+        ),
       ),
     );
   }

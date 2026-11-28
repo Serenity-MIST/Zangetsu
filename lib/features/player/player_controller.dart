@@ -11,20 +11,37 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import '../../core/platform/app_paths.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
+import '../../core/download/folder_manifest.dart';
 
 import '../../core/app_mode.dart';
+import '../../core/desktop/desktop_hang_watch.dart';
+import '../../core/desktop/desktop_media_keys.dart';
+import '../../core/desktop/desktop_native.dart';
+import '../../core/desktop/desktop_prefs.dart';
+// Windows only: Cloudflare cookie headers for mpv (R1) and the "this source
+// uses an Android feature" dead-end wording (B2).
+import '../../core/desktop/desktop_extension_unsupported.dart';
+import '../../core/desktop/desktop_stream_headers.dart';
 import '../../core/di/injector.dart';
 import '../../core/discord/discord_presence.dart';
 import '../../core/discord/discord_rpc.dart';
+import '../../core/download/subtitle_sidecars.dart' show kUnlabelledSubtitle;
+import '../../core/boot_network.dart';
 import '../../core/share/share_link.dart';
 import '../../core/logging/app_logger.dart';
 import '../../core/metadata/episode_metadata_service.dart';
+import '../../core/metadata/metadata_enrichment.dart';
 import '../../core/tracker/tracker_hub.dart';
 import '../../core/tracker/simkl_playback_session.dart';
 import '../../core/models/episode.dart';
+import '../../core/models/episode_title.dart';
+import '../../core/models/media_detail.dart';
 import '../../core/models/provider_info.dart';
 import '../../core/models/video_source.dart';
 import '../../core/playback/hls.dart';
+import '../../core/playback/list_auto_status.dart';
+import '../../core/models/watch_status.dart';
 import '../../core/playback/playback_prefs.dart';
 import '../../core/playback/source_health_store.dart';
 import '../../core/playback/filler_service.dart';
@@ -57,7 +74,12 @@ import 'subtitle_font_service.dart';
 import 'subtitle_style.dart' show libassOutline;
 import 'player_lifecycle.dart';
 import 'playback_failover.dart';
+// Windows-only recovery rules (safe second try, fresh links, end-of-video
+// resume mark), kept as plain functions for tests.
+import 'desktop_playback_recovery.dart';
+import 'desktop_late_mirrors.dart';
 import 'player_engine_fallback.dart';
+import '../../l10n/l10n.dart';
 
 /// The mpv video output (renderer) to create the player with, from the user's
 /// Video renderer setting.
@@ -71,6 +93,7 @@ import 'player_engine_fallback.dart';
 /// change only takes effect the next time the player is opened.
 String? _resolveVideoOutput() => resolveVideoOutput(
   isTv: sl<AppMode>().isTv,
+  isWindows: Platform.isWindows,
   choice: sl<PlaybackPrefs>().videoOutput,
   shaderStyle: sl<PlaybackPrefs>().videoShaderStyle,
 );
@@ -82,13 +105,126 @@ String? _resolveVideoOutput() => resolveVideoOutput(
 /// the user picked never reaches mpv. Passing it here makes our value the one
 /// that gets applied.
 ///
+/// Windows has the same race: media_kit writes its own `hwdec=auto` after an
+/// awaited handle/decoder query, which can land after [_configureMpv]. So the
+/// Video decoder setting is passed here too and applies on the first open.
+///
 /// Null everywhere else ON PURPOSE. Android's media_kit default is `auto-safe`
 /// — and `no` when it detects an emulator, which is what keeps video working on
 /// emulators. Overriding that would take the emulator fallback away, so Android
 /// keeps exactly the behaviour it ships with today.
-String? _configHwdec() => currentDecoderPlatform == DecoderPlatform.apple
-    ? sl<PlaybackPrefs>().hwdecValue
-    : null;
+String? _configHwdec() =>
+    configHwdecFor(currentDecoderPlatform, () => sl<PlaybackPrefs>().hwdecValue);
+
+/// Pure form of [_configHwdec]: the creation-time `hwdec` for [platform].
+/// [hwdec] is only read for the platforms that pass it.
+@visibleForTesting
+String? configHwdecFor(DecoderPlatform platform, String Function() hwdec) =>
+    switch (platform) {
+      DecoderPlatform.apple || DecoderPlatform.windows => hwdec(),
+      _ => null,
+    };
+
+/// The software-decoder (libavcodec) options for this platform. Phones and
+/// TV keep the light settings they always had (4 threads, loop filter skipped
+/// on non-key frames, fast decode). Windows gets full-quality decoding: as
+/// many threads as the PC has, the loop filter always on, and no fast paths,
+/// because the light settings visibly smear and block up the picture.
+@visibleForTesting
+Map<String, String> lavcDecodeOptions(bool isWindows) => isWindows
+    ? const {
+        'vd-lavc-threads': '0',
+        'vd-lavc-skiploopfilter': 'default',
+        'vd-lavc-fast': 'no',
+      }
+    : const {
+        'vd-lavc-threads': '4',
+        'vd-lavc-skiploopfilter': 'nonkey',
+        'vd-lavc-fast': 'yes',
+      };
+
+/// Windows: true for a video bigger than 1440p (a 4K film). Only these get
+/// the light handling below; 1080p and 1440p keep full-size output.
+bool isAbove1440p(int width, int height) =>
+    width * height > 2560 * 1440 || width > 2560 || height > 1440;
+
+/// Windows: the mpv `framedrop` value for a video.
+///
+/// A video above 1440p that is decoded in software ([hwdec] null, empty or
+/// "no") may also drop frames in the decoder (`decoder+vo`), so a CPU that
+/// cannot keep up with a 4K film shows a moving picture instead of falling
+/// further behind. With a hardware decoder active, mpv's decoder frame
+/// dropping can cause short corruption or stutter on some drivers, so it keeps
+/// mpv's normal `vo` dropping, the same as every smaller video.
+@visibleForTesting
+String windowsFramedropMode({required bool big, String? hwdec}) {
+  if (!big) return 'vo';
+  final h = hwdec?.trim() ?? '';
+  final software = h.isEmpty || h == 'no';
+  return software ? 'decoder+vo' : 'vo';
+}
+
+/// Windows: the size media_kit should render a video above 1440p at, or null
+/// to keep the video's own size.
+///
+/// On the Windows hardware path mpv draws every frame into a texture as big
+/// as the video, and Flutter then shrinks it to the player box. For a
+/// 3840x2160 film that is four times the work of 1080p on every frame, which
+/// a weak Intel iGPU could not finish in time (the picture stayed black). No
+/// screen shows more pixels than it has, so a video above 1440p is drawn at
+/// most at the size of the largest screen (at least 1920x1080), keeping its
+/// shape. mpv then does the shrinking itself, with its own good scaler.
+/// A 4K screen still gets the full 4K picture.
+@visibleForTesting
+(int, int)? windowsRenderCap({
+  required int videoWidth,
+  required int videoHeight,
+  required int screenWidth,
+  required int screenHeight,
+}) {
+  if (videoWidth <= 0 || videoHeight <= 0) return null;
+  if (!isAbove1440p(videoWidth, videoHeight)) return null;
+  final boxW = screenWidth < 1920 ? 1920 : screenWidth;
+  final boxH = screenHeight < 1080 ? 1080 : screenHeight;
+  final scaleW = boxW / videoWidth;
+  final scaleH = boxH / videoHeight;
+  final scale = scaleW < scaleH ? scaleW : scaleH;
+  if (scale >= 1) return null;
+  final w = (videoWidth * scale).round();
+  final h = (videoHeight * scale).round();
+  return (w < 1 ? 1 : w, h < 1 ? 1 : h);
+}
+
+/// True when at least one episode has no real name: neither the source's
+/// title nor a looked-up one (a bare "Episode 3" does not count as a name).
+@visibleForTesting
+bool episodesMissingNames(List<Episode> episodes) =>
+    episodes.any((e) => episodeDisplayTitle(e) == null);
+
+/// True when an mpv log line means the Anime4K shaders could not load,
+/// compile or render. Only error-level video-output lines count, so a normal
+/// network or decoder error never switches the enhancement off.
+@visibleForTesting
+bool isShaderFailureLog(String prefix, String level, String text) {
+  if (level != 'error' && level != 'fatal') return false;
+  if (!prefix.startsWith('vo')) return false;
+  final t = text.toLowerCase();
+  return t.contains('shader') ||
+      t.contains('glsl') ||
+      t.contains('failed rendering frame');
+}
+
+/// Position at which the next episode starts resolving in the background:
+/// 5 minutes before the end, or at 85% when that is sooner, never before a
+/// quarter of a short video.
+@visibleForTesting
+Duration nextEpisodePrefetchAt(Duration duration) {
+  final fiveMinLeft = duration - const Duration(minutes: 5);
+  final share = duration * 0.85;
+  final floor = duration * 0.25;
+  final at = fiveMinLeft < share ? fiveMinLeft : share;
+  return at < floor ? floor : at;
+}
 
 /// Immutable view-state for the player screen: exactly the fields the UI
 /// rebuilds on. These used to drive `notifyListeners()` on the old
@@ -286,15 +422,47 @@ class PlayerCubit extends Cubit<PlayerState> {
     this.initialResume = Duration.zero,
     this.initialSource,
     this.onDrmSource,
+    Future<List<VideoSource>?> Function(Episode episode)? localDownloadFinder,
+    Future<bool> Function()? confirmLocalFallback,
     this.onSourceFailure,
     this.engineFallback,
     this.forceInitialResume = false,
   }) : _resolveSources = resolveSources,
        _resolveDownloadedSources = resolveDownloadedSources,
+       _localDownloadFinder = localDownloadFinder,
+       _confirmLocalFallback = confirmLocalFallback,
        _pollSources = pollSources,
        _dio = dio,
        _activeCategory = category ?? 'sub',
        super(const PlayerState());
+
+  /// Looks up the finished download of an episode, or null when there is none.
+  /// Used only as a last resort after every online option has failed.
+  /// Not final: on Windows a playback that floated in the mini player and is
+  /// opened full again points this at the new player page (see
+  /// [rebindScreenCallbacks]).
+  Future<List<VideoSource>?> Function(Episode episode)? _localDownloadFinder;
+
+  /// Asks the viewer before switching to the download (setting "ask").
+  Future<bool> Function()? _confirmLocalFallback;
+
+  /// Windows: the floating mini player hands this same playback back to a
+  /// new player page. The page-owned questions (DRM hand-off, "play the
+  /// download instead?") must then talk to that new page, not to the one
+  /// that closed when the video floated. Phone never calls this.
+  void rebindScreenCallbacks({
+    void Function(VideoSource drm)? onDrmSource,
+    Future<List<VideoSource>?> Function(Episode episode)? localDownloadFinder,
+    Future<bool> Function()? confirmLocalFallback,
+  }) {
+    this.onDrmSource = onDrmSource;
+    _localDownloadFinder = localDownloadFinder;
+    _confirmLocalFallback = confirmLocalFallback;
+  }
+
+  /// One attempt per episode open, so a failing local file can never bounce
+  /// back to the network and loop.
+  bool _triedLocalFallback = false;
 
   final String sourceId;
   // Mutable: switching Sub/Dub on a provider that separates the two by episode
@@ -361,7 +529,8 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// (clearkey CENC/DASH). mpv can't decrypt DRM, so the host screen hands off to
   /// the ExoPlayer-backed [DrmPlayerScreen]. Null on screens with no handoff
   /// (e.g. watch-together), where a DRM source just fails as before.
-  final void Function(VideoSource drm)? onDrmSource;
+  /// Not final only so [rebindScreenCallbacks] can repoint it (Windows).
+  void Function(VideoSource drm)? onDrmSource;
   final Future<bool> Function(VideoSource source, Duration position)?
   onSourceFailure;
   final PlayerEngineFallback? engineFallback;
@@ -426,7 +595,7 @@ class PlayerCubit extends Cubit<PlayerState> {
       // high-res playback + less battery/heat. media_kit auto-falls back to
       // software decode if the device can't hardware-decode a codec.
       enableHardwareAcceleration: true,
-      // Apple only — see [_configHwdec]. Null on Android, which keeps
+      // Apple and Windows — see [_configHwdec]. Null on Android, which keeps
       // media_kit's own default (and its emulator fallback) exactly as before.
       hwdec: _configHwdec(),
       // Attach the Android render surface only once the video's dimensions are
@@ -532,6 +701,31 @@ class PlayerCubit extends Cubit<PlayerState> {
   String? _softwareDecodeRetryError;
   bool _softwareDecoderFallbackActive = false;
 
+  /// Windows only (plan item R3): true once this episode has asked its source
+  /// for fresh links after an expired-looking failure. Once per episode, so a
+  /// source that keeps handing out dead links can never loop. Reset with
+  /// [_tried] when a new episode (or cut) opens.
+  bool _freshLinksTried = false;
+
+  /// Windows only: the last few mpv error log lines for the link being opened.
+  /// media_kit only forwards some of mpv's errors to the error stream (an HTTP
+  /// 403 usually arrives only as an ffmpeg log line), so [_onPlaybackError]
+  /// reads these to tell an expired link from other failures. Cleared on every
+  /// open.
+  final List<String> _desktopErrorLog = [];
+
+  /// Windows only (plan item P5): the open generation whose end-of-video
+  /// resume mark was already reset, so the duration listener and
+  /// [_verifyResume] never reset (or seek) twice for the same open.
+  int? _endMarkResetGen;
+
+  /// Windows only (plan item P5): the saved resume mark the latest open read
+  /// from the resume store, or zero when that open came from a server or
+  /// quality switch (which reopens at the live position). Only this mark may
+  /// be reset by the end-of-video rule, so a switch during the credits keeps
+  /// its place instead of restarting the episode.
+  Duration _desktopSavedMark = Duration.zero;
+
   /// True once ANY source has actually produced picture in this player
   /// session, unlike [_startedThisSource] which resets on every source switch.
   ///
@@ -563,7 +757,9 @@ class PlayerCubit extends Cubit<PlayerState> {
         Uri.parse(s.url),
         options: Options(
           responseType: ResponseType.plain,
-          headers: s.headers,
+          // Windows: same Cloudflare cookie headers mpv gets (plan item R1);
+          // other platforms get s.headers unchanged.
+          headers: desktopStreamHeaders(s.url, s.headers),
           receiveTimeout: const Duration(seconds: 8),
           validateStatus: (c) => c != null && c < 500,
         ),
@@ -701,6 +897,8 @@ class PlayerCubit extends Cubit<PlayerState> {
     await _cancelProgressive();
     final keepPos = _lastPos;
     _tried.clear();
+    _stopDesktopLatePoll(); // Windows R5: the old open's poll ends here
+    _freshLinksTried = false; // Windows R3: one fresh-links try per episode / cut
     _sourceHops = 0; // a different cut is a fresh set of sources
     _recovering = false;
     emit(
@@ -781,6 +979,9 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// re-open, a quality switch), and keying on that threw away good results.
   /// An episode or Sub/Dub switch changes the URL, which does stop it.
   Future<void> _pollForMoreSources(String epUrl) async {
+    // Windows (plan item R5): its own version of this poll, with a fallback
+    // poller and stop rules. Phone and TV carry on below, unchanged.
+    if (desktopLateMirrorsEnabled) return _pollDesktopLateMirrors(epUrl);
     final poll = _pollSources;
     if (poll == null) return;
     // Back off quickly for the usual case, then keep checking CloudStream's
@@ -817,6 +1018,113 @@ class PlayerCubit extends Cubit<PlayerState> {
     }
   }
 
+  // ── Windows: late mirrors after playback starts (plan item R5) ──────────
+
+  /// Windows: which background late-mirror poll is the live one. Each new
+  /// poll takes the next number, and anything that must stop the running
+  /// poll (a new episode open, fresh links, closing) moves it on, so an
+  /// older poll sees the change and ends without adding anything.
+  int _desktopLatePollRun = 0;
+
+  /// Windows: stops the background late-mirror poll, if one is running.
+  void _stopDesktopLatePoll() {
+    if (desktopLateMirrorsEnabled) _desktopLatePollRun++;
+  }
+
+  /// Windows: the poller for late mirrors. The launcher's own one when it
+  /// passed one; otherwise (Continue Watching, History, Search and the
+  /// other launches that pass none) [_desktopFallbackPoll]. Never for a
+  /// Downloads-only session, which has nothing online to collect.
+  Future<({List<VideoSource> sources, bool done})> Function(String)?
+  get _desktopPoller => desktopLateMirrorPoller(
+    isWindows: desktopLateMirrorsEnabled && !localOnly,
+    given: _pollSources,
+    fallback: sl.isRegistered<CatalogueRepository>()
+        ? _desktopFallbackPoll
+        : null,
+  );
+
+  /// Windows: the same read the show page's player gets
+  /// (`CatalogueRepository.polledSources`), which only reads links already
+  /// being collected and starts no new search. For a Z Mode episode whose
+  /// playing source is no longer known it answers "nothing more" at once,
+  /// because asking the resolver then would start a whole new sweep. (Z Mode
+  /// reads normally go through [_desktopLateRead] instead; this check is a
+  /// second guard in case this poller is ever called for one directly.)
+  Future<({List<VideoSource> sources, bool done})> _desktopFallbackPoll(
+    String epUrl,
+  ) async {
+    if (ZmodeIds.isZ(epUrl) &&
+        sl.isRegistered<PlaybackResolver>() &&
+        sl<PlaybackResolver>().resolvedSourceId(
+              epUrl,
+              category: _activeCategory,
+            ) ==
+            null) {
+      return (sources: const <VideoSource>[], done: true);
+    }
+    return sl<CatalogueRepository>().polledSources(epUrl, sourceId: sourceId);
+  }
+
+  /// Windows: the read the late-mirror poll and the failure-time check use
+  /// for [epUrl] in the Sub/Dub [category], or null when there is none.
+  ///
+  /// For a Z Mode episode it always reads the resolver's winner for THIS
+  /// player's cut directly (`PlaybackResolver.polledWinnerSources`), even
+  /// when the launcher passed its own poller. That poller goes through
+  /// `CatalogueRepository.polledSources`, which picks the cut the show's
+  /// detail was last loaded with; when that differs from the cut playing
+  /// here it would start a whole new search of the sites and could add
+  /// links of the other cut. The direct read never searches: no winner for
+  /// this cut means "nothing more".
+  Future<({List<VideoSource> sources, bool done})> Function()?
+  _desktopLateRead(String epUrl, String category) {
+    final poll = _desktopPoller;
+    if (poll == null) return null;
+    if (ZmodeIds.isZ(epUrl) && sl.isRegistered<PlaybackResolver>()) {
+      return () => sl<PlaybackResolver>().polledWinnerSources(
+        epUrl,
+        category: category,
+      );
+    }
+    return () => poll(epUrl);
+  }
+
+  /// Windows: keeps reading late mirrors for [epUrl] for about 60 s after
+  /// playback started (see [pollDesktopLateMirrors]), adding new ones to the
+  /// Sources list so a later failure has more to fall back to. Starting a
+  /// new one ends the previous one, so two never run side by side.
+  Future<void> _pollDesktopLateMirrors(String epUrl) async {
+    final category = _activeCategory;
+    final read = _desktopLateRead(epUrl, category);
+    if (read == null) return;
+    final run = ++_desktopLatePollRun;
+    final zmode =
+        ZmodeIds.isZ(epUrl) && sl.isRegistered<PlaybackResolver>();
+    await pollDesktopLateMirrors(
+      poll: read,
+      isCurrent: () =>
+          !isClosed &&
+          run == _desktopLatePollRun &&
+          category == _activeCategory &&
+          episodes.isNotEmpty &&
+          state.currentIndex < episodes.length &&
+          _episodeUrl(currentEpisode) == epUrl,
+      currentSources: () => state.sources,
+      add: (extra) => emit(state.copyWith(sources: [...state.sources, ...extra])),
+      // Z Mode: only while the resolver still knows which source is playing
+      // (it forgets it while the player moves to another source).
+      canPoll: zmode
+          ? () =>
+                sl<PlaybackResolver>().resolvedSourceId(
+                  epUrl,
+                  category: category,
+                ) !=
+                null
+          : null,
+    );
+  }
+
   /// Merges late-arriving streams for the CURRENT episode into the quality
   /// list, by position, deduplicated by URL. Never touches the playing
   /// stream. No-op when the arrivals belong to a departed episode (generation
@@ -843,6 +1151,22 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// hosts drop on a seek (which otherwise restarts playback at 0). HLS already
   /// seeks fine; this is what lets the MP4 mirrors behave like they do in
   /// ExoPlayer-based apps.
+  /// Apply runtime settings when returning from the Settings route.
+  Future<void> applySavedPlaybackSettings() async {
+    // Reconfiguring mpv also applies the default gain. Preserve the user's
+    // current volume/mute when returning from settings instead of resetting it.
+    final volume = player.state.volume;
+    await _configureMpv();
+    if (_desktopVolume) {
+      // Windows: re-apply the user's level on top of the (maybe changed)
+      // boost, so a new boost from Settings takes effect right away.
+      await _applyUserVolume();
+    } else {
+      await player.setVolume(volume);
+    }
+    await applySubtitleStyle();
+  }
+
   Future<void> _configureMpv() async {
     final p = player.platform;
     if (p is NativePlayer) {
@@ -910,9 +1234,17 @@ class PlayerCubit extends Cubit<PlayerState> {
         // usual case), so it only helps the streams that actually struggle:
         // multithread across cores, skip the loop filter on non-key frames
         // (big CPU saving, near-invisible), and allow fast decode shortcuts.
-        await p.setProperty('vd-lavc-threads', '4');
-        await p.setProperty('vd-lavc-skiploopfilter', 'nonkey');
-        await p.setProperty('vd-lavc-fast', 'yes');
+        // Windows: a PC has the CPU to decode properly, and these shortcuts
+        // are what made software-decoded anime look smeared and blocky
+        // (skipping the deblocking filter on every non-key frame leaves block
+        // edges that grow until the next key frame). Software decoding also
+        // happens on its own there, whenever the GPU cannot decode a codec
+        // (10-bit H.264 is common in anime), so Windows keeps full quality:
+        // all cores, the loop filter on, no non-standard fast paths.
+        final pcQuality = lavcDecodeOptions(Platform.isWindows);
+        for (final entry in pcQuality.entries) {
+          await p.setProperty(entry.key, entry.value);
+        }
         // On a cache underrun, pause audio+video together and wait until a little
         // is rebuffered before resuming, so they restart in lock-step instead of
         // audio-ahead (mirrors ExoPlayer's buffer-for-playback-after-rebuffer).
@@ -926,7 +1258,11 @@ class PlayerCubit extends Cubit<PlayerState> {
         await p.setProperty('volume-max', '200');
         await p.setProperty(
           'volume',
-          sl<PlaybackPrefs>().volumeBoost.toString(),
+          // Windows: the saved 0-100 level scaled by the boost (player-6);
+          // elsewhere the boost itself, as before.
+          _desktopVolume
+              ? _mpvVolumeFor(_userVolume).toString()
+              : sl<PlaybackPrefs>().volumeBoost.toString(),
         );
         await p.setProperty('af', _audioFilterChain());
         // Keep voices natural (not chipmunk) when playing above 1× speed.
@@ -946,15 +1282,176 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// Apply the saved Anime4K enhancement (upscaling shaders + render tuning) to
   /// mpv (best-effort). Off resets everything to mpv defaults.
   Future<void> _applyShader(NativePlayer p) async {
+    final prefs = sl<PlaybackPrefs>();
+    final style = prefs.videoShaderStyle;
+    final tier = prefs.videoShaderTier;
     try {
-      final prefs = sl<PlaybackPrefs>();
-      final style = prefs.videoShaderStyle;
-      final tier = prefs.videoShaderTier;
-      await p.setProperty(
-        'glsl-shaders',
-        await ShaderPresets.mpvValue(tier, style),
-      );
+      final value = await ShaderPresets.mpvValue(tier, style);
+      // Style on but the files are gone (deleted, or a partial download):
+      // mpv would log a load failure, so fall back cleanly instead.
+      // Windows only: phone keeps its shipped behaviour (see [_onMpvLog]).
+      if (Platform.isWindows && style != 'off' && value.isEmpty) {
+        await _disableShaders(
+          p,
+          message:
+              'Anime4K files are missing, so it was turned off. '
+              'Download them again in Settings.',
+        );
+        return;
+      }
+      _shadersActive = value.isNotEmpty;
+      await p.setProperty('glsl-shaders', value);
       await _applyRenderQuality(p, on: style != 'off', high: tier == 'high');
+    } catch (_) {
+      if (Platform.isWindows && style != 'off') await _disableShaders(p);
+    }
+  }
+
+  /// True while Anime4K shaders are loaded into mpv. Gates [_onMpvLog] so a
+  /// render error is only blamed on shaders when shaders are actually on.
+  bool _shadersActive = false;
+
+  /// Bumped when Anime4K had to be switched off because mpv could not load,
+  /// compile or render the shaders on this GPU. The player screen listens to
+  /// tell the user and refresh the enhance control.
+  final ValueNotifier<int> shaderFallbackRev = ValueNotifier<int>(0);
+
+  /// Why Anime4K was last switched off (GPU failure or missing files), for
+  /// the watch page's snackbar.
+  String shaderFallbackMessage =
+      "Anime4K couldn't run on this GPU, so it was turned off.";
+
+  /// Anime4K failure watch: an error from mpv's video output while shaders
+  /// are loaded means they broke rendering (black video), so drop them.
+  /// Windows only: the phone's gpu-next path ships without this watch and
+  /// must not start dropping Anime4K on a non-fatal libplacebo message.
+  void _onMpvLog(PlayerLog log) {
+    // Windows: keep the last few error lines of the link being opened, so an
+    // HTTP 403/410 that mpv only logs can still be recognised as an expired
+    // link (plan item R3). Bounded, cleared on every open.
+    if (Platform.isWindows && log.level == 'error' && !_startedThisSource) {
+      _desktopErrorLog.add('${log.prefix}: ${log.text}');
+      if (_desktopErrorLog.length > 12) _desktopErrorLog.removeAt(0);
+    }
+    if (!Platform.isWindows || !_shadersActive) return;
+    if (!isShaderFailureLog(log.prefix, log.level, log.text)) return;
+    AppLogger.instance.log('[anime4k] mpv ${log.prefix}: ${log.text}');
+    final p = player.platform;
+    if (p is NativePlayer) unawaited(_disableShaders(p));
+  }
+
+  /// Windows: the video size [_fitWindowsVideoOutput] last handled, so the
+  /// same size reported twice is not handled twice.
+  (int, int)? _fittedVideoSize;
+
+  /// Windows: true once the render size has been set by hand. From then on
+  /// every new video gets its size set too (media_kit keeps a hand-set size
+  /// for the next video otherwise).
+  bool _renderSizeSet = false;
+
+  /// Windows: the `framedrop` value last set (null: mpv's own, i.e. `vo`).
+  String? _framedropMode;
+
+  /// Bumped for every video size handled; a late diagnostics read for an
+  /// older video then stays quiet.
+  int _videoFitGen = 0;
+
+  /// Windows only. Called when mpv reports a new video size.
+  ///  * Above 1440p: render no bigger than the screen ([windowsRenderCap]),
+  ///    and, when it is decoded in software, let mpv drop frames already in
+  ///    the decoder when it falls behind ([windowsFramedropMode]), so a CPU
+  ///    that cannot keep up with a 4K film shows a moving, slightly choppy
+  ///    picture instead of falling further and further behind. With a
+  ///    hardware decoder mpv's normal dropping stays. Hardware decoding is
+  ///    left as it is.
+  ///  * 1440p and below: the video's own size and mpv's normal frame
+  ///    dropping, exactly as before, so 1080p stays as sharp as it was.
+  /// Also writes one line to the app log with the codec, decoder and dropped
+  /// frames, so a black or choppy picture can be told apart later.
+  Future<void> _fitWindowsVideoOutput() async {
+    final w = player.state.width;
+    final h = player.state.height;
+    if (w == null || h == null || w <= 0 || h <= 0) return;
+    if (_fittedVideoSize == (w, h)) return;
+    _fittedVideoSize = (w, h);
+    final gen = ++_videoFitGen;
+    final big = isAbove1440p(w, h);
+    var screenW = 0;
+    var screenH = 0;
+    for (final d in PlatformDispatcher.instance.displays) {
+      if (d.size.width > screenW) screenW = d.size.width.round();
+      if (d.size.height > screenH) screenH = d.size.height.round();
+    }
+    final cap = windowsRenderCap(
+      videoWidth: w,
+      videoHeight: h,
+      screenWidth: screenW,
+      screenHeight: screenH,
+    );
+    try {
+      if (cap != null) {
+        _renderSizeSet = true;
+        await videoController.setSize(width: cap.$1, height: cap.$2);
+      } else if (_renderSizeSet) {
+        await videoController.setSize(width: w, height: h);
+      }
+    } catch (_) {
+      /* keep media_kit's own size */
+    }
+    final p = player.platform;
+    if (p is! NativePlayer || isClosed) return;
+    // Only a big video needs the decoder read; smaller ones always get 'vo'.
+    final hwdecNow = big ? await mpvStat('hwdec-current') : null;
+    if (isClosed || gen != _videoFitGen) return;
+    final mode = windowsFramedropMode(big: big, hwdec: hwdecNow);
+    try {
+      // Nothing set yet and mpv's own 'vo' wanted: leave mpv alone.
+      if (mode != (_framedropMode ?? 'vo')) {
+        await p.setProperty('framedrop', mode);
+        _framedropMode = mode;
+      }
+    } catch (_) {}
+    if (!big) return;
+    final render = cap == null ? '${w}x$h' : '${cap.$1}x${cap.$2}';
+    AppLogger.instance.log(
+      '[video] big video ${w}x$h screen=${screenW}x$screenH render=$render '
+      'hwdec=$hwdecNow framedrop=$mode',
+    );
+    // Diagnostics only: give the decoder a few seconds, then note how it is
+    // doing. Never changes playback.
+    unawaited(
+      Future<void>.delayed(const Duration(seconds: 8), () async {
+        if (isClosed || gen != _videoFitGen) return;
+        final codec = await mpvStat('video-codec');
+        final hwdec = await mpvStat('hwdec-current');
+        final voDrops = await mpvStat('frame-drop-count');
+        final decDrops = await mpvStat('decoder-frame-drop-count');
+        if (isClosed || gen != _videoFitGen) return;
+        AppLogger.instance.log(
+          '[video] ${w}x$h codec=$codec hwdec=$hwdec '
+          'drops vo=$voDrops decoder=$decDrops',
+        );
+      }),
+    );
+  }
+
+  /// Turns Anime4K off (saved, so the next open stays safe), restores mpv's
+  /// plain renderer settings and tells the screen. Runs once per failure.
+  Future<void> _disableShaders(
+    NativePlayer p, {
+    String message = "Anime4K couldn't run on this GPU, so it was turned off.",
+  }) async {
+    _shadersActive = false;
+    shaderFallbackMessage = message;
+    try {
+      await sl<PlaybackPrefs>().setVideoShaderStyle('off');
+      await p.setProperty('glsl-shaders', '');
+      await _applyRenderQuality(p, on: false, high: false);
+    } catch (_) {}
+    // The player may have closed (and disposed its notifiers) meanwhile.
+    try {
+      _toast(message, duration: const Duration(seconds: 4));
+      shaderFallbackRev.value++;
     } catch (_) {}
   }
 
@@ -987,6 +1484,8 @@ class PlayerCubit extends Cubit<PlayerState> {
     await sl<PlaybackPrefs>().setVideoShaderStyle(style);
     final p = player.platform;
     if (p is NativePlayer) await _applyShader(p);
+    // A failed load already switched it off and said so; don't cover that.
+    if (sl<PlaybackPrefs>().videoShaderStyle != style) return;
     _toast('Anime4K Enhancement: ${ShaderPresets.styleById(style).label}');
   }
 
@@ -1098,6 +1597,8 @@ class PlayerCubit extends Cubit<PlayerState> {
     unawaited(_mpvConfigured);
     _ensureFiller(); // background filler lookup for auto-skip (anime only)
     unawaited(_enrichEpisodeTitles());
+    // Windows: show this episode in the media overlay / taskbar buttons.
+    _attachDesktopMedia();
     emit(state.copyWith(tracks: player.state.tracks));
     _subs.add(
       player.stream.tracks.listen((t) {
@@ -1203,14 +1704,21 @@ class PlayerCubit extends Cubit<PlayerState> {
           _persist();
         }
 
-        // Seamless binge: once we pass ~85% of the episode, resolve the NEXT
-        // episode's stream in the background so advancing is instant. Fires at
-        // most once per current episode (re-armed when the index changes).
+        // Seamless binge: resolve the NEXT episode's stream in the background
+        // so advancing is instant. Starts 5 minutes before the end (or at 85%
+        // if that is sooner) so an outro/credits skip never beats it, but not
+        // before a quarter of a short video. Fires at most once per current
+        // episode (re-armed when the index changes).
         final idx = state.currentIndex;
+        // Windows starts 5 minutes before the end (see
+        // [nextEpisodePrefetchAt]); phone and TV keep the 85% mark.
+        final prefetchAt = Platform.isWindows
+            ? nextEpisodePrefetchAt(_lastDur)
+            : _lastDur * 0.85;
         if (_prefetchedNextForIndex != idx &&
             idx + 1 < episodes.length &&
             _lastDur > Duration.zero &&
-            p >= _lastDur * 0.85) {
+            p >= prefetchAt) {
           _prefetchedNextForIndex = idx;
           final nextUrl = _episodeUrl(episodes[idx + 1]);
           if (sourceId == stremioSourceId &&
@@ -1249,12 +1757,21 @@ class PlayerCubit extends Cubit<PlayerState> {
         // clamped to 0 — the "always resumes from 0" bug. So apply the pending
         // resume HERE, the moment seeking is possible. (This is how CloudStream
         // does it — re-seek to the saved position on STATE_READY.)
-        if (_pendingResume > Duration.zero && d > Duration.zero) {
+        // Windows (plan item P5): a mark at, or within 5 s of, the end of a
+        // video whose length is now known would only show the last seconds
+        // (and then end). Start from 0 and reset the mark instead.
+        if (Platform.isWindows &&
+            _pendingResume > Duration.zero &&
+            _desktopResetEndMark(_pendingResume, d)) {
+          // handled: playback restarted at 0, mark reset
+        } else if (_pendingResume > Duration.zero && d > Duration.zero) {
           if (_pendingResume >= d) {
             // Mark is at/after the end (corrupted/too-large) — can't resume
             // there; drop it so playback + saving proceed normally.
             _pendingResume = Duration.zero;
-          } else if (_lastPos < _pendingResume) {
+          } else if (Platform.isWindows
+              ? !resumeSeekLanded(position: _lastPos, target: _pendingResume)
+              : _lastPos < _pendingResume) {
             player.seek(_pendingResume);
           }
         }
@@ -1291,6 +1808,14 @@ class PlayerCubit extends Cubit<PlayerState> {
       }),
     );
     _subs.add(player.stream.error.listen((e) => _onPlaybackError(e)));
+    // Windows: Anime4K safety net (mpv reports shader load/compile/render
+    // failures only in its log) and fitting the render size and decoder
+    // pacing to each new video (see [_fitWindowsVideoOutput]). Phone and TV
+    // never listen.
+    if (Platform.isWindows) {
+      _subs.add(player.stream.log.listen(_onMpvLog));
+      _subs.add(player.stream.height.listen((_) => _fitWindowsVideoOutput()));
+    }
     _subs.add(
       player.stream.buffering.listen((buffering) {
         _syncSimkl(buffering: buffering);
@@ -1385,23 +1910,53 @@ class PlayerCubit extends Cubit<PlayerState> {
   void seekTo(Duration d) {
     if (_isRoomViewer) return;
     _pendingResume = Duration.zero; // user took control → drop the resume floor
+    // An absolute seek replaces any relative target still being built.
+    _pendingSeekTarget = null;
     _markUserSeek(d);
     player.seek(d);
     if (roomRole == RoomRole.host) onLocalPlayback?.call('seek', d);
+    _pushDesktopMedia(position: d);
   }
+
+  // Windows (player-7): the target of the last [seekBy] and when it was sent.
+  // The reported position lags while a stream seeks, so quick repeated
+  // presses add to this pending target instead of the stale position.
+  Duration? _pendingSeekTarget;
+  int _pendingSeekAtMs = 0;
+
+  /// How long a [seekBy] target keeps absorbing further presses.
+  static const pendingSeekWindow = Duration(milliseconds: 1000);
+
+  /// Clock for [seekBy]'s pending window; tests swap it for a fake.
+  @visibleForTesting
+  int Function() seekClock = () => DateTime.now().millisecondsSinceEpoch;
 
   /// Seek by [delta] (signed), clamped into 0..duration.
   void seekBy(Duration delta) {
     if (_isRoomViewer) return;
     _pendingResume = Duration.zero; // user took control → drop the resume floor
-    final target = _lastPos + delta;
+    final now = seekClock();
+    // Windows: a press within ~1s of the previous one builds on its target
+    // (5 quick taps of +10s = +50s), like YouTube and mpv. Phone unchanged.
+    final pending = _pendingSeekTarget;
+    final base =
+        defaultTargetPlatform == TargetPlatform.windows &&
+            pending != null &&
+            now - _pendingSeekAtMs < pendingSeekWindow.inMilliseconds
+        ? pending
+        : _lastPos;
+    final target = base + delta;
     final dur = _lastDur;
     final clamped = target < Duration.zero
         ? Duration.zero
         : (dur > Duration.zero && target > dur ? dur : target);
     _markUserSeek(clamped);
+    // Remember where this press aimed so the next quick press adds to it.
+    _pendingSeekTarget = clamped;
+    _pendingSeekAtMs = now;
     player.seek(clamped);
     if (roomRole == RoomRole.host) onLocalPlayback?.call('seek', clamped);
+    _pushDesktopMedia(position: clamped);
   }
 
   /// Record a deliberate user seek to [target]. Besides flagging the jump as
@@ -1599,9 +2154,25 @@ class PlayerCubit extends Cubit<PlayerState> {
             t.id != 'auto' &&
             t.id != 'no' &&
             !t.id.startsWith('http') &&
-            !t.id.startsWith('/'),
+            !t.id.startsWith('/') &&
+            // Windows: hide mpv's own copy of a saved subtitle.
+            !(Platform.isWindows && isDuplicateOfSavedSub(t)),
       )
       .toList();
+
+  /// True when [t] is just the player's own copy of one of [softSubs]: mpv lists
+  /// a file added with `sub-add` as a track whose id is a plain number, so the
+  /// id checks above cannot recognise it. We passed the saved subtitle's label
+  /// and language when adding it, and mpv echoes them back, so a track with the
+  /// same title and language is that copy (including the extra one added each
+  /// time the subtitle is re-applied at STATE_READY). A genuine embedded track
+  /// carries its own language code, so it is not matched.
+  @visibleForTesting
+  bool isDuplicateOfSavedSub(SubtitleTrack t) => isSavedSubCopy(
+    title: t.title,
+    language: t.language,
+    saved: [for (final s in softSubs) (label: s.label ?? s.lang, lang: s.lang)],
+  );
 
   /// Currently-selected audio track (id == 'auto'/'no' for the synthetic ones).
   AudioTrack get activeAudioTrack => player.state.track.audio;
@@ -1858,6 +2429,18 @@ class PlayerCubit extends Cubit<PlayerState> {
     final revision = _subtitleChoiceRevision;
     bool isCurrent() =>
         !isClosed && gen == _gen && revision == _subtitleChoiceRevision;
+    // Windows: trail for "why are there no subtitles?" reports: what was
+    // asked for, and for a saved file whether it is actually on disk. Names
+    // only, no secrets. Scheme check is case-insensitive: "HTTPS://host/sub.vtt"
+    // is still a web address that needs the source's headers, not a local file.
+    final scheme = Uri.tryParse(url)?.scheme.toLowerCase();
+    final isWeb = scheme == 'http' || scheme == 'https';
+    if (Platform.isWindows) {
+      AppLogger.instance.log(
+        '[subtitle] load lang=${language ?? '?'} label=${title ?? '?'} '
+        '${isWeb ? 'remote' : 'file exists=${File(url).existsSync()}'}',
+      );
+    }
 
     Future<void> loadRemote() async {
       if (!isCurrent()) return;
@@ -1865,6 +2448,20 @@ class PlayerCubit extends Cubit<PlayerState> {
         SubtitleTrack.uri(url, title: title, language: language),
       );
       if (isCurrent()) _wantedSubId = url;
+      AppLogger.instance.log('[subtitle] handed to the player as-is');
+    }
+
+    // Windows: a saved subtitle file on this PC: hand mpv the path directly.
+    // Fetching it over HTTP first always fails for a local path and only
+    // delayed things.
+    if (Platform.isWindows && !isWeb) {
+      if (!isCurrent()) return;
+      await player.setSubtitleTrack(
+        SubtitleTrack.uri(url, title: title, language: language),
+      );
+      if (isCurrent()) _wantedSubId = url;
+      AppLogger.instance.log('[subtitle] applied saved file');
+      return;
     }
 
     try {
@@ -1874,7 +2471,9 @@ class PlayerCubit extends Cubit<PlayerState> {
           url,
           options: Options(
             responseType: ResponseType.bytes,
-            headers: state.active?.headers,
+            // Windows: add the subtitle host's saved Cloudflare cookie, if
+            // any (plan item R1). Unchanged elsewhere.
+            headers: desktopStreamHeaders(url, state.active?.headers),
             validateStatus: (_) => true,
           ),
         );
@@ -1898,7 +2497,11 @@ class PlayerCubit extends Cubit<PlayerState> {
         SubtitleTrack.uri(local, title: title, language: language),
       );
       if (isCurrent()) _wantedSubId = local;
-    } catch (_) {
+      AppLogger.instance.log('[subtitle] fetched and applied from a temp copy');
+    } catch (e) {
+      AppLogger.instance.log(
+        '[subtitle] fetch failed (${e.runtimeType}); falling back to the plain path',
+      );
       // A request can complete after close() disposed the native player. Do
       // not turn that cancellation into a second, late native call.
       if (!isCurrent()) return;
@@ -1960,7 +2563,8 @@ class PlayerCubit extends Cubit<PlayerState> {
           target.url,
           options: Options(
             responseType: ResponseType.plain,
-            headers: state.active?.headers,
+            // Windows: same Cloudflare cookie rule as above (plan item R1).
+            headers: desktopStreamHeaders(target.url, state.active?.headers),
             validateStatus: (_) => true,
           ),
         );
@@ -2065,6 +2669,12 @@ class PlayerCubit extends Cubit<PlayerState> {
         ? sl<TitlePrefsStore>().subtitleChoice(sourceId, show)
         : null;
     final prefRaw = remembered ?? sl<PlaybackPrefs>().subtitlePreference;
+    if (Platform.isWindows) {
+      AppLogger.instance.log(
+        '[subtitle] choose · preference="${prefRaw.isEmpty ? 'auto' : prefRaw}" '
+        'saved=${softSubs.length} embedded=${mediaSubtitleTracks.length}',
+      );
+    }
 
     // 'off' → subtitles off on every video.
     if (prefRaw == 'off') {
@@ -2085,7 +2695,15 @@ class PlayerCubit extends Cubit<PlayerState> {
       _subApplied = true;
       return;
     }
-    final soft = pickPreferredSub(softSubs, prefLang);
+    // A downloaded file's saved subtitle may carry no readable language (an
+    // HLS rendition, or a language written in a non-Latin script). The
+    // download already kept only tracks in the preferred language, so use it
+    // rather than showing none.
+    final soft =
+        pickPreferredSub(softSubs, prefLang) ??
+        (Platform.isWindows && _openedLocalFile
+            ? softSubs.where((s) => s.lang == kUnlabelledSubtitle).firstOrNull
+            : null);
     if (soft != null) {
       unawaited(
         _setRemoteSub(
@@ -2127,6 +2745,27 @@ class PlayerCubit extends Cubit<PlayerState> {
   void reapplyPreferredSubtitle() {
     _subApplied = false;
     _autoSubDlTried = false;
+    // Windows only: phone and TV keep the plain re-apply below.
+    if (Platform.isWindows &&
+        sl<PlaybackPrefs>().subtitlePreference.isEmpty) {
+      // Auto after Off is an actual transition: release the explicit "no"
+      // track and restore the source default rather than leaving subs muted.
+      if (softSubs.isNotEmpty) {
+        final sourceDefault = softSubs.firstWhere(
+          (sub) => sub.isDefault,
+          orElse: () => softSubs.first,
+        );
+        unawaited(
+          _setRemoteSub(
+            sourceDefault.url,
+            title: sourceDefault.label ?? sourceDefault.lang,
+            language: sourceDefault.lang,
+          ),
+        );
+      } else {
+        player.setSubtitleTrack(SubtitleTrack.auto());
+      }
+    }
     _tryApplySubPref();
   }
 
@@ -2147,10 +2786,13 @@ class PlayerCubit extends Cubit<PlayerState> {
             imdbId: imdbId,
             tmdbId: tmdbId,
             isTv: tmdbIsTv,
-            // The Episode model carries no season, so assume season 1 for TV —
-            // correct for single-season shows and season-relative episode lists;
-            // a mismatch just yields no result (never a wrong-episode sub).
-            season: tmdbIsTv ? 1 : null,
+            // Use the episode's own season when it is known (downloaded
+            // episodes carry it); otherwise assume season 1, which is right for
+            // single-season shows. A mismatch just yields no result and never
+            // a wrong-episode subtitle.
+            season: tmdbIsTv
+                ? (Platform.isWindows ? (currentEpisode.season ?? 1) : 1)
+                : null,
             episode: tmdbIsTv ? epNum : null,
             title: title,
             iso2: lang.iso2,
@@ -2229,7 +2871,10 @@ class PlayerCubit extends Cubit<PlayerState> {
     // same-episode re-open (recovery/failover) must keep targeting it.
     if (index != state.currentIndex) _pendingResume = Duration.zero;
     _tried.clear();
+    _stopDesktopLatePoll(); // Windows R5: the old open's poll ends here
+    _freshLinksTried = false; // Windows R3: one fresh-links try per episode / cut
     _sourceHops = 0;
+    _triedLocalFallback = false;
     _recovering = false;
     _skips = const []; // clear previous episode's skip markers
     _skipsForIndex = -1; // refetched when the new duration arrives
@@ -2299,7 +2944,13 @@ class PlayerCubit extends Cubit<PlayerState> {
               ? _sweepError('No source has this yet', e.outcomes)
               : _selectedSourceError(
                   e.selectedSourceName!,
-                  '${e.selectedSourceName} did not match this title.',
+                  // Windows: a source whose extension hit a "Stub!" (an
+                  // Android class the Windows engine lacks) says so instead
+                  // of blaming the title (plan item B2). Phone: unchanged.
+                  DesktopExtensionUnsupported.deadEndText(
+                    e.selectedSourceName!,
+                    '${e.selectedSourceName} did not match this title.',
+                  ),
                   e.outcomes,
                 ),
         ),
@@ -2325,7 +2976,12 @@ class PlayerCubit extends Cubit<PlayerState> {
                   e.hadTitleMatch
                       ? "Episode ${e.episode} isn't available from "
                             '${e.selectedSourceName}.'
-                      : '${e.selectedSourceName} did not match this title.',
+                      // Windows: "uses an Android feature" wording for a
+                      // source that hit a "Stub!" (plan item B2).
+                      : DesktopExtensionUnsupported.deadEndText(
+                          e.selectedSourceName!,
+                          '${e.selectedSourceName} did not match this title.',
+                        ),
                   e.outcomes,
                 ),
         ),
@@ -2770,6 +3426,21 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// as a buffering overlay. Returns a playable local-url source, or null if it
   /// couldn't (a clean error is emitted, no throw). Stops any previous torrent.
   Future<VideoSource?> _resolveTorrent(VideoSource s, int g) async {
+    // No torrent method/event channel is registered by the Windows runner.
+    // Fail before subscribing: an absent event channel otherwise leaves the
+    // player stuck on "Finding peers" with an asynchronous plugin exception.
+    if (Platform.isWindows) {
+      emit(
+        state.copyWith(
+          torrentPhase: () => null,
+          loadingSources: false,
+          error: () =>
+              'Torrent streaming is not available on this platform. '
+              'Choose a direct video source.',
+        ),
+      );
+      return null;
+    }
     await _stopTorrent();
     if (g != _gen || isClosed) return null;
     emit(
@@ -2856,8 +3527,17 @@ class PlayerCubit extends Cubit<PlayerState> {
     // a Cloudflare-blocked Aniyomi stream onto its hidden proxy fallback.
     String? playUrlOverride,
     bool softwareDecodeRetry = false,
+    // Windows only (plan item R2): open with the "safe" profile, used by the
+    // one safe second try: no audio-track trimming, plain demuxer options and
+    // a 15 s start window. Always passed together with softwareDecodeRetry.
+    bool desktopSafeProfile = false,
   }) async {
     final g = gen ?? ++_gen;
+    // A new file starts its own timeline: never add a key press to a seek
+    // target from the previous one.
+    _pendingSeekTarget = null;
+    // Windows: error lines from the previous link say nothing about this one.
+    _desktopErrorLog.clear();
     if (!isTorrentUrl(s.url) &&
         (_activeTorrentId != null ||
             _torrentSub != null ||
@@ -2931,7 +3611,13 @@ class PlayerCubit extends Cubit<PlayerState> {
     // Torrents excluded (pieces take a while).
     _neverStartedTimer?.cancel();
     final openGen = g;
-    _neverStartedTimer = Timer(const Duration(seconds: 30), () {
+    // The normal window is 30 s, the same as the phone's start timeout. The
+    // Windows safe second try (R2) gets only 15 s: that link already failed
+    // once, so it does not get the full wait again.
+    final startWindow = desktopSafeProfile
+        ? kDesktopSafeRetryWatchdog
+        : const Duration(seconds: 30);
+    _neverStartedTimer = Timer(startWindow, () {
       if (openGen != _gen ||
           _startedThisSource ||
           _recovering ||
@@ -2980,6 +3666,15 @@ class PlayerCubit extends Cubit<PlayerState> {
         resumeAt > Duration.zero) {
       _pendingResume = resumeAt;
     }
+    // Windows (plan item P5): remember which start is a saved mark. A reopen
+    // at the live position (switch / quality) is not one, unless the player
+    // is still aiming for the earlier saved mark (kept by the check below).
+    if ((seekTo == null || seekTo <= Duration.zero) &&
+        resumeAt > Duration.zero) {
+      _desktopSavedMark = resumeAt;
+    } else if (_pendingResume != _desktopSavedMark) {
+      _desktopSavedMark = Duration.zero;
+    }
     // A source/quality switch passes seekTo: _lastPos to keep the position. But
     // right after a resume-open _lastPos is still ~0, so an early default-quality
     // switch would re-open near 0 and wipe the resume. Keep targeting the pending
@@ -3004,7 +3699,11 @@ class PlayerCubit extends Cubit<PlayerState> {
     _audioRenditions = const [];
     _keptAudioUri = null;
     var trimmedLocal = false;
-    if (playUrlOverride == null && s.container == SourceContainer.hls) {
+    // The Windows safe second try (R2) skips the trim: a rewritten local
+    // master is one more thing that can break a link that already failed.
+    if (playUrlOverride == null &&
+        !desktopSafeProfile &&
+        s.container == SourceContainer.hls) {
       final trimmed = await _trimMasterAudio(s);
       if (g != _gen || isClosed || !_lifecycle.canContinue(openToken)) return;
       if (trimmed != null) {
@@ -3037,12 +3736,18 @@ class PlayerCubit extends Cubit<PlayerState> {
       setupSteps.add(
         () => plat.setProperty(
           'demuxer-lavf-o',
-          (isHls
-                  ? 'extension_picky=0,allowed_extensions=ALL,http_persistent=0,'
-                        'analyzeduration=2000000'
-                  : 'extension_picky=0,allowed_extensions=ALL,'
-                        'analyzeduration=2000000') +
-              (trimmedLocal ? whitelist : ''),
+          // Windows safe second try (R2): no http_persistent=0 and no
+          // analyzeduration cap, only the extension relaxation. The property
+          // is sticky, so the next normal open writes its own value again.
+          // (The safe try never trims, so it never needs the whitelist.)
+          desktopSafeProfile
+              ? kDesktopSafeRetryDemuxerOptions
+              : ((isHls
+                        ? 'extension_picky=0,allowed_extensions=ALL,'
+                              'http_persistent=0,analyzeduration=2000000'
+                        : 'extension_picky=0,allowed_extensions=ALL,'
+                              'analyzeduration=2000000') +
+                    (trimmedLocal ? whitelist : '')),
         ),
       );
       // Progressive MP4 file hosts often drop the connection right after a
@@ -3100,7 +3805,17 @@ class PlayerCubit extends Cubit<PlayerState> {
         _softwareDecodeRetryError = null;
         if (invalidatesSoftwareRetry) _recovering = false;
       }
-      await player.open(Media(playUrl, httpHeaders: s.headers));
+      // Windows (plan item R1): add the saved Cloudflare cookie, its
+      // User-Agent and an Origin for a host that was verified, never
+      // replacing a header the source set. Matched against the real link
+      // (s.url) when mpv opens a trimmed local copy of its playlist; a local
+      // proxy URL matches no stored host and is left alone. Other platforms
+      // get s.headers unchanged.
+      final headers = Platform.isWindows
+          ? desktopStreamHeaders(trimmedLocal ? s.url : playUrl, s.headers)
+          : s.headers;
+      DesktopHangWatch.step('player open');
+      await player.open(Media(playUrl, httpHeaders: headers));
       if (g == _gen && !isClosed) {
         _simklOpening = false;
         _syncSimkl();
@@ -3232,54 +3947,27 @@ class PlayerCubit extends Cubit<PlayerState> {
     // unplayable, and cycling sources would not fix any of them.
     if (isHarmlessPlaybackError(e)) return;
     final active = state.active;
-    if (active != null &&
+    final codecRetry =
+        active != null &&
         player.platform is NativePlayer &&
         shouldRetryWithSoftwareDecoder(
-          isLocalFile: _openedLocalFile,
+          // Windows: an online stream whose codec the GPU decoder rejects
+          // also gets the one software retry before the player gives up on
+          // the source, instead of hopping mirrors that carry the same codec.
+          // Phones keep the retry for downloads only.
+          isLocalFile: _openedLocalFile || Platform.isWindows,
           alreadyRetried: _softwareDecodeRetried,
           softwareDecoderSelected: sl<PlaybackPrefs>().videoDecoder == 'sw',
           error: e,
-        )) {
-      _softwareDecodeRetried = true;
-      final retryGen = ++_gen;
-      _softwareDecodeRetryGeneration = retryGen;
-      _softwareDecodeRetryInProgress = true;
-      _softwareDecodeRetryError = null;
-      _recovering = true;
-      _neverStartedTimer?.cancel();
-      _toast('Hardware decoding failed. Retrying in software.');
-      try {
-        await _open(
-          active,
-          seekTo: _lastPos,
-          gen: retryGen,
-          softwareDecodeRetry: true,
         );
-      } catch (error) {
-        _softwareDecodeRetryError = 'Software decoder retry failed: $error';
-      } finally {
-        if (_softwareDecodeRetryGeneration == retryGen &&
-            isCurrentSoftwareDecoderRetry(
-              retryGeneration: retryGen,
-              currentGeneration: _gen,
-            )) {
-          _softwareDecodeRetryInProgress = false;
-          _softwareDecodeRetryGeneration = null;
-          _recovering = false;
-        }
-      }
-      if (!isCurrentSoftwareDecoderRetry(
-            retryGeneration: retryGen,
-            currentGeneration: _gen,
-          ) ||
-          isClosed) {
-        return;
-      }
-      final retryError = _softwareDecodeRetryError;
-      _softwareDecodeRetryError = null;
-      if (retryError != null && !isClosed) {
-        await _onPlaybackError(retryError);
-      }
+    // Windows (plan item R2): any other fatal error before the first frame
+    // gets the same single retry, with the safe profile. Phones: always false.
+    final safeRetry =
+        !codecRetry &&
+        active != null &&
+        _desktopSafeRetryAllowed(active, timedOut: false);
+    if (active != null && (codecRetry || safeRetry)) {
+      await _runOneTimeRetry(active, safeProfile: safeRetry);
       return;
     }
     // A direct Aniyomi stream that failed on Cloudflare → swap to its hidden
@@ -3292,6 +3980,19 @@ class PlayerCubit extends Cubit<PlayerState> {
       return;
     }
     _recovering = true;
+    // Windows: no connection means the mirrors are not dead, the network is.
+    // Hopping through them only burns minutes and blames good sources, so go
+    // straight to a downloaded copy of this episode, or wait for the
+    // connection to return.
+    if (Platform.isWindows &&
+        BootConnectivity.instance.offline.value &&
+        !_openedLocalFile) {
+      final startGen = _gen;
+      final onDisk = await _tryLocalDownloadFallback();
+      if (!onDisk && startGen == _gen && !isClosed) _waitForConnection();
+      _recovering = false;
+      return;
+    }
     final engineGen = _gen;
     if (onSourceFailure != null && await _tryOtherEngine()) {
       return;
@@ -3325,17 +4026,38 @@ class PlayerCubit extends Cubit<PlayerState> {
     // Providers may emit their first playable URL before sibling mirrors have
     // finished resolving. Give that SAME provider session a short bounded
     // window to publish another URL before escalating to another source.
-    final poll = _pollSources;
-    if (next == null && failed != null && poll != null) {
+    // Windows (plan item R5): also for players launched without a poller.
+    Future<({List<VideoSource> sources, bool done})> Function()? read;
+    if (next == null && failed != null) {
       final episodeUrl = _episodeUrl(currentEpisode);
+      final pollSources = _pollSources;
+      // Windows: the same cut-safe read the late-mirror poll uses, so a Z
+      // Mode check here never starts a new search either.
+      read = desktopLateMirrorsEnabled
+          ? _desktopLateRead(episodeUrl, _activeCategory)
+          : pollSources == null
+          ? null
+          : () => pollSources(episodeUrl);
+    }
+    if (next == null && failed != null && read != null) {
       availableSources = await collectLatePlaybackMirrors(
         initial: availableSources,
-        poll: () => poll(episodeUrl),
+        poll: read,
         isStillCurrent: () => gen == _gen && !isClosed,
       );
       if (gen != _gen || isClosed) {
         _recovering = false;
         return;
+      }
+      if (desktopLateMirrorsEnabled) {
+        // Windows: the background late-mirror poll may have added links
+        // while this check ran. Keep those: start from the list as it is
+        // now and only add what this check found on top of it.
+        final seen = state.sources.map((s) => s.url).toSet();
+        availableSources = [
+          ...state.sources,
+          ...availableSources.where((s) => seen.add(s.url)),
+        ];
       }
       if (!_sameUrlOrder(availableSources, state.sources)) {
         emit(state.copyWith(sources: availableSources));
@@ -3354,7 +4076,11 @@ class PlayerCubit extends Cubit<PlayerState> {
       _toast("That one didn't cut. Trying another source.");
       await _open(next, seekTo: _lastPos);
       _applyDefaultQuality(); // honor the quality pref on the fallback source too
-    } else if (!await _tryNextSource()) {
+    } else if (Platform.isWindows && await _tryDesktopFreshLinks(e, gen)) {
+      // Windows (plan item R3): every mirror is used up and the failure
+      // looked like an expired link, so the same source was asked once for
+      // fresh links and one of them is now opening.
+    } else if (!await _tryNextSource() && !await _tryLocalDownloadFallback()) {
       // Guarded, not returned: _recovering still has to drop, or a player that
       // outlives this (a newer open on the same cubit) can never recover again.
       if (gen == _gen) {
@@ -3390,7 +4116,80 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// launched against one specific source has no next source to go to.
   ///
   /// Returns true when something new is playing.
+  /// Last resort once every online source has failed or stalled: play the
+  /// downloaded copy of this exact episode from where playback was.
+  ///
+  /// Respects the "local download fallback" setting (auto / ask / off) and runs
+  /// at most once per episode open. A brief buffering hiccup never gets here:
+  /// it takes the stall watchdog plus every mirror and source hop first.
+  /// Returns true when playback moved to the download.
+  Future<bool> _tryLocalDownloadFallback() async {
+    // Windows only: phone and TV keep their own dead-end handling.
+    if (!Platform.isWindows) return false;
+    final finder = _localDownloadFinder;
+    final action = localFallbackAction(
+      mode: sl<PlaybackPrefs>().localDownloadFallback,
+      alreadyLocal: _openedLocalFile,
+      alreadyTried: _triedLocalFallback,
+      hasFinder: finder != null,
+    );
+    if (action == LocalFallbackAction.none) return false;
+    _triedLocalFallback = true;
+    final gen = _gen;
+    try {
+      final local = await finder!(currentEpisode);
+      if (local == null || local.isEmpty || gen != _gen || isClosed) {
+        return false;
+      }
+      if (action == LocalFallbackAction.ask) {
+        final accepted = await (_confirmLocalFallback?.call() ?? Future.value(false));
+        if (!accepted || gen != _gen || isClosed) return false;
+      }
+      // Stop any online sweep still feeding the old list before replacing it.
+      await _cancelProgressive();
+      _toast('Playing your downloaded copy.');
+      emit(state.copyWith(sources: local, error: () => null));
+      await _open(local.first, seekTo: _lastPos);
+      return true;
+    } catch (e) {
+      debugPrint('[player] local download fallback failed: $e');
+      return false;
+    }
+  }
+
+  /// Called when playback stopped because the connection is gone and there is
+  /// no downloaded copy to switch to. Tells the viewer, then reopens the same
+  /// source from where it stopped as soon as the connection returns. Nothing is
+  /// marked dead meanwhile, so the source that worked before still works.
+  void _waitForConnection() {
+    _toast("You're offline. Playback will resume when your connection returns.");
+    if (_onlineListener != null) return;
+    final gen = _gen;
+    void listener() {
+      if (BootConnectivity.instance.offline.value) return;
+      BootConnectivity.instance.offline.removeListener(listener);
+      _onlineListener = null;
+      if (isClosed || gen != _gen || _openedLocalFile) return;
+      final active = state.active;
+      if (active == null) return;
+      _tried.remove(active.url);
+      unawaited(_open(active, seekTo: _lastPos));
+    }
+
+    _onlineListener = listener;
+    BootConnectivity.instance.offline.addListener(listener);
+  }
+
+  /// The pending "reopen when online" listener, so [close] can detach it.
+  VoidCallback? _onlineListener;
+
   Future<bool> _tryNextSource() async {
+    // Offline there is no other source to find, and the attempt would mark the
+    // current (good) source unplayable for the rest of the session.
+    // Windows only.
+    if (Platform.isWindows && BootConnectivity.instance.offline.value) {
+      return false;
+    }
     // Local-file playback never sweeps the network: a download that won't
     // open is reported as-is instead of hunting online mirrors for a file
     // the viewer asked to play offline.
@@ -3442,6 +4241,10 @@ class PlayerCubit extends Cubit<PlayerState> {
     // Failover re-resolves and emits a fresh list: a progressive subscription
     // still feeding the old sweep would merge its dead links straight back.
     await _cancelProgressive();
+    // Windows (plan item R5): the old source's late-mirror poll ends here,
+    // before the new source's list is shown, so a read still running for
+    // the dead source cannot add its links after the new list.
+    _stopDesktopLatePoll();
     _sourceHops++;
     resolver.markSourceUnplayable(epUrl, winner, category: _activeCategory);
     _toast('That one didn\'t cut. Trying another source.');
@@ -3459,6 +4262,10 @@ class PlayerCubit extends Cubit<PlayerState> {
       if (gen != _gen) return true;
       _buildQualityMenu(gen);
       _applyDefaultQuality();
+      // Windows (plan item R5): collect the NEW source's late mirrors too,
+      // so a later failure there also has more to try. Replaces any poll
+      // still running for the old source.
+      if (desktopLateMirrorsEnabled) unawaited(_pollForMoreSources(epUrl));
       return true;
     } catch (e) {
       // A sweep that finds nothing throws (EpisodeNotAvailable / NoSourceMatch)
@@ -3576,7 +4383,29 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// Recover a source that never started; ordinary buffering stays put.
   Future<void> _failoverToNext() async {
     if (_recovering) return;
+    // Windows (plan item R2): a link that produced no frame within the start
+    // window gets the one safe second try, but only when no other mirror is
+    // left (a silent link usually stays silent; the next mirror is the better
+    // bet). Phones: never.
+    final silent = state.active;
+    if (silent != null && _desktopSafeRetryAllowed(silent, timedOut: true)) {
+      await _runOneTimeRetry(silent, safeProfile: true);
+      return;
+    }
     _recovering = true;
+    // Windows: no connection means the mirrors are not dead, the network is.
+    // Hopping through them only burns minutes and blames good sources, so go
+    // straight to a downloaded copy of this episode, or wait for the
+    // connection to return.
+    if (Platform.isWindows &&
+        BootConnectivity.instance.offline.value &&
+        !_openedLocalFile) {
+      final startGen = _gen;
+      final onDisk = await _tryLocalDownloadFallback();
+      if (!onDisk && startGen == _gen && !isClosed) _waitForConnection();
+      _recovering = false;
+      return;
+    }
     final engineGen = _gen;
     if (onSourceFailure != null && await _tryOtherEngine()) {
       return;
@@ -3610,9 +4439,18 @@ class PlayerCubit extends Cubit<PlayerState> {
         _episodeUrl(currentEpisode),
         sourceId: sourceId,
       );
-      // A source whose every mirror stalls is as unplayable as one whose links
-      // 404 — same fallthrough to the next source rather than ending here.
-      if (!await _tryNextSource()) {
+      // Windows (plan item R3): an HTTP 403 often reaches only mpv's log, not
+      // its error stream, so the link just stalls until this watchdog. When
+      // those log lines read like an expired link, ask the same source once
+      // per episode for fresh links (15 s cap) before moving to the next one.
+      final stallGen = _gen;
+      if (Platform.isWindows && await _tryDesktopFreshLinks('', stallGen)) {
+        // A fresh link is opening (or a newer open took over).
+      } else if (
+          // A source whose every mirror stalls is as unplayable as one whose
+          // links 404 — same fallthrough to the next source as before.
+          !await _tryNextSource() &&
+          !await _tryLocalDownloadFallback()) {
         // Same reason as the dead end above: a stalled player left running
         // keeps retrying behind the message.
         await _stopQuietly();
@@ -3629,6 +4467,229 @@ class PlayerCubit extends Cubit<PlayerState> {
     _recovering = false;
   }
 
+  /// Windows only (plan item R2): whether [active], which failed before its
+  /// first frame, may get the one safe second try. [timedOut] is true for the
+  /// no-frame watchdog, false for an mpv error. The rules themselves live in
+  /// [shouldDesktopSafeRetry]; this only gathers the player's facts.
+  bool _desktopSafeRetryAllowed(VideoSource active, {required bool timedOut}) {
+    if (!Platform.isWindows || player.platform is! NativePlayer) return false;
+    final otherMirrorLeft = state.sources.any(
+      (x) => x.url != active.url && !_tried.contains(x.url),
+    );
+    return shouldDesktopSafeRetry(
+      isWindows: true,
+      alreadyRetried: _softwareDecodeRetried,
+      startedThisSource: _startedThisSource,
+      isLocalFile: _openedLocalFile,
+      isTorrent: _activeTorrentId != null || isTorrentUrl(active.url),
+      isDrm: active.isDrm,
+      offline: BootConnectivity.instance.offline.value,
+      proxied: _isProxiedStream,
+      // An Aniyomi link with a hidden proxy copy tries that copy first.
+      proxySwapPending:
+          sourceId.startsWith('ani:') &&
+          !_isProxiedStream &&
+          active.proxyUrl != null,
+      timedOut: timedOut,
+      otherMirrorLeft: otherMirrorLeft,
+    );
+  }
+
+  /// Reopens [active] once with the software decoder, at the live position.
+  ///
+  /// Shared by the codec retry (every platform, unchanged) and the Windows
+  /// safe second try ([safeProfile] true: also no audio trimming, plain
+  /// demuxer options and a 15 s start window). [_softwareDecodeRetried] stays
+  /// set until a different link opens, so each link is retried at most once
+  /// and this can never loop. An error the retry hits while opening is
+  /// handled afterwards, which then moves on to the next mirror.
+  Future<void> _runOneTimeRetry(
+    VideoSource active, {
+    required bool safeProfile,
+  }) async {
+    _softwareDecodeRetried = true;
+    final retryGen = ++_gen;
+    _softwareDecodeRetryGeneration = retryGen;
+    _softwareDecodeRetryInProgress = true;
+    _softwareDecodeRetryError = null;
+    _recovering = true;
+    _neverStartedTimer?.cancel();
+    if (safeProfile) {
+      AppLogger.instance.log(
+        '[player] safe second try for a link that did not start',
+      );
+      _toast("That link didn't start. Trying it once more.");
+    } else {
+      // Translated text (same English wording as before).
+      _toast(
+        Platform.isWindows
+            ? appL10n.playerHardwareDecodeRetrying
+            : 'Hardware decoding failed. Retrying in software.',
+      );
+    }
+    try {
+      await _open(
+        active,
+        seekTo: _lastPos,
+        gen: retryGen,
+        softwareDecodeRetry: true,
+        desktopSafeProfile: safeProfile,
+      );
+    } catch (error) {
+      _softwareDecodeRetryError = 'Software decoder retry failed: $error';
+    } finally {
+      if (_softwareDecodeRetryGeneration == retryGen &&
+          isCurrentSoftwareDecoderRetry(
+            retryGeneration: retryGen,
+            currentGeneration: _gen,
+          )) {
+        _softwareDecodeRetryInProgress = false;
+        _softwareDecodeRetryGeneration = null;
+        _recovering = false;
+      }
+    }
+    if (!isCurrentSoftwareDecoderRetry(
+          retryGeneration: retryGen,
+          currentGeneration: _gen,
+        ) ||
+        isClosed) {
+      return;
+    }
+    final retryError = _softwareDecodeRetryError;
+    _softwareDecodeRetryError = null;
+    if (retryError != null && !isClosed) {
+      await _onPlaybackError(retryError);
+    }
+  }
+
+  /// Windows only (plan item R3): every mirror of this source failed and the
+  /// failure [error] (or mpv's error log for the link) reads like an expired
+  /// link (403 / 410 / "expired"). Like the phone, ask the SAME source once
+  /// per episode for fresh links (a full scrape, not the quick one, capped at
+  /// 15 s) and play the first link not tried yet.
+  ///
+  /// Returns true when a fresh link is opening (or a newer open took over),
+  /// false to carry on with the next source as before.
+  Future<bool> _tryDesktopFreshLinks(String error, int gen) async {
+    final active = state.active;
+    if (!shouldTryFreshLinks(
+      isWindows: Platform.isWindows,
+      alreadyTried: _freshLinksTried,
+      // Only called once no mirror is left (see [_onPlaybackError]).
+      mirrorsLeft: false,
+      isLocalFile: _openedLocalFile,
+      isTorrent:
+          _activeTorrentId != null ||
+          (active != null && isTorrentUrl(active.url)),
+      offline: BootConnectivity.instance.offline.value,
+      looksExpired: looksLikeExpiredLink(
+        error: error,
+        logLines: _desktopErrorLog,
+      ),
+    )) {
+      return false;
+    }
+    _freshLinksTried = true;
+    final epUrl = _episodeUrl(currentEpisode);
+    final url = showUrl;
+    final zmode =
+        url != null && ZmodeIds.isZ(url) && sl.isRegistered<PlaybackResolver>();
+    // Z Mode: the source that actually played, not the session's 'zm' id.
+    final from = zmode
+        ? sl<PlaybackResolver>().resolvedSourceId(
+            epUrl,
+            category: _activeCategory,
+          )
+        : sourceId;
+    if (from == null || from.isEmpty) return false;
+    AppLogger.instance.log(
+      '[player] links look expired · asking $from once for fresh links',
+    );
+    _toast('That link expired. Getting fresh links…');
+    List<VideoSource> fresh;
+    try {
+      final ask = zmode
+          ? sl<PlaybackResolver>().sourcesFrom(
+              epUrl,
+              from,
+              fast: false,
+              category: _activeCategory,
+            )
+          : sl<SourceRepository>().sources(epUrl, sourceId: from, fast: false);
+      fresh = await ask.timeout(kDesktopFreshLinksCap);
+    } catch (e) {
+      // Over the cap, or the scrape failed: move on to the next source.
+      debugPrint('[player] fresh links · none: $e');
+      return false;
+    }
+    if (gen != _gen || isClosed) return true; // a newer open took over
+    final pick = firstUntriedLink<VideoSource>(fresh, _tried, (s) => s.url);
+    if (pick == null) {
+      debugPrint('[player] fresh links · only links already tried');
+      return false;
+    }
+    // Same order as [_tryNextSource]: stop a progressive sweep still feeding
+    // the old list first, or it would merge the expired links straight back.
+    await _cancelProgressive();
+    if (gen != _gen || isClosed) return true;
+    // R5: the fresh list replaces the old one on purpose; a late-mirror poll
+    // still running must not add the old links back on top of it.
+    _stopDesktopLatePoll();
+    emit(state.copyWith(sources: fresh, error: () => null));
+    final openGen = ++_gen;
+    await _open(pick, seekTo: _lastPos, gen: openGen);
+    // Rebuild the quality menu from the fresh list: the old one still points
+    // at the expired master, so picking a quality would reopen the dead link.
+    if (openGen == _gen && !isClosed) {
+      _buildQualityMenu(openGen);
+      _applyDefaultQuality();
+    }
+    return true;
+  }
+
+  /// Windows only (plan item P5): when the video's length [duration] is known
+  /// and the resume [target] sits at or within 5 s of it, start from 0 and
+  /// save the mark as 0, once per open. Returns true when it did that (or had
+  /// already done it for this open).
+  ///
+  /// A saved `.ts` download is skipped: mpv only estimates its length, and a
+  /// guess must never erase a valid mark.
+  bool _desktopResetEndMark(Duration target, Duration duration) {
+    if (!Platform.isWindows) return false;
+    if (_endMarkResetGen == _gen) return true;
+    // Only a SAVED mark is reset; a switch near the end reopens at the live
+    // position and must keep it (see [isSavedResumeTarget]).
+    if (!isSavedResumeTarget(
+      target: target,
+      savedMark: _desktopSavedMark,
+      pending: _pendingResume,
+    )) {
+      return false;
+    }
+    final activeUrl = state.active?.url.toLowerCase() ?? '';
+    final trusted = !(_openedLocalFile && activeUrl.endsWith('.ts'));
+    if (!resumeMarkAtOrPastEnd(
+      target: target,
+      duration: duration,
+      durationTrusted: trusted,
+    )) {
+      return false;
+    }
+    _endMarkResetGen = _gen;
+    _pendingResume = Duration.zero;
+    AppLogger.instance.log(
+      '[resume] mark ${target.inSeconds}s is at the end of '
+      '${duration.inSeconds}s · starting from 0',
+    );
+    unawaited(player.seek(Duration.zero).catchError((_) {}));
+    unawaited(
+      resume
+          .save(sourceId, _showKey, currentEpisode.id, Duration.zero, duration)
+          .catchError((_) {}),
+    );
+    return true;
+  }
+
   /// Re-seek shortly after open if the stream ignored Media.start (position is
   /// still near 0 instead of the resume target). Retries a couple of times to
   /// catch slow-loading sources.
@@ -3637,6 +4698,25 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// past a stalling deep-seek), abandon the resume, restart from 0, and reset
   /// the bad mark so the title plays instead of freezing forever.
   Future<void> _resumeWatchdog(int g) async {
+    // Merge glue: Windows keeps our conservative watchdog (a slow seek must
+    // never erase a valid resume mark); other platforms keep upstream's
+    // frozen-resume reset with its Stremio guard.
+    if (Platform.isWindows) {
+      await Future.delayed(const Duration(seconds: 30));
+      if (g != _gen || _pendingResume <= Duration.zero || !player.state.playing)
+        return;
+      // A slow range request or paused video must never erase a valid resume
+      // mark. Keep the target; retry when seeking becomes possible.
+      final duration = player.state.duration;
+      if (duration > _pendingResume &&
+          !resumeSeekLanded(
+            position: player.state.position,
+            target: _pendingResume,
+          )) {
+        await player.seek(_pendingResume);
+      }
+      return;
+    }
     await Future.delayed(const Duration(seconds: 15));
     if (g != _gen) return;
     final before = _lastPos;
@@ -3670,20 +4750,41 @@ class PlayerCubit extends Cubit<PlayerState> {
   }
 
   Future<void> _verifyResume(Duration target, int g) async {
+    final initialUserSeek = _userSeekMs;
     // A seek issued while the stream is still buffering at position 0 is
     // silently dropped, so a fixed 3-try window often expires before slow
     // sources (remote MP4s) start producing frames — and the user lands at 0.
-    // Poll for up to ~12s and only seek ONCE the player is actually playing
-    // (a real position or a known duration), retrying until it sticks.
-    for (var attempt = 0; attempt < 20; attempt++) {
+    // Poll for up to ~12s (Windows: ~60s) and only seek ONCE the player is
+    // actually playing (a real position or a known duration), retrying until
+    // it sticks.
+    final windows = Platform.isWindows;
+    final attempts = windows ? 80 : 20;
+    for (var attempt = 0; attempt < attempts; attempt++) {
       await Future.delayed(const Duration(milliseconds: 750));
       if (g != _gen) return; // a newer open superseded this
+      // Windows: a user seek or a closed player also ends the wait.
+      if (windows && (isClosed || _userSeekMs != initialUserSeek)) return;
       final pos = player.state.position;
-      if ((pos - target).abs() <= const Duration(seconds: 8)) return; // reached
+      // Windows: within a keyframe of the target counts as reached.
+      // Demanding an exact landing re-seeked a sparse-keyframe .ts forever
+      // (the looping clip).
+      final reached = windows
+          ? resumeSeekLanded(position: pos, target: target)
+          : (pos - target).abs() <= const Duration(seconds: 8);
+      if (reached) return;
       // Seeking needs a KNOWN duration: remote MP4s (file hosts) report
       // duration only after mpv reads the moov atom, and a seek issued before
       // then is clamped to 0 — the "always starts from 0" bug. Wait for it.
       final dur = player.state.duration;
+      // Windows (plan item P5): a mark at or within 5 s of the known end is
+      // not a place to resume. Start from 0 and reset the mark (once per
+      // open; the duration listener may already have done it) instead of
+      // waiting here for a seek that can never help. A mark that is simply
+      // slow to reach is untouched (see [_resumeWatchdog]).
+      if (Platform.isWindows &&
+          (_endMarkResetGen == g || _desktopResetEndMark(target, dur))) {
+        return;
+      }
       if (dur > Duration.zero && target < dur) await player.seek(target);
     }
   }
@@ -3741,6 +4842,246 @@ class PlayerCubit extends Cubit<PlayerState> {
   Future<void> playPrevious() async {
     if (state.currentIndex > 0) {
       await openEpisode(state.currentIndex - 1);
+    }
+  }
+
+  // ── Windows keyboard actions (player-5) ───────────────────────────────────
+
+  /// Speeds the [ and ] keys step through.
+  static const keyboardSpeeds = [
+    0.25,
+    0.5,
+    0.75,
+    1.0,
+    1.25,
+    1.5,
+    1.75,
+    2.0,
+    2.5,
+    3.0,
+    4.0,
+  ];
+
+  /// One speed step slower (-1) or faster (+1); returns the new rate. The
+  /// choice is remembered like a pick from the speed menu.
+  double stepSpeed(int direction) {
+    final rate = player.state.rate;
+    double next;
+    if (direction > 0) {
+      next = keyboardSpeeds.firstWhere(
+        (r) => r > rate + 0.01,
+        orElse: () => keyboardSpeeds.last,
+      );
+    } else {
+      next = keyboardSpeeds.lastWhere(
+        (r) => r < rate - 0.01,
+        orElse: () => keyboardSpeeds.first,
+      );
+    }
+    setRateRemembered(next);
+    return next;
+  }
+
+  /// S: skips the intro / ending / recap under the playhead. Returns false
+  /// when there is nothing to skip right now.
+  bool skipCurrentInterval() {
+    final pos = _lastPos;
+    for (final iv in _skips) {
+      if (pos >= iv.start && pos < iv.end - const Duration(seconds: 1)) {
+        seekTo(iv.end);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// 0-9: jumps to [fraction] (0.0 … 0.9) of the episode.
+  void jumpToFraction(double fraction) {
+    final dur = _lastDur > Duration.zero ? _lastDur : player.state.duration;
+    if (dur <= Duration.zero) return;
+    seekTo(dur * fraction.clamp(0.0, 1.0));
+  }
+
+  /// , and .: one frame back (-1) / forward (+1). Only while paused, so a
+  /// stray press never freezes a playing video. Returns whether it stepped.
+  Future<bool> frameStep(int direction) async {
+    if (_isRoomViewer || player.state.playing) return false;
+    final p = player.platform;
+    if (p is! NativePlayer) return false;
+    try {
+      await p.command([direction < 0 ? 'frame-back-step' : 'frame-step']);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// G and H move subtitles by this much per press.
+  static const subtitleDelayStep = Duration(milliseconds: 100);
+
+  /// G (-1): subtitles earlier; H (+1): later. Returns the new delay.
+  Duration nudgeSubtitleDelay(int direction) {
+    final next = subtitleDelay + subtitleDelayStep * direction.sign;
+    unawaited(setSubtitleDelay(next));
+    return next;
+  }
+
+  // The subtitle track C turns back on (the one showing before it was hidden).
+  SubtitleTrack? _subtitleBeforeHide;
+
+  /// C: subtitles on / off for this session (does not change the saved
+  /// subtitle preference). Returns true when subtitles are now on.
+  Future<bool> toggleSubtitles() async {
+    final current = player.state.track.subtitle;
+    if (current.id != 'no') {
+      _subtitleBeforeHide = current;
+      await _applyManualSubtitle(
+        () => player.setSubtitleTrack(SubtitleTrack.no()),
+        trackId: 'no',
+      );
+      return false;
+    }
+    // Back on: the track from before, else the first real one available.
+    var back = _subtitleBeforeHide;
+    if (back == null || back.id == 'no' || back.id == 'auto') {
+      final real = player.state.tracks.subtitle
+          .where((t) => t.id != 'no' && t.id != 'auto')
+          .toList();
+      back = real.isEmpty ? null : real.first;
+    }
+    if (back == null) return false;
+    final track = back;
+    await _applyManualSubtitle(
+      () => player.setSubtitleTrack(track),
+      trackId: track.id,
+    );
+    return true;
+  }
+
+  // ── Windows media overlay + taskbar buttons (player-10) ───────────────────
+  // The player that currently owns the Windows media overlay. Only one at a
+  // time: a newer player takes over, and only the owner clears it on close.
+  static PlayerCubit? _desktopMediaOwner;
+  StreamSubscription<DesktopMediaCommand>? _desktopMediaSub;
+  Timer? _desktopMediaTimer;
+
+  /// Called for the media Stop button / key. The player screen sets it to
+  /// leave the player; null just pauses.
+  VoidCallback? onDesktopMediaStop;
+
+  /// Starts showing this player in the Windows media overlay and the taskbar
+  /// thumbnail buttons, and listens for their commands. Windows only; never
+  /// for a peek preview.
+  void _attachDesktopMedia() {
+    if (defaultTargetPlatform != TargetPlatform.windows || peek) return;
+    final previous = _desktopMediaOwner;
+    if (previous != null && previous != this) previous._detachDesktopMedia();
+    _desktopMediaOwner = this;
+    _desktopMediaSub = DesktopNative.mediaCommands.listen(
+      _onDesktopMediaCommand,
+    );
+    // Play state, duration and episode changes refresh the overlay at once;
+    // the timer keeps its timeline roughly in step while playing.
+    _subs.add(player.stream.playing.listen((_) => _pushDesktopMedia()));
+    _subs.add(player.stream.duration.listen((_) => _pushDesktopMedia()));
+    _subs.add(
+      stream
+          .map((s) => s.currentIndex)
+          .distinct()
+          .listen((_) => _pushDesktopMedia()),
+    );
+    _desktopMediaTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (player.state.playing) _pushDesktopMedia();
+    });
+    _pushDesktopMedia();
+  }
+
+  /// Stops listening; clears the overlay and thumbnail buttons when this
+  /// player still owns them.
+  void _detachDesktopMedia() {
+    _desktopMediaSub?.cancel();
+    _desktopMediaSub = null;
+    _desktopMediaTimer?.cancel();
+    _desktopMediaTimer = null;
+    if (_desktopMediaOwner != this) return;
+    _desktopMediaOwner = null;
+    unawaited(DesktopNative.clearMediaSession());
+    unawaited(DesktopNative.setThumbButtons(visible: false));
+  }
+
+  /// Sends the current episode, play state and position to Windows.
+  void _pushDesktopMedia({Duration? position}) {
+    if (_desktopMediaOwner != this || isClosed) return;
+    if (episodes.isEmpty) return;
+    final ep = currentEpisode;
+    final playing = player.state.playing;
+    final canNext = hasPlayableNext;
+    final canPrevious = state.currentIndex > 0;
+    final number = ep.number;
+    final title = ep.title.trim().isNotEmpty
+        ? ep.title.trim()
+        : (number != null
+              ? appL10n.episodeNumberLabel('${number == number.truncateToDouble() ? number.toInt() : number}')
+              : (showTitle ?? 'Zangetsu'));
+    final art = (ep.thumbnail?.isNotEmpty ?? false) ? ep.thumbnail : cover;
+    final dur = _lastDur > Duration.zero ? _lastDur : player.state.duration;
+    unawaited(
+      DesktopNative.updateMediaSession(
+        DesktopMediaInfo(
+          title: title,
+          subtitle: showTitle,
+          artworkUrl: (art?.startsWith('http') ?? false) ? art : null,
+          playing: playing,
+          position: position ?? _lastPos,
+          duration: dur > Duration.zero ? dur : null,
+          canNext: canNext,
+          canPrevious: canPrevious,
+        ),
+      ),
+    );
+    unawaited(
+      DesktopNative.setThumbButtons(
+        visible: true,
+        playing: playing,
+        canPrevious: canPrevious,
+        canNext: canNext,
+      ),
+    );
+  }
+
+  /// Runs a command from the overlay, a thumbnail button or a media key.
+  /// The same key press may already have been handled as a focused key
+  /// event (see DesktopPlayerInput); [DesktopMediaKeyDedupe] drops the copy.
+  @visibleForTesting
+  void debugDesktopMediaCommand(DesktopMediaCommand command) =>
+      _onDesktopMediaCommand(command);
+
+  /// Windows: acts on one media overlay / taskbar / media key command.
+  void _onDesktopMediaCommand(DesktopMediaCommand command) {
+    if (isClosed || _desktopMediaOwner != this) return;
+    final bucket = DesktopMediaKeyDedupe.actionFor(command.kind);
+    if (bucket != null && !DesktopMediaKeyDedupe.claim(bucket)) return;
+    switch (command.kind) {
+      case DesktopMediaCommandKind.play:
+        if (!player.state.playing) togglePlay();
+      case DesktopMediaCommandKind.pause:
+        if (player.state.playing) togglePlay();
+      case DesktopMediaCommandKind.toggle:
+        togglePlay();
+      case DesktopMediaCommandKind.next:
+        unawaited(playNext());
+      case DesktopMediaCommandKind.previous:
+        unawaited(playPrevious());
+      case DesktopMediaCommandKind.stop:
+        final stop = onDesktopMediaStop;
+        if (stop != null) {
+          stop();
+        } else if (player.state.playing) {
+          togglePlay();
+        }
+      case DesktopMediaCommandKind.seek:
+        final to = command.position;
+        if (to != null) seekTo(to);
     }
   }
 
@@ -3805,7 +5146,7 @@ class PlayerCubit extends Cubit<PlayerState> {
           scrobbleTitle == null &&
           malId == null &&
           (imdbId != null || tmdbId != null);
-      final List<SkipInterval> skips;
+      List<SkipInterval> skips;
       if (useIntroDb) {
         skips = await service.introDbTimes(
           imdbId: imdbId,
@@ -3825,6 +5166,20 @@ class PlayerCubit extends Cubit<PlayerState> {
           duration: dur,
         );
       }
+      // Windows: a download carries its own times in its folder's metadata
+      // file (also when the folder came from another PC); use them when
+      // nothing else did.
+      if (Platform.isWindows && skips.isEmpty && isLocalMedia) {
+        skips = await _skipsFromManifest(state.active!.url);
+        final title = showTitle;
+        final number = ep.number?.toInt();
+        if (skips.isNotEmpty &&
+            title != null &&
+            title.isNotEmpty &&
+            number != null) {
+          unawaited(sl<SkipService>().rememberSkipTimes(title, number, skips));
+        }
+      }
       if (!isClosed &&
           index == state.currentIndex &&
           index < episodes.length &&
@@ -3832,6 +5187,29 @@ class PlayerCubit extends Cubit<PlayerState> {
         _skips = skips;
       }
     } catch (_) {}
+  }
+
+  /// Skip times stored for [mediaPath] in the nearest `.zangetsu` manifest
+  /// (the show folder, or the one above a season folder).
+  Future<List<SkipInterval>> _skipsFromManifest(String mediaPath) async {
+    final path = mediaPath.startsWith('file:')
+        ? Uri.parse(mediaPath).toFilePath()
+        : mediaPath;
+    final name = p.basename(path);
+    var dir = File(path).parent;
+    final store = FolderManifestStore();
+    for (var up = 0; up < 3; up++) {
+      final manifest = await store.read(dir);
+      if (manifest != null) {
+        for (final e in manifest.episodes) {
+          if (p.basename(e.file) == name && e.skips.isNotEmpty) return e.skips;
+        }
+      }
+      final parent = dir.parent;
+      if (parent.path == dir.path) break;
+      dir = parent;
+    }
+    return const [];
   }
 
   // ── Subtitle / audio sync (delay offsets, applied via mpv) ────────────────
@@ -3872,7 +5250,8 @@ class PlayerCubit extends Cubit<PlayerState> {
     subSyncTextMs = null;
   }
 
-  /// Grab the current video frame and save it to the gallery. Returns true on
+  /// Grab the current video frame and save it to the gallery (Pictures on
+  /// Windows). Returns true on
   /// success. NOTE: subtitles are a Flutter overlay, so they are NOT part of the
   /// captured frame — only the raw video.
   Future<bool> captureScreenshot() async {
@@ -3891,7 +5270,12 @@ class PlayerCubit extends Cubit<PlayerState> {
         await Gal.requestAccess();
         await Gal.putImageBytes(bytes, name: name);
       }
-      _toast('Saved to gallery');
+      // Windows has no gallery; there the image lands in Pictures.
+      _toast(
+        defaultTargetPlatform == TargetPlatform.windows
+            ? 'Saved to Pictures'
+            : 'Saved to gallery',
+      );
       return true;
     } catch (_) {
       _toast('Screenshot failed');
@@ -3977,7 +5361,11 @@ class PlayerCubit extends Cubit<PlayerState> {
       sl<PlaybackPrefs>().styledSubtitles ? 'no' : 'force',
     );
     await set('sub-scale', prefs.subtitleScale.toString());
-    if (prefs.subtitleFont.isNotEmpty) {
+    // Empty clears a previously selected font when Reset restores defaults.
+    // Skipping the property would leave the old libass family active forever.
+    // Windows: always written, so Reset clears an old font. Phone and TV
+    // keep setting it only when one is chosen.
+    if (Platform.isWindows || prefs.subtitleFont.isNotEmpty) {
       await set('sub-font', prefs.subtitleFont);
     }
     await set('sub-color', color);
@@ -4035,6 +5423,12 @@ class PlayerCubit extends Cubit<PlayerState> {
   Future<void> setVolumeBoost(int percent) async {
     final v = percent.clamp(0, 200);
     await sl<PlaybackPrefs>().setVolumeBoost(v);
+    // Windows: the boost multiplies the user's 0-100 level, so changing it
+    // keeps that level instead of jumping to the boost value.
+    if (_desktopVolume) {
+      await _applyUserVolume();
+      return;
+    }
     // Real software gain via mpv's native volume property (0–200, softvol).
     final p = player.platform;
     if (p is NativePlayer) {
@@ -4042,6 +5436,88 @@ class PlayerCubit extends Cubit<PlayerState> {
         await p.setProperty('volume', v.toString());
       } catch (_) {}
     }
+  }
+
+  // ── Windows volume (player-6) ─────────────────────────────────────────────
+  // Keys, wheel and slider work on a familiar 0-100 "user" level. The saved
+  // volume boost (100-200%) is applied on top: mpv volume = user * boost / 100
+  // (volume-max is 200), so a volume change never resets the boost.
+
+  /// Hive key (desktop_prefs box) holding the last non-zero user level.
+  static const desktopVolumeKey = 'player_volume';
+
+  /// True where the user/boost split applies (Windows UI only).
+  bool get _desktopVolume => defaultTargetPlatform == TargetPlatform.windows;
+
+  // Current 0-100 level; starts at the level saved last session.
+  late double _userVolume = _savedUserVolume();
+
+  // Level to come back to when unmuting.
+  double _volumeBeforeMute = 100;
+
+  /// The 0-100 level saved last session, or 100 when none is saved.
+  static double _savedUserVolume() {
+    final raw = DesktopPrefs.readRaw(desktopVolumeKey);
+    return raw is num ? raw.toDouble().clamp(0.0, 100.0) : 100.0;
+  }
+
+  /// The saved volume boost (100-200%), 100 when prefs are not set up.
+  int get _boostPercent => sl.isRegistered<PlaybackPrefs>()
+      ? sl<PlaybackPrefs>().volumeBoost.clamp(100, 200)
+      : 100;
+
+  /// mpv's `volume` for a 0-100 [user] level with the boost applied.
+  double _mpvVolumeFor(double user) =>
+      (user.clamp(0.0, 100.0) * _boostPercent / 100).clamp(0.0, 200.0);
+
+  /// The 0-100 user level shown by the slider for mpv's [mpvVolume].
+  double userVolumeFromMpv(double mpvVolume) =>
+      (mpvVolume * 100 / _boostPercent).clamp(0.0, 100.0);
+
+  /// The current 0-100 user level.
+  double get userVolume => _userVolume;
+
+  /// Whether the user level is muted (0).
+  bool get userMuted => _userVolume <= 0;
+
+  /// Sets the 0-100 user level; the boost stays applied on top. Non-zero
+  /// levels are saved so the next session starts at them.
+  Future<void> setUserVolume(double level) async {
+    _userVolume = level.clamp(0.0, 100.0);
+    if (_userVolume > 0) {
+      // Also the level M unmutes back to, even after dragging to 0.
+      _volumeBeforeMute = _userVolume;
+      unawaited(DesktopPrefs.writeRaw(desktopVolumeKey, _userVolume));
+    }
+    await _applyUserVolume();
+  }
+
+  /// One Up / Down / wheel step; returns the new 0-100 level.
+  double stepUserVolume(double delta) {
+    final next = (_userVolume + delta).clamp(0.0, 100.0);
+    unawaited(setUserVolume(next));
+    return next;
+  }
+
+  /// M: mutes, or unmutes back to the level from before. Returns the new
+  /// 0-100 level.
+  double toggleUserMute() {
+    final double next;
+    if (_userVolume > 0) {
+      _volumeBeforeMute = _userVolume;
+      next = 0;
+    } else {
+      next = _volumeBeforeMute > 0 ? _volumeBeforeMute : 100;
+    }
+    unawaited(setUserVolume(next));
+    return next;
+  }
+
+  /// Sends the user level, with the boost on top, to mpv.
+  Future<void> _applyUserVolume() async {
+    try {
+      await player.setVolume(_mpvVolumeFor(_userVolume));
+    } catch (_) {}
   }
 
   /// The mpv audio-filter chain from prefs. Volume boost is NOT here — it's the
@@ -4166,6 +5642,12 @@ class PlayerCubit extends Cubit<PlayerState> {
   /// Mark the anime CURRENT when playback starts.
   void _markWatching() {
     if (peek) return;
+    // Windows: rewatching a Completed show keeps it Completed, so do not tell
+    // the trackers it is "watching" again.
+    if (defaultTargetPlatform == TargetPlatform.windows &&
+        ListAutoStatus.instance.currentStatus(showUrl) == WatchStatus.completed) {
+      return;
+    }
     if (malId == null &&
         (scrobbleTitle == null || scrobbleTitle!.isEmpty) &&
         tmdbId == null &&
@@ -4182,7 +5664,33 @@ class PlayerCubit extends Cubit<PlayerState> {
     );
   }
 
+  /// Windows: show URLs already reported as started this session, and the
+  /// episode indices already reported as finished.
+  bool _listStartReported = false;
+  final Set<int> _listFinishReported = {};
+
+  /// Windows list automation (see [ListAutoStatus]): "started" once real
+  /// watching begins (2 min in, or 15% of a short episode), "finished" at the
+  /// same 92% mark the tracker scrobble uses. Previews never count.
+  void _maybeReportListStatus({bool force = false}) {
+    if (peek || defaultTargetPlatform != TargetPlatform.windows) return;
+    final url = showUrl;
+    if (url == null || url.isEmpty) return;
+    final pos = _lastPos.inMilliseconds;
+    final dur = _lastDur.inMilliseconds;
+    if (!_listStartReported &&
+        (force || pos >= 120000 || (dur > 0 && pos >= dur * 0.15))) {
+      _listStartReported = true;
+      unawaited(ListAutoStatus.instance.onStarted(url));
+    }
+    final finished = force || (dur > 0 && pos >= dur * 0.92);
+    if (finished && _listFinishReported.add(state.currentIndex)) {
+      unawaited(ListAutoStatus.instance.onFinished(url, currentEpisode.number));
+    }
+  }
+
   void _maybeScrobble({bool force = false}) {
+    _maybeReportListStatus(force: force);
     if (malId == null &&
         (scrobbleTitle == null || scrobbleTitle!.isEmpty) &&
         tmdbId == null &&
@@ -4253,22 +5761,70 @@ class PlayerCubit extends Cubit<PlayerState> {
     );
   }
 
+  /// Bumped (Windows only) when episode names arrive in the background, so
+  /// the player header can swap "E1" for "E1 · The Name" without waiting for
+  /// some other change to rebuild it.
+  final ValueNotifier<int> episodeTitlesRev = ValueNotifier<int>(0);
+
   Future<void> _enrichEpisodeTitles() async {
     if (!sl.isRegistered<EpisodeMetadataService>()) return;
+    final windows = defaultTargetPlatform == TargetPlatform.windows;
     try {
+      // The list being enriched. Kept so a list swapped in meanwhile (Sub/Dub
+      // switch) is not overwritten with names meant for the old one.
+      final base = episodes;
+      var mal = malId;
+      // Windows: a player opened without a MAL id (Continue Watching, Home,
+      // an id-less source) never had a way to look the names up, which is
+      // why the header usually showed only "E1". Find the id from the show's
+      // name the same way the detail page does, but only when some episode
+      // really has no name yet. Runs in the background; playback never
+      // waits for it.
+      if (windows &&
+          mal == null &&
+          tmdbId == null &&
+          episodesMissingNames(base)) {
+        mal = await _lookupMalIdForNames();
+        if (isClosed) return;
+      }
       final next = await sl<EpisodeMetadataService>().enrich(
-        episodes: episodes,
-        type: (scrobbleTitle != null || malId != null)
+        episodes: base,
+        type: (scrobbleTitle != null || mal != null)
             ? ProviderType.anime
             : ProviderType.movie,
-        malId: malId,
+        malId: mal,
         tmdbId: tmdbId,
         tmdbIsTv: tmdbIsTv,
       );
       if (isClosed || identical(next, episodes)) return;
+      if (windows && !identical(base, episodes)) return;
       episodes = next;
+      // Windows: tell the header the names are here.
+      if (windows) episodeTitlesRev.value++;
     } catch (_) {
       /* keep source titles */
+    }
+  }
+
+  /// Windows: the MAL id for this anime, found from its title on AniList.
+  /// Null when it is not an anime, has no title, or nothing matched in time.
+  Future<int?> _lookupMalIdForNames() async {
+    final title = (scrobbleTitle ?? '').trim();
+    if (title.isEmpty || !sl.isRegistered<MetadataEnrichment>()) return null;
+    try {
+      return await sl<MetadataEnrichment>()
+          .resolveMalId(
+            MediaDetail(
+              id: showUrl ?? title,
+              title: title,
+              url: showUrl ?? '',
+              type: ProviderType.anime,
+              sourceId: sourceId,
+            ),
+          )
+          .timeout(const Duration(seconds: 10));
+    } catch (_) {
+      return null;
     }
   }
 
@@ -4289,6 +5845,12 @@ class PlayerCubit extends Cubit<PlayerState> {
     if (!playing && player.state.playing) player.pause();
   }
 
+  /// Saves the resume mark and history now and waits until both are written.
+  /// close() starts the same save without waiting for it; the Windows
+  /// floating player waits on this first, so a profile switch right after
+  /// closing it cannot land the last history entry in the new profile.
+  Future<void> flushProgress() => _persist(flush: true).catchError((_) {});
+
   @override
   Future<void> close() {
     _simklPlayback?.stop();
@@ -4302,6 +5864,13 @@ class PlayerCubit extends Cubit<PlayerState> {
     // Before _persist, which doesn't consult _gen — the resume mark is still
     // written on the way out.
     _gen++;
+    _stopDesktopLatePoll(); // Windows R5: no late-mirror reads after closing
+    // Stop waiting for the connection: nothing should reopen a closed player.
+    final waiting = _onlineListener;
+    if (waiting != null) {
+      BootConnectivity.instance.offline.removeListener(waiting);
+      _onlineListener = null;
+    }
     AppLogger.instance.log(
       '[player-lifecycle] cubit close start gen=$_gen '
       'active=${state.active?.label ?? state.active?.url ?? 'none'}',
@@ -4318,6 +5887,8 @@ class PlayerCubit extends Cubit<PlayerState> {
     if (sl.isRegistered<DiscordRpc>()) {
       sl<DiscordRpc>().clear(delay: DiscordRpc.playerExitClearDelay);
     }
+    // Windows: take this player out of the media overlay / taskbar buttons.
+    _detachDesktopMedia();
     for (final s in _subs) {
       s.cancel();
     }
@@ -4333,6 +5904,8 @@ class PlayerCubit extends Cubit<PlayerState> {
     unawaited(_stopTorrent().catchError((_) {}));
     toast.dispose();
     subtitleStyleRev.dispose();
+    shaderFallbackRev.dispose();
+    episodeTitlesRev.dispose();
     fillerEpisodes.dispose();
     // Stop first, wait for any in-flight open to settle, then dispose. The
     // route has already gone; this runs independently without allowing a late
@@ -4353,6 +5926,7 @@ class PlayerCubit extends Cubit<PlayerState> {
           dispose: () async {
             AppLogger.instance.log('[player-lifecycle] native dispose start');
             try {
+              DesktopHangWatch.step('player dispose');
               await player.dispose();
               AppLogger.instance.log('[player-lifecycle] native dispose done');
             } catch (error) {

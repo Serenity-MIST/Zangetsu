@@ -1,9 +1,11 @@
 import 'browse_sources_screen_tv.dart';
 import '../../core/di/injector.dart';
 import '../../core/app_mode.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/mode/content_mode.dart';
+import '../sources/desktop_sources_manager.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../l10n/l10n.dart';
@@ -68,6 +70,12 @@ class _BrowseSourcesScreenState extends State<BrowseSourcesScreen>
     // the hand-off itself never landed, so nothing could reach it.
     if (sl.isRegistered<AppMode>() && sl<AppMode>().isTv) {
       return const BrowseSourcesScreenTv();
+    }
+    // Windows: the sidebar's Sources page is the two-pane Sources manager
+    // (tabs -> chips, Providers hub and per-ecosystem screens folded in). It
+    // sits in the shell's IndexedStack, so no Back button and no autofocus.
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      return const DesktopSourcesManager();
     }
     return Scaffold(
       backgroundColor: AppColors.bg,

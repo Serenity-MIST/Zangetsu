@@ -1,9 +1,13 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../core/ui/app_dialog.dart';
+// src-11: tells a source time-out apart from other failures.
+import '../../core/desktop/source_timeout.dart'
+    show isSourceTimeout, sourceFailureMessage;
 import '../../core/ui/app_toast.dart';
 import '../../core/di/injector.dart';
 import '../../core/mihon/mihon_extension_service.dart';
@@ -15,6 +19,7 @@ import '../../core/repository/source_actions.dart' as source_actions;
 import '../../core/provider/cf_solve_needed.dart';
 import '../../core/repository/source_domain_overrides.dart';
 import '../../core/repository/source_repository.dart';
+import '../../core/repository/source_inventory_events.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/ui/content_row.dart';
@@ -30,6 +35,9 @@ import '../../core/zmode/zmode_prefs.dart';
 import '../../l10n/l10n.dart';
 import '../detail/detail_screen.dart';
 import '../home/see_all_screen.dart';
+// Windows catalogue time limit, shared with the Sources page's poster row.
+import '../sources/desktop_source_popular_row.dart'
+    show desktopCatalogueTimeout;
 import '../../core/aniyomi/aniyomi_filters.dart';
 import '../../core/mihon/mihon_filters.dart';
 import '../aniyomi/aniyomi_filter_sheet.dart';
@@ -38,6 +46,21 @@ import 'mangayomi_filter_sheet.dart';
 import 'dart:convert';
 import 'bloc/search_state.dart' show SearchEcosystem, ecosystemOf;
 import 'cubit/browse_source_cubit.dart';
+// Windows-only additions: poster info card (search-5), search-all fallback
+// (search-11) and the page's own Ctrl+F / Esc handling (shell-7, search-1).
+import '../../core/mode/content_mode.dart';
+import '../../core/models/media_detail.dart';
+import '../../core/models/provider_info.dart';
+import '../../core/playback/my_list.dart';
+import '../../core/playback/playback_prefs.dart';
+import '../../core/playback/resume_store.dart';
+import '../../core/playback/title_prefs.dart';
+import '../../core/playback/watch_history.dart';
+import '../../core/ui/media_info_sheet.dart';
+import '../auth/auth_screens.dart' show requireLogin;
+import '../home/search_screen.dart';
+import '../player/player_screen.dart';
+import 'search_page_keys.dart';
 
 /// How long a tap waits on the catalogue before it just opens the source's own
 /// page. Short on purpose: this sits between a tap and a screen, and a title
@@ -56,7 +79,11 @@ const Duration kLinkingIndicatorDelay = Duration(milliseconds: 350);
 ///
 /// Shared by the source browser and Home's source catalogue so both open the
 /// same title identity. The pin, timeout, and fallback live here.
-Future<MediaItem?> canonicalTargetFor(MediaItem item) async {
+Future<MediaItem?> canonicalTargetFor(MediaItem item, {
+  bool Function()? abandoned,
+}) async {
+  if (abandoned?.call() ?? false) return null;
+  // Stremio items are already catalogue-keyed; open them as-is.
   if (item.sourceId == stremioSourceId) return item;
   if (!ZModePrefs.enabled || !sl.isRegistered<MetadataRepository>()) {
     return null;
@@ -67,6 +94,9 @@ Future<MediaItem?> canonicalTargetFor(MediaItem item) async {
     final hit = await sl<MetadataRepository>()
         .canonicalFor(item)
         .timeout(kCanonicalLookupTimeout);
+    // Metadata can outlive its route or the installed plugin. Check before
+    // committing a new pin, rather than only suppressing later navigation.
+    if (abandoned?.call() ?? false) return null;
     final c = hit == null ? null : ZmodeIds.parseShow(hit.url);
     if (c == null) return null;
     // Pin the source the user is standing in, for THIS title only — otherwise
@@ -79,6 +109,18 @@ Future<MediaItem?> canonicalTargetFor(MediaItem item) async {
   } catch (_) {
     return null;
   }
+}
+
+/// A nested source grid must not append results from an obsolete plugin.
+/// Throwing preserves the grid's retry path; an empty answer means real EOF.
+Future<List<MediaItem>> loadCurrentSourcePage({
+  required bool Function() isCurrent,
+  required Future<List<MediaItem>> Function() load,
+}) async {
+  if (!isCurrent()) throw StateError('Source catalogue is no longer current');
+  final items = await load();
+  if (!isCurrent()) throw StateError('Source catalogue changed during loading');
+  return items;
 }
 
 /// One source's catalogue — today's Home, pinned to a chosen source.
@@ -98,7 +140,13 @@ class BrowseSourceScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) => BlocProvider(
     create: (_) =>
-        BrowseSourceCubit(repo: sl<SourceRepository>(), sourceId: sourceId)
+        BrowseSourceCubit(repo: sl<SourceRepository>(), sourceId: sourceId,
+          sourceAvailable: () => sl<SourceRepository>().hasSource(sourceId),
+          inventoryChanges: sourceInventoryEvents(sourceId),
+          // Windows: room for a request plus a verified-browser replay.
+          timeout: defaultTargetPlatform == TargetPlatform.windows
+              ? desktopCatalogueTimeout
+              : const Duration(seconds: 40))
           ..load(),
     child: _BrowseSourceView(sourceId: sourceId, title: title),
   );
@@ -207,11 +255,149 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
     widget.sourceId,
   );
 
+  /// New desktop behaviour is Windows-only; phone keeps today's flow.
+  bool get _windows => defaultTargetPlatform == TargetPlatform.windows;
+
+  /// Windows only: scroller of the search-results grid, so a first page
+  /// that fits a large window can keep loading until it scrolls (search-2).
+  final ScrollController _resultsController = ScrollController();
+
   @override
   void dispose() {
     _controller.dispose();
     _focusNode.dispose();
+    _resultsController.dispose();
     super.dispose();
+  }
+
+  /// search-5 (Windows right-click): the same info / My List card Search
+  /// and See all show for a poster, opened from this source's grid.
+  void _showInfo(MediaItem item) {
+    if (!mounted) return;
+    final myList = sl.isRegistered<MyListStore>() ? sl<MyListStore>() : null;
+    // Reading sources have nothing to play: the main button opens the title.
+    final video =
+        item.type == ProviderType.anime || item.type == ProviderType.movie;
+    showMediaInfoSheet(
+      context,
+      title: item.title,
+      englishTitle: item.englishTitle,
+      cover: item.cover,
+      headers: item.coverHeaders,
+      typeLabel: item.type == ProviderType.movie
+          ? context.l10n.movieLabel
+          : null,
+      subCount: item.subCount,
+      dubCount: item.dubCount,
+      detail: _detailOf(item),
+      inMyList: myList?.contains(item) ?? false,
+      playLabel: video ? null : context.l10n.read,
+      onPlay: video ? () => _play(item) : () => _openDetail(context, item),
+      onOpenDetail: () => _openDetail(context, item),
+      onToggleMyList: () async {
+        if (myList == null) return false;
+        // Same sign-in gate Search uses for this button.
+        if (!requireLogin(context, action: 'add to My List')) {
+          return myList.contains(item);
+        }
+        await myList.toggle(item);
+        if (mounted) setState(() {});
+        return myList.contains(item);
+      },
+    );
+  }
+
+  /// Detail for the info card; a failure just leaves the card's text short.
+  Future<MediaDetail?> _detailOf(MediaItem item) async {
+    try {
+      return await sl<SourceRepository>().detail(
+        item.url,
+        sourceId: item.sourceId,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// The info card's Play: the same direct player hand-off Search's info
+  /// card uses for a source result.
+  Future<void> _play(MediaItem item) async {
+    final repo = sl<SourceRepository>();
+    final category =
+        sl<TitlePrefsStore>().category(item.sourceId, item.url) ??
+        sl<PlaybackPrefs>().defaultCategory;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => PlayerScreen(
+          sourceId: item.sourceId,
+          episodesResolver: () =>
+              repo.episodes(item.url, sourceId: item.sourceId),
+          resume: sl<ResumeStore>(),
+          resolveSources: (u) =>
+              repo.sources(u, sourceId: item.sourceId, fast: true),
+          history: sl<WatchHistory>(),
+          showTitle: item.title,
+          cover: item.cover,
+          coverHeaders: item.coverHeaders,
+          showUrl: item.url,
+          downloadShowId: item.id,
+          category: category,
+          malId: item.malId,
+          scrobbleTitle: item.type == ProviderType.anime ? item.title : null,
+        ),
+      ),
+    );
+  }
+
+  /// Ctrl+F on Windows (shell-7): open this source's search, or refocus it
+  /// with the text selected when it is already open.
+  void _openSearchShortcut() {
+    if (!_searching) {
+      _startSearch();
+      return;
+    }
+    _focusNode.requestFocus();
+    _controller.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: _controller.text.length,
+    );
+  }
+
+  /// Page-level Esc on Windows (search-1): an open in-page search closes
+  /// before the app-wide Esc is allowed to go back.
+  bool _escapeSearch() {
+    if (!_searching) return false;
+    _stopSearch(context);
+    return true;
+  }
+
+  /// Content mode matching this source, so "Search all sources" fans out
+  /// over the same kind of sources (search-11).
+  ContentMode _sourceMode() => switch (sourceTypeOf(widget.sourceId)) {
+    ProviderType.manga => ContentMode.manga,
+    ProviderType.novel => ContentMode.novel,
+    _ => ContentMode.anime,
+  };
+
+  /// search-11: run the same query across every installed source.
+  void _searchAllSources(String query) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SearchScreen(
+          initialQuery: query,
+          forceSources: true,
+          forceMode: _sourceMode(),
+        ),
+      ),
+    );
+  }
+
+  /// Re-runs whatever produced the failed results: the text search, or a
+  /// filter-only browse (search-8 Retry).
+  Future<void> _retrySearch(BrowseSourceState state) {
+    final cubit = context.read<BrowseSourceCubit>();
+    if (state.query.isNotEmpty) return cubit.search(state.query);
+    return cubit.applyFilters(state.filtersJson);
   }
 
   /// Open a tapped title.
@@ -227,9 +413,12 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
   /// catalogue has simply never heard of all open the source's own item
   /// exactly as before — a source-only title stays fully watchable.
   Future<void> _openDetail(BuildContext context, MediaItem item) async {
-    if (_opening) return; // a tap is already resolving
+    if (!mounted) return;
+    final browser = context.read<BrowseSourceCubit>();
+    if (_opening || !browser.checkSourceAvailability()) return; // a tap is already resolving
     _opening = true;
     final nav = Navigator.of(context);
+    final acceptsResult = browser.retainSourceIntent();
     // A bar, not a barrier: the lookup is short and the screen stays usable —
     // scroll, tap Back, open the overflow. Covering it was what made a tap on
     // a title the catalogue doesn't know feel like the app had frozen.
@@ -237,8 +426,9 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
       if (mounted) setState(() => _linking = true);
     });
     try {
-      final canonical = await canonicalTargetFor(item);
-      if (!mounted) return;
+      final canonical = await canonicalTargetFor(item,
+        abandoned: () => !mounted || !acceptsResult());
+      if (!mounted || !acceptsResult()) return;
       nav.push(DetailScreen.route(canonical ?? item));
     } finally {
       show.cancel();
@@ -247,20 +437,30 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
     }
   }
 
-  void _openSeeAll(BuildContext context, HomeSection section) =>
-      Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => SeeAllScreen(
-            title: section.title,
-            items: section.items,
-            onTap: (i) => _openDetail(context, i),
-            onLoadMore: section.more == null
-                ? null
-                : (page) =>
-                      sl<SourceRepository>().browseMore(section.more!, page),
-          ),
+  void _openSeeAll(BuildContext context, HomeSection section) {
+    final browser = context.read<BrowseSourceCubit>();
+    if (!browser.checkSourceAvailability()) return;
+    final acceptsResult = browser.retainSourceIntent();
+    final repository = sl<SourceRepository>();
+    bool current() => mounted && acceptsResult();
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SeeAllScreen(
+          title: section.title,
+          items: section.items,
+          onTap: (item) { if (current()) _openDetail(context, item); },
+          // search-5: right-click a poster for the info card (Windows only;
+          // phone keeps no long-press here, as before).
+          onLongPress: _windows
+              ? (item) { if (current()) _showInfo(item); }
+              : null,
+          onLoadMore: section.more == null ? null : (page) =>
+              loadCurrentSourcePage(isCurrent: current,
+                load: () => repository.browseMore(section.more!, page)),
         ),
-      );
+      ),
+    );
+  }
 
   void _startSearch() {
     setState(() => _searching = true);
@@ -287,6 +487,33 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
       widget.sourceId,
     );
     if (target == null || target.isEmpty) return;
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      if (!mounted) return;
+      // Windows: one verifier for every ecosystem (mg: included) that
+      // reports a browser which failed to open instead of reloading straight
+      // back into the same Cloudflare error, so desktop CloudStream uses its
+      // own session.
+      final verified = await source_actions.verifySourceChallengeWithFeedback(
+        context,
+        widget.sourceId,
+        target,
+      );
+      if (!mounted || !verified) return;
+      // Continue should retry the exact failed operation without making the
+      // user leave verification and then press a second Retry button.
+      final cubit = context.read<BrowseSourceCubit>();
+      final state = cubit.state;
+      if (_controller.text.trim().isNotEmpty) {
+        await cubit.search(_controller.text);
+      } else if (state.searchFailed && state.query.isNotEmpty) {
+        await cubit.search(state.query);
+      } else if (state.filtersJson.isNotEmpty) {
+        await cubit.applyFilters(state.filtersJson);
+      } else {
+        await cubit.load();
+      }
+      return;
+    }
     if (widget.sourceId.startsWith('mg:')) {
       await MangayomiCloudflare.solve(target);
     } else {
@@ -464,24 +691,41 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
 
   @override
   Widget build(BuildContext context) {
+    // Windows: Ctrl+F opens this source's own search (shell-7) and Esc
+    // closes it before going back (search-1). Pass-through elsewhere.
+    return SearchPageKeys(
+      onSearch: _openSearchShortcut,
+      onEscape: _escapeSearch,
+      child: _scaffold(context),
+    );
+  }
+
+  Widget _scaffold(BuildContext context) {
     return Scaffold(
       backgroundColor: AppColors.bg,
       appBar: AppBar(
         backgroundColor: AppColors.bg,
         title: _searching
-            ? TextField(
+            // search-1 Option A (Windows): Esc clears the text, then closes
+            // the in-page search. Pass-through on phone.
+            ? SearchFieldEscape(
                 controller: _controller,
-                focusNode: _focusNode,
-                autofocus: true,
-                textInputAction: TextInputAction.search,
-                style: AppText.body.copyWith(color: AppColors.textPrimary),
-                cursorColor: AppColors.accent,
-                decoration: InputDecoration(
-                  hintText: context.l10n.search2,
-                  hintStyle: AppText.body,
-                  border: InputBorder.none,
+                onClose: () => _stopSearch(context),
+                child: TextField(
+                  controller: _controller,
+                  focusNode: _focusNode,
+                  autofocus: true,
+                  textInputAction: TextInputAction.search,
+                  style: AppText.body.copyWith(color: AppColors.textPrimary),
+                  cursorColor: AppColors.accent,
+                  decoration: InputDecoration(
+                    hintText: context.l10n.search2,
+                    hintStyle: AppText.body,
+                    border: InputBorder.none,
+                  ),
+                  onSubmitted: (q) =>
+                      context.read<BrowseSourceCubit>().search(q),
                 ),
-                onSubmitted: (q) => context.read<BrowseSourceCubit>().search(q),
               )
             : Text(widget.title, style: AppText.headline),
         actions: [
@@ -593,12 +837,23 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
                 if (blocked && widget.sourceId.startsWith('mg:')) {
                   return _mangayomiCloudflareState(context);
                 }
+                // src-11 (Windows): a catalogue load that timed out says
+                // so; Retry stays the same.
+                final timedOut =
+                    _windows && state.failed && isSourceTimeout(state.loadError);
                 return EmptyState(
                   icon: blocked
                       ? Icons.shield_outlined
+                      : timedOut
+                      ? Icons.hourglass_disabled_rounded
                       : Icons.cloud_off_rounded,
                   message: state.failed
-                      ? context.l10n.somethingWentWrong
+                      ? (timedOut
+                            ? sourceFailureMessage(
+                                state.loadError,
+                                context.l10n.somethingWentWrong,
+                              )
+                            : context.l10n.somethingWentWrong)
                       : context.l10n.noTitlesInThisList,
                   actionLabel: blocked
                       ? context.l10n.solveCloudflare
@@ -633,6 +888,11 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
                       scoreBadge: items[j].score,
                       dubBadge: items[j].dubBadge,
                       onTap: () => _openDetail(context, items[j]),
+                      // search-5: PosterCard turns this into right-click on
+                      // Windows. Phone keeps no long-press action here.
+                      onLongPress: _windows
+                          ? () => _showInfo(items[j])
+                          : null,
                     ),
                   );
                 },
@@ -655,6 +915,9 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
           CfSolveNeeded.sourceFlagged(widget.sourceId)) {
         return _mangayomiCloudflareState(context);
       }
+      // search-8 Option B (Windows): the same EmptyState error panel the
+      // catalogue uses, with Retry / Solve Cloudflare, instead of bare text.
+      if (_windows) return _failurePanel(context, state, more: false);
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
@@ -667,6 +930,12 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
       );
     }
     final results = state.searchResults ?? const [];
+    if (results.isEmpty && _windows) {
+      // search-11 (Windows): offer the same query across every source
+      // instead of leaving "No titles" as a dead end.
+      return _desktopNoResults(context, state);
+    }
+    if (_windows) return _desktopResults(context, state, results);
     if (results.isEmpty) {
       return Center(
         child: Padding(
@@ -694,12 +963,7 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
       },
       child: GridView.builder(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
-        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: posterGridColumns(context),
-          childAspectRatio: posterGridAspect(context),
-          crossAxisSpacing: 12,
-          mainAxisSpacing: 16,
-        ),
+        gridDelegate: posterGridDelegate(context),
         // One trailing cell for the spinner while the next page is coming.
         itemCount: results.length + (state.loadingMore ? 1 : 0),
         itemBuilder: (_, i) {
@@ -731,6 +995,193 @@ class _BrowseSourceViewState extends State<_BrowseSourceView> {
             onTap: () => _openDetail(context, item),
           );
         },
+      ),
+    );
+  }
+
+  /// One search-result poster on Windows, with the right-click info card
+  /// (search-5). Same card fields as the phone grid above.
+  Widget _desktopResultCard(BuildContext context, MediaItem item) => PosterCard(
+    title: item.title,
+    logoItem: item,
+    imageUrl: item.cover,
+    wideImageUrl: item.banner,
+    genres: item.genres,
+    isAdult: item.isAdult,
+    headers: item.coverHeaders,
+    qualityBadge: item.quality,
+    scoreBadge: item.score,
+    dubBadge: item.dubBadge,
+    cellWidth: posterGridCellWidth(context),
+    onTap: () => _openDetail(context, item),
+    onLongPress: () => _showInfo(item),
+  );
+
+  /// Windows search results: the grid plus a footer that shows the next
+  /// page's spinner, its failure (search-8) or a 'Load more' fallback
+  /// (search-2 Option B). Also auto-loads pages while the grid can't scroll
+  /// yet (search-2 Option A).
+  Widget _desktopResults(
+    BuildContext context,
+    BrowseSourceState state,
+    List<MediaItem> results,
+  ) {
+    final cubit = context.read<BrowseSourceCubit>();
+    _scheduleFill(cubit, state);
+    return NotificationListener<ScrollNotification>(
+      // Same early paging as the phone grid. A failed page waits for the
+      // footer's Retry instead of re-firing on every scroll tick.
+      onNotification: (n) {
+        if (n.depth == 0 &&
+            !state.loadMoreFailed &&
+            n.metrics.pixels >=
+                n.metrics.maxScrollExtent - n.metrics.viewportDimension) {
+          cubit.loadMore();
+        }
+        return false;
+      },
+      child: CustomScrollView(
+        controller: _resultsController,
+        // Rows are built before they scroll into view. (This grid is the
+        // Windows one; phones have their own.)
+        // ignore: deprecated_member_use
+        cacheExtent: 800,
+        slivers: [
+          SliverPadding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            sliver: SliverGrid(
+              gridDelegate: posterGridDelegate(context),
+              delegate: SliverChildBuilderDelegate(
+                (c, i) => _desktopResultCard(c, results[i]),
+                childCount: results.length,
+              ),
+            ),
+          ),
+          SliverToBoxAdapter(child: _resultsFooter(context, state)),
+        ],
+      ),
+    );
+  }
+
+  /// search-2 Option A: once this frame is laid out, if the results don't
+  /// reach (or nearly reach) past the window yet and the source may have
+  /// more, fetch the next page. Scroll notifications never fire on a list
+  /// that fits, so a maximised window used to stop after page 1. The cubit's
+  /// own guards (in flight / at end / nothing new) stop the loop.
+  void _scheduleFill(BrowseSourceCubit cubit, BrowseSourceState state) {
+    if (state.loadingMore || state.atEnd || state.loadMoreFailed) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || cubit.isClosed || !_resultsController.hasClients) return;
+      final pos = _resultsController.position;
+      if (pos.extentAfter < pos.viewportDimension * 0.5) cubit.loadMore();
+    });
+  }
+
+  /// Footer under the Windows results grid.
+  Widget _resultsFooter(BuildContext context, BrowseSourceState state) {
+    if (state.loadingMore) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+        child: Center(
+          child: SizedBox(
+            width: 22,
+            height: 22,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: AppColors.accent,
+            ),
+          ),
+        ),
+      );
+    }
+    if (state.loadMoreFailed) {
+      // search-8: a failed next page is shown, not silently dropped.
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
+        child: _failurePanel(context, state, more: true),
+      );
+    }
+    if (!state.atEnd) {
+      // search-2 Option B: always-available fallback to fetch the next page.
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
+        child: Center(
+          child: TextButton.icon(
+            key: const ValueKey('browse-source-load-more'),
+            onPressed: () => context.read<BrowseSourceCubit>().loadMore(),
+            icon: const Icon(Icons.expand_more_rounded),
+            label: Text(context.l10n.loadMore),
+          ),
+        ),
+      );
+    }
+    return const SizedBox(height: 24);
+  }
+
+  /// search-8 Option B: the catalogue's EmptyState error panel, reused for a
+  /// failed search ([more] false) or a failed next page ([more] true).
+  /// Offers Solve Cloudflare when the source is flagged, else Retry.
+  Widget _failurePanel(
+    BuildContext context,
+    BrowseSourceState state, {
+    required bool more,
+  }) {
+    final blocked = CfSolveNeeded.sourceFlagged(widget.sourceId);
+    // src-11 (Windows): a source that timed out says so, with the same Retry.
+    final timedOut = _windows && isSourceTimeout(state.searchError);
+    return EmptyState(
+      key: ValueKey(more ? 'browse-source-more-failed' : 'browse-source-failed'),
+      icon: blocked
+          ? Icons.shield_outlined
+          : timedOut
+          ? Icons.hourglass_disabled_rounded
+          : Icons.cloud_off_rounded,
+      message: _windows
+          ? sourceFailureMessage(
+              state.searchError,
+              context.l10n.somethingWentWrong,
+            )
+          : context.l10n.somethingWentWrong,
+      actionLabel: blocked
+          ? context.l10n.solveCloudflare
+          : context.l10n.retry,
+      onAction: blocked
+          ? _solveCloudflare
+          : more
+          ? () => context.read<BrowseSourceCubit>().loadMore()
+          : () => _retrySearch(state),
+    );
+  }
+
+  /// Windows "No titles": the old caption plus, for a text search, a
+  /// "Search all sources" button carrying the same query (search-11).
+  Widget _desktopNoResults(BuildContext context, BrowseSourceState state) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              context.l10n.noTitlesInThisList,
+              style: AppText.caption,
+              textAlign: TextAlign.center,
+            ),
+            if (state.query.isNotEmpty) ...[
+              const SizedBox(height: 14),
+              FilledButton.tonalIcon(
+                key: const ValueKey('browse-source-search-all'),
+                onPressed: () => _searchAllSources(state.query),
+                icon: const Icon(Icons.travel_explore_rounded, size: 18),
+                label: Text(
+                  context.l10n.searchAllSourcesFor(state.query),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }

@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/di/injector.dart';
@@ -13,6 +14,7 @@ import '../../core/theme/app_text.dart';
 import '../../core/tracker/tracker_hub.dart';
 import '../../core/ui/home_rows_prefs.dart';
 import '../../core/ui/settings_widgets.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import '../../core/zmode/home_layouts.dart';
 import '../../core/zmode/metadata_provider_prefs.dart';
 import '../../core/zmode/zmode_ids.dart';
@@ -180,43 +182,60 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
   /// one you are about to switch to shouldn't require switching first.
   Future<void> _pickLayout() async {
     final layouts = allHomeLayouts();
-    final picked = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: AppColors.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (ctx) => SafeArea(
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
-                child: Row(
+    // The desktop editor changes only the layout being edited; selecting a
+    // metadata layout must not silently change the active Home provider.
+    final picked = DesktopSettingsScope.contains(context)
+        ? await showGraphiteSettingsChoice<String>(
+            context,
+            title: context.l10n.homeRowsLayout,
+            current: _layoutKey,
+            options: [
+              for (final layout in layouts)
+                (layout.key, _layoutLabel(context, layout)),
+            ],
+          )
+        : await showModalBottomSheet<String>(
+            context: context,
+            backgroundColor: AppColors.surface,
+            shape: const RoundedRectangleBorder(
+              borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+            ),
+            builder: (ctx) => SafeArea(
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    Text(ctx.l10n.homeRowsLayout, style: AppText.headline),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+                      child: Row(
+                        children: [
+                          Text(
+                            ctx.l10n.homeRowsLayout,
+                            style: AppText.headline,
+                          ),
+                        ],
+                      ),
+                    ),
+                    const Divider(color: AppColors.hairline, height: 1),
+                    for (final l in layouts)
+                      ListTile(
+                        onTap: () => Navigator.pop(ctx, l.key),
+                        title: Text(
+                          _layoutLabel(ctx, l),
+                          style: AppText.body.copyWith(
+                            color: AppColors.textPrimary,
+                          ),
+                        ),
+                        trailing: l.key == _layoutKey
+                            ? Icon(Icons.check, color: AppColors.accent)
+                            : null,
+                      ),
+                    const SizedBox(height: 8),
                   ],
                 ),
               ),
-              const Divider(color: AppColors.hairline, height: 1),
-              for (final l in layouts)
-                ListTile(
-                  onTap: () => Navigator.pop(ctx, l.key),
-                  title: Text(
-                    _layoutLabel(ctx, l),
-                    style: AppText.body.copyWith(color: AppColors.textPrimary),
-                  ),
-                  trailing: l.key == _layoutKey
-                      ? Icon(Icons.check, color: AppColors.accent)
-                      : null,
-                ),
-              const SizedBox(height: 8),
-            ],
-          ),
-        ),
-      ),
-    );
+            ),
+          );
     if (picked == null || !mounted || picked == _layoutKey) return;
     setState(() => _select(picked));
   }
@@ -252,11 +271,7 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
     if (kind == null || !sl.isRegistered<TrackerHub>()) {
       return provider ?? 'AniList';
     }
-    final pick = pickHomeTracker(
-      sl<TrackerHub>(),
-      kind,
-      preferred: provider,
-    );
+    final pick = pickHomeTracker(sl<TrackerHub>(), kind, preferred: provider);
     return pick?.displayName ?? provider ?? 'AniList';
   }
 
@@ -264,10 +279,9 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
   /// exactly like the rows do on Home.
   bool get _reading => _kind == ZKind.manga || _kind == ZKind.novel;
 
-  Future<void> _save() => HomeRowsPrefs.save(
-    _layoutKey,
-    [for (final e in _layout) encodeRowEntry(e)],
-  );
+  Future<void> _save() => HomeRowsPrefs.save(_layoutKey, [
+    for (final e in _layout) encodeRowEntry(e),
+  ]);
 
   void _toggle(HomeRowEntry entry, bool shown) {
     setState(() {
@@ -310,10 +324,32 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
     final moved = items.removeAt(oldIndex);
     items.insert(newIndex < 1 ? 1 : newIndex, moved);
     setState(() {
-      _layout = [for (final o in items) if (o is HomeRowEntry) o];
+      _layout = [
+        for (final o in items)
+          if (o is HomeRowEntry) o,
+      ];
     });
     _save();
   }
+
+  /// Windows: move [entry] one place up (-1) or down (+1) in the saved order.
+  /// Same result as dragging it one slot, so group labels re-anchor the same
+  /// way, and it saves immediately like a drag does.
+  void _moveBy(HomeRowEntry entry, int delta) {
+    final from = _layout.indexWhere((e) => e.id == entry.id);
+    final to = from + delta;
+    if (from < 0 || to < 0 || to >= _layout.length) return;
+    setState(() {
+      final next = [..._layout];
+      next.insert(to, next.removeAt(from));
+      _layout = next;
+    });
+    _save();
+  }
+
+  /// Up/down buttons are a Windows addition for mouse and keyboard users;
+  /// phone keeps drag only.
+  bool get _showMoveButtons => defaultTargetPlatform == TargetPlatform.windows;
 
   @override
   Widget build(BuildContext context) {
@@ -322,7 +358,7 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
     final canReset = HomeRowsPrefs.savedFor(_layoutKey) != null;
     final info = _layoutInfo;
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar(
         l10n.homeRows,
         actions: [
@@ -337,66 +373,65 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
           ),
         ],
       ),
-      body:
-          _ready
-              ? ListView(
-                // SettingsCard brings its own 16px side margin; adding more
-                // here would inset these cards past every other settings page.
-                padding: const EdgeInsets.fromLTRB(0, 8, 0, 32),
-                children: [
-                  // Which arrangement is on screen, and the ONLY provider
-                  // choice here: the layout's provider is also the tracker
-                  // behind its list rows, so one control decides both.
-                  if (info != null)
-                    SettingsCard(
-                      children: [
-                        SettingsTile(
-                          icon: Icons.dashboard_customize_outlined,
-                          title: l10n.homeRowsLayout,
-                          trailing: Text(
-                            _layoutLabel(context, info),
-                            style: AppText.caption,
-                          ),
-                          onTap: _pickLayout,
-                        ),
-                      ],
-                    ),
-                  // Cards are normally spaced by the section label between
-                  // them; there is no heading to put here, just the gap.
-                  if (info != null) const SizedBox(height: 14),
+      body: _ready
+          ? ListView(
+              // SettingsCard brings its own 16px side margin; adding more
+              // here would inset these cards past every other settings page.
+              padding: const EdgeInsets.fromLTRB(0, 8, 0, 32),
+              children: [
+                // Which arrangement is on screen, and the ONLY provider
+                // choice here: the layout's provider is also the tracker
+                // behind its list rows, so one control decides both.
+                if (info != null)
                   SettingsCard(
                     children: [
-                      ReorderableListView(
-                        shrinkWrap: true,
-                        physics: const NeverScrollableScrollPhysics(),
-                        buildDefaultDragHandles: false,
-                        onReorderItem: _reorder,
-                        children: [
-                          for (var i = 0; i < arrangement.length; i++)
-                            if (arrangement[i] is _GroupTag)
-                              _groupLabel(arrangement[i] as _GroupTag, i)
-                            else
-                              _row(arrangement[i] as HomeRowEntry, i),
-                        ],
+                      SettingsTile(
+                        icon: Icons.dashboard_customize_outlined,
+                        title: l10n.homeRowsLayout,
+                        trailing: Text(
+                          _layoutLabel(context, info),
+                          style: AppText.caption,
+                        ),
+                        onTap: _pickLayout,
                       ),
                     ],
                   ),
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(28, 14, 22, 0),
-                    child: Text(
-                      l10n.homeRowsHelp,
-                      style: AppText.caption.copyWith(
-                        color: AppColors.textTertiary,
-                      ),
+                // Cards are normally spaced by the section label between
+                // them; there is no heading to put here, just the gap.
+                if (info != null) const SizedBox(height: 14),
+                SettingsCard(
+                  children: [
+                    ReorderableListView(
+                      shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      buildDefaultDragHandles: false,
+                      onReorderItem: _reorder,
+                      children: [
+                        for (var i = 0; i < arrangement.length; i++)
+                          if (arrangement[i] is _GroupTag)
+                            _groupLabel(arrangement[i] as _GroupTag, i)
+                          else
+                            _row(arrangement[i] as HomeRowEntry, i),
+                      ],
+                    ),
+                  ],
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(28, 14, 22, 0),
+                  child: Text(
+                    l10n.homeRowsHelp,
+                    style: AppText.caption.copyWith(
+                      color: AppColors.textTertiary,
                     ),
                   ),
-                ],
-              )
-              : Center(
-                // Home hasn't finished a load; its sections are half of what
-                // this editor edits, so wait rather than offer half a list.
-                child: Text(l10n.loading, style: AppText.caption),
-              ),
+                ),
+              ],
+            )
+          : Center(
+              // Home hasn't finished a load; its sections are half of what
+              // this editor edits, so wait rather than offer half a list.
+              child: Text(l10n.loading, style: AppText.caption),
+            ),
     );
   }
 
@@ -425,6 +460,7 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
 
   Widget _row(HomeRowEntry e, int index) {
     final tint = e.hidden ? AppColors.textTertiary : AppColors.textPrimary;
+    final position = _layout.indexWhere((x) => x.id == e.id);
     return Padding(
       key: ValueKey(e.id),
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
@@ -432,15 +468,37 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
         children: [
           ReorderableDragStartListener(
             index: index,
-            child: const Padding(
-              padding: EdgeInsetsDirectional.only(end: 10),
-              child: Icon(
-                Icons.drag_indicator_rounded,
-                size: 19,
-                color: AppColors.textTertiary,
+            child: MouseRegion(
+              cursor: _showMoveButtons
+                  ? SystemMouseCursors.grab
+                  : MouseCursor.defer,
+              child: const Padding(
+                padding: EdgeInsetsDirectional.only(end: 10),
+                child: Icon(
+                  Icons.drag_indicator_rounded,
+                  size: 19,
+                  color: AppColors.textTertiary,
+                ),
               ),
             ),
           ),
+          if (_showMoveButtons) ...[
+            _moveButton(
+              key: ValueKey('home-row-up-${e.id}'),
+              tooltip: 'Move up',
+              icon: Icons.keyboard_arrow_up_rounded,
+              onPressed: position > 0 ? () => _moveBy(e, -1) : null,
+            ),
+            _moveButton(
+              key: ValueKey('home-row-down-${e.id}'),
+              tooltip: 'Move down',
+              icon: Icons.keyboard_arrow_down_rounded,
+              onPressed: position < _layout.length - 1
+                  ? () => _moveBy(e, 1)
+                  : null,
+            ),
+            const SizedBox(width: 8),
+          ],
           Expanded(
             child: Text(
               _rowTitle(e),
@@ -459,6 +517,27 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
     );
   }
 
+  /// Compact, focusable arrow button for the Windows reorder controls.
+  Widget _moveButton({
+    required Key key,
+    required String tooltip,
+    required IconData icon,
+    required VoidCallback? onPressed,
+  }) => IconButton(
+    key: key,
+    tooltip: tooltip,
+    onPressed: onPressed,
+    icon: Icon(icon, size: 20),
+    color: AppColors.textSecondary,
+    disabledColor: AppColors.textTertiary.withValues(alpha: .35),
+    visualDensity: VisualDensity.compact,
+    padding: EdgeInsets.zero,
+    constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+    style: IconButton.styleFrom(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+    ),
+  );
+
   /// One row's label, resolved the same way Home renders it — shared helpers
   /// and l10n keys, so editor and screen can't drift.
   String _rowTitle(HomeRowEntry e) {
@@ -475,9 +554,8 @@ class _HomeRowsScreenState extends State<HomeRowsScreen> {
     if (id == newEpisodesRowId) return l10n.homeRowNewEpisodes;
     if (id == streamingServicesRowId) return l10n.streamingServices;
     if (id.startsWith('section:')) return id.substring('section:'.length);
-    final status = WatchStatus.values.asNameMap()[id.substring(
-      'tracker:'.length,
-    )];
+    final status = WatchStatus.values
+        .asNameMap()[id.substring('tracker:'.length)];
     return status == null
         ? id
         : trackerStatusLabel(context, status, reading: _reading);

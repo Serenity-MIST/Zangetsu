@@ -17,6 +17,8 @@
 //  - the existing Zangetsu/CloudStream/Aniyomi rows and their counts are
 //    completely unaffected by the new row.
 import 'package:flutter/material.dart';
+import 'dart:io';
+import 'package:watch_app/core/desktop/extension_runtime.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:get_it/get_it.dart';
 import 'package:hive/hive.dart';
@@ -78,15 +80,15 @@ class _FakeReposRegistry implements ProviderReposRegistry {
 }
 
 MihonProvider _mihonSrc(int id, String name) => MihonProvider(
-      info: MihonSourceInfo(
-        id: id,
-        name: name,
-        lang: 'en',
-        baseUrl: '',
-        pkg: 'p.$id',
-        nsfw: false,
-      ),
-    );
+  info: MihonSourceInfo(
+    id: id,
+    name: name,
+    lang: 'en',
+    baseUrl: '',
+    pkg: 'p.$id',
+    nsfw: false,
+  ),
+);
 
 void main() {
   final sl = GetIt.instance;
@@ -123,16 +125,21 @@ void main() {
     await tester.pumpAndSettle();
   }
 
-  testWidgets(
-    'Mihon row stays absent off-Android, same as CloudStream/Aniyomi',
-    (tester) async {
-      await pump(tester);
+  testWidgets('extension rows follow the installed platform capabilities', (
+    tester,
+  ) async {
+    await pump(tester);
 
-      expect(find.text('Mihon'), findsNothing);
-      expect(find.text('CloudStream'), findsNothing);
-      expect(find.text('Aniyomi'), findsNothing);
-    },
-  );
+    // Desktop CloudStream is bundled; APK ecosystems require their JVM.
+    final extensions =
+        Platform.isAndroid || DesktopExtensionRuntime.isAvailable;
+    expect(find.text('Mihon'), extensions ? findsOneWidget : findsNothing);
+    expect(
+      find.text('CloudStream'),
+      Platform.isAndroid || Platform.isWindows ? findsOneWidget : findsNothing,
+    );
+    expect(find.text('Aniyomi'), extensions ? findsOneWidget : findsNothing);
+  });
 
   testWidgets(
     'the TV hub view never renders a Mihon row — the hub row is phone-only '
@@ -170,25 +177,25 @@ void main() {
     (tester) async {
       final mihon = sl<MihonManager>()..register(_mihonSrc(1, 'Manga One'));
       mihon.checkerOverride = (url, codes) async => [
-            MihonUpdate(
-              pkg: 'p.1',
-              name: 'Manga One',
-              installedCode: 1,
-              availableCode: 2,
-              availableVersion: '2.0',
-              entry: AniyomiRepoEntry(
-                name: 'Manga One',
-                pkg: 'p.1',
-                apk: 'p.1.apk',
-                lang: 'en',
-                version: '2.0',
-                code: 2,
-                nsfw: false,
-                sources: const [],
-                repoBaseUrl: 'https://r/x',
-              ),
-            ),
-          ];
+        MihonUpdate(
+          pkg: 'p.1',
+          name: 'Manga One',
+          installedCode: 1,
+          availableCode: 2,
+          availableVersion: '2.0',
+          entry: AniyomiRepoEntry(
+            name: 'Manga One',
+            pkg: 'p.1',
+            apk: 'p.1.apk',
+            lang: 'en',
+            version: '2.0',
+            code: 2,
+            nsfw: false,
+            sources: const [],
+            repoBaseUrl: 'https://r/x',
+          ),
+        ),
+      ];
       await mihon.checkRepoUpdates('https://r/x');
       expect(mihon.updateCount, 1, reason: 'sanity: the update is real');
 
@@ -202,21 +209,20 @@ void main() {
     },
   );
 
-  testWidgets(
-    'a mihon: active id does not badge the Zangetsu row as ACTIVE',
-    (tester) async {
-      sl.unregister<ActiveSourceCubit>();
-      sl.registerSingleton<ActiveSourceCubit>(
-        ActiveSourceCubit(fallback: 'mihon:1'),
-      );
-      await pump(tester);
+  testWidgets('a mihon: active id does not badge the Zangetsu row as ACTIVE', (
+    tester,
+  ) async {
+    sl.unregister<ActiveSourceCubit>();
+    sl.registerSingleton<ActiveSourceCubit>(
+      ActiveSourceCubit(fallback: 'mihon:1'),
+    );
+    await pump(tester);
 
-      // Before this task, activeIsZangetsu didn't exclude mihon: ids, so the
-      // Zangetsu row would have shown ACTIVE here. Off-Android the Mihon row
-      // itself is hidden, so correctly nothing should show ACTIVE at all.
-      expect(find.text('ACTIVE'), findsNothing);
-    },
-  );
+    // Before this task, activeIsZangetsu didn't exclude mihon: ids, so the
+    // Zangetsu row would have shown ACTIVE here. Off-Android the Mihon row
+    // itself is hidden, so correctly nothing should show ACTIVE at all.
+    expect(find.text('ACTIVE'), findsNothing);
+  });
 
   testWidgets(
     '_activeSourceLabel resolves a registered mihon: id to its display name',

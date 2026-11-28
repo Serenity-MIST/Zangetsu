@@ -52,8 +52,10 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   const sourceId = 'cs:Test';
+  // Exercise the same contract on Windows without starting a real companion.
+  setUp(() { cloudStreamHostOverride = (method, args) => _channel.invokeMethod(method, args); });
 
-  tearDown(() {
+  tearDown(() { cloudStreamHostOverride = null;
     CfSolveNeeded.clear('challenged.test');
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(_channel, null);

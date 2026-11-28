@@ -3,6 +3,7 @@ import 'package:flutter_bloc/flutter_bloc.dart';
 import '../../core/tv/tv_list_focusable.dart';
 
 import '../app_mode.dart';
+import '../desktop/desktop_sheet.dart';
 import '../di/injector.dart';
 import '../models/media_item.dart';
 import '../models/provider_info.dart';
@@ -65,13 +66,17 @@ Future<void> showListStatusSheet(
 
   // Single source of truth for "is this a reading title" — derived from the
   // ITEM, not the global content mode. The label (below) and the tracker
-  // kind (in _syncToTrackers) both read this same value, so they can never
+  // kind (in syncListStatusToTrackers) both read this same value, so they can never
   // disagree with each other again.
   final reading =
       item.type == ProviderType.manga || item.type == ProviderType.novel;
 
-  final picked = await showModalBottomSheet<Object?>(
-    context: context,
+  // Windows (home-3 / show-2): a centred graphite dialog instead of a phone
+  // bottom sheet; phone and TV keep the bottom sheet exactly as before.
+  final picked = await showAdaptiveSheet<Object?>(
+    context,
+    title: context.l10n.addToYourList,
+    desktopWidth: 420,
     isScrollControlled: true,
     backgroundColor: AppColors.surface,
     shape: const RoundedRectangleBorder(
@@ -123,7 +128,7 @@ Future<void> showListStatusSheet(
         await sl<SeriesGroupStore>().purgeTitle('${item.sourceId}::${item.id}');
       }
       onChanged?.call();
-      _syncToTrackers(
+      syncListStatusToTrackers(
         item,
         null,
         malId,
@@ -151,7 +156,7 @@ Future<void> showListStatusSheet(
     await myList.pushStatus(item); // sync the watch status to the cloud row
   }
   onChanged?.call();
-  _syncToTrackers(
+  syncListStatusToTrackers(
     item,
     status,
     malId,
@@ -163,9 +168,44 @@ Future<void> showListStatusSheet(
   );
 }
 
+/// The sheet's "Remove from list": drops [item] from My List and its local
+/// status, then removes it from every connected tracker in the background.
+/// Public so the Windows My List poster menu can offer the same Remove
+/// directly.
+Future<void> removeFromListEverywhere(
+  MediaItem item, {
+  int? malId,
+  int? tmdbId,
+  bool tmdbIsTv = false,
+  String? imdbId,
+  VoidCallback? onChanged,
+}) async {
+  await sl<MyListStore>().remove(item);
+  await sl<ListStatusStore>().remove(item);
+  // Same as the sheet's remove: drop the title's series membership too, or
+  // the group keeps a dead key that renders as a ghost.
+  if (sl.isRegistered<SeriesGroupStore>()) {
+    await sl<SeriesGroupStore>().purgeTitle('${item.sourceId}::${item.id}');
+  }
+  onChanged?.call();
+  final reading =
+      item.type == ProviderType.manga || item.type == ProviderType.novel;
+  syncListStatusToTrackers(
+    item,
+    null,
+    malId,
+    tmdbId,
+    tmdbIsTv,
+    imdbId,
+    item.type == ProviderType.anime,
+    reading: reading,
+    remove: true,
+  );
+}
+
 /// Best-effort tracker push. Resolves the MAL/TMDB id from the detail when the
 /// caller didn't supply one (browse cards don't carry ids). Fire-and-forget.
-Future<void> _syncToTrackers(
+Future<void> syncListStatusToTrackers(
   MediaItem item,
   WatchStatus? status,
   int? malId,
@@ -265,6 +305,8 @@ class ListStatusSheet extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final statuses = WatchStatus.values;
+    // True inside the Windows dialog (showAdaptiveSheet).
+    final desktop = DesktopSheetScope.of(context);
     return SafeArea(
       child: ConstrainedBox(
         constraints: BoxConstraints(
@@ -274,22 +316,27 @@ class ListStatusSheet extends StatelessWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const SizedBox(height: 10),
-              Container(
-                width: 36,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: AppColors.hairline,
-                  borderRadius: BorderRadius.circular(2),
+              // Phone drag handle + heading. In the Windows dialog the title
+              // bar already says it, and there is nothing to drag.
+              if (!desktop) ...[
+                const SizedBox(height: 10),
+                Container(
+                  width: 36,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: AppColors.hairline,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
                 ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
-                child: Align(
-                  alignment: AlignmentDirectional.centerStart,
-                  child: Text('Add to your list', style: AppText.headline),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
+                  child: Align(
+                    alignment: AlignmentDirectional.centerStart,
+                    child: Text('Add to your list', style: AppText.headline),
+                  ),
                 ),
-              ),
+              ] else
+                const SizedBox(height: 6),
               for (var i = 0; i < statuses.length; i++)
                 _row(
                   autofocus: i == 0,

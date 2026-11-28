@@ -1,0 +1,11 @@
+Windows desktop resource lifecycle repair
+
+Destroy browser/headless consumers before the shared composition manager and
+WebView environments. Release shared compositor, graphics context, dispatcher
+controller and RoHelper on the owning UI apartment when the last manager is
+destroyed, instead of releasing them during static DLL teardown.
+
+Reproduced diagnostic shutdown coremessaging.dll0xc0000005; after repair,
+full-engine range download/pause/resume fixture completed and process exited0.
+Active WebView and multi-engine acceptance remains separate.
+Existing WebView session/Cloudflare changes in this local dependency are retained.

@@ -14,7 +14,6 @@ import 'package:watch_app/core/mode/content_mode.dart';
 import 'package:watch_app/core/models/episode.dart';
 import 'package:watch_app/core/models/home_section.dart';
 import 'package:watch_app/core/models/media_detail.dart';
-import 'package:watch_app/core/models/media_item.dart';
 import 'package:watch_app/core/models/provider_info.dart';
 import 'package:watch_app/core/notify/subscription_checker.dart';
 import 'package:watch_app/core/notify/subscription_store.dart';
@@ -156,7 +155,7 @@ void main() {
       mode: ContentMode.anime,
     ));
 
-    await SubscriptionChecker(router, subs).checkAll();
+    await SubscriptionChecker(router, subs, deliver: _told).checkAll();
 
     // The proof: the far-edge source was asked for ITS url, which only
     // happens if the router sent zm:// to the metadata repository and that
@@ -182,7 +181,7 @@ void main() {
     ));
 
     // Handing the checker the source repository directly is what shipped.
-    await SubscriptionChecker(src, subs).checkAll();
+    await SubscriptionChecker(src, subs, deliver: _told).checkAll();
 
     // It asked the source for the zm url, which throws, and the sweep
     // swallowed it: the count never moved, so no notification could ever fire.
@@ -190,3 +189,7 @@ void main() {
     expect(subs.all().single.lastCount, 3, reason: 'never checked');
   });
 }
+
+/// Stands in for a delivered alert: these tests are about routing, and the
+/// checker only records a new count once the user was told (track-6).
+Future<bool> _told(Subscription sub, int count) async => true;

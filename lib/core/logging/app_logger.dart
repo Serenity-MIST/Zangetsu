@@ -20,6 +20,14 @@ class AppLogger {
   /// growing forever — see [_persist].
   static const int _compactEvery = 2000;
 
+  /// Called with each line as it is logged (already redacted, cut to
+  /// [_hookChars]). The file is written a little later, so lines logged right
+  /// before the app stops responding never reach it; on Windows the hang watch
+  /// listens here and keeps them. Null everywhere else.
+  static void Function(String line)? onLine;
+
+  static const int _hookChars = 300;
+
   final List<String> _buffer = <String>[];
   File? _file;
   int _appended = 0;
@@ -63,6 +71,9 @@ class AppLogger {
       final line = '${_stamp()} $level $raw';
       fresh.add(line);
       _buffer.add(line);
+      onLine?.call(
+        line.length > _hookChars ? line.substring(0, _hookChars) : line,
+      );
       // Errors also go to the console. Until now they went ONLY here, so a
       // failure like "download resolve failed" was invisible to logcat and
       // could only be read by exporting the log from inside the app — which

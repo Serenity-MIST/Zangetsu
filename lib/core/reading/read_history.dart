@@ -96,9 +96,15 @@ class ReadEntry {
 
   /// Same finished rule as [ReadStore]: total == 1000 is the novel
   /// scroll-permille convention (>=950 counts as done); otherwise last
-  /// page/chapter (manga).
-  bool get finished =>
-      total > 0 && (total == 1000 ? pos >= 950 : pos >= total - 1);
+  /// page/chapter (manga, including its 95% variable-height scroll tolerance).
+  bool get finished {
+    if (total <= 0) return false;
+    if (total == 1000) return pos >= 950;
+    // Match ReadStore: variable-height webtoon pages can estimate slightly
+    // short of the literal final index even at the chapter's visible end.
+    final last = total - 1;
+    return pos >= last || pos >= last * 0.95;
+  }
 
   /// Reconstructs the internal native-image marker (`x-mihon-src` / `x-ani-src`)
   /// from the stored [sourceId], so Continue-Reading covers on a Cloudflare-gated
@@ -426,6 +432,17 @@ class ReadHistory {
   /// the cloud push is throttled unless [flush] is true.
   Future<void> save(ReadEntry e, {bool flush = false}) async {
     if (IncognitoMode.on) return; // incognito: don't record what's read
+    await _write(e, flush: flush);
+  }
+
+  /// Puts back an entry the user just removed (the Undo of a removed reading
+  /// entry). Unlike [save] it also runs in incognito: it only restores a row
+  /// that already existed, it records nothing new. Pushed to the cloud
+  /// straight away so the earlier cloud delete does not win.
+  Future<void> restore(ReadEntry e) => _write(e, flush: true);
+
+  /// Local write + cloud push shared by [save] and [restore].
+  Future<void> _write(ReadEntry e, {required bool flush}) async {
     final profileId = _profileId;
     final key = _key(e.sourceId, e.showId, profileId);
     await _box.put(key, e.toJson());
@@ -468,7 +485,9 @@ class ReadHistory {
     try {
       await Future.wait([
         pendingWrite,
-        _remote.upsert(_rowFor(uid, e, profileId)),
+        _remote
+            .upsert(_rowFor(uid, e, profileId))
+            .timeout(const Duration(seconds: 5)),
       ]);
       if (_matchesLocalEntry(key, e)) await _clearPending(key, profileId);
     } catch (_) {

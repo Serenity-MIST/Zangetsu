@@ -1,4 +1,8 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:hive_flutter/hive_flutter.dart';
+import '../../core/lnreader/lnreader_extension_service.dart';
+import '../../core/provider/provider_registry.dart';
 
 import '../../core/di/injector.dart';
 import '../../core/mangayomi/mangayomi_manager.dart';
@@ -111,6 +115,16 @@ class BrowseSourcesList extends StatelessWidget {
       if (sl.isRegistered<CloudStreamManager>()) sl<CloudStreamManager>(),
       if (sl.isRegistered<AniyomiManager>()) sl<AniyomiManager>(),
       if (sl.isRegistered<MihonManager>()) sl<MihonManager>(),
+      // Windows: these engines persist inventory directly rather than
+      // notifying a manager. Observe metadata only: redrawing must not load
+      // plugin JS. Startup opens both boxes before the shell; lightweight
+      // hosts may omit them.
+      if (defaultTargetPlatform == TargetPlatform.windows &&
+          Hive.isBoxOpen(ProviderRegistry.boxName))
+        Hive.box<Map>(ProviderRegistry.boxName).listenable(),
+      if (defaultTargetPlatform == TargetPlatform.windows &&
+          Hive.isBoxOpen(LnReaderExtensionService.boxName))
+        Hive.box<Map>(LnReaderExtensionService.boxName).listenable(),
       if (sl.isRegistered<MangayomiManager>()) sl<MangayomiManager>(),
       // The language prefs too. Turning a language back on changes which
       // sources belong here, and without these the list kept the answer it
@@ -144,12 +158,17 @@ class BrowseSourcesList extends StatelessWidget {
     // One list per tab, not one per manifest type. Streaming used to split
     // into ANIME and MOVIES & SERIES, which put the same source two headers
     // apart depending on what it declares and made the A-Z rail meaningless.
-    final all = <({String id, String label, String? repo, String? icon})>[
-      if (showStreaming) ...b.anime.where(matches),
-      if (showStreaming) ...b.movies.where(matches),
-      if (showManga) ...b.manga.where(matches),
-      if (showNovel) ...b.novel.where(matches),
-    ]..sort((x, y) => _sortKey(x.label).compareTo(_sortKey(y.label)));
+    // Mixed providers belong to both capability buckets, but this combined
+    // browse list must show each installed source only once.
+    final seenIds = <String>{};
+    final all =
+        <({String id, String label, String? repo, String? icon})>[
+            if (showStreaming) ...b.anime.where(matches),
+            if (showStreaming) ...b.movies.where(matches),
+            if (showManga) ...b.manga.where(matches),
+            if (showNovel) ...b.novel.where(matches),
+          ].where((row) => seenIds.add(row.id)).toList()
+          ..sort((x, y) => _sortKey(x.label).compareTo(_sortKey(y.label)));
 
     // Pinned keeps its own group at the top, in pin order: that list is the
     // user's own arrangement, so it is the one thing alphabetical order must
@@ -375,7 +394,10 @@ class _SourceListViewState extends State<_SourceListView> {
         // swell somewhere to go, but a swollen letter floats over the list for
         // the moment it is swollen — padding the list out for it left a strip
         // of dead space beside every chevron, permanently.
-        Padding(padding: const EdgeInsetsDirectional.only(end: 24), child: list),
+        Padding(
+          padding: const EdgeInsetsDirectional.only(end: 24),
+          child: list,
+        ),
         Positioned(
           top: _railInset,
           bottom: bottomInset,
@@ -460,7 +482,10 @@ class _SourceListViewState extends State<_SourceListView> {
     ),
   );
 
-  Widget _row(SourceRow s) => ListTile(
+  // Windows: the row reports hover so its pin button can appear (search-6).
+  Widget _row(SourceRow s) => _RowHover(child: _tile(s));
+
+  Widget _tile(SourceRow s) => ListTile(
     // Trimmed on the right only: ListTile's default 16 each side stacked on
     // top of the rail's gutter and pushed the chevron well clear of the edge.
     contentPadding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
@@ -489,7 +514,14 @@ class _SourceListViewState extends State<_SourceListView> {
     trailing: Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        if (widget.pinnedSet.contains(s.id))
+        // search-6 Option B (Windows): a real pin button (shown on hover, or
+        // always while pinned) instead of the display-only pin icon.
+        if (defaultTargetPlatform == TargetPlatform.windows)
+          _HoverPinButton(
+            pinned: widget.pinnedSet.contains(s.id),
+            onToggle: () => PinnedSources.toggle(s.id),
+          )
+        else if (widget.pinnedSet.contains(s.id))
           Padding(
             padding: const EdgeInsetsDirectional.only(end: 6),
             child: Icon(
@@ -505,6 +537,116 @@ class _SourceListViewState extends State<_SourceListView> {
     // Same gesture as the switcher, so there is one thing to learn.
     onLongPress: () => PinnedSources.toggle(s.id),
   );
+}
+
+/// search-6 Option B (Windows): pin toggle at the end of a source row.
+///
+/// Hidden until the row is hovered so the list stays calm, but a pinned row
+/// always shows its (filled) pin, which is what the old static icon did.
+/// Hover is tracked for the whole row by the enclosing [_RowHover]; the
+/// tooltip names the action. Long-press on the row still toggles too.
+class _HoverPinButton extends StatefulWidget {
+  const _HoverPinButton({required this.pinned, required this.onToggle});
+
+  final bool pinned;
+  final VoidCallback onToggle;
+
+  @override
+  State<_HoverPinButton> createState() => _HoverPinButtonState();
+}
+
+class _HoverPinButtonState extends State<_HoverPinButton> {
+  /// Keyboard focus on the button. Tab can still reach it, so it must show
+  /// itself then; otherwise focus would land on an invisible control.
+  bool _focused = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final pinned = widget.pinned;
+    final onToggle = widget.onToggle;
+    final hovered = _RowHover.of(context);
+    final visible = pinned || hovered || _focused;
+    return Focus(
+      // Only listens for focus changes; the IconButton owns its own node.
+      canRequestFocus: false,
+      skipTraversal: true,
+      onFocusChange: (f) {
+        if (f != _focused) setState(() => _focused = f);
+      },
+      child: _button(visible, pinned, onToggle),
+    );
+  }
+
+  Widget _button(bool visible, bool pinned, VoidCallback onToggle) {
+    return Padding(
+      padding: const EdgeInsetsDirectional.only(end: 2),
+      child: AnimatedOpacity(
+        duration: const Duration(milliseconds: 120),
+        opacity: visible ? 1 : 0,
+        child: IgnorePointer(
+          // Invisible buttons must not catch clicks meant for the row.
+          ignoring: !visible,
+          child: IconButton(
+            key: const ValueKey('browse-source-pin'),
+            tooltip: pinned ? context.l10n.unpinSource : context.l10n.pinSource,
+            onPressed: onToggle,
+            visualDensity: VisualDensity.compact,
+            iconSize: 17,
+            constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+            padding: EdgeInsets.zero,
+            icon: Icon(
+              pinned ? Icons.push_pin : Icons.push_pin_outlined,
+              color: pinned ? AppColors.accent : AppColors.textTertiary,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Windows: tracks whether the mouse is over one source row and exposes it
+/// to [_HoverPinButton] below. Off Windows it just returns [child].
+class _RowHover extends StatefulWidget {
+  const _RowHover({required this.child});
+
+  final Widget child;
+
+  /// True while the pointer is over the enclosing row.
+  static bool of(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<_RowHoverScope>()?.hovered ??
+      false;
+
+  @override
+  State<_RowHover> createState() => _RowHoverState();
+}
+
+class _RowHoverState extends State<_RowHover> {
+  bool _hovered = false;
+
+  void _set(bool v) {
+    if (_hovered != v) setState(() => _hovered = v);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (defaultTargetPlatform != TargetPlatform.windows) return widget.child;
+    return MouseRegion(
+      onEnter: (_) => _set(true),
+      onExit: (_) => _set(false),
+      child: _RowHoverScope(hovered: _hovered, child: widget.child),
+    );
+  }
+}
+
+/// Carries the row hover flag down to the pin button.
+class _RowHoverScope extends InheritedWidget {
+  const _RowHoverScope({required this.hovered, required super.child});
+
+  final bool hovered;
+
+  @override
+  bool updateShouldNotify(_RowHoverScope old) => old.hovered != hovered;
 }
 
 /// The letters down the right edge. Tap or drag to jump.

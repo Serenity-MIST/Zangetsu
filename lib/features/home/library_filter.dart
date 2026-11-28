@@ -1,10 +1,12 @@
 import 'dart:math';
 
+import '../../core/models/provider_info.dart';
 import '../../core/models/watch_status.dart';
 import '../../core/mode/content_mode.dart';
 import '../../core/playback/category_store.dart';
 import '../../core/tracker/tracker.dart';
 import '../../core/tracker/tracker_hub.dart';
+import '../../core/zmode/zmode_prefs.dart';
 import 'cubit/my_list_cubit.dart';
 
 List<ContentMode> libraryKindsForTracker(Tracker? tracker) => [
@@ -58,6 +60,24 @@ List<MyListEntry> filterLibraryEntries(
         e,
   ];
 }
+
+/// Filters New-style My List by dock media, separating anime from movie/TV
+/// within Streaming without changing the underlying saved entries.
+List<MyListEntry> libraryEntriesForDock(
+  List<MyListEntry> entries,
+  ContentMode mode,
+  StreamKind kind,
+) => entries
+    .where(
+      (e) =>
+          mode.matchesProvider(e.item.type) &&
+          (mode != ContentMode.anime ||
+              e.item.type ==
+                  (kind == StreamKind.movie
+                      ? ProviderType.movie
+                      : ProviderType.anime)),
+    )
+    .toList();
 
 /// Reuses category counts across layout changes without retaining another
 /// profile's assignments or stale list/category data.

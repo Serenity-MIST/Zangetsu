@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/gestures.dart' show PointerDeviceKind;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -13,6 +14,7 @@ import 'package:watch_app/core/tv/tv_alert_dialog.dart';
 import 'package:watch_app/core/stremio/stremio_manager.dart';
 import 'package:watch_app/core/stremio/stremio_sync.dart';
 import 'package:watch_app/features/sources/stremio_sources_screen.dart';
+import 'package:watch_app/l10n/app_localizations.dart';
 import 'package:zangetsu_source_bridge/stremio.dart';
 
 class _FakeSync extends ChangeNotifier implements StremioSync {
@@ -607,4 +609,70 @@ void main() {
     expect(find.text('Streams Only'), findsOne);
     expect(find.textContaining('add a catalogue addon to browse'), findsOne);
   });
+
+  // Windows: the addon card's hover outline must sit exactly on the card
+  // (same bounds, same rounded corners), not shifted down by the card gap.
+  testWidgets(
+    'Windows addon card hover outline matches the card bounds and shape',
+    (tester) async {
+      tester.view.physicalSize = const Size(1280, 900);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      await manager.install('https://addon.example/manifest.json');
+      await tester.pumpWidget(
+        const MaterialApp(
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: StremioSourcesScreen(),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final highlight = find.byKey(
+        const ValueKey('desktop-source-row-card-highlight'),
+      );
+      expect(highlight, findsOne);
+      final card = find.descendant(of: highlight, matching: find.byType(Card));
+      expect(card, findsOne);
+
+      // Hover the card so the outline is drawn.
+      final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+      addTearDown(mouse.removePointer);
+      await mouse.addPointer(location: Offset.zero);
+      await mouse.moveTo(tester.getCenter(card));
+      await tester.pumpAndSettle();
+
+      // Same rectangle: the gap under the card is no longer inside the
+      // highlighted area.
+      expect(tester.getRect(highlight), tester.getRect(card));
+      final box = tester.widget<AnimatedContainer>(highlight);
+      final decoration = box.foregroundDecoration! as BoxDecoration;
+      final cardShape =
+          tester.widget<Card>(card).shape! as RoundedRectangleBorder;
+      // Same corner radius as the card, and the outline is visible.
+      expect(decoration.borderRadius, cardShape.borderRadius);
+      expect(decoration.border, isNotNull);
+      expect(
+        (decoration.border! as Border).top.color,
+        isNot(Colors.transparent),
+      );
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.windows),
+  );
+
+  // Android: no hover wrapper at all, and the card keeps its 12dp gap below.
+  testWidgets('Android addon card has no hover outline and keeps its spacing', (
+    tester,
+  ) async {
+    await manager.install('https://addon.example/manifest.json');
+    await pump(tester);
+    expect(
+      find.byKey(const ValueKey('desktop-source-row-card-highlight')),
+      findsNothing,
+    );
+    final row = find.byKey(const ValueKey('stremio-addon-row:stremio_1'));
+    final card = find.descendant(of: row, matching: find.byType(Card));
+    expect(tester.getRect(row).bottom - tester.getRect(card).bottom, 12);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 }

@@ -64,6 +64,165 @@ Map<String, dynamic> discordPresenceUpdate(
   };
 }
 
+/// Windows gateway only: returns a copy of an op 3 `d` payload with the
+/// activity fields Discord refuses cleaned up, so one odd title cannot get
+/// the socket closed:
+///  * `details` / `state` / image texts that are blank or shorter than 2
+///    characters are dropped, longer than 128 are cut to 128;
+///  * a blank `name` falls back to the app name;
+///  * timestamps are whole integer milliseconds (or dropped if not numbers);
+///  * an empty `assets` / `timestamps` map is removed;
+///  * at most 2 buttons, each label 1..32 characters with an http(s) URL.
+/// Phone/TV keep sending [discordPresenceUpdate] unchanged.
+Map<String, dynamic> discordSanitizePresenceUpdate(Map<String, dynamic> d) {
+  final out = Map<String, dynamic>.from(d);
+  final acts = d['activities'];
+  if (acts is List) {
+    out['activities'] = [
+      for (final a in acts)
+        if (a is Map) _sanitizeActivity(Map<String, dynamic>.from(a)),
+    ];
+  }
+  return out;
+}
+
+/// Windows Social SDK only: returns a copy of an activity map cleaned up for
+/// the SDK. The same rules as [discordSanitizePresenceUpdate], plus:
+///  * images it cannot take ([discordSdkImageOk]) are dropped together with
+///    their hover text;
+///  * a button whose link is over Discord's 512 character limit is dropped, so
+///    it cannot get the whole status refused.
+/// Phones do not call this.
+Map<String, dynamic> discordSanitizeSdkActivity(Map<String, dynamic> activity) {
+  final out = _sanitizeActivity(
+    Map<String, dynamic>.from(activity),
+    longestButtonUrl: 512,
+  );
+  final assets = out['assets'];
+  if (assets is! Map) return out;
+  final m = Map<String, dynamic>.from(assets);
+  for (final side in const ['large', 'small']) {
+    final image = m['${side}_image'];
+    if (image == null) continue;
+    if (image is String && discordSdkImageOk(image)) continue;
+    m.remove('${side}_image');
+    m.remove('${side}_text');
+  }
+  if (m.isEmpty) {
+    out.remove('assets');
+  } else {
+    out['assets'] = m;
+  }
+  return out;
+}
+
+/// Whether the Social SDK can show [image] on Windows: it takes plain http(s)
+/// links of at most 300 characters (no local files, no `mp:` keys).
+bool discordSdkImageOk(String image) =>
+    image.length <= 300 && discordIsWebUrl(image);
+
+/// Whether [url] is a plain http(s) link.
+bool discordIsWebUrl(String url) {
+  final scheme = Uri.tryParse(url)?.scheme;
+  return scheme == 'http' || scheme == 'https';
+}
+
+/// Trims [v]; null when it is not a usable 2..128 character line.
+String? _line(Object? v) {
+  if (v is! String) return null;
+  final s = v.trim();
+  if (s.length < 2) return null;
+  return s.length <= 128 ? s : s.substring(0, 128);
+}
+
+/// Cleans one activity map (see [discordSanitizePresenceUpdate]). Buttons with
+/// a link over [longestButtonUrl] characters are dropped when it is given.
+Map<String, dynamic> _sanitizeActivity(
+  Map<String, dynamic> a, {
+  int? longestButtonUrl,
+}) {
+  // Name is required by Discord; never send it blank.
+  final name = (a['name'] is String) ? (a['name'] as String).trim() : '';
+  a['name'] = name.isEmpty
+      ? 'Zangetsu'
+      : (name.length <= 128 ? name : name.substring(0, 128));
+  // Optional text lines: drop when unusable instead of sending "" or " ".
+  for (final k in const ['details', 'state']) {
+    final v = _line(a[k]);
+    if (v == null) {
+      a.remove(k);
+    } else {
+      a[k] = v;
+    }
+  }
+  // Assets: keep image keys, clean their hover texts, drop an empty map.
+  final assets = a['assets'];
+  if (assets is Map) {
+    final m = <String, dynamic>{};
+    for (final k in const ['large_image', 'small_image']) {
+      final v = assets[k];
+      if (v is String && v.trim().isNotEmpty) m[k] = v.trim();
+    }
+    for (final k in const ['large_text', 'small_text']) {
+      final v = _line(assets[k]);
+      if (v != null) m[k] = v;
+    }
+    if (m.isEmpty) {
+      a.remove('assets');
+    } else {
+      a['assets'] = m;
+    }
+  }
+  // Timestamps must be integer unix ms; floats/strings are rejected.
+  final ts = a['timestamps'];
+  if (ts is Map) {
+    final m = <String, dynamic>{};
+    for (final k in const ['start', 'end']) {
+      final v = ts[k];
+      if (v is num && v > 0) m[k] = v.toInt();
+    }
+    if (m.isEmpty) {
+      a.remove('timestamps');
+    } else {
+      a['timestamps'] = m;
+    }
+  }
+  // Buttons: labels and URLs travel as two parallel lists; keep only valid
+  // pairs, at most 2, and drop both lists when none is left.
+  final labels = a['buttons'];
+  final meta = a['metadata'];
+  final urls = meta is Map ? meta['button_urls'] : null;
+  if (labels is List || urls != null) {
+    final keepL = <String>[];
+    final keepU = <String>[];
+    if (labels is List && urls is List) {
+      for (var i = 0; i < labels.length && i < urls.length; i++) {
+        final l = labels[i];
+        final u = urls[i];
+        if (l is! String || u is! String) continue;
+        final label = l.trim();
+        if (label.isEmpty || label.length > 32) continue;
+        final uri = Uri.tryParse(u);
+        if (uri == null || !(uri.scheme == 'http' || uri.scheme == 'https')) {
+          continue;
+        }
+        if (longestButtonUrl != null && u.length > longestButtonUrl) continue;
+        keepL.add(label);
+        keepU.add(u);
+        if (keepL.length == 2) break;
+      }
+    }
+    if (keepL.isEmpty) {
+      a.remove('buttons');
+      a.remove('metadata');
+    } else {
+      a['buttons'] = keepL;
+      a['metadata'] = {'button_urls': keepU};
+    }
+  }
+  return a;
+}
+
 /// A Discord activity (Rich Presence). [type]: 0 Playing · 2 Listening ·
 /// 3 Watching. For Watching, [name] is what renders after "Watching ".
 class DiscordActivity {

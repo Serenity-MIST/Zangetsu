@@ -21,6 +21,7 @@ class ChapterDownload {
     required this.mode,
     required this.status,
     this.cover,
+    this.coverHeaders,
     this.thumbnail,
     this.pageCount = 0,
     this.pagesDone = 0,
@@ -41,8 +42,12 @@ class ChapterDownload {
   final String showTitle;
   final String? cover;
 
+  /// Source image headers, scoped to cover origin when reused for a thumbnail.
+  final Map<String, String>? coverHeaders;
+
   /// The chapter's own image when the source has one (Mangayomi/Aniyomi
-  /// previews); most manga sources and every novel leave it null.
+  /// previews); most manga sources and every novel leave it null, as do old
+  /// records.
   final String? thumbnail;
   final String chapterId;
   final String chapterUrl;
@@ -118,6 +123,7 @@ class ChapterDownload {
     showId: showId,
     showTitle: showTitle,
     cover: cover,
+    coverHeaders: coverHeaders,
     thumbnail: thumbnail,
     chapterId: chapterId,
     chapterUrl: chapterUrl,
@@ -139,6 +145,7 @@ class ChapterDownload {
     'showId': showId,
     'showTitle': showTitle,
     'cover': cover,
+    'coverHeaders': coverHeaders,
     'thumbnail': thumbnail,
     'chapterId': chapterId,
     'chapterUrl': chapterUrl,
@@ -167,7 +174,10 @@ class ChapterDownload {
       showId: '${m['showId'] ?? ''}',
       showTitle: '${m['showTitle'] ?? ''}',
       cover: m['cover'] as String?,
-      thumbnail: m['thumbnail'] as String?,
+      coverHeaders: m['coverHeaders'] is Map
+          ? (m['coverHeaders'] as Map).map((k, v) => MapEntry('$k', '$v'))
+          : null,
+      thumbnail: m['thumbnail'] is String ? m['thumbnail'] as String : null,
       chapterId: '${m['chapterId'] ?? ''}',
       chapterUrl: '${m['chapterUrl'] ?? ''}',
       chapterTitle: '${m['chapterTitle'] ?? ''}',

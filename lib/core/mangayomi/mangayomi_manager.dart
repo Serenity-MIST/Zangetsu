@@ -11,8 +11,13 @@ import '../provider/cf_solve_needed.dart';
 import '../update/update_service.dart';
 import 'mangayomi_provider.dart';
 
+/// Owns installed Mangayomi sources and lazily managed worker lifetimes.
 class MangayomiManager extends ChangeNotifier {
-  MangayomiManager(this.service);
+  MangayomiManager(this.service, {this.sessionHeaders});
+
+  /// Root-isolate URL-specific desktop session lookup. Null preserves the
+  /// existing mobile native channel; no cookie jar is copied into workers.
+  final Future<Map<String, String>> Function(Uri url)? sessionHeaders;
 
   final MangayomiExtensionService service;
   final Map<String, InstalledMangayomiSource> _installed = {};
@@ -184,6 +189,7 @@ class MangayomiManager extends ChangeNotifier {
       code,
       item.source.codeLanguage,
       preferences: await _savedSettings(sourceId),
+      sessionHeaders: sessionHeaders,
     );
   }
 

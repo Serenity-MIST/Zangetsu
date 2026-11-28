@@ -1,5 +1,6 @@
 import 'package:zangetsu_source_bridge/zangetsu_source_bridge.dart';
 
+/// Decodes a validated stable source key without guessing from its display name.
 MangayomiContentType? mangayomiContentTypeOf(String sourceId) {
   final parts = sourceId.split(':');
   if (parts.length != 5 || parts[0] != 'mg' || parts[1].isEmpty) return null;

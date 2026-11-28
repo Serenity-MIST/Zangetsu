@@ -27,7 +27,7 @@ void main() {
       expect(PlaybackPrefs.bufferSecsFor('high'), 120);
     });
 
-    test('max is a LENGTH-only preset — 300s, and never shrinks the size', () {
+    test('max supports 1 GiB and 30 minutes', () {
       expect(PlaybackPrefs.bufferSecsFor('max'), 300);
       // 'max' is only offered for length, but if it ever reached a size lookup
       // it must not fall through to the 128MiB default and quietly shrink the

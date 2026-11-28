@@ -6,6 +6,8 @@ import 'dart:ui' as ui;
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/gestures.dart' show DragStartBehavior;
+import 'package:flutter/foundation.dart'
+    show ValueListenable, defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/physics.dart';
 
@@ -14,6 +16,8 @@ import '../../core/theme/app_text.dart';
 import '../../core/ui/frosted_surface.dart';
 import '../detail/episode_filter.dart';
 import '../../l10n/l10n.dart';
+import 'desktop_player_hud.dart';
+import 'desktop_watch_page.dart';
 import 'episode_player_route.dart';
 import 'in_app_mini_player.dart';
 import 'seek_preview.dart';
@@ -83,7 +87,85 @@ class PlayerWatchPage extends StatefulWidget {
     required this.onComments,
     required this.onAutoplayChanged,
     this.isMovie = false,
+    this.onShowPage,
+    this.onTitleTap,
+    this.showTitle,
+    this.episodeProgress,
+    this.skipButtonFor,
+    this.seekBar,
+    this.onContextMenu,
+    this.onWheelVolume,
+    this.hud,
+    this.volumeStream,
+    this.initialVolume = 100,
+    this.onVolumeChanged,
+    this.onToggleMute,
+    this.rateStream,
+    this.initialRate = 1,
+    this.onSpeed,
+    this.onFullScreen,
+    this.onMiniPlayer,
   });
+
+  /// Windows only: full screen on / off (the window fills the monitor with
+  /// the theatre layout; leaving it comes back here). Null hides the button.
+  final VoidCallback? onFullScreen;
+
+  /// Windows only: pops the video into the small floating mini player.
+  /// Null hides the button.
+  final VoidCallback? onMiniPlayer;
+
+  /// Windows only: the full player's seek bar (buffered range, skip marks,
+  /// hover time), built by the player so it seeks through the cubit. Null
+  /// keeps the theater page's plain slider.
+  final Widget? seekBar;
+
+  /// Windows only: right-click on the video opens the player's context menu
+  /// at this global position.
+  final ValueChanged<Offset>? onContextMenu;
+
+  /// Windows only: mouse wheel over the video (+1 up, -1 down) changes the
+  /// volume. Null leaves the wheel to scroll the page.
+  final ValueChanged<int>? onWheelVolume;
+
+  /// Windows only: volume / seek feedback for keyboard and wheel input,
+  /// driven by the player.
+  final ValueListenable<DesktopHudEvent?>? hud;
+
+  /// Windows only: live volume (0..100) for the compact volume button.
+  final Stream<double>? volumeStream;
+  final double initialVolume;
+
+  /// Windows only: the volume slider and mute button. Null hides them.
+  final ValueChanged<double>? onVolumeChanged;
+  final VoidCallback? onToggleMute;
+
+  /// Windows only: playback speed for the speed button label.
+  final Stream<double>? rateStream;
+  final double initialRate;
+
+  /// Windows only: opens the speed picker. Null hides the speed button.
+  final VoidCallback? onSpeed;
+
+  /// Windows only: the full player's Skip / Skip Recap button for a position,
+  /// or null outside a skip interval (or with the setting off), so the
+  /// theater page honours Settings → Skip intro button too.
+  final Widget? Function(Duration position)? skipButtonFor;
+
+  /// Windows only: jumps straight to the show's detail page. Null hides it.
+  final VoidCallback? onShowPage;
+
+  /// Windows only: clicking the episode title / show line under the video.
+  /// The player opens the show's detail page and moves the video into the
+  /// floating mini player. Null keeps the title plain, unclickable text.
+  final VoidCallback? onTitleTap;
+
+  /// Windows only: the show name on the "Show page" header button.
+  final String? showTitle;
+
+  /// Windows only: saved watch progress (0..1) for an episode index, or null
+  /// when there is none. Drives the progress bar on the desktop rows.
+  final double? Function(int index)? episodeProgress;
 
   /// Uses movie wording while retaining the playable rows and their actions.
   final bool isMovie;
@@ -181,7 +263,13 @@ class PlayerWatchPage extends StatefulWidget {
   final ValueChanged<bool> onAutoplayChanged;
 
   @override
-  State<PlayerWatchPage> createState() => _PlayerWatchPageState();
+  // Windows gets the theater layout; every other platform keeps the portrait
+  // page untouched. Same config, so the player wires both identically.
+  State<PlayerWatchPage> createState() =>
+      // ignore: no_logic_in_create_state
+      defaultTargetPlatform == TargetPlatform.windows
+      ? DesktopWatchPageState()
+      : _PlayerWatchPageState();
 }
 
 enum _WatchEpisodeAction { reverse, autoplay }

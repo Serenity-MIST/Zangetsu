@@ -1,10 +1,15 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
+import '../desktop/desktop_native.dart';
+import '../desktop/desktop_prefs.dart';
 import 'notification_router.dart';
+import '../../l10n/l10n.dart';
 
 /// Thin wrapper over flutter_local_notifications.
 ///
@@ -13,7 +18,9 @@ import 'notification_router.dart';
 ///   • "New episode" alerts stay ANDROID-ONLY. They depend on the app waking
 ///     itself to check what aired, and iOS background refresh is a suggestion
 ///     the system is free to ignore — an alert that fires whenever iOS feels
-///     like it is worse than none.
+///     like it is worse than none. Windows is the other exception: the app
+///     checks while it is open and raises its own notification through
+///     DesktopNative (the runner's tray balloon, shown as a toast).
 ///   • Push broadcasts ([showMessage]) work on iOS too: APNs does the waking,
 ///     so none of the above applies.
 class NotificationService {
@@ -29,7 +36,19 @@ class NotificationService {
   );
   bool _inited = false;
 
+  /// Windows: clicks on our notifications (from DesktopNative). Kept so the
+  /// listener is installed once.
+  StreamSubscription<String?>? _desktopClicks;
+
+  /// Windows desktop UI (alerts go through DesktopNative and the inbox).
+  static bool get _windows => defaultTargetPlatform == TargetPlatform.windows;
+
   Future<bool> get canShowAlerts async {
+    // Windows shows new-episode alerts itself (track-1): the in-app inbox
+    // always, plus a Windows notification when the setting is on.
+    // Gated on the target platform, not the host OS, so tests that pretend
+    // to be a phone on a Windows host keep the phone behaviour.
+    if (_windows) return true;
     if (!Platform.isAndroid) return false;
     return await _plugin
             .resolvePlatformSpecificImplementation<
@@ -40,7 +59,17 @@ class NotificationService {
   }
 
   Future<void> init() async {
-    if (_inited || !(Platform.isAndroid || Platform.isIOS)) return;
+    if (_inited) return;
+    if (Platform.isWindows) {
+      // Windows notifications come from the native runner (DesktopNative);
+      // a click restores the window and opens the title it announced.
+      _desktopClicks ??= DesktopNative.notificationClicks.listen(
+        (payload) => openShowFromNotification(payload),
+      );
+      _inited = true;
+      return;
+    }
+    if (!(Platform.isAndroid || Platform.isIOS)) return;
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
     // PushService owns the runtime permission request, so local notifications
     // do not request the same Android permission a second time.
@@ -66,6 +95,11 @@ class NotificationService {
   Future<void> handleLaunch() async {
     // The native half below is the Android CloudStream worker's channel; there
     // is no iOS equivalent, so iOS has nothing to handle here yet.
+    // Windows only needs its click listener, which init installs.
+    if (Platform.isWindows) {
+      await init();
+      return;
+    }
     if (!Platform.isAndroid) return;
     if (!_inited) await init();
     _notifChannel.setMethodCallHandler((call) async {
@@ -91,14 +125,30 @@ class NotificationService {
   /// [reading] picks the wording and the channel: manga and novels get their
   /// own so they can be muted without silencing episode alerts, and so the text
   /// doesn't call a chapter an episode.
-  Future<void> showNewEpisode({
+  ///
+  /// Returns true when an alert was actually raised, so the checker only
+  /// records the new count when someone was told (track-6).
+  Future<bool> showNewEpisode({
     required int id,
     required String title,
     required int episode,
     String? payload,
     bool reading = false,
   }) async {
-    if (!Platform.isAndroid) return;
+    if (_windows) {
+      // Off in Settings > Window & system: the in-app inbox still gets it.
+      if (!DesktopPrefs.newEpisodeAlerts) return false;
+      if (!_inited) await init();
+      await DesktopNative.showNotification(
+        title: title,
+        body: reading
+            ? appL10n.chapterIsOut('$episode')
+            : appL10n.episodeIsOut('$episode'),
+        payload: payload,
+      );
+      return true;
+    }
+    if (!Platform.isAndroid) return false;
     if (!_inited) await init();
     final details = NotificationDetails(
       android: AndroidNotificationDetails(
@@ -118,6 +168,7 @@ class NotificationService {
       details,
       payload: payload,
     );
+    return true;
   }
 
   /// Stable id for the "source updates available" notification, so a later check

@@ -1,4 +1,8 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
+
+import '../../core/boot_network.dart';
 
 import '../../core/di/injector.dart';
 import '../../core/metadata/streaming_providers.dart';
@@ -7,6 +11,7 @@ import '../../core/models/home_section.dart';
 import '../../core/models/media_item.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
+import '../../core/ui/settings_widgets.dart';
 import '../../core/ui/streaming_prefs.dart';
 import '../../core/zmode/metadata_repository.dart';
 import '../../core/zmode/tmdb_catalogue.dart';
@@ -35,14 +40,79 @@ class StreamingServicesScreen extends StatefulWidget {
 
 class _StreamingServicesScreenState extends State<StreamingServicesScreen> {
   late Future<List<StreamingService>> _future;
+  late String _region;
+  int _openRequest = 0;
 
   @override
   void initState() {
     super.initState();
-    _future = sl<StreamingProvidersService>().list(StreamingPrefs.region);
+    _region = StreamingPrefs.region;
+    _future = _fetch(_region);
+    StreamingPrefs.revision.addListener(_regionChanged);
+    if (_desktop) BootConnectivity.instance.offline.addListener(_connectionChanged);
+  }
+
+  /// Windows keeps this page alive as a desktop tab, so it must recover by
+  /// itself: a time limit, an offline message, and a reload once back online.
+  static bool get _desktop => defaultTargetPlatform == TargetPlatform.windows;
+
+  /// Whether the last load came back empty (offline, timed out or failed).
+  bool _lastEmpty = false;
+
+  Future<List<StreamingService>> _fetch(String region) {
+    var f = sl<StreamingProvidersService>().list(region);
+    if (_desktop) {
+      if (BootConnectivity.instance.offline.value) {
+        f.ignore();
+        f = Future.value(const <StreamingService>[]);
+      } else {
+        f = f.timeout(const Duration(seconds: 15),
+            onTimeout: () => const <StreamingService>[]);
+      }
+    }
+    return f.then((list) {
+      _lastEmpty = list.isEmpty;
+      return list;
+    });
+  }
+
+  void _retry() {
+    if (!mounted) return;
+    setState(() => _future = _fetch(_region));
+  }
+
+  /// Back online with nothing on screen: load again without being asked.
+  void _connectionChanged() {
+    if (!BootConnectivity.instance.offline.value && _lastEmpty) {
+      _retry();
+    } else if (mounted) {
+      // Going offline only needs a redraw for the message to change.
+      setState(() {});
+    }
+  }
+
+  /// Retained desktop tabs must follow the saved region just like a new page.
+  void _regionChanged() {
+    final region = StreamingPrefs.region;
+    if (region == _region) return;
+    _openRequest++;
+    setState(() {
+      _region = region;
+      _future = _fetch(region);
+    });
+  }
+
+  @override
+  void dispose() {
+    _openRequest++;
+    StreamingPrefs.revision.removeListener(_regionChanged);
+    if (_desktop) BootConnectivity.instance.offline.removeListener(_connectionChanged);
+    super.dispose();
   }
 
   Future<void> _open(StreamingService s) async {
+    final request = ++_openRequest;
+    final region = _region;
     final repo = sl<MetadataRepository>();
     final more = BrowseMore(
       sourceId: ZmodeIds.sourceId,
@@ -55,7 +125,7 @@ class _StreamingServicesScreenState extends State<StreamingServicesScreen> {
     } catch (_) {
       first = const [];
     }
-    if (!mounted) return;
+    if (!mounted || request != _openRequest || region != _region) return;
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => SeeAllScreen(
@@ -68,13 +138,45 @@ class _StreamingServicesScreenState extends State<StreamingServicesScreen> {
     );
   }
 
+  /// Windows empty state: says whether it is the connection or the service,
+  /// and always offers Retry.
+  Widget _desktopEmpty(BuildContext context) {
+    final l10n = context.l10n;
+    final offline = BootConnectivity.instance.offline.value;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          SvgPicture.asset(
+            offline ? 'assets/icons/lucide/wifi-off.svg' : 'assets/icons/lucide/circle-play.svg',
+            width: 40, height: 40,
+            colorFilter: const ColorFilter.mode(AppColors.textTertiary, BlendMode.srcIn)),
+          const SizedBox(height: 14),
+          Text(offline ? l10n.offlineTitle : l10n.streamingServicesEmpty,
+            textAlign: TextAlign.center, style: AppText.title),
+          if (offline) ...[
+            const SizedBox(height: 6),
+            Text('Streaming services will load when you are back online.',
+              textAlign: TextAlign.center,
+              style: AppText.body.copyWith(color: AppColors.textSecondary)),
+          ],
+          const SizedBox(height: 18),
+          OutlinedButton(
+            key: const ValueKey('streaming-retry'),
+            onPressed: offline ? null : _retry,
+            child: Text(l10n.retry)),
+        ]),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final l10n = context.l10n;
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: AppBar(
-        backgroundColor: AppColors.bg,
+        backgroundColor: settingsPageBackground(context),
         title: Text(l10n.streamingServices, style: AppText.headline),
       ),
       body: FutureBuilder<List<StreamingService>>(
@@ -84,6 +186,7 @@ class _StreamingServicesScreenState extends State<StreamingServicesScreen> {
             return const Center(child: CircularProgressIndicator());
           }
           final services = snap.data ?? const <StreamingService>[];
+          if (services.isEmpty && _desktop) return _desktopEmpty(context);
           if (services.isEmpty) {
             return Center(
               child: Padding(
@@ -115,14 +218,13 @@ class _StreamingServicesScreenState extends State<StreamingServicesScreen> {
                   // Same proportions as the Home rail's cards, and the same
                   // widget — the two must not drift into different designs for
                   // the same thing.
-                  gridDelegate:
-                      const SliverGridDelegateWithMaxCrossAxisExtent(
-                        maxCrossAxisExtent: 150,
-                        // The card's own ratio plus room for the caption.
-                        childAspectRatio: 128 / 92,
-                        mainAxisSpacing: 14,
-                        crossAxisSpacing: 12,
-                      ),
+                  gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                    maxCrossAxisExtent: 150,
+                    // The card's own ratio plus room for the caption.
+                    childAspectRatio: 128 / 92,
+                    mainAxisSpacing: 14,
+                    crossAxisSpacing: 12,
+                  ),
                   delegate: SliverChildBuilderDelegate(
                     (context, i) => _tile(services[i]),
                     childCount: services.length,

@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/ui/nav_prefs.dart';
@@ -205,6 +206,18 @@ void main() {
       expect(NavPrefs().style, NavBarStyle.liquid);
     });
 
+    test(
+      'My List style defaults to Classic and survives changes/restarts',
+      () async {
+        final prefs = NavPrefs();
+        expect(prefs.myListStyle, 'classic');
+        await prefs.setMyListStyle('new');
+        expect(NavPrefs().myListStyle, 'new');
+        await prefs.setMyListStyle('classic');
+        expect(NavPrefs().myListStyle, 'classic');
+      },
+    );
+
     test('a chosen landing tab survives a restart', () async {
       await NavPrefs().setStartTab(DockTab.myList);
 
@@ -243,6 +256,56 @@ void main() {
         expect(NavPrefs().isDefault, isTrue);
       },
     );
+  });
+
+  // Windows "Start page": the desktop sidebar is fixed, so the start page is
+  // validated against the desktop pages rather than the phone dock (whose
+  // default does not include Downloads).
+  group('NavPrefs.startTab on Windows', () {
+    late Directory dir;
+
+    setUp(() async {
+      dir = await Directory.systemTemp.createTemp('nav_prefs_start_test');
+      Hive.init(dir.path);
+      await NavPrefs.init();
+    });
+
+    tearDown(() async {
+      debugDefaultTargetPlatformOverride = null;
+      await Hive.close();
+      await dir.delete(recursive: true);
+    });
+
+    test('Downloads survives on Windows though the phone dock lacks it', () async {
+      final prefs = NavPrefs();
+      await prefs.setStartTab(DockTab.downloads);
+      // Phone: Downloads is not in the default dock, so it falls back.
+      expect(prefs.startTab, DockTab.home);
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      expect(prefs.startTab, DockTab.downloads);
+      // And it persists across a reopen of the real box.
+      await Hive.box(NavPrefs.boxName).close();
+      await NavPrefs.init();
+      expect(NavPrefs().startTab, DockTab.downloads);
+    });
+
+    test('every desktop start page round-trips on Windows', () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      final prefs = NavPrefs();
+      for (final tab in NavPrefs.desktopStartTabs) {
+        await prefs.setStartTab(tab);
+        expect(prefs.startTab, tab);
+      }
+    });
+
+    test('pages without a sidebar item fall back to Home on Windows', () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      final prefs = NavPrefs();
+      await prefs.setStartTab(DockTab.history);
+      expect(prefs.startTab, DockTab.home);
+      await prefs.setStartTab(DockTab.profile);
+      expect(prefs.startTab, DockTab.home);
+    });
   });
 
   group('DockTab', () {

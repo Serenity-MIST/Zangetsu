@@ -2,6 +2,7 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
 import '../app_mode.dart';
+import '../desktop/desktop_sheet.dart';
 import '../di/injector.dart';
 import '../models/media_item.dart';
 import '../anilist/anilist_service.dart';
@@ -41,8 +42,10 @@ Future<void> showTrackerEntrySheet(
   Future<void> Function(MediaItem item, Future<void> Function() commit)?
   onRemove,
 }) async {
-  await showModalBottomSheet<void>(
-    context: context,
+  // Windows (home-3): a centred graphite dialog; phone/TV keep the sheet.
+  await showAdaptiveSheet<void>(
+    context,
+    desktopWidth: 560,
     backgroundColor: AppColors.surface,
     isScrollControlled: true,
     shape: const RoundedRectangleBorder(
@@ -219,16 +222,18 @@ class _TrackerEntrySheetState extends State<_TrackerEntrySheet> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 const SizedBox(height: 10),
-                Center(
-                  child: Container(
-                    width: 36,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: AppColors.hairline,
-                      borderRadius: BorderRadius.circular(2),
+                // Phone drag handle; the Windows dialog has nothing to drag.
+                if (!DesktopSheetScope.of(context))
+                  Center(
+                    child: Container(
+                      width: 36,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: AppColors.hairline,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
                     ),
                   ),
-                ),
                 _header(),
                 const Divider(
                   height: 1,

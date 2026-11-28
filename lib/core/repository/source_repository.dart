@@ -592,6 +592,9 @@ class SourceRepository implements CatalogueRepository {
         _isLnReader(sourceId) ||
         _isMangayomi(sourceId) ||
         _isStremio(sourceId)) {
+      // Windows: an ecosystem being supported does not mean this plugin is
+      // installed, so report actual presence there.
+      if (Platform.isWindows) return hasSource(sourceId);
       return true; // non-JS sources are always available
     }
     if (_manager.get(sourceId) != null) return true; // already loaded
@@ -730,32 +733,41 @@ class SourceRepository implements CatalogueRepository {
         );
       }
       final p = await _providerReady(more.sourceId);
-      switch (more.kind) {
-        case 'ani_popular':
-          return p.popular(page: page);
-        case 'ani_latest':
-          return p is AniyomiProvider ? p.latest(page: page) : const [];
-        case 'mihon_popular':
-          return p.popular(page: page);
-        case 'mihon_latest':
-          return p is MihonProvider ? p.latest(page: page) : const [];
-        case 'lnr_popular':
-          return p.popular(page: page);
-        case 'mg_popular':
-          return p.popular(page: page);
-        case 'mg_latest':
-          return p is MangayomiProvider ? p.latest(page: page) : const [];
-        case 'cs_mainpage':
-          return (p is CloudStreamProvider && more.categoryId != null)
-              ? p.browseMainPage(more.categoryId!, page)
-              : const [];
-        case 'js_home':
-          return (p is JsProvider && more.categoryId != null)
-              ? p.getHomePage(more.categoryId!, page)
-              : const [];
-        default:
-          return const [];
+
+      /// Starts the page load for [more]'s kind on provider [p].
+      Future<List<MediaItem>> load() async {
+        switch (more.kind) {
+          case 'ani_popular':
+            return p.popular(page: page);
+          case 'ani_latest':
+            return p is AniyomiProvider ? p.latest(page: page) : const [];
+          case 'mihon_popular':
+            return p.popular(page: page);
+          case 'mihon_latest':
+            return p is MihonProvider ? p.latest(page: page) : const [];
+          case 'lnr_popular':
+            return p.popular(page: page);
+          case 'mg_popular':
+            return p.popular(page: page);
+          case 'mg_latest':
+            return p is MangayomiProvider ? p.latest(page: page) : const [];
+          case 'cs_mainpage':
+            return (p is CloudStreamProvider && more.categoryId != null)
+                ? p.browseMainPage(more.categoryId!, page)
+                : const [];
+          case 'js_home':
+            return (p is JsProvider && more.categoryId != null)
+                ? p.getHomePage(more.categoryId!, page)
+                : const [];
+          default:
+            return const [];
+        }
       }
+
+      // Windows awaits the page here so a failure is caught below instead of
+      // escaping as an unawaited Future.
+      if (Platform.isWindows) return await load();
+      return load();
     } catch (_) {
       return const [];
     }
@@ -856,6 +868,16 @@ class SourceRepository implements CatalogueRepository {
         final p = _csManager.get(resolved);
         if (p is! CloudStreamProvider) {
           return (items: const <MediaItem>[], outcome: SourceOutcome.error);
+        }
+        if (Platform.isWindows && page > 1) {
+          // The status search has no page argument, so later pages ("Load
+          // more" in Wrong title?) go through the plain paged search. It
+          // swallows errors itself, so a failure reads as "no more".
+          final more = await p.search(query, page, category: category);
+          return (
+            items: more,
+            outcome: more.isEmpty ? SourceOutcome.empty : SourceOutcome.ok,
+          );
         }
         final r = await p.searchWithStatus(query);
         if (r.error != null) {
@@ -1277,6 +1299,15 @@ class SourceRepository implements CatalogueRepository {
     }
     final future = _providerFor(sourceId)
         .getVideoSources(episodeUrl, fast: true)
+        .then((found) {
+          // Windows also keeps the result in the 20-minute resolved cache:
+          // the player preloads the next episode ~5 minutes before the end,
+          // which outlives the 2-minute one-shot prefetch entry.
+          if (Platform.isWindows && found.isNotEmpty) {
+            _resolved[key] = (at: DateTime.now(), sources: found);
+          }
+          return found;
+        })
         .catchError((_) => <VideoSource>[]);
     _prefetch[key] = (at: DateTime.now(), future: future);
   }

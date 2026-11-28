@@ -1,10 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:dio/dio.dart';
+import 'package:flutter/gestures.dart'
+    show PointerDeviceKind, PointerScrollEvent, kSecondaryMouseButton;
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -41,7 +45,12 @@ import 'package:watch_app/core/supabase/supabase_service.dart';
 import 'package:watch_app/core/theme/app_colors.dart';
 import 'package:watch_app/core/tracker/tracker.dart';
 import 'package:watch_app/core/tracker/tracker_hub.dart';
+import 'package:watch_app/core/desktop/desktop_image_clipboard.dart';
+import 'package:watch_app/core/reading/reader_overrides.dart';
+import 'package:watch_app/features/reader/desktop_chapter_list_panel.dart';
+import 'package:watch_app/features/reader/desktop_page_scroller.dart';
 import 'package:watch_app/features/reader/manga_reader_screen.dart';
+import 'package:watch_app/features/reader/reader_chrome.dart';
 import 'package:watch_app/features/reader/manga_page_translation_settings_sheet.dart';
 import 'package:watch_app/features/reader/reader_pull_chapter.dart';
 
@@ -668,6 +677,18 @@ Future<void> settle(WidgetTester tester) async {
   }
 }
 
+/// Allows real cache writes to finish without assuming a fixed disk latency.
+/// A bounded wait still fails a stalled translation instead of hiding it.
+Future<void> settleIoUntil(WidgetTester tester, bool Function() ready) async {
+  for (var retry = 0; retry < 100 && !ready(); retry++) {
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 20)),
+    );
+    await tester.pump();
+  }
+  await settle(tester);
+}
+
 /// [settle], but past the reader's automatic retry wait as well — otherwise a
 /// test sees the moment between the two attempts and reads it as a failure.
 Future<void> settleThroughRetry(WidgetTester tester) async {
@@ -932,6 +953,15 @@ void main() {
         await tester.pumpWidget(const SizedBox());
         await Future<void>.delayed(const Duration(milliseconds: 50));
       });
+      // The image-cache dependency schedules its own ten-second cleanup.
+      // Let it fire after detaching the reader, rather than leaking a fake
+      // timer into the next widget test's invariant check.
+      for (var turn = 0; turn < 3; turn++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 30)),
+        );
+        await tester.pump(const Duration(seconds: 11));
+      }
     }
 
     testWidgets('a chapter with no pages says so instead of going black', (
@@ -958,6 +988,617 @@ void main() {
       await disposeHarness(tester);
     });
 
+    testWidgets(
+      'Windows reader turns actual pages with keyboard and hides touch controls',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+        addTearDown(() => debugDefaultTargetPlatformOverride = null);
+        await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+        await tester.pumpWidget(harness());
+        await settle(tester);
+        final pageView = tester.widget<PageView>(find.byType(PageView));
+        expect(pageView.controller!.page, 0);
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 200));
+        expect(pageView.controller!.page, 1);
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 200));
+        expect(pageView.controller!.page, 0);
+        expect(
+          find.byKey(const ValueKey('manga-translation-floating-control')),
+          findsNothing,
+        );
+        await disposeHarness(tester);
+        debugDefaultTargetPlatformOverride = null;
+      },
+    );
+
+    /// A 1280x720 Windows window for the desktop reader tests below.
+    void desktopWindow(WidgetTester tester) {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      tester.view.physicalSize = const Size(1280, 720);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        debugDefaultTargetPlatformOverride = null;
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+    }
+
+    /// Moves a real mouse pointer to [at], so DesktopReaderInput's hover edges
+    /// react the way they do under a PC mouse.
+    Future<TestGesture> hoverMouse(WidgetTester tester, Offset at) async {
+      final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+      await mouse.addPointer(location: at);
+      await mouse.moveTo(at);
+      await tester.pump();
+      return mouse;
+    }
+
+    testWidgets(
+      'Windows Width fit lays a page out full width inside its own scroll view',
+      (tester) async {
+        desktopWindow(tester);
+        await tester.runAsync(() async {
+          await sl<ReaderPrefs>().setDirection('ltr');
+          await sl<ReaderPrefs>().setFitMode('width');
+        });
+        await tester.pumpWidget(harness());
+        await settle(tester);
+
+        // The paged item is a page scroller, sized to the 1040px reading column.
+        expect(find.byKey(const ValueKey('desktop-page-scroll')), findsOne);
+        expect(
+          tester.getSize(
+            find.byKey(const ValueKey('desktop-page-placeholder-0')),
+          ),
+          const Size(1040, 720),
+        );
+        // Space on a page that fits turns it (it has nothing left to scroll).
+        final pageView = tester.widget<PageView>(find.byType(PageView));
+        await tester.sendKeyEvent(LogicalKeyboardKey.space);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 200));
+        expect(pageView.controller!.page, 1);
+        // Shift+Space goes back.
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.space);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 200));
+        expect(pageView.controller!.page, 0);
+        expect(tester.takeException(), isNull);
+        await disposeHarness(tester);
+        debugDefaultTargetPlatformOverride = null;
+      },
+    );
+
+    testWidgets(
+      'Windows Width fit: a tall page scrolls with wheel and keys before '
+      'turning, and stepping back lands on the previous page bottom',
+      (tester) async {
+        desktopWindow(tester);
+        // Two real 500x2500 page files: at 1040px wide each is 5200px tall.
+        final paths = await tester.runAsync(() async {
+          final recorder = ui.PictureRecorder();
+          Canvas(recorder).drawRect(
+            const Rect.fromLTWH(0, 0, 500, 2500),
+            Paint()..color = const Color(0xFF808080),
+          );
+          final image = await recorder.endRecording().toImage(500, 2500);
+          final png = await image.toByteData(format: ui.ImageByteFormat.png);
+          final out = <String>[];
+          for (var i = 0; i < 2; i++) {
+            final f = File('${dir.path}/tall$i.png');
+            await f.writeAsBytes(png!.buffer.asUint8List());
+            out.add(f.path);
+          }
+          await sl<ReaderPrefs>().setDirection('ltr');
+          await sl<ReaderPrefs>().setFitMode('width');
+          // A 1:5 page would otherwise switch the chapter to webtoon mode.
+          await sl<ReaderPrefs>().setAutoWebtoon(false);
+          return out;
+        });
+        ani.register(
+          _FakeReadingProvider('ani:m', {
+            'u1': [for (final p in paths!) PageImage(url: p)],
+          }),
+        );
+        await tester.pumpWidget(harness());
+        await settle(tester);
+
+        DesktopPageScrollerState scroller() =>
+            tester.state<DesktopPageScrollerState>(
+              find.byType(DesktopPageScroller).first,
+            );
+        Future<void> waitForImage() async {
+          for (var i = 0; i < 100; i++) {
+            final ready =
+                find.byType(DesktopPageScroller).evaluate().isNotEmpty &&
+                scroller().vertical.hasClients &&
+                scroller().vertical.position.maxScrollExtent > 0;
+            if (ready) return;
+            await tester.runAsync(
+              () => Future<void>.delayed(const Duration(milliseconds: 20)),
+            );
+            await tester.pump();
+          }
+        }
+
+        await waitForImage();
+        final pageView = tester.widget<PageView>(find.byType(PageView));
+        final s = scroller();
+        expect(s.vertical.position.maxScrollExtent, closeTo(5200 - 720, 1));
+
+        // Mouse wheel scrolls inside the page; the page does not turn.
+        final pointer = TestPointer(1, PointerDeviceKind.mouse);
+        pointer.hover(const Offset(640, 360));
+        await tester.sendEventToBinding(pointer.scroll(const Offset(0, 300)));
+        await tester.pump();
+        expect(s.vertical.offset, 300);
+        expect(pageView.controller!.page, 0);
+
+        // Arrow Down nudges (a short glide of kDesktopArrowScrollStep,
+        // reader-3), End jumps to the bottom, still the same page.
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+        expect(s.vertical.offset, 300 + kDesktopArrowScrollStep);
+        await tester.sendKeyEvent(LogicalKeyboardKey.end);
+        await tester.pump();
+        expect(s.vertical.offset, closeTo(4480, 1));
+        expect(pageView.controller!.page, 0);
+
+        // At the bottom, Page Down turns to the next page, which opens at top.
+        await tester.sendKeyEvent(LogicalKeyboardKey.pageDown);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+        expect(pageView.controller!.page, 1);
+        await waitForImage();
+        expect(scroller().vertical.offset, 0);
+
+        // Page Up at the top goes back and lands on that page's bottom.
+        await tester.sendKeyEvent(LogicalKeyboardKey.pageUp);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+        expect(pageView.controller!.page, 0);
+        await waitForImage();
+        await tester.pump();
+        final back = scroller();
+        expect(
+          back.vertical.offset,
+          closeTo(back.vertical.position.maxScrollExtent, 1),
+        );
+        expect(tester.takeException(), isNull);
+        await disposeHarness(tester);
+        debugDefaultTargetPlatformOverride = null;
+      },
+    );
+
+    testWidgets('Windows Contain fit keeps the page fitted, with no scroller', (
+      tester,
+    ) async {
+      desktopWindow(tester);
+      await tester.runAsync(() async {
+        await sl<ReaderPrefs>().setDirection('ltr');
+        await sl<ReaderPrefs>().setFitMode('contain');
+      });
+      await tester.pumpWidget(harness());
+      await settle(tester);
+      expect(find.byKey(const ValueKey('desktop-page-scroll')), findsNothing);
+      expect(find.byKey(const ValueKey('manga-page-transform-0')), findsOne);
+      await disposeHarness(tester);
+      debugDefaultTargetPlatformOverride = null;
+    });
+
+    // ── Windows reader items owned by reader-manga ─────────────────────────
+
+    /// Registers the per-series override store the Windows tests below use
+    /// (page width, spread shift).
+    Future<void> useOverrides(WidgetTester tester) async {
+      await tester.runAsync(() async {
+        await ReaderOverrideStore.init();
+        sl.registerSingleton<ReaderOverrideStore>(ReaderOverrideStore());
+      });
+    }
+
+    /// Closes the override box while still inside the test, pumping between
+    /// real waits. A write the reader started from a key press runs in the
+    /// test's fake zone, so tearDown's Hive.close() (outside it) would wait
+    /// on that write forever; here its continuations get pumped through.
+    Future<void> closeOverrides(WidgetTester tester) async {
+      var closed = false;
+      await tester.runAsync(() async {
+        unawaited(
+          Hive.box(
+            ReaderOverrideStore.boxName,
+          ).close().whenComplete(() => closed = true),
+        );
+      });
+      for (var round = 0; round < 100 && !closed; round++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 20)),
+        );
+        await tester.pump();
+      }
+      expect(closed, isTrue, reason: 'override box should close');
+    }
+
+    /// Lets real Hive writes started by the reader finish, then rebuilds.
+    Future<void> flushIo(WidgetTester tester) async {
+      for (var round = 0; round < 8; round++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 20)),
+        );
+        await tester.pump();
+      }
+    }
+
+    testWidgets(
+      'Windows (reader-6): next on the end-of-chapter page opens the next '
+      'chapter',
+      (tester) async {
+        desktopWindow(tester);
+        await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+        await tester.pumpWidget(harness());
+        await settle(tester);
+        final pageView = tester.widget<PageView>(find.byType(PageView));
+        for (var i = 0; i < 3; i++) {
+          await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 200));
+        }
+        // Three pages, then the end-of-chapter page.
+        expect(pageView.controller!.page, 3);
+        await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+        await settle(tester);
+        // Chapter 2 (two pages) is open, and chapter 1 counts as read.
+        expect(find.textContaining(RegExp(r'ch 2 · pg \d/2')), findsOneWidget);
+        expect(sl<ReadStore>().finished('ani:m', 'm1', 'c1'), isTrue);
+        await disposeHarness(tester);
+        debugDefaultTargetPlatformOverride = null;
+      },
+    );
+
+    testWidgets(
+      'Windows (reader-8): spreads use the whole window, and O shifts them by '
+      'one page for this series',
+      (tester) async {
+        desktopWindow(tester);
+        await useOverrides(tester);
+        ani.register(
+          _FakeReadingProvider('ani:m', {'u1': pages(4), 'u2': pages(2)}),
+        );
+        await tester.runAsync(() async {
+          await sl<ReaderPrefs>().setDirection('ltr');
+          await sl<ReaderPrefs>().setDoublePageLandscape(true);
+        });
+        await tester.pumpWidget(harness());
+        await settle(tester);
+        int items() =>
+            (tester.widget<PageView>(find.byType(PageView)).childrenDelegate
+                    as SliverChildBuilderDelegate)
+                .childCount!;
+        // Not squeezed into the 1040px single-page column.
+        expect(tester.getSize(find.byType(PageView)).width, 1280);
+        // [0,1] [2,3] + the end-of-chapter page.
+        expect(items(), 3);
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.keyO);
+        await flushIo(tester);
+        await tester.pump(const Duration(seconds: 1));
+        // [0] [1,2] [3] + the end page.
+        expect(items(), 4);
+        expect(sl<ReaderOverrideStore>().shiftSpread('ani:m', 'm1'), isTrue);
+        await disposeHarness(tester);
+        await closeOverrides(tester);
+        debugDefaultTargetPlatformOverride = null;
+      },
+    );
+
+    testWidgets(
+      'Windows (reader-12/9): skip buttons name their chapter, the slider '
+      'labels pages, and neither takes keyboard focus',
+      (tester) async {
+        desktopWindow(tester);
+        await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+        await tester.pumpWidget(harness());
+        await settle(tester);
+        expect(find.byTooltip('Chapter 2 - c2'), findsOneWidget);
+        expect(find.byTooltip('No previous chapter'), findsOneWidget);
+        final slider = tester.widget<ReaderSlider>(find.byType(ReaderSlider));
+        expect(slider.labelFor!(1), 'Page 2 / 3');
+        // Wrapped so a click can never leave focus on them.
+        for (final type in [Slider, IconButton]) {
+          expect(
+            find.ancestor(
+              of: find.byType(type).first,
+              matching: find.byType(ExcludeFocus),
+            ),
+            findsWidgets,
+          );
+        }
+        await disposeHarness(tester);
+        debugDefaultTargetPlatformOverride = null;
+      },
+    );
+
+    testWidgets(
+      'Windows (reader-10): C opens the chapter panel with read markers; '
+      'filter then Enter opens a chapter',
+      (tester) async {
+        desktopWindow(tester);
+        await tester.runAsync(() async {
+          await sl<ReaderPrefs>().setDirection('ltr');
+          await sl<ReadStore>().setRead('ani:m', 'm1', 'c1', read: true);
+        });
+        await tester.pumpWidget(harness(startIndex: 1));
+        await settle(tester);
+        await tester.sendKeyEvent(LogicalKeyboardKey.keyC);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+        expect(find.byType(DesktopChapterListPanel), findsOneWidget);
+        expect(
+          find.byKey(const ValueKey('reader-chapter-read-0')),
+          findsOneWidget,
+        );
+        await tester.enterText(
+          find.byKey(const ValueKey('reader-chapter-search')),
+          'c1',
+        );
+        await tester.pump();
+        expect(
+          find.byKey(const ValueKey('reader-chapter-row-1')),
+          findsNothing,
+        );
+        await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+        await settle(tester);
+        expect(find.byType(DesktopChapterListPanel), findsNothing);
+        expect(find.textContaining(RegExp(r'ch 1 · pg \d/3')), findsOneWidget);
+        await disposeHarness(tester);
+        debugDefaultTargetPlatformOverride = null;
+      },
+    );
+
+    testWidgets(
+      'Windows (reader-1): right-click Copy image reads the page file, even '
+      'for a downloaded (local) page',
+      (tester) async {
+        desktopWindow(tester);
+        final path = await tester.runAsync(() async {
+          final recorder = ui.PictureRecorder();
+          Canvas(recorder).drawRect(
+            const Rect.fromLTWH(0, 0, 40, 60),
+            Paint()..color = const Color(0xFF336699),
+          );
+          final image = await recorder.endRecording().toImage(40, 60);
+          final png = await image.toByteData(format: ui.ImageByteFormat.png);
+          final f = File('${dir.path}/local-page.png');
+          await f.writeAsBytes(png!.buffer.asUint8List());
+          await sl<ReaderPrefs>().setDirection('ltr');
+          await sl<ReaderPrefs>().setFitMode('contain');
+          return f.path;
+        });
+        ani.register(
+          _FakeReadingProvider('ani:m', {
+            'u1': [PageImage(url: path!)],
+            'u2': pages(2),
+          }),
+        );
+        Uint8List? copied;
+        debugImageClipboardOverride = (bytes) async {
+          copied = bytes;
+          return true;
+        };
+        addTearDown(() => debugImageClipboardOverride = null);
+        await tester.pumpWidget(harness());
+        await settle(tester);
+
+        await tester.tapAt(
+          const Offset(640, 360),
+          buttons: kSecondaryMouseButton,
+          kind: PointerDeviceKind.mouse,
+        );
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+        expect(find.text('Copy image'), findsOneWidget);
+        expect(find.text('Save to Pictures'), findsOneWidget);
+        await tester.tap(find.text('Copy image'));
+        for (var i = 0; i < 5 && copied == null; i++) {
+          await flushIo(tester);
+        }
+        expect(copied, File(path).readAsBytesSync());
+        await disposeHarness(tester);
+        debugDefaultTargetPlatformOverride = null;
+      },
+    );
+
+    testWidgets(
+      'Windows (reader-5): Ctrl+= zooms the page with a brief level badge, '
+      'Ctrl+0 resets',
+      (tester) async {
+        desktopWindow(tester);
+        await tester.runAsync(() async {
+          await sl<ReaderPrefs>().setDirection('ltr');
+          await sl<ReaderPrefs>().setFitMode('contain');
+        });
+        await tester.pumpWidget(harness());
+        await settle(tester);
+        double scale() => tester
+            .widget<Transform>(
+              find.byKey(const ValueKey('manga-page-transform-0')),
+            )
+            .transform
+            .getMaxScaleOnAxis();
+
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.equal);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        await tester.pump();
+        expect(scale(), closeTo(1.25, 0.001));
+        expect(find.text('125%'), findsOneWidget);
+
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.digit0);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        await tester.pump();
+        expect(scale(), closeTo(1.0, 0.001));
+        expect(find.text('100%'), findsOneWidget);
+        // The badge goes away by itself.
+        await tester.pump(const Duration(seconds: 2));
+        expect(find.text('100%'), findsNothing);
+        await disposeHarness(tester);
+        debugDefaultTargetPlatformOverride = null;
+      },
+    );
+
+    testWidgets(
+      'Windows (reader-5/2): the long strip follows the series page width',
+      (tester) async {
+        desktopWindow(tester);
+        await useOverrides(tester);
+        await tester.runAsync(() async {
+          await sl<ReaderPrefs>().setDirection('vertical');
+          await sl<ReaderOverrideStore>().setPageWidthOverride(
+            'ani:m',
+            'm1',
+            800,
+          );
+        });
+        await tester.pumpWidget(harness());
+        await settle(tester);
+        final strip = find.byKey(const ValueKey('manga-listview'));
+        expect(tester.getSize(strip).width, 800);
+
+        // Ctrl+0 goes back to the default width (the window is wider).
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.digit0);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        await flushIo(tester);
+        expect(
+          tester.getSize(strip).width,
+          ReaderOverrideStore.defaultPageWidth,
+        );
+
+        // Ctrl+wheel in the margin beside the capped strip still zooms it
+        // (narrower), instead of only scrolling.
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendEventToBinding(
+          const PointerScrollEvent(
+            kind: PointerDeviceKind.mouse,
+            position: Offset(40, 360),
+            scrollDelta: Offset(0, 100),
+          ),
+        );
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        await flushIo(tester);
+        expect(
+          tester.getSize(strip).width,
+          lessThan(ReaderOverrideStore.defaultPageWidth),
+        );
+        await tester.pump(const Duration(seconds: 2));
+        await disposeHarness(tester);
+        await closeOverrides(tester);
+        debugDefaultTargetPlatformOverride = null;
+      },
+    );
+
+    testWidgets('Windows page number stays up and steps aside for the bottom '
+        'bar', (tester) async {
+      desktopWindow(tester);
+      await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+      await tester.pumpWidget(harness());
+      await settle(tester);
+
+      double pillOpacity() => tester
+          .widget<AnimatedOpacity>(
+            find.descendant(
+              of: find.byKey(const ValueKey('reader-scroll-page-number')),
+              matching: find.byType(AnimatedOpacity),
+            ),
+          )
+          .opacity;
+
+      // Shown without a page turn first, counted within the chapter.
+      expect(pillOpacity(), 1);
+      expect(find.text('01/03'), findsOneWidget);
+      // Hovering the bottom edge reveals the bottom bar; the pill gives way.
+      final mouse = await hoverMouse(tester, const Offset(640, 700));
+      expect(pillOpacity(), 0);
+      // Back over the page (after the bar's grace period) it returns.
+      await mouse.moveTo(const Offset(640, 360));
+      await tester.pump(const Duration(milliseconds: 700));
+      expect(pillOpacity(), 1);
+      await mouse.removePointer();
+      await disposeHarness(tester);
+      debugDefaultTargetPlatformOverride = null;
+    });
+
+    testWidgets(
+      'Windows reader menu has no page translation and settings open as a '
+      'side panel',
+      (tester) async {
+        desktopWindow(tester);
+        await tester.runAsync(() => sl<ReaderPrefs>().setDirection('ltr'));
+        await tester.pumpWidget(harness());
+        await settle(tester);
+
+        final mouse = await hoverMouse(tester, const Offset(640, 30));
+        await tester.pump(const Duration(milliseconds: 250));
+        await tester.tap(find.byIcon(Icons.more_vert_rounded));
+        await settle(tester);
+        expect(
+          find.byKey(const ValueKey('reader-menu-translate-page')),
+          findsNothing,
+        );
+        await tester.tap(find.byKey(const ValueKey('reader-menu-settings')));
+        await settle(tester);
+
+        expect(find.byKey(const ValueKey('reader-desktop-panel')), findsOne);
+        expect(find.byType(BottomSheet), findsNothing);
+        expect(
+          find.byKey(const ValueKey('reader-settings-manga-translation')),
+          findsNothing,
+        );
+        // The panel sits on the right and leaves the page visible beside it.
+        final panel = tester.getRect(
+          find.byKey(const ValueKey('reader-desktop-panel')),
+        );
+        expect(panel.left, greaterThan(640));
+        expect(panel.bottom, lessThanOrEqualTo(720));
+
+        // Settings in the panel apply to the reader live.
+        final pageNumberSwitch = find.byKey(
+          const ValueKey('reader-show-page-number'),
+        );
+        await tester.ensureVisible(pageNumberSwitch);
+        await tester.runAsync(() => tester.tap(pageNumberSwitch));
+        await settle(tester);
+        expect(sl<ReaderPrefs>().showPageNumber, isFalse);
+        expect(
+          find.byKey(const ValueKey('reader-scroll-page-number')),
+          findsNothing,
+        );
+
+        await tester.ensureVisible(
+          find.byKey(const ValueKey('reader-panel-close')),
+        );
+        await tester.pump();
+        await tester.tap(find.byKey(const ValueKey('reader-panel-close')));
+        await settle(tester);
+        expect(
+          find.byKey(const ValueKey('reader-desktop-panel')),
+          findsNothing,
+        );
+        expect(tester.takeException(), isNull);
+        await tester.runAsync(() => sl<ReaderPrefs>().setShowPageNumber(true));
+        await mouse.removePointer();
+        await disposeHarness(tester);
+        debugDefaultTargetPlatformOverride = null;
+      },
+    );
     testWidgets('ltr direction renders a non-reversed PageView', (
       tester,
     ) async {
@@ -2805,6 +3446,10 @@ void main() {
       );
       await settle(tester);
       expect(find.text('translated text'), findsOneWidget);
+      await settleIoUntil(
+        tester,
+        () => platform.recognizeCalls == 3 && onlineTranslationCalls == 3,
+      );
       expect(platform.recognizeCalls, 3);
       expect(onlineTranslationCalls, 3);
       expect(find.byTooltip('Turn translation off'), findsOneWidget);
@@ -2905,6 +3550,7 @@ void main() {
       );
       await settle(tester);
 
+      await settleIoUntil(tester, () => platform.recognizeCalls == 3);
       expect(platform.recognizeCalls, 3);
       expect(platform.recognizedFilePaths, pagePaths);
       expect(find.text('translated text'), findsOneWidget);

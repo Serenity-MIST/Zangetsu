@@ -1,3 +1,26 @@
+import 'desktop_download_thumbnails.dart';
+import 'download_folder_sync.dart';
+import 'downloaded_show_details.dart';
+import 'folder_manifest_scanner.dart';
+import '../platform/app_paths.dart';
+import 'desktop_download_retry.dart';
+import 'desktop_download_recovery.dart';
+import '../desktop/desktop_storage.dart';
+import 'download_failure.dart';
+import 'package:crypto/crypto.dart';
+import 'dart:math';
+import 'package:path/path.dart' as p;
+import 'file_audio_transaction.dart';
+import 'desktop_file_audio.dart';
+import 'desktop_audio_mux.dart';
+import 'desktop_dash_downloader.dart';
+import 'download_link_label.dart' show downloadServerName;
+import 'download_server_preference.dart';
+import 'transfer_slots.dart';
+import 'direct_file_connections.dart';
+import 'subtitle_selection.dart';
+import '../playback/playback_prefs.dart';
+import '../playback/skip_service.dart';
 import 'dart:async';
 import 'package:watch_app/core/hive/safe_box.dart';
 import 'dart:convert';
@@ -12,6 +35,7 @@ import 'package:hive/hive.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import '../boot_network.dart';
 import '../logging/app_logger.dart';
 import '../models/episode.dart';
 import '../models/video_source.dart';
@@ -28,6 +52,12 @@ import 'download_record.dart';
 import 'download_service.dart';
 import 'external_subtitle_export.dart';
 import 'video_destination.dart';
+// Windows desktop additions: queue panel numbers, recycle-bin deletes, close
+// guard / tray registration and taskbar + notification signals.
+import '../desktop/desktop_background_work.dart';
+import 'desktop_download_signals.dart';
+import 'download_live_stats.dart';
+import 'download_recycle.dart';
 
 /// Owns offline downloads. Direct-file (MP4/MKV) sources go through
 /// background_downloader (true background); HLS (m3u8) sources go through the
@@ -36,12 +66,35 @@ import 'video_destination.dart';
 /// `downloads` box so the library survives restarts. A [ChangeNotifier] so the
 /// UI can rebuild live. See docs/downloads-feature.md.
 class DownloadManager extends ChangeNotifier {
+  /// Optional transports support isolated offline integration checks; normal
+  /// callers use the shared native downloader and standard HTTP timeouts.
   DownloadManager(
     this._repo, [
     DownloadPrefs? downloadPrefs,
     TorrentDownloadService? torrentSvc,
+    Dio? downloadClient,
+    FileDownloader? fileDownloader,
+    DesktopFileAudio? fileAudio,
+    Future<void> Function(DownloadRecord)? writeAudioCheckpoint,
+    Future<void> Function(DownloadRecord)? writeCompletedRecord,
+    DesktopDownloadRecovery? localRecovery,
+    DesktopDownloadRetry? retryScheduler,
   ]) : _downloadPrefs = downloadPrefs ?? DownloadPrefs(),
-       _torrentSvc = torrentSvc ?? TorrentDownloadService();
+       _torrentSvc = torrentSvc ?? TorrentDownloadService(),
+       _dl = fileDownloader,
+       _fileAudio = fileAudio ?? DesktopFileAudio(),
+       _writeAudioCheckpoint = writeAudioCheckpoint,
+       _writeCompletedRecord = writeCompletedRecord,
+       _localRecovery = localRecovery ?? DesktopDownloadRecovery(),
+       _retryScheduler = retryScheduler ?? DesktopDownloadRetry(),
+       _dio =
+           downloadClient ??
+           Dio(
+             BaseOptions(
+               connectTimeout: const Duration(seconds: 20),
+               receiveTimeout: const Duration(seconds: 30),
+             ),
+           );
 
   /// The ROUTER, not the source repository.
   ///
@@ -52,6 +105,24 @@ class DownloadManager extends ChangeNotifier {
   /// title could be downloaded at all. Same mistake [SubscriptionChecker] had.
   final CatalogueRepository _repo;
   final DownloadPrefs _downloadPrefs;
+  final DesktopDownloadRecovery _localRecovery;
+  final DesktopDownloadRetry _retryScheduler;
+  Future<void> _automaticRetryWork = Future.value();
+  final Map<String, String> _restoredPendingRetries = {};
+  Future<void>? _localRecoveryWork;
+  final DesktopFileAudio _fileAudio;
+  final Future<void> Function(DownloadRecord)? _writeAudioCheckpoint;
+  final Future<void> Function(DownloadRecord)? _writeCompletedRecord;
+  final Set<String> _finalizingFiles = {};
+  final Set<Future<void>> _subtitleWork = {};
+  final Set<Future<void>> _foregroundHlsWork = {};
+  final Map<String, ({String storageKey, Future<void> done})>
+  _foregroundHlsAttempts = {};
+  final Map<String, String> _deferredHlsReplacements = {};
+  final Map<String, Completer<void>> _finalizationDone = {};
+  // A new attempt must not reuse an ID while deletion still owns its files.
+  final Map<String, Completer<void>> _deletionDone = {};
+  final Set<String> _pendingAudioResumes = {};
   final TorrentDownloadService _torrentSvc;
 
   /// Latest torrent-download progress per id (peers/speed for the UI), kept
@@ -61,9 +132,9 @@ class DownloadManager extends ChangeNotifier {
   static const String boxName = 'downloads';
   static const String _sharedDir = 'Zangetsu';
 
-  /// When a source clearly supplies both cuts, keep only the selected one.
-  /// Single-cut and unlabelled lists stay untouched; language tracks on a
-  /// VideoSource are not separate Sub/Dub links and are never filtered here.
+  /// Never replace an explicitly requested cut with a known different cut.
+  /// Fully unlabelled lists may contain multi-audio files; keep those intact,
+  /// without treating this cut filter as proof of a file's audio language.
   static List<VideoSource> sourcesForDownloadCategory(
     List<VideoSource> sources,
     String category,
@@ -75,9 +146,10 @@ class DownloadManager extends ChangeNotifier {
     };
     if (wanted == AudioKind.unknown) return sources;
 
-    final hasSub = sources.any((source) => source.kind == AudioKind.sub);
-    final hasDub = sources.any((source) => source.kind == AudioKind.dub);
-    if (!hasSub || !hasDub) return sources;
+    final hasKnownCut = sources.any(
+      (source) => source.kind != AudioKind.unknown,
+    );
+    if (!hasKnownCut) return sources;
 
     return sources.where((source) => source.kind == wanted).toList();
   }
@@ -95,30 +167,81 @@ class DownloadManager extends ChangeNotifier {
   // background_downloader runs enqueued tasks concurrently, so without this the
   // limit was silently HLS-only. The queue holds extras until a slot frees.
   final MemoryTaskQueue _mp4Queue = MemoryTaskQueue();
+  TransferSlots? _desktopTransferSlots;
+  TransferSlots get _desktopSlots =>
+      _desktopTransferSlots ??= TransferSlots(_downloadPrefs.parallelDownloads);
+
   // Small HTTP client for fetching subtitle sidecar files (they're tiny, so a
   // direct GET in the UI isolate beats threading them through the downloaders).
-  final Dio _dio = Dio(
-    BaseOptions(
-      connectTimeout: const Duration(seconds: 20),
-      receiveTimeout: const Duration(seconds: 30),
-    ),
-  );
+  final Dio _dio;
 
   /// In-memory cache of records, keyed by id (mirrors the Hive box).
   final Map<String, DownloadRecord> _records = {};
   final Set<String> _publishingExternalSubtitles = {};
   // Live DownloadTask objects for in-session control (pause/resume/move).
   final Map<String, DownloadTask> _tasks = {};
+  final Set<String> _singleConnectionIds = {};
   // Remaining fallback mirrors per record (CloudStream-style try-next): when a
   // download fails or saves a web page, we advance to the next candidate.
   final Map<String, List<VideoSource>> _candidates = {};
   StreamSubscription<TaskUpdate>? _sub;
+  Future<void>? _desktopRecovery;
+  Future<void> _retiredCleanup = Future.value();
+  Object? _desktopRecoveryError;
+  bool _disposed = false;
+
+  // ── Live progress (Windows, dl-5 / dl-7) ──────────────────────────────────
+  // Per-record progress notifiers so one tile can repaint without the whole
+  // library regrouping on every tick.
+  final Map<String, ValueNotifier<double>> _progressNotifiers = {};
+  // Speed / time left per downloading record; memory only.
+  final Map<String, DownloadLiveStats> _liveStats = {};
+  // Rate estimators for transports that only report a fraction (HLS).
+  final Map<String, ProgressRateEstimator> _rateEstimators = {};
+  // When each record's progress was last written to Hive.
+  final Map<String, int> _lastProgressSave = {};
+  // Records whose newest progress is only in memory (flushed on dispose).
+  final Set<String> _unsavedProgress = {};
+  // Last time a progress tick was allowed to notify every listener.
+  int _lastProgressNotify = 0;
+  // Records the user asked to download next while they were not yet waiting
+  // in the slot queue (paused, failed or still resolving), dl-6.
+  final Set<String> _promoteWhenQueued = {};
+  // Whether this instance registered itself with the close guard / tray.
+  bool _registeredBackgroundWork = false;
+
+  /// Progress is saved at most this often while only the percentage moves.
+  static const int progressSaveIntervalMs = 5000;
+
+  /// Fallback whole-manager notify rate for progress-only changes, so screens
+  /// that still read records from [all] keep moving about once a second.
+  static const int progressNotifyIntervalMs = 1000;
+
+  /// Clock for the progress throttles; tests replace it.
+  @visibleForTesting
+  int Function() progressClock = () => DateTime.now().millisecondsSinceEpoch;
 
   /// Wire notifications + the update streams. Call once at app start.
   void setup() {
     for (final raw in _box.values) {
       final r = DownloadRecord.fromMap(raw);
       _records[r.id] = r;
+      if (r.autoResumePending && r.status != DownloadStatus.paused) {
+        _restoredPendingRetries[r.id] = r.storageKey;
+      }
+    }
+    // Windows desktop: let the close guard / tray see running downloads, and
+    // drive taskbar progress + finish notifications from this manager.
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      DesktopBackgroundWork.register(
+        'downloads',
+        // Internal name only (never shown), so it stays English.
+        label: 'downloads',
+        activeCount: () => activeCount,
+        pauseAll: pauseAll,
+      );
+      _registeredBackgroundWork = true;
+      DesktopDownloadSignals.instance.attachVideos(this);
     }
     // background_downloader persists to Application Support, which tvOS cannot
     // create — constructing FileDownloader there logs errors and can stall boot.
@@ -134,12 +257,38 @@ class DownloadManager extends ChangeNotifier {
       progressBar: true,
     );
     _sub = dl.updates.listen(_onUpdate);
+    if (Platform.isWindows) {
+      _raiseDesktopEngineLimit(dl);
+      // Rows waiting for the network try again the moment it is back.
+      BootConnectivity.instance.addReconnectTask(wakeNetworkWaiters);
+      _desktopRecovery = _recoverDesktopTransfers();
+      _retiredCleanup = _desktopRecovery!.then((_) async {
+        if (_desktopRecoveryError == null) {
+          // First, so the queue panel does not list last session's dead
+          // entries for long (the library never shows them).
+          await _removeDeadRecords();
+          await _cleanupRetiredCompletedFiles();
+          await recoverLocalFiles();
+          // Only boot-restored intent is rearmed here. Jobs accepted while
+          // startup cleanup runs already belong to their original batch loop.
+          for (final entry in _restoredPendingRetries.entries.toList()) {
+            final record = _records[entry.key];
+            if (record != null && record.storageKey == entry.value) {
+              _armPendingRetry(record);
+            }
+          }
+          _restoredPendingRetries.clear();
+        }
+      });
+      unawaited(_retiredCleanup);
+    }
     // Route MP4 downloads through the concurrency-limited queue.
     _mp4Queue.maxConcurrent = _downloadPrefs.parallelDownloads;
     dl.addTaskQueue(_mp4Queue);
     // A task the queue couldn't enqueue at all (rare) → same fallback as a
     // failed start: try the next mirror, else mark failed.
     _mp4Queue.enqueueErrors.listen((task) async {
+      if (Platform.isWindows) _desktopSlots.release(task.taskId);
       final rec = _records[task.taskId];
       if (rec == null || rec.status == DownloadStatus.canceled) return;
       AppLogger.instance.log(
@@ -160,6 +309,434 @@ class DownloadManager extends ChangeNotifier {
     _listenTorrentDownloads();
     unawaited(_publishPreviouslyDownloadedSubtitles());
     unawaited(_recoverBackgroundHlsJobs());
+  }
+
+  /// How many tasks the Windows download engine may run at once: every
+  /// episode "Parallel downloads" allows, plus every connection
+  /// "Connections per download" gives each of them (a split file runs as one
+  /// parent task and one task per connection).
+  static const int desktopEngineTaskLimit =
+      DownloadPrefs.parallelMax * (DownloadPrefs.connectionsMax + 1);
+
+  /// background_downloader's desktop engine runs at most 10 tasks by
+  /// default, and a split file's connection tasks queue in that same line
+  /// behind their parent, which keeps its place while it waits for them. So
+  /// with 3 episodes at 8 connections only 7 connections ran in all, and 10
+  /// split episodes at once never moved. Our own slots already cap how many
+  /// episodes run, so the engine only needs room for all of them plus their
+  /// connections.
+  void _raiseDesktopEngineLimit(FileDownloader dl) {
+    try {
+      unawaited(
+        dl
+            .configure(
+              desktopConfig: (
+                Config.holdingQueue,
+                (desktopEngineTaskLimit, null, null),
+              ),
+            )
+            .then((results) {
+              for (final (item, error) in results) {
+                if (error.isEmpty) continue;
+                AppLogger.instance.log(
+                  '[download] engine config $item not applied — $error',
+                  level: 'W',
+                );
+              }
+            })
+            .catchError((Object e) {
+              AppLogger.instance.log(
+                '[download] engine limit not raised — $e',
+                level: 'W',
+              );
+            }),
+      );
+    } catch (e) {
+      // Test doubles of FileDownloader without configure().
+      AppLogger.instance.log(
+        '[download] engine limit not raised — $e',
+        level: 'W',
+      );
+    }
+  }
+
+  /// Desktop workers live in this process. Reconcile their real inventory
+  /// before admitting new work; saved labels alone are not running transfers.
+  Future<void> _recoverDesktopTransfers() async {
+    try {
+      final tasks = await _fileDownloader.allTasks(allGroups: true);
+      if (_disposed) return;
+      final byId = {for (final task in tasks) task.taskId: task};
+      for (final rec in _records.values.toList()) {
+        if (_disposed) return;
+        if (rec.isTorrent) continue;
+        final task = byId[rec.id];
+        if (task is DownloadTask) _tasks[rec.id] = task;
+        final interrupted = const {
+          DownloadStatus.queued,
+          DownloadStatus.resolving,
+          DownloadStatus.downloading,
+          DownloadStatus.finalizing,
+        }.contains(rec.status);
+        if (!interrupted) continue;
+        if (rec.status == DownloadStatus.finalizing && rec.filePath != null) {
+          final recovery = await FileAudioTransaction.recover(rec.filePath!);
+          if (_disposed) return;
+          if (recovery != null) {
+            await _storeRestoredState(
+              rec.copyWith(
+                status: DownloadStatus.failed,
+                error: () => recovery,
+              ),
+            );
+            continue;
+          }
+        }
+        if (rec.autoResumePending &&
+            rec.retryAt != null &&
+            rec.status == DownloadStatus.queued) {
+          _tasks.remove(rec.id);
+          if (task != null) await _fileDownloader.cancelTaskWithId(rec.id);
+          continue;
+        }
+        if (task != null) {
+          _desktopSlots.adopt(rec.id);
+        } else if (rec.autoResumePending) {
+          await _storeRestoredState(
+            rec.copyWith(status: DownloadStatus.queued),
+          );
+        } else if (await _hasSavedHlsProgress(rec)) {
+          if (_disposed) return;
+          // An HLS download the app closed on, with its progress saved:
+          // it carries on by itself from the saved segment after start-up.
+          await _storeRestoredState(
+            rec.copyWith(
+              status: DownloadStatus.queued,
+              autoResumePending: true,
+              retryAt: () => null,
+              retryHost: () => null,
+            ),
+          );
+          final restored = _records[rec.id];
+          if (restored != null &&
+              restored.storageKey == rec.storageKey &&
+              restored.status == DownloadStatus.queued) {
+            _restoredPendingRetries[rec.id] = rec.storageKey;
+          }
+        } else {
+          // Preserve partial bytes and metadata. Resume resolves a fresh URL
+          // rather than leaving a dead process's job permanently downloading.
+          await _storeRestoredState(
+            rec.copyWith(status: DownloadStatus.paused),
+          );
+        }
+      }
+      if (!_disposed) notifyListeners();
+    } catch (error) {
+      // Fail closed: an unknown native inventory cannot safely admit more work.
+      _desktopRecoveryError = error;
+    }
+  }
+
+  /// Windows: true when [rec] has a resumable HLS partial (and its progress
+  /// file) on disk.
+  Future<bool> _hasSavedHlsProgress(DownloadRecord rec) async {
+    if (!Platform.isWindows || rec.isTorrent || rec.filePath != null) {
+      return false;
+    }
+    final output = _windowsHlsOutputOrNull(rec);
+    return output != null && await HlsDownloader.hasResumableProgress(output);
+  }
+
+  /// Startup completion includes durable state/compaction, not just labels.
+  /// Newer user pause/cancel/recreate intent wins during recovery awaits.
+  Future<void> _storeRestoredState(DownloadRecord record) async {
+    if (!_ownsDownloadGeneration(record) ||
+        _records[record.id]?.status == DownloadStatus.paused) {
+      return;
+    }
+    _records[record.id] = record;
+    await _box.put(record.id, record.toMap());
+  }
+
+  /// Snapshot barrier for background restart cleanup without blocking Home.
+  @visibleForTesting
+  Future<void> get retiredCleanupCompleted => _retiredCleanup;
+
+  /// Subtitle files share the video's name but are not video data.
+  static const Set<String> _sidecarExtensions = {
+    '.vtt',
+    '.srt',
+    '.ass',
+    '.ssa',
+    '.sub',
+  };
+
+  /// Windows start-up: removes downloads that failed (or turned out
+  /// unsupported) in an earlier session and left nothing behind. The queue
+  /// panel showed the reason when it happened; afterwards such an entry could
+  /// never turn into a file, yet it stayed for ever. Entries with any file or
+  /// partial data stay until the user retries or deletes them.
+  Future<void> _removeDeadRecords() async {
+    var removed = 0;
+    // One directory listing per show folder, however many entries it has.
+    final listings = <String, List<FileSystemEntity>>{};
+    // Oldest first, so the entry kept for a show (below) is its newest.
+    final records = _records.values.toList()
+      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    for (final rec in records) {
+      if (_disposed) return;
+      try {
+        if (!await _isDeadRecord(rec, listings)) continue;
+        // A retry or a new download started during the disk checks wins.
+        if (_disposed || !identical(_records[rec.id], rec)) continue;
+        if (_isLastLinkToShow(rec)) {
+          _keptForShowLink[rec.id] = rec.storageKey;
+          continue;
+        }
+        await delete(rec);
+        removed++;
+      } catch (_) {
+        // Unsure, or it could not be removed: keep it, the next start retries.
+      }
+    }
+    if (removed > 0) {
+      AppLogger.instance.log(
+        '[download] removed $removed failed download(s) with nothing saved',
+      );
+    }
+  }
+
+  /// Dead entries kept only because they hold a show's page link, ids and
+  /// cover (record id to storage key). Never listed or retried; a new
+  /// download of that episode gets a new storage key and is listed as usual.
+  final Map<String, String> _keptForShowLink = {};
+
+  bool _isHiddenLink(DownloadRecord r) =>
+      (r.status == DownloadStatus.failed ||
+          r.status == DownloadStatus.unsupported) &&
+      _keptForShowLink.containsKey(r.id) &&
+      _keptForShowLink[r.id] == r.storageKey;
+
+  /// Files found on disk know no provider: the library opens their show page
+  /// through a provider entry with the same title. True when [rec] is the
+  /// last such entry of its show.
+  bool _isLastLinkToShow(DownloadRecord rec) {
+    final title = downloadTitleKey(rec.showTitle);
+    if (title.isEmpty) return false;
+    var foundOnDisk = false;
+    for (final other in _records.values) {
+      if (other.id == rec.id) continue;
+      final sameShow =
+          other.sourceId == rec.sourceId && other.showId == rec.showId;
+      if (!other.recoveredFromDisk) {
+        if (sameShow) return false;
+      } else if (sameShow || downloadTitleKey(other.showTitle) == title) {
+        foundOnDisk = true;
+      }
+    }
+    return foundOnDisk;
+  }
+
+  /// True only for a failed / unsupported entry with no file, no partial
+  /// bytes, nothing to resume and no work in progress. Anything that cannot
+  /// be checked (a drive that is not plugged in) counts as alive.
+  Future<bool> _isDeadRecord(
+    DownloadRecord rec,
+    Map<String, List<FileSystemEntity>> listings,
+  ) async {
+    if (rec.status != DownloadStatus.failed &&
+        rec.status != DownloadStatus.unsupported) {
+      return false;
+    }
+    if (rec.recoveredFromDisk || rec.pendingAudioFinalization) return false;
+    // A finished download whose file is away (drive unplugged, folder moved)
+    // is not a failed download: it comes back when the file does.
+    if (rec.isSavedFileAway) return false;
+    // An interrupted audio swap left a journal beside the file.
+    if (rec.error == FileAudioTransaction.recoveryError) return false;
+    if (_tasks.containsKey(rec.id) ||
+        _finalizationDone.containsKey(rec.id) ||
+        _foregroundHlsAttempts.containsKey(rec.id) ||
+        _sweeping.contains(rec.id) ||
+        torrentProgress.containsKey(rec.id)) {
+      return false;
+    }
+    if (rec.isTorrent && rec.progress > 0) return false;
+    // Media this entry owns, including older copies a retry kept.
+    for (final path in {
+      rec.filePath,
+      rec.supersededPath,
+      ...rec.retainedMediaPaths,
+    }.whereType<String>()) {
+      if (path.isEmpty) continue;
+      if (isUriPath(path)) return false;
+      if (await File(path).exists()) return false;
+      if (!await _storageAccessible(path)) return false;
+      // An interrupted audio swap holds the video in a hidden folder beside
+      // its place, also after a Retry cleared the message that said so.
+      final siblings = await _cachedListing(p.dirname(path), listings);
+      for (final entity in siblings) {
+        if (entity is Directory &&
+            p.basename(entity.path).startsWith('.zangetsu-file-audio-') &&
+            await File(
+              p.join(entity.path, FileAudioTransaction.journalName),
+            ).exists()) {
+          return false;
+        }
+      }
+    }
+    // Partial HLS / DASH files sit in the show folder under the entry's name.
+    String? folder;
+    try {
+      folder = _windowsVideoDirectory(rec);
+    } catch (_) {
+      // No download folder was ever chosen: nothing can be in it.
+    }
+    if (folder != null) {
+      if (!await _storageAccessible(p.join(folder, 'x'))) return false;
+      final listing = await _cachedListing(folder, listings);
+      final stem = _mediaFileStem(rec);
+      for (final entity in listing) {
+        final name = p.basename(entity.path);
+        if (!name.startsWith(stem) ||
+            _sidecarExtensions.contains(p.extension(name).toLowerCase())) {
+          continue;
+        }
+        if (entity is! File || await entity.length() > 0) return false;
+      }
+    }
+    // Partial direct-file bytes are kept by the native downloader in its own
+    // temp folder; its resume data tells whether there are any. (The HLS job
+    // journal is not asked: Windows never writes one.) An unsupported
+    // episode has no Retry, so leftover bytes of an older try are no use.
+    if (rec.status == DownloadStatus.unsupported) return true;
+    bool partial;
+    try {
+      partial = await _fileDownloader
+          .taskCanResume(
+            DownloadTask(taskId: rec.id, url: 'https://localhost/'),
+          )
+          .timeout(const Duration(seconds: 5));
+    } catch (_) {
+      partial = rec.progress > 0;
+    }
+    return !partial;
+  }
+
+  /// The entries of [folder], read once per clean-up; none when it is gone.
+  static Future<List<FileSystemEntity>> _cachedListing(
+    String folder,
+    Map<String, List<FileSystemEntity>> listings,
+  ) async {
+    final cached = listings[folder];
+    if (cached != null) return cached;
+    final dir = Directory(folder);
+    return listings[folder] = await dir.exists()
+        ? await dir.list(followLinks: false).toList()
+        : const [];
+  }
+
+  /// Retire only files backed by an intact saved replacement. Keep metadata
+  /// for unavailable volumes so an unplugged drive is never mistaken for a
+  /// successful deletion. One record is processed at a time.
+  Future<void> _cleanupRetiredCompletedFiles() async {
+    for (final saved in _records.values.toList()) {
+      if (_disposed) return;
+      if (saved.status != DownloadStatus.done ||
+          saved.retainedMediaPaths.isEmpty ||
+          saved.filePath == null ||
+          isUriPath(saved.filePath!)) {
+        continue;
+      }
+      if (_finalizationDone.containsKey(saved.id)) continue;
+      final finished = Completer<void>();
+      _finalizationDone[saved.id] = finished;
+      try {
+        if (!await _replacementIntact(saved)) continue;
+        for (final previous in saved.retainedMediaPaths) {
+          if (_disposed || !await _replacementIntact(saved)) break;
+          if (!isUriPath(previous) &&
+              !_sameMediaPath(previous, saved.filePath!)) {
+            await _deleteUnreferencedMedia(previous, saved.id);
+          }
+        }
+        if (_disposed || !await _replacementIntact(saved)) continue;
+        final remaining = <String>[];
+        for (final previous in saved.retainedMediaPaths) {
+          if (_sameMediaPath(previous, saved.filePath!)) continue;
+          if (isUriPath(previous) ||
+              await File(previous).exists() ||
+              !await _storageAccessible(previous)) {
+            remaining.add(previous);
+          }
+        }
+        if (remaining.length != saved.retainedMediaPaths.length) {
+          await _commitCompletedRecord(
+            saved.copyWith(retainedMediaPaths: remaining),
+          );
+        }
+      } catch (_) {
+        // The current download remains valid; retained pointers allow another
+        // attempt after storage/permissions recover on a subsequent launch.
+      } finally {
+        _finalizationDone.remove(saved.id);
+        finished.complete();
+      }
+    }
+    if (!_disposed) notifyListeners();
+  }
+
+  /// Validate current ownership and saved size before removing any older copy.
+  Future<bool> _replacementIntact(DownloadRecord saved) async {
+    final current = _records[saved.id];
+    if (_disposed ||
+        current?.status != DownloadStatus.done ||
+        current?.filePath != saved.filePath) {
+      return false;
+    }
+    try {
+      final file = File(saved.filePath!);
+      if (!await file.exists()) return false;
+      final size = await file.length();
+      return size > 0 && (saved.bytesTotal <= 0 || size == saved.bytesTotal);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// A missing file is definitive only when an ancestor on its volume exists.
+  static Future<bool> _storageAccessible(String path) async {
+    var directory = File(path).absolute.parent;
+    try {
+      while (true) {
+        if (await directory.exists()) return true;
+        final parent = directory.parent;
+        if (parent.path == directory.path) return false;
+        directory = parent;
+      }
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Windows spelling/case differences do not create a second media file.
+  static bool _sameMediaPath(String first, String second) {
+    if (!Platform.isWindows || isUriPath(first) || isUriPath(second)) {
+      return first == second;
+    }
+    return p.windows.normalize(p.windows.absolute(first)).toLowerCase() ==
+        p.windows.normalize(p.windows.absolute(second)).toLowerCase();
+  }
+
+  /// New jobs and resume share the startup inventory barrier.
+  Future<void> _awaitDesktopRecovery() async {
+    await _desktopRecovery;
+    if (_desktopRecoveryError != null) {
+      throw StateError(
+        'Could not inspect existing downloads. Restart the app before starting more.',
+      );
+    }
   }
 
   /// Existing completed downloads predate public subtitle copies. Publish them
@@ -185,16 +762,24 @@ class DownloadManager extends ChangeNotifier {
   void setParallel(int n) {
     final v = n.clamp(DownloadPrefs.parallelMin, DownloadPrefs.parallelMax);
     _mp4Queue.maxConcurrent = v;
+    if (Platform.isWindows) _desktopSlots.limit = v;
     // The queue only re-checks on add/finish, not when maxConcurrent changes —
     // so nudge it, otherwise raising the limit wouldn't start queued downloads
     // until the current one ended.
     _mp4Queue.advanceQueue();
-    if (!isAppleTv) {
+    if (forwardsParallelToBackgroundService) {
       try {
         DownloadService.instance.invoke('setParallel', {'n': v});
       } catch (_) {}
     }
   }
+
+  /// Whether [setParallel] mirrors the limit into the Android foreground
+  /// download service. Windows (desktop slots above) and tvOS have no such
+  /// service, so the call is skipped there instead of poking a missing plugin.
+  @visibleForTesting
+  static bool get forwardsParallelToBackgroundService =>
+      !isAppleTv && !Platform.isWindows;
 
   /// Apply progress/done/failed events the foreground-service isolate sends for
   /// HLS downloads (live, while the UI is alive).
@@ -210,8 +795,10 @@ class DownloadManager extends ChangeNotifier {
         final rec = _records[id];
         if (rec == null || rec.status == DownloadStatus.canceled) return;
         final p = (d?['progress'] as num?)?.toDouble() ?? rec.progress;
-        _put(rec.copyWith(status: DownloadStatus.downloading, progress: p));
-        notifyListeners();
+        // Same as before on phone (save + notify); throttled on Windows.
+        _putProgress(
+          rec.copyWith(status: DownloadStatus.downloading, progress: p),
+        );
       });
       svc.on('done').listen((d) async {
         final id = d?['id'] as String?;
@@ -281,12 +868,17 @@ class DownloadManager extends ChangeNotifier {
         case 'paused':
           _put(rec.copyWith(status: DownloadStatus.paused));
         default: // queued | downloading | copying — keep it "downloading"
-          _put(
+          // Progress tick: throttled save/notify on Windows (dl-7).
+          _putProgress(
             rec.copyWith(
               status: DownloadStatus.downloading,
               progress: p.progress,
             ),
+            bytesPerSecond: p.downSpeedBps > 0
+                ? p.downSpeedBps.toDouble()
+                : null,
           );
+          return;
       }
       notifyListeners();
     });
@@ -389,7 +981,19 @@ class DownloadManager extends ChangeNotifier {
 
   @override
   void dispose() {
+    // Save any progress that so far only lived in memory (dl-7).
+    _flushUnsavedProgress();
+    if (_registeredBackgroundWork) {
+      DesktopBackgroundWork.unregister('downloads');
+      DesktopDownloadSignals.instance.detachVideos(this);
+      _registeredBackgroundWork = false;
+    }
+    _disposed = true;
+    BootConnectivity.instance.removeReconnectTask(wakeNetworkWaiters);
+    _retryScheduler.dispose();
+    _pendingAudioResumes.clear();
     _sub?.cancel();
+    _desktopTransferSlots?.close();
     super.dispose();
   }
 
@@ -398,6 +1002,112 @@ class DownloadManager extends ChangeNotifier {
   List<DownloadRecord> get all =>
       _records.values.toList()
         ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+
+  /// Statuses that are moving data or waiting for a slot right now (paused
+  /// and failed are not "running" for the close guard or the taskbar).
+  static const Set<DownloadStatus> runningStatuses = {
+    DownloadStatus.queued,
+    DownloadStatus.resolving,
+    DownloadStatus.downloading,
+    DownloadStatus.finalizing,
+  };
+
+  /// How many downloads are running or waiting for a slot (close guard,
+  /// tray and taskbar use this).
+  int get activeCount =>
+      _records.values.where((r) => runningStatuses.contains(r.status)).length;
+
+  /// Everything the Windows queue panel lists (dl-5): running, waiting,
+  /// paused, failed and unsupported items, in queue order (oldest first) with
+  /// the item currently transferring before the ones still waiting. The
+  /// library hides failed ones, so this is where they are told and cleared.
+  List<DownloadRecord> get queueItems {
+    int rank(DownloadRecord r) => switch (r.status) {
+      DownloadStatus.downloading || DownloadStatus.finalizing => 0,
+      DownloadStatus.resolving => 1,
+      DownloadStatus.queued => 2,
+      DownloadStatus.paused => 3,
+      _ => 4,
+    };
+    final items =
+        _records.values
+            .where(
+              (r) =>
+                  runningStatuses.contains(r.status) ||
+                  r.status == DownloadStatus.paused ||
+                  ((r.status == DownloadStatus.failed ||
+                          r.status == DownloadStatus.unsupported) &&
+                      !_isHiddenLink(r)),
+            )
+            .toList()
+          ..sort((a, b) {
+            final byRank = rank(a).compareTo(rank(b));
+            if (byRank != 0) return byRank;
+            // Waiting items follow the real slot order when one is known.
+            final slotA = _desktopTransferSlots?.waitingPosition(a.id) ?? -1;
+            final slotB = _desktopTransferSlots?.waitingPosition(b.id) ?? -1;
+            if (slotA != slotB && slotA >= 0 && slotB >= 0) {
+              return slotA.compareTo(slotB);
+            }
+            if (slotA >= 0 && slotB < 0) return -1;
+            if (slotB >= 0 && slotA < 0) return 1;
+            return a.createdAt.compareTo(b.createdAt);
+          });
+    return items;
+  }
+
+  /// Live progress of one record (dl-7). A tile listens to this instead of
+  /// the whole manager so only that tile repaints on each tick.
+  ValueListenable<double> progressListenable(String id) =>
+      _progressNotifiers.putIfAbsent(
+        id,
+        () => ValueNotifier<double>(_records[id]?.progress ?? 0),
+      );
+
+  /// Speed and time left of a downloading record, or null when unknown.
+  DownloadLiveStats? liveStatsOf(String id) {
+    final record = _records[id];
+    if (record == null || record.status != DownloadStatus.downloading) {
+      return null;
+    }
+    // Torrents report their own rate through the torrent engine.
+    final torrent = torrentProgress[id];
+    if (record.isTorrent && torrent != null && torrent.downSpeedBps > 0) {
+      final remaining = record.bytesTotal > 0
+          ? (1 - record.progress).clamp(0.0, 1.0) * record.bytesTotal
+          : null;
+      return DownloadLiveStats(
+        bytesPerSecond: torrent.downSpeedBps.toDouble(),
+        timeLeft: remaining == null
+            ? null
+            : Duration(seconds: (remaining / torrent.downSpeedBps).round()),
+      );
+    }
+    return _liveStats[id];
+  }
+
+  /// Current transfer rate in bytes per second, or null when unknown.
+  double? speedOf(String id) => liveStatsOf(id)?.bytesPerSecond;
+
+  /// Estimated time until the record finishes, or null when unknown.
+  Duration? timeLeftOf(String id) => liveStatsOf(id)?.timeLeft;
+
+  /// Whether 'Download next' (dl-6) can promote [r]: it is waiting for a
+  /// slot, or is paused / failed / resolving and would join the queue.
+  bool canMoveToFront(DownloadRecord r) {
+    if (!Platform.isWindows || r.isTorrent) return false;
+    final current = _records[r.id] ?? r;
+    if (_desktopTransferSlots?.isWaiting(r.id) == true) {
+      // Already first in line: nothing to move.
+      return _desktopTransferSlots!.waitingPosition(r.id) != 0;
+    }
+    return const {
+      DownloadStatus.queued,
+      DownloadStatus.resolving,
+      DownloadStatus.paused,
+      DownloadStatus.failed,
+    }.contains(current.status);
+  }
 
   /// Records grouped by show, newest show first.
   Map<String, List<DownloadRecord>> get byShow {
@@ -408,8 +1118,12 @@ class DownloadManager extends ChangeNotifier {
     return out;
   }
 
-  DownloadRecord? recordFor(String sourceId, String showId, String episodeId) =>
-      _records[_idFor(sourceId, showId, episodeId)];
+  DownloadRecord? recordFor(
+    String sourceId,
+    String showId,
+    String episodeId, {
+    String? category,
+  }) => _records[_idFor(sourceId, showId, episodeId, category: category)];
 
   /// Finished download for this episode, even when today's title page differs
   /// from the one it was saved from (source page then, metadata page now —
@@ -423,21 +1137,40 @@ class DownloadManager extends ChangeNotifier {
     required String episodeId,
     String? episodeUrl,
     int? malId,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    int? anilistId,
     double? episodeNumber,
+    String? category,
+    int? season,
   }) async {
-    final exact = recordFor(sourceId, showId, episodeId);
-    if (exact != null && await filePresent(exact)) return exact;
+    final exact = recordFor(sourceId, showId, episodeId, category: category);
+    bool eligible(DownloadRecord r) =>
+        !Platform.isWindows ||
+        ((category == null || r.category == category) &&
+            (season == null || r.season == season));
+    if (exact != null && eligible(exact) && await filePresent(exact))
+      return exact;
     final candidates = <DownloadRecord>[];
     for (final r in _records.values) {
-      if (r.status != DownloadStatus.done) continue;
+      if (r.status != DownloadStatus.done || !eligible(r)) continue;
       if (episodeUrl != null &&
           episodeUrl.isNotEmpty &&
           r.episodeUrl == episodeUrl) {
         candidates.insert(0, r);
         continue;
       }
-      if (malId != null &&
-          r.malId == malId &&
+      // Same catalogue title (any id we saved) plus the same episode number.
+      // TMDB ids live in separate movie and series namespaces, and a series id
+      // is shared by every season, so those also need a matching kind/season.
+      final sameTitle =
+          (malId != null && r.malId == malId) ||
+          (anilistId != null && r.anilistId == anilistId) ||
+          (tmdbId != null &&
+              r.tmdbId == tmdbId &&
+              r.tmdbIsTv == tmdbIsTv &&
+              (season == null || r.season == null || r.season == season));
+      if (sameTitle &&
           episodeNumber != null &&
           r.episodeNumber == episodeNumber) {
         candidates.add(r);
@@ -447,6 +1180,279 @@ class DownloadManager extends ChangeNotifier {
       if (await filePresent(r)) return r;
     }
     return null;
+  }
+
+  /// Join concurrent startup/Downloads refresh requests; existing media and
+  /// app data never move. Missing metadata is recreated as explicit local files.
+  Future<void> recoverLocalFiles() {
+    if (!Platform.isWindows || _disposed) return Future.value();
+    return _localRecoveryWork ??= _recoverLocalFiles().whenComplete(() {
+      _localRecoveryWork = null;
+    });
+  }
+
+  Future<void>? _thumbnailWork;
+
+  /// Writes each show folder's portable manifest and PNG artwork. Frames for
+  /// episodes without a thumbnail URL come from the bundled ffmpeg extractor.
+  late final DownloadFolderSync _folderSync = DownloadFolderSync(
+    extractFrame: (mediaPath) async => DesktopDownloadThumbnails().ensure(
+      mediaPath,
+      await writableAppSubdir('download-thumbnails'),
+    ),
+    // AniSkip times saved with each episode (also kept on this PC) so intros
+    // and outros can be skipped when playing the download offline.
+    lookupSkips: GetIt.I.isRegistered<SkipService>()
+        ? (title, episode) => GetIt.I<SkipService>().skipTimes(
+            title: title,
+            episode: episode,
+            // 0 = any length: the file's duration isn't known at this point.
+            duration: Duration.zero,
+          )
+        : null,
+    // Stop between steps once disposed, so no folder file is opened after
+    // shutdown (an open handle would keep the download folder locked).
+    canceled: () => _disposed,
+  );
+  bool _manifestUpgradeStarted = false;
+
+  /// Records a finished download in its folder's manifest. Fire-and-forget:
+  /// metadata problems are logged inside [DownloadFolderSync] and never affect
+  /// the download itself.
+  void _syncFolder(DownloadRecord record) {
+    if (!Platform.isWindows || _disposed) return;
+    // Once the manifest exists, also copy the show's saved details (all
+    // episodes, Details fields, cover/banner/thumbnail images) into the
+    // folder, so the downloaded show page looks like the online one offline,
+    // even for downloads queued from the player or in bulk. Never throws.
+    unawaited(
+      _folderSync
+          .onDone(record)
+          .then(
+            (_) => DownloadedShowDetails.mirrorSavedFor(
+              record,
+              all,
+              // Disposed: do not open the details box or folder files.
+              canceled: () => _disposed,
+            ),
+          ),
+    );
+  }
+
+  /// Once per session, adds manifests to downloads made before they existed.
+  /// Waits for startup to settle, runs one folder at a time, and only ever
+  /// adds files inside `.zangetsu`.
+  Future<void> _upgradeFolderManifests() async {
+    if (_manifestUpgradeStarted || _disposed || !Platform.isWindows) return;
+    _manifestUpgradeStarted = true;
+    await Future<void>.delayed(const Duration(seconds: 20));
+    if (_disposed) return;
+    final added = await _folderSync.upgradeExisting(
+      _records.values.where((r) => r.status == DownloadStatus.done).toList(),
+    );
+    if (added > 0) {
+      AppLogger.instance.log(
+        '[folder-manifest] added $added existing downloads',
+      );
+    }
+  }
+
+  /// Backfill one saved video at a time without blocking startup or transfers.
+  /// A deleted/replaced record always wins over work that finishes later.
+  Future<void> _backfillRecoveredThumbnails() async {
+    final cache = await writableAppSubdir('download-thumbnails');
+    final extractor = DesktopDownloadThumbnails();
+    for (final snapshot in _records.values.toList()) {
+      if (_disposed) return;
+      if (!snapshot.recoveredFromDisk ||
+          snapshot.status != DownloadStatus.done ||
+          snapshot.filePath == null) {
+        continue;
+      }
+      final existing = Uri.tryParse(snapshot.episodeThumbnail ?? '');
+      if (existing?.scheme == 'file' && await File.fromUri(existing!).exists())
+        continue;
+      if (snapshot.episodeThumbnail?.isNotEmpty == true &&
+          existing?.scheme != 'file')
+        continue;
+      final artwork = await extractor.ensure(snapshot.filePath!, cache);
+      if (_disposed) return;
+      final current = _records[snapshot.id];
+      if (artwork == null ||
+          current == null ||
+          current.filePath != snapshot.filePath ||
+          current.storageKey != snapshot.storageKey ||
+          current.status != DownloadStatus.done) {
+        continue;
+      }
+      final updated = current.copyWith(episodeThumbnail: artwork);
+      await _box.put(updated.id, updated.toMap());
+      if (_disposed || !identical(_records[updated.id], current)) continue;
+      _records[updated.id] = updated;
+      notifyListeners();
+    }
+  }
+
+  /// Publish recovered entries durably before notifying the Windows library.
+  Future<void> _recoverLocalFiles() async {
+    try {
+      final found = await _localRecovery.discover(
+        roots: [
+          if (_downloadPrefs.locationUri != null) _downloadPrefs.locationUri!,
+          if (DesktopStorage.downloadsRoot != null)
+            DesktopStorage.downloadsRoot!,
+          if (DesktopStorage.previousRoot != null) DesktopStorage.previousRoot!,
+        ],
+        known: _records.values.toList(),
+        canceled: () => _disposed,
+      );
+      for (final record in found) {
+        if (_disposed) return;
+        if (_records.containsKey(record.id)) continue;
+        // Another transfer may have claimed this path while FFprobe was active.
+        if (_records.values.any(
+          (r) =>
+              r.filePath != null &&
+              _sameMediaPath(r.filePath!, record.filePath!),
+        )) {
+          continue;
+        }
+        await _box.put(record.id, record.toMap());
+        if (_disposed) return;
+        _records[record.id] = record;
+      }
+      if (!_disposed && found.isNotEmpty) notifyListeners();
+      // Folders that carry a manifest are recognised by it, not by file name:
+      // a show folder moved back under Videos rejoins the library with its
+      // real identity and artwork. One level deep, inside the known roots only.
+      for (final root in {
+        if (_downloadPrefs.locationUri != null) _downloadPrefs.locationUri!,
+        if (DesktopStorage.downloadsRoot != null) DesktopStorage.downloadsRoot!,
+        if (DesktopStorage.previousRoot != null) DesktopStorage.previousRoot!,
+      }) {
+        final videos = Directory(p.join(root, 'Videos'));
+        if (_disposed || !await videos.exists()) continue;
+        await scanFolderForDownloads(
+          videos.path,
+          downloadRoot: root,
+          maxDepth: 1,
+        );
+      }
+      if (!_disposed && _thumbnailWork == null) {
+        _thumbnailWork = _backfillRecoveredThumbnails()
+            .catchError((Object _) {
+              // Artwork is optional; a later library refresh can retry safely.
+            })
+            .whenComplete(() => _thumbnailWork = null);
+        unawaited(_thumbnailWork);
+      }
+      unawaited(_upgradeFolderManifests());
+    } catch (_) {
+      // Recovery failure leaves existing records/files intact and can be retried.
+      AppLogger.instance.log(
+        '[download] Local media recovery could not finish',
+        level: 'W',
+      );
+    }
+  }
+
+  /// Looks under [scanPath] for show folders that carry a Zangetsu manifest and
+  /// brings them into the library.
+  ///
+  /// - An episode the library has never seen is added with the identity stored
+  ///   in its manifest (title, ids, language, artwork, subtitles).
+  /// - An episode the library knows under an old path, whose old file is gone,
+  ///   is re-linked to its new location, so moving a folder keeps its record.
+  /// - A file already in the library, or a copy of one whose original still
+  ///   exists, is left alone.
+  ///
+  /// Reads and adds records only: it never moves, renames or deletes media.
+  /// [downloadRoot] is recorded on new records (defaults to [scanPath]).
+  Future<FolderScanResult> scanFolderForDownloads(
+    String scanPath, {
+    String? downloadRoot,
+    int maxDepth = 3,
+  }) async {
+    if (!Platform.isWindows || _disposed) return const FolderScanResult();
+    final root = downloadRoot ?? scanPath;
+    final shows = await FolderManifestScanner().scan(
+      Directory(scanPath),
+      maxDepth: maxDepth,
+      canceled: () => _disposed,
+    );
+    var added = 0, relinked = 0, skipped = 0;
+    for (final show in shows) {
+      final fresh = await FolderManifestScanner.recordsFor(
+        show,
+        downloadRoot: root,
+      );
+      for (final record in fresh) {
+        if (_disposed) break;
+        final path = record.filePath!;
+        final same = _records.values
+            .where(
+              (r) => r.filePath != null && _sameMediaPath(r.filePath!, path),
+            )
+            .firstOrNull;
+        if (same != null) {
+          // Filename-based recovery may have added a bare record for this very
+          // file. When the manifest knows the real provider, it is the better
+          // description, so it takes that record's place.
+          if (same.recoveredFromDisk && !record.recoveredFromDisk) {
+            await _box.delete(same.id);
+            _records.remove(same.id);
+            await _box.put(record.id, record.toMap());
+            _records[record.id] = record;
+            added++;
+          } else {
+            skipped++;
+          }
+          continue;
+        }
+        final key = record.id.split(':').last;
+        final known = _records.values
+            .where(
+              (r) =>
+                  r.status == DownloadStatus.done &&
+                  r.filePath != null &&
+                  FolderManifestScanner.keyOf(r) == key,
+            )
+            .firstOrNull;
+        if (known != null) {
+          // Same download, different place. Only follow it when the old file is
+          // really gone, so a copy never steals a record from its original.
+          if (await File(known.filePath!).exists()) {
+            skipped++;
+            continue;
+          }
+          final moved = known.copyWith(
+            filePath: () => path,
+            downloadRoot: root,
+            subtitles: record.subtitles.isEmpty ? null : record.subtitles,
+            episodeThumbnail: record.episodeThumbnail ?? known.episodeThumbnail,
+          );
+          await _box.put(moved.id, moved.toMap());
+          _records[moved.id] = moved;
+          relinked++;
+          continue;
+        }
+        if (_records.containsKey(record.id)) {
+          skipped++;
+          continue;
+        }
+        await _box.put(record.id, record.toMap());
+        _records[record.id] = record;
+        added++;
+      }
+    }
+    final result = FolderScanResult(
+      folders: shows.length,
+      added: added,
+      relinked: relinked,
+      skipped: skipped,
+    );
+    if (result.changedLibrary && !_disposed) notifyListeners();
+    return result;
   }
 
   /// True when a finished record's file is still on disk and playable.
@@ -467,6 +1473,48 @@ class DownloadManager extends ChangeNotifier {
 
   // ── Enqueue ───────────────────────────────────────────────────────────────
 
+  /// Real sources the viewer picked links from, by record id, waiting for the
+  /// next enqueue of that record to store them (see
+  /// [DownloadRecord.resolveSourceId]). Kept off the enqueue signatures so
+  /// existing overrides of those methods stay valid.
+  final Map<String, String> _resolveSourceHints = {};
+
+  /// Windows download dialogs call this right before enqueueing a catalogue
+  /// (`zm`) episode whose links came from [resolveSourceId], so later
+  /// re-resolves ask that same source (falling back to the sweep).
+  void hintResolveSource({
+    required String sourceId,
+    required String showId,
+    required Iterable<String> episodeIds,
+    required String category,
+    required String resolveSourceId,
+  }) {
+    for (final id in episodeIds) {
+      _resolveSourceHints[_idFor(sourceId, showId, id, category: category)] =
+          resolveSourceId;
+    }
+  }
+
+  /// Record ids whose next [enqueueSource] is a link the viewer picked by
+  /// hand (Windows single-episode dialog): its saved server preference is
+  /// marked exact, so retries stay on that server and never sweep to another
+  /// source. A hint like [_resolveSourceHints], so overrides of
+  /// [enqueueSource] keep compiling.
+  final Set<String> _pinnedServerHints = {};
+
+  /// Windows single download dialog: pin the next [enqueueSource] of this
+  /// episode to the exact server (and SUB/DUB kind) the viewer picked.
+  void hintPinnedServer({
+    required String sourceId,
+    required String showId,
+    required String episodeId,
+    required String category,
+  }) {
+    _pinnedServerHints.add(
+      _idFor(sourceId, showId, episodeId, category: category),
+    );
+  }
+
   /// Persist a [DownloadStatus.queued] record for each episode, then resolve +
   /// enqueue them in the background. Safe to not await.
   Future<void> enqueueEpisodes({
@@ -479,9 +1527,15 @@ class DownloadManager extends ChangeNotifier {
     required String category,
     required String quality,
     required List<Episode> episodes,
+    DownloadServerPreference? serverPreference,
     required int nowMs,
     int? malId,
+    int? anilistId,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    String? imdbId,
   }) async {
+    if (!await _downloadPrefs.ensureDesktopFolder()) return;
     // Best-effort notification permission so the progress notification shows.
     try {
       await Permission.notification.request();
@@ -498,12 +1552,20 @@ class DownloadManager extends ChangeNotifier {
       });
     final pending = <DownloadRecord>[];
     for (final ep in ordered) {
-      final id = _idFor(sourceId, showId, ep.id);
+      final id = _idFor(sourceId, showId, ep.id, category: category);
+      // Taken up front so a skipped (active/done) episode cannot leave a stale
+      // source hint behind for a later, unrelated enqueue of the same id.
+      final resolveHint = _resolveSourceHints.remove(id);
+      if (_records[id]?.isActive == true) continue;
+      if (Platform.isWindows && !await _waitForFinalization(id)) return;
       final existing = _records[id];
       // Skip ones already done or in flight.
-      if (existing != null &&
-          (existing.status == DownloadStatus.done || existing.isActive)) {
-        continue;
+      if (existing?.isActive == true) continue;
+      if (existing?.status == DownloadStatus.done) {
+        final present = !Platform.isWindows || await filePresent(existing!);
+        if (_disposed) return;
+        // A file stat must not revive a user-canceled/replaced generation.
+        if (!identical(_records[id], existing) || present) continue;
       }
       final rec = DownloadRecord(
         id: id,
@@ -516,20 +1578,46 @@ class DownloadManager extends ChangeNotifier {
         episodeId: ep.id,
         episodeUrl: ep.url,
         episodeNumber: ep.number,
+        season: ep.season,
         episodeSeason: ep.season,
+        storageKey: Platform.isWindows ? _randomNonce() : '',
+        downloadRoot: Platform.isWindows ? _downloadPrefs.locationUri : null,
         episodeTitle: ep.title,
         episodeThumbnail: ep.thumbnail,
         category: category,
         quality: quality,
+        serverPreference: serverPreference,
+        resolveSourceId: resolveHint,
+        retainedMediaPaths: {
+          ...?existing?.retainedMediaPaths,
+          if (existing?.filePath != null) existing!.filePath!,
+          if (existing?.supersededPath != null) existing!.supersededPath!,
+        }.toList(),
         malId: malId,
+        anilistId: anilistId,
+        tmdbId: tmdbId,
+        tmdbIsTv: tmdbIsTv,
+        imdbId: imdbId,
+        autoResumePending: Platform.isWindows,
         createdAt: nowMs,
       );
       _put(rec);
       pending.add(rec);
     }
+    if (Platform.isWindows) {
+      await _box.putAll({
+        for (final record in pending) record.id: record.toMap(),
+      });
+    }
+    if (_disposed) return;
     notifyListeners();
 
     for (final rec in pending) {
+      if (Platform.isWindows &&
+          (!_ownsDownloadGeneration(rec) ||
+              _records[rec.id]?.status == DownloadStatus.paused)) {
+        continue;
+      }
       await _resolveAndEnqueue(rec);
     }
   }
@@ -550,8 +1638,18 @@ class DownloadManager extends ChangeNotifier {
     required String qualityLabel,
     required int nowMs,
     int? malId,
+    int? anilistId,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    String? imdbId,
     List<VideoSource> fallbacks = const [],
   }) async {
+    // Hints are consumed up front so an early return below cannot leave them
+    // to a later, unrelated enqueue of the same episode.
+    final hintId = _idFor(sourceId, showId, episode.id, category: category);
+    final pinned = _pinnedServerHints.remove(hintId);
+    final resolveHint = _resolveSourceHints.remove(hintId);
+    if (!await _downloadPrefs.ensureDesktopFolder()) return;
     try {
       await Permission.notification.request();
     } catch (_) {}
@@ -559,12 +1657,26 @@ class DownloadManager extends ChangeNotifier {
     // in memory it was lost if the app died mid re-download, stranding the old
     // file for good. A previous supersededPath wins if this record never got a
     // file of its own (a re-download that failed, then was retried).
-    final replacing = _records[_idFor(sourceId, showId, episode.id)];
+    if (_records[_idFor(sourceId, showId, episode.id, category: category)]
+            ?.isActive ==
+        true) {
+      return;
+    }
+    if (Platform.isWindows &&
+        !await _waitForFinalization(
+          _idFor(sourceId, showId, episode.id, category: category),
+        )) {
+      return;
+    }
+    final replacing =
+        _records[_idFor(sourceId, showId, episode.id, category: category)];
+    // Repeated bulk/server clicks must not replace an already-owned transfer.
+    if (replacing?.isActive == true) return;
     final outgoing = (replacing?.filePath?.isNotEmpty ?? false)
         ? replacing!.filePath
         : replacing?.supersededPath;
     final rec = DownloadRecord(
-      id: _idFor(sourceId, showId, episode.id),
+      id: _idFor(sourceId, showId, episode.id, category: category),
       sourceId: sourceId,
       showId: showId,
       showTitle: showTitle,
@@ -574,25 +1686,167 @@ class DownloadManager extends ChangeNotifier {
       episodeId: episode.id,
       episodeUrl: episode.url,
       episodeNumber: episode.number,
+      season: episode.season,
       episodeSeason: episode.season,
+      storageKey: Platform.isWindows ? _randomNonce() : '',
+      downloadRoot: Platform.isWindows ? _downloadPrefs.locationUri : null,
       episodeTitle: episode.title,
       episodeThumbnail: episode.thumbnail,
       category: category,
       quality: qualityLabel,
+      // Server name + SUB/DUB kind of the picked link; exact when the Windows
+      // dialog pinned it (see hintPinnedServer).
+      serverPreference: DownloadServerPreference.fromSource(
+        source,
+        exact: pinned,
+      ),
+      resolveSourceId: resolveHint,
       malId: malId,
+      anilistId: anilistId,
+      tmdbId: tmdbId,
+      tmdbIsTv: tmdbIsTv,
+      imdbId: imdbId,
       supersededPath: outgoing,
+      retainedMediaPaths: {
+        ...?replacing?.retainedMediaPaths,
+        if (replacing?.supersededPath != null &&
+            replacing!.supersededPath != outgoing)
+          replacing.supersededPath!,
+      }.toList(),
       createdAt: nowMs,
     );
     _put(rec);
     notifyListeners();
     // The user's chosen source first, then the other mirrors as fallback (so a
     // dead mirror auto-advances instead of just failing).
-    _candidates[rec.id] = [
-      source,
-      ...fallbacks.where((s) => s.url != source.url),
-    ];
-    await _enqueueTaskFor(rec, source);
+    final eligible = rec.serverPreference!.prioritize(
+      sourcesForDownloadCategory([
+        source,
+        ...fallbacks.where((s) => s.url != source.url),
+      ], category),
+    );
+    if (eligible.isEmpty) {
+      _put(
+        rec.copyWith(
+          status: DownloadStatus.unsupported,
+          error: () =>
+              'The selected $category audio is unavailable from this source',
+        ),
+      );
+      notifyListeners();
+      return;
+    }
+    _candidates[rec.id] = eligible;
+    await _enqueueTaskFor(rec, eligible.first);
   }
+
+  /// Resolve saved jobs independently of whatever cut the detail page last used.
+  /// The concrete metadata API accepts the cut without widening every catalogue
+  /// implementation; ordinary source episode URLs already identify their cut.
+  Future<List<VideoSource>> _sourcesForSavedCategory(DownloadRecord rec) {
+    final metadata = _repo is MetadataRepository
+        ? _repo
+        : ZmodeIds.isZ(rec.episodeUrl) &&
+              GetIt.I.isRegistered<MetadataRepository>()
+        ? GetIt.I<MetadataRepository>()
+        : null;
+    final picked = rec.resolveSourceId;
+    if (metadata != null && picked != null && ZmodeIds.isZ(rec.episodeUrl)) {
+      // The viewer picked (or Auto Resolve settled on) this source in the
+      // download dialog: ask only it, the same way the dialog did.
+      // metadata.sources would sweep to whatever other source answers when
+      // this one is slow or empty, downloading a different show/episode.
+      // Bounded, so a hung source fails the job visibly (Retry) instead.
+      return metadata.playbackResolver
+          .attemptForDownload(rec.episodeUrl, picked, category: rec.category)
+          .timeout(const Duration(seconds: 90))
+          .then((hit) => hit?.streams ?? const <VideoSource>[]);
+    }
+    return metadata != null
+        ? metadata.sources(
+            rec.episodeUrl,
+            // The source the viewer picked links from, when one was saved.
+            sourceId: rec.resolveSourceId ?? rec.sourceId,
+            category: rec.category,
+          )
+        : _repo.sources(rec.episodeUrl, sourceId: rec.sourceId);
+  }
+
+  /// Audio language is a constraint; server and quality only rank eligible links.
+  List<VideoSource> _rankedForRecord(
+    DownloadRecord rec,
+    List<VideoSource> sources,
+  ) {
+    // Windows: a batch the viewer pointed at a DASH server ("MovieBox
+    // (Original) DASH") downloads that server through the bundled engine.
+    // Auto and every other server keep the old order, where DASH is skipped.
+    return rankForRecord(
+      rec,
+      sources,
+      desktopDash: Platform.isWindows && _dashDownloader.available,
+    );
+  }
+
+  /// The ranking behind [_rankedForRecord], free of platform checks so it
+  /// can be tested. [desktopDash] says this build can save DASH (Windows
+  /// with the bundled engine). Without a DASH pin it is the old order:
+  /// non-DASH links by quality, then the server preference.
+  @visibleForTesting
+  static List<VideoSource> rankForRecord(
+    DownloadRecord rec,
+    List<VideoSource> sources, {
+    required bool desktopDash,
+  }) {
+    final dash = desktopDash ? _dashRankedForRecord(rec, sources) : null;
+    if (dash != null) return dash;
+    final byQuality = _ranked(sources, rec.quality, category: rec.category);
+    return rec.serverPreference?.prioritize(byQuality) ?? byQuality;
+  }
+
+  /// The DASH links of the server [rec] was pinned to, when that server is a
+  /// DASH one; null otherwise (the caller then keeps its normal, DASH-free
+  /// ranking). The other links stay behind them as fallbacks. Encrypted
+  /// (DRM) DASH never counts: ffmpeg would copy the locked tracks into a
+  /// file that cannot play.
+  static List<VideoSource>? _dashRankedForRecord(
+    DownloadRecord rec,
+    List<VideoSource> sources,
+  ) {
+    final pref = rec.serverPreference;
+    if (pref == null || pref.label.isEmpty) return null;
+    final picked = pref.label.toLowerCase();
+    final byCategory = sourcesForDownloadCategory(sources, rec.category);
+    // Only clear (non-DRM) DASH links carrying the picked server's name.
+    final dashOfPick = pref
+        .prioritize(byCategory.where((s) => isDash(s) && !s.isDrm).toList())
+        .where((s) => downloadServerName(s).toLowerCase() == picked)
+        .toList();
+    if (dashOfPick.isEmpty) return null;
+    final rest = _ranked(sources, rec.quality, category: rec.category);
+    return [...dashOfPick, ...pref.prioritize(rest)];
+  }
+
+  /// Saves DASH streams on Windows (bundled ffmpeg). Made on first use.
+  late final DesktopDashDownloader _dashDownloader = DesktopDashDownloader(
+    dio: _dio,
+    // Offline time is not a stall, and a run the network ended starts again.
+    networkDown: () => networkOffline(),
+    waitForNetwork: () => waitForNetwork(),
+  );
+
+  /// True when [source] is clear (non-DRM) DASH and this Windows build can
+  /// download it. Encrypted DASH keeps the old path, which refuses it.
+  bool _usesDesktopDash(VideoSource source) =>
+      Platform.isWindows &&
+      isDash(source) &&
+      !source.isDrm &&
+      _dashDownloader.available;
+
+  /// Source resolution must not revive a paused, replaced or disposed Windows job.
+  bool _resolutionRetired(DownloadRecord rec) => Platform.isWindows
+      ? !_ownsDownloadGeneration(rec) ||
+            _records[rec.id]?.status == DownloadStatus.paused
+      : _isCanceled(rec.id);
 
   /// Resolve a source for [rec] (batch path) then enqueue it, keeping the rest
   /// as fallback mirrors.
@@ -600,16 +1854,25 @@ class DownloadManager extends ChangeNotifier {
     _put(rec.copyWith(status: DownloadStatus.resolving));
     notifyListeners();
     try {
-      final sources = await _repo.sources(
-        rec.episodeUrl,
-        sourceId: rec.sourceId,
-      );
-      if (_isCanceled(rec.id)) return; // canceled while resolving
-      final ranked = _ranked(sources, rec.quality, category: rec.category);
+      // Windows resolves the saved cut (and any source the viewer picked);
+      // phone and TV keep asking the record's own source.
+      final sources = Platform.isWindows
+          ? await _sourcesForSavedCategory(rec)
+          : await _repo.sources(rec.episodeUrl, sourceId: rec.sourceId);
+      if (_resolutionRetired(rec)) return; // canceled while resolving
+      var ranked = Platform.isWindows
+          ? _rankedForRecord(rec, sources)
+          : _ranked(sources, rec.quality, category: rec.category);
       if (ranked.isEmpty) {
+        // Windows, network down: an empty answer is the drop, not a stream
+        // the app cannot save. Wait for the network and resolve again.
+        if (Platform.isWindows && networkOffline()) {
+          await _queueNetworkWait(rec);
+          return;
+        }
         // Everything this source offers is a manifest. Another source may
         // serve real files — that is worth trying before saying no.
-        if (await _tryAnotherSource(rec) || _isCanceled(rec.id)) return;
+        if (await _tryAnotherSource(rec) || _resolutionRetired(rec)) return;
         AppLogger.instance.log(
           '[download] no downloadable source — ${rec.showTitle} · '
           '${rec.episodeTitle} (${sources.length} source(s), all DASH/unusable)',
@@ -618,16 +1881,51 @@ class DownloadManager extends ChangeNotifier {
         _put(
           rec.copyWith(
             status: DownloadStatus.unsupported,
-            error: () => 'No downloadable (non-HLS) source',
+            error: () =>
+                'No downloadable stream for the selected ${rec.category} audio',
           ),
         );
         notifyListeners();
         return;
       }
+      // Windows: go back to the server the saved HLS progress came from, so
+      // a network wait or a link refresh carries on there instead of
+      // restarting on the first server of the list.
+      if (Platform.isWindows) {
+        ranked = await _preferSavedHlsSource(rec, ranked);
+      }
+      if (_resolutionRetired(rec)) return;
       _candidates[rec.id] = ranked;
       await _enqueueTaskFor(rec, ranked.first);
     } catch (e) {
-      if (_isCanceled(rec.id)) return;
+      if (_resolutionRetired(rec)) return;
+      if (Platform.isWindows &&
+          e is DioException &&
+          e.response?.statusCode == 429) {
+        final response = e.response!;
+        await _rememberDownloadHostCooldown(
+          response.realUri,
+          response.headers.value('retry-after'),
+        );
+        await _queueHostRetry(rec, response.realUri, received429: true);
+        return;
+      }
+      // Windows: the lookup failed because the connection did. Try again
+      // later (sooner on reconnect) rather than fail the row; capped so a
+      // provider that is really down still fails visibly.
+      if (Platform.isWindows && (networkOffline() || isNetworkFailure(e))) {
+        final strikes = (_networkStrikes[rec.id] ?? 0) + 1;
+        _networkStrikes[rec.id] = strikes;
+        if (networkOffline() || strikes <= _networkStrikeLimit) {
+          AppLogger.instance.log(
+            '[download] resolve network-wait — ${rec.showTitle} · '
+            '${rec.episodeTitle}',
+            level: 'W',
+          );
+          await _queueNetworkWait(rec);
+          return;
+        }
+      }
       AppLogger.instance.log(
         'download resolve failed (${rec.showTitle}): $e',
         level: 'E',
@@ -646,6 +1944,13 @@ class DownloadManager extends ChangeNotifier {
   /// enqueued or the record was canceled, false when mirrors are exhausted.
   Future<bool> _tryNext(DownloadRecord rec) async {
     if (_isCanceled(rec.id)) return true;
+    // Windows: with the network down every mirror fails at once, so moving
+    // on would burn through all of them in seconds and fail the row. Wait
+    // for the network instead, then resolve the episode again.
+    if (Platform.isWindows && !rec.isTorrent && networkOffline()) {
+      await _queueNetworkWait(rec);
+      return true;
+    }
     final cands = _candidates[rec.id];
     if (cands != null && cands.length > 1) {
       cands.removeAt(0); // drop the one that just failed
@@ -675,22 +1980,33 @@ class DownloadManager extends ChangeNotifier {
   /// whose streams are all manifests instead of settling on it. One sweep, not
   /// one sweep per rejected source — that was quadratic and froze the app.
   Future<bool> _tryAnotherSource(DownloadRecord rec) async {
-    if (!ZmodeIds.isZ(rec.episodeUrl))
+    if (!ZmodeIds.isZ(rec.episodeUrl)) {
       return false; // only the catalogue sweeps
+    }
     if (!GetIt.I.isRegistered<MetadataRepository>()) return false;
-    if (_sweeping.contains(rec.id))
+    // A job tied to a source the viewer picked (or to a hand-picked server)
+    // must not silently switch sources: that is how a download came back as
+    // a different show or episode. It fails visibly instead.
+    if (rec.resolveSourceId != null || rec.serverPreference?.exact == true) {
+      return false;
+    }
+    if (_sweeping.contains(rec.id)) {
       return false; // already looking for this one
+    }
     _sweeping.add(rec.id);
     try {
       final next = await GetIt.I<MetadataRepository>().sourcesWhere(
         rec.episodeUrl,
-        (streams) => sourcesForDownloadCategory(
-          streams,
-          rec.category,
-        ).any((s) => !isDash(s)),
+        (streams) => _rankedForRecord(rec, streams).isNotEmpty,
+        category: rec.category,
       );
       if (_isCanceled(rec.id)) return true;
-      final ranked = _ranked(next.streams, rec.quality, category: rec.category);
+      final byQuality = _ranked(
+        next.streams,
+        rec.quality,
+        category: rec.category,
+      );
+      final ranked = rec.serverPreference?.prioritize(byQuality) ?? byQuality;
       if (ranked.isEmpty) return false;
       AppLogger.instance.log(
         '[download] ${rec.showTitle} · ${rec.episodeTitle}: swept past the '
@@ -715,11 +2031,276 @@ class DownloadManager extends ChangeNotifier {
 
   /// Start [rec] from a concrete [source] — HLS via the in-app segment
   /// downloader, everything else via background_downloader.
+  /// Desktop HLS and direct-file transfers share one capacity pool. Mobile
+  /// retains its background-service queues and torrents their own scheduler.
+  /// Snapshot barrier for source re-resolution already dispatched by timers.
+  @visibleForTesting
+  Future<void> get automaticRetryWorkCompleted => _automaticRetryWork;
+
+  /// Save pending intent before arming any retry; never persist signed URLs.
+  Future<bool> _queueHostRetry(
+    DownloadRecord snapshot,
+    Uri uri, {
+    required bool received429,
+  }) async {
+    if (!_ownsDownloadGeneration(snapshot)) return false;
+    final current = _records[snapshot.id]!;
+    if (uri.host.isEmpty || !const ['http', 'https'].contains(uri.scheme))
+      return false;
+    final now = _retryScheduler.now();
+    final count = current.retryCount + (received429 ? 1 : 0);
+    var deadline = _downloadPrefs.hostCooldownUntil(uri, now: now);
+    if (received429) {
+      final exponent = (count - 1).clamp(0, 7).toInt();
+      final fallback = now.add(
+        Duration(seconds: min(3600, 30 * (1 << exponent))),
+      );
+      if (deadline == null || deadline.isBefore(fallback)) deadline = fallback;
+      // Extend the host deadline only for a real429, never for a queued follower.
+      await _rememberDownloadHostCooldown(
+        uri,
+        ((deadline.difference(now).inMilliseconds + 999) ~/ 1000).toString(),
+      );
+    }
+    deadline ??= current.retryAt == null
+        ? now.add(const Duration(seconds: 30))
+        : DateTime.fromMillisecondsSinceEpoch(current.retryAt!, isUtc: true);
+    if (!_ownsDownloadGeneration(snapshot) ||
+        _records[snapshot.id]?.status == DownloadStatus.paused) {
+      return false;
+    }
+    final waiting = _records[snapshot.id]!.copyWith(
+      status: DownloadStatus.queued,
+      retryAt: () => deadline!.millisecondsSinceEpoch,
+      retryHost: () => uri.host.toLowerCase(),
+      retryCount: count,
+      autoResumePending: true,
+      error: () => 'Source is rate limiting downloads (429). Waiting to retry.',
+    );
+    _tasks.remove(waiting.id);
+    _records[waiting.id] = waiting;
+    try {
+      await _box.put(waiting.id, waiting.toMap());
+    } catch (_) {
+      if (_ownsDownloadGeneration(waiting)) {
+        _records[waiting.id] = waiting.copyWith(
+          status: DownloadStatus.failed,
+          error: () =>
+              'Could not save the delayed download. Check storage and retry.',
+        );
+        notifyListeners();
+      }
+      return false;
+    }
+    if (!_ownsDownloadGeneration(waiting) ||
+        _records[waiting.id]?.status != DownloadStatus.queued) {
+      return false;
+    }
+    _armPendingRetry(_records[waiting.id]!);
+    notifyListeners();
+    return true;
+  }
+
+  /// Keep pending jobs dormant until both their saved and shared host wait ends.
+  void _armPendingRetry(DownloadRecord record) {
+    if (_disposed ||
+        !record.autoResumePending ||
+        record.status != DownloadStatus.queued)
+      return;
+    if (_tasks.containsKey(record.id) ||
+        (record.retryAt == null && _desktopSlots.contains(record.id))) {
+      return;
+    }
+    var deadline = record.retryAt == null
+        ? _retryScheduler.now()
+        : DateTime.fromMillisecondsSinceEpoch(record.retryAt!, isUtc: true);
+    if (record.retryHost != null && record.retryHost!.isNotEmpty) {
+      final host = _downloadPrefs.hostCooldownUntil(
+        Uri(scheme: 'https', host: record.retryHost),
+        now: _retryScheduler.now(),
+      );
+      if (host != null && host.isAfter(deadline)) deadline = host;
+    }
+    _retryScheduler.schedule(record.id, record.storageKey, deadline, () {
+      // Fresh source resolution is serialized, like the original batch loop;
+      // dozens of expired timers must not burst at a provider simultaneously.
+      _automaticRetryWork = _automaticRetryWork
+          .then((_) async {
+            final current = _records[record.id];
+            if (!_ownsDownloadGeneration(record) ||
+                current?.status != DownloadStatus.queued)
+              return;
+            final host = current!.retryHost == null
+                ? null
+                : _downloadPrefs.hostCooldownUntil(
+                    Uri(scheme: 'https', host: current.retryHost),
+                    now: _retryScheduler.now(),
+                  );
+            if (host != null) {
+              await _queueHostRetry(
+                current,
+                Uri(scheme: 'https', host: current.retryHost),
+                received429: false,
+              );
+              return;
+            }
+            final ready = current.copyWith(
+              retryAt: () => null,
+              retryHost: () => null,
+              error: () => null,
+            );
+            _put(ready);
+            await _resolveAndEnqueue(ready);
+          })
+          .catchError((Object _) {
+            if (!_ownsDownloadGeneration(record)) return;
+            _put(
+              _records[record.id]!.copyWith(
+                status: DownloadStatus.failed,
+                error: () =>
+                    'The pending download could not resume. Retry later.',
+              ),
+            );
+            notifyListeners();
+          });
+    });
+  }
+
+  /// Keep Windows transfers off a rate-limited host without occupying a slot.
+  /// Pending jobs hold no lease; pause/cancel invalidates their timer.
+  Future<bool> _hostCooldownBlocks(DownloadRecord rec, String url) async {
+    final uri = Uri.tryParse(url);
+    final deadline = uri == null
+        ? null
+        : _downloadPrefs.hostCooldownUntil(uri, now: _retryScheduler.now());
+    if (deadline == null) return false;
+    await _queueHostRetry(rec, uri!, received429: false);
+    return true;
+  }
+
   Future<void> _enqueueTaskFor(DownloadRecord rec, VideoSource source) async {
+    if (_disposed) return;
+    if (!Platform.isWindows || isTorrentSource(source)) {
+      return _enqueueTaskNow(rec, source);
+    }
+    await _awaitDesktopRecovery();
+    // Recovery can settle after route/service replacement disposed this owner.
+    if (_disposed || _isCanceled(rec.id)) return;
+    // Paused while its source was resolving (dl-6): stay paused.
+    if (_pausedByUser(rec.id)) return;
+    if (_desktopSlots.contains(rec.id)) {
+      final retiring = _foregroundHlsAttempts[rec.id];
+      if (retiring != null &&
+          retiring.storageKey != rec.storageKey &&
+          _deferredHlsReplacements[rec.id] != rec.storageKey) {
+        _deferredHlsReplacements[rec.id] = rec.storageKey;
+        final work = _enqueueAfterHlsRetirement(rec, source, retiring.done);
+        _foregroundHlsWork.add(work);
+        unawaited(work.whenComplete(() => _foregroundHlsWork.remove(work)));
+      }
+      return;
+    }
+    if (await _hostCooldownBlocks(rec, source.url)) return;
+    _tasks.remove(rec.id);
+    _put(rec.copyWith(status: DownloadStatus.queued));
+    notifyListeners();
+    final lease = await _acquireSlot(rec.id);
+    if (lease == null) return;
+    if (_disposed || _isCanceled(rec.id)) {
+      lease.release();
+      return;
+    }
+    // A preceding transfer may have received429 while this job waited in FIFO.
+    if (await _hostCooldownBlocks(rec, source.url)) {
+      lease.release();
+      return;
+    }
+    // Paused after the slot was granted but before the transfer started
+    // (dl-6): hand the slot back instead of starting over the pause.
+    if (_pausedByUser(rec.id)) {
+      lease.release();
+      return;
+    }
+    // DASH (Windows) uses the same detached-worker bookkeeping as HLS: an
+    // in-process transfer that holds the lease until it ends.
+    final dash = _usesDesktopDash(source);
+    if (_isHls(source) || dash) {
+      _scheduleSubtitles(rec, source);
+      // Scheduling returns now, allowing a bulk operation to queue its other
+      // episodes. The lease lasts until the actual HLS transfer finishes.
+      final transfer = dash
+          ? _startDashDownload(rec, source, lease: lease)
+          : _startHlsDownload(rec, source, lease: lease);
+      final work = transfer
+          .whenComplete(lease.release)
+          .catchError((Object error) {
+            // Cleanup/storage failures must finish this detached operation too.
+            if (!_ownsDownloadGeneration(rec)) return;
+            _put(
+              rec.copyWith(
+                status: DownloadStatus.failed,
+                error: () => 'Download could not finish: $error',
+              ),
+            );
+            notifyListeners();
+          });
+      _foregroundHlsAttempts[rec.id] = (storageKey: rec.storageKey, done: work);
+      _foregroundHlsWork.add(work);
+      unawaited(
+        work.whenComplete(() {
+          _foregroundHlsWork.remove(work);
+          if (identical(_foregroundHlsAttempts[rec.id]?.done, work)) {
+            _foregroundHlsAttempts.remove(rec.id);
+          }
+        }),
+      );
+      return;
+    }
+    try {
+      await _enqueueTaskNow(rec, source);
+      // The platform status callback releases the direct-file lease.
+    } catch (_) {
+      lease.release();
+      rethrow;
+    }
+  }
+
+  /// A replacement keeps its place without stealing a retiring HLS lease.
+  /// Recheck generation after the old worker settles so cancel/delete/dispose
+  /// cannot restart a job and repeated same-ID retries cannot duplicate it.
+  Future<void> _enqueueAfterHlsRetirement(
+    DownloadRecord rec,
+    VideoSource source,
+    Future<void> retired,
+  ) async {
+    try {
+      await retired;
+      if (!_ownsDownloadGeneration(rec) ||
+          _deferredHlsReplacements[rec.id] != rec.storageKey) {
+        return;
+      }
+      await _enqueueTaskFor(rec, source);
+    } catch (_) {
+      if (!_ownsDownloadGeneration(rec)) return;
+      _put(
+        rec.copyWith(
+          status: DownloadStatus.failed,
+          error: () => 'The replacement download could not start. Retry later.',
+        ),
+      );
+      notifyListeners();
+    } finally {
+      if (_deferredHlsReplacements[rec.id] == rec.storageKey) {
+        _deferredHlsReplacements.remove(rec.id);
+      }
+    }
+  }
+
+  Future<void> _enqueueTaskNow(DownloadRecord rec, VideoSource source) async {
     if (_isCanceled(rec.id)) return; // don't (re)start a canceled download
     // Save any soft subtitles this source advertises, in parallel with the
     // video (they're tiny and best-effort — never block or fail the download).
-    unawaited(_fetchSubtitles(rec, source));
+    _scheduleSubtitles(rec, source);
     if (_isHls(source)) {
       await _startHlsDownload(rec, source);
       return;
@@ -728,9 +2309,7 @@ class DownloadManager extends ChangeNotifier {
       await _startTorrentDownload(rec, source);
       return;
     }
-    final filename =
-        '${_safe(rec.showTitle)}_E${rec.episodeNumber?.toInt() ?? ''}'
-        '_${_safe(rec.quality)}${_ext(source.url)}';
+    final filename = '${_mediaFileStem(rec)}${_ext(source.url)}';
     final displayName =
         '${rec.showTitle} · E${rec.episodeNumber?.toInt() ?? ''}';
     final headers = source.headers ?? const <String, String>{};
@@ -753,11 +2332,13 @@ class DownloadManager extends ChangeNotifier {
             VideoDestination.safTree
         ? _downloadPrefs.locationUri
         : null;
-    final DownloadTask task = safUri != null
+    final attempt = Platform.isWindows ? _nativeAttemptToken() : '';
+    DownloadTask task = safUri != null
         // Custom SAF folder: stream straight into the user's picked directory
         // (the file ends up as a content:// URI — see _finish). No post-move.
         ? UriDownloadTask(
             taskId: rec.id,
+            metaData: attempt,
             url: source.url,
             filename: filename,
             headers: headers,
@@ -769,44 +2350,514 @@ class DownloadManager extends ChangeNotifier {
           )
         : DownloadTask(
             taskId: rec.id,
+            metaData: attempt,
             url: source.url,
             filename: filename,
             headers: headers,
-            directory: '$_sharedDir/${_safe(rec.showTitle)}',
-            baseDirectory: BaseDirectory.applicationDocuments,
+            directory: Platform.isWindows
+                ? _windowsVideoDirectory(rec)
+                : '$_sharedDir/${_safe(rec.showTitle)}',
+            baseDirectory: Platform.isWindows
+                ? BaseDirectory.root
+                : BaseDirectory.applicationDocuments,
             updates: Updates.statusAndProgress,
-            retries: 5,
+            // Windows: the engine's most (10). A weak connection drops often,
+            // and each engine retry is cheaper than the app's own wait.
+            retries: Platform.isWindows ? 10 : 5,
             allowPause: true,
             displayName: displayName,
           );
+    if (Platform.isWindows && !_singleConnectionIds.contains(rec.id)) {
+      Uri? probeLimitedHost;
+      final connections = await directFileConnections(
+        _dio,
+        source.url,
+        headers,
+        _downloadPrefs.connectionsPerDownload,
+        onRateLimited: (uri, retryAfter) async {
+          probeLimitedHost = uri;
+          await _rememberDownloadHostCooldown(uri, retryAfter);
+        },
+      );
+      if (_isCanceled(rec.id) || _disposed) {
+        _desktopSlots.release(rec.id);
+        return;
+      }
+      if (connections == 0) {
+        await _queueHostRetry(
+          rec,
+          probeLimitedHost ?? Uri.parse(source.url),
+          received429: true,
+        );
+        _desktopSlots.release(rec.id);
+        return;
+      }
+      // Another worker can discover a shared host limit while the probe waits.
+      if (await _hostCooldownBlocks(rec, source.url)) {
+        _desktopSlots.release(rec.id);
+        return;
+      }
+      if (connections > 1) {
+        task = ParallelDownloadTask(
+          taskId: task.taskId,
+          metaData: task.metaData,
+          creationTime: task.creationTime,
+          url: task.url,
+          filename: task.filename,
+          headers: task.headers,
+          directory: task.directory,
+          baseDirectory: task.baseDirectory,
+          updates: task.updates,
+          retries: task.retries,
+          allowPause: task.allowPause,
+          displayName: task.displayName,
+          chunks: connections,
+        );
+      }
+    }
     _tasks[rec.id] = task;
     // Mark it waiting ("Queued"); the queue enqueues it when a parallel slot is
     // free (→ enqueued/running in _onUpdate). Start failures come back via
     // _mp4Queue.enqueueErrors + _onUpdate's failed case.
     _put(rec.copyWith(status: DownloadStatus.queued, progress: 0));
     notifyListeners();
-    _mp4Queue.add(task);
+    if (Platform.isWindows) {
+      // The shared desktop lease already limits HLS and native files together;
+      // a second MP4-only queue would introduce unrelated capacity accounting.
+      if (!await _fileDownloader.enqueue(task)) {
+        _desktopSlots.release(rec.id);
+        if (await _tryNext(rec) || _isCanceled(rec.id)) return;
+        _put(
+          rec.copyWith(
+            status: DownloadStatus.failed,
+            error: () => "Couldn't start download",
+          ),
+        );
+        notifyListeners();
+      }
+    } else {
+      _mp4Queue.add(task);
+    }
+  }
+
+  /// Share server cooldowns across Windows probes, HLS and subtitle requests.
+  Future<void> _rememberDownloadHostCooldown(
+    Uri uri,
+    String? retryAfter,
+  ) async {
+    try {
+      await _downloadPrefs.rememberHostCooldown(
+        uri,
+        retryAfter,
+        now: _retryScheduler.now(),
+      );
+    } catch (_) {
+      // Storage failures must not hide429 or strand active transfer capacity.
+      AppLogger.instance.log(
+        '[download] Could not save host cooldown',
+        level: 'E',
+      );
+    }
+  }
+
+  /// Windows HLS requests share persisted host limits with direct-file jobs.
+  /// [resilient] is for the episode video itself: it waits out network drops
+  /// and carries on from the saved segment (see [HlsDownloader.resilient]).
+  HlsDownloader _desktopHlsDownloader({
+    HlsAudioMux? muxAudio,
+    bool resilient = false,
+  }) => HlsDownloader(
+    _dio,
+    muxAudio: muxAudio,
+    isHostCoolingDown: (uri) =>
+        _downloadPrefs.hostCooldownUntil(uri, now: _retryScheduler.now()) !=
+        null,
+    onRateLimited: _rememberDownloadHostCooldown,
+    resilient: resilient,
+    waitForNetwork: resilient ? () => waitForNetwork() : null,
+    retryDelays: resilient ? hlsRetryDelays : null,
+    networkPatience: hlsNetworkPatience,
+  );
+
+  // ── Weak network (Windows) ────────────────────────────────────────────────
+
+  /// True while the app knows the network is down. Tests replace it.
+  @visibleForTesting
+  bool Function() networkOffline = () =>
+      BootConnectivity.instance.offline.value;
+
+  /// Completes when the network is up again (at once when it already is).
+  /// Tests replace it.
+  @visibleForTesting
+  Future<void> Function() waitForNetwork = _waitUntilOnline;
+
+  /// Waits between tries of one failed HLS request; null keeps the
+  /// downloader's own (1, 2, 4, 8, then 15 s). Tests make them short.
+  @visibleForTesting
+  List<Duration>? hlsRetryDelays;
+
+  /// How long one HLS request may keep failing while the network looks up
+  /// before the run stops and the row waits (see [networkRetryDelay]).
+  @visibleForTesting
+  Duration hlsNetworkPatience = const Duration(minutes: 3);
+
+  /// How long a row waits before trying again after the network failed it.
+  /// The reconnect hook wakes it sooner when the network comes back.
+  @visibleForTesting
+  Duration networkRetryDelay = const Duration(seconds: 15);
+
+  /// Network give-ups in a row with no new segment saved. After this many
+  /// while the network looks up, the host itself is treated as down and the
+  /// normal next-mirror path runs, so a dead host cannot wait forever.
+  static const int _networkStrikeLimit = 5;
+  final Map<String, int> _networkStrikes = {};
+
+  /// Fresh stream links fetched after a 403/410 in a row; capped so an
+  /// always-refusing host cannot loop.
+  static const int _linkRefreshLimit = 3;
+  final Map<String, int> _linkRefreshes = {};
+
+  static Future<void> _waitUntilOnline() {
+    final net = BootConnectivity.instance;
+    // A request just failed: check now instead of at the next timer tick.
+    net.suspectOffline();
+    if (!net.offline.value) return Future.value();
+    final back = Completer<void>();
+    void check() {
+      if (net.offline.value || back.isCompleted) return;
+      net.offline.removeListener(check);
+      back.complete();
+    }
+
+    net.offline.addListener(check);
+    return back.future;
+  }
+
+  /// Puts [snapshot] back in line to try again after [delay], keeping its
+  /// storage key and file so the next run carries on where this one stopped.
+  /// Holds no transfer slot while it waits. Returns false when the row is no
+  /// longer this job's (canceled, replaced) or the user paused it.
+  Future<bool> _queueNetworkWait(
+    DownloadRecord snapshot, {
+    Duration? delay,
+    String message = 'Waiting for the network to come back',
+  }) async {
+    if (!_ownsDownloadGeneration(snapshot)) return false;
+    final current = _records[snapshot.id]!;
+    if (current.status == DownloadStatus.paused) return false;
+    final wait =
+        delay ??
+        (networkOffline() ? const Duration(seconds: 60) : networkRetryDelay);
+    final waiting = current.copyWith(
+      status: DownloadStatus.queued,
+      retryAt: () => _retryScheduler.now().add(wait).millisecondsSinceEpoch,
+      retryHost: () => null,
+      autoResumePending: true,
+      error: () => message,
+    );
+    _tasks.remove(waiting.id);
+    _records[waiting.id] = waiting;
+    try {
+      await _box.put(waiting.id, waiting.toMap());
+    } catch (_) {
+      // Not saved: the timer below still brings it back while the app runs.
+    }
+    if (!_ownsDownloadGeneration(waiting) ||
+        _records[waiting.id]?.status != DownloadStatus.queued) {
+      return false;
+    }
+    _armPendingRetry(_records[waiting.id]!);
+    if (!_disposed) notifyListeners();
+    return true;
+  }
+
+  /// Reconnect hook: every row waiting for the network tries again now
+  /// instead of waiting out its timer. Rows waiting on a host's rate limit
+  /// (they name a host) keep their wait.
+  @visibleForTesting
+  Future<void> wakeNetworkWaiters() async {
+    if (_disposed || !Platform.isWindows) return;
+    final now = _retryScheduler.now().millisecondsSinceEpoch;
+    for (final rec in _records.values.toList()) {
+      if (rec.isTorrent ||
+          rec.status != DownloadStatus.queued ||
+          !rec.autoResumePending ||
+          rec.retryAt == null ||
+          rec.retryHost != null ||
+          rec.retryAt! <= now) {
+        continue;
+      }
+      final ready = rec.copyWith(retryAt: () => now);
+      _records[rec.id] = ready;
+      _armPendingRetry(ready);
+    }
+  }
+
+  /// One log line per stopped Windows HLS run: the reason code and how far
+  /// it got, never a link.
+  void _logHlsStop(DownloadRecord rec, HlsDownloader? hls, String failure) {
+    final reason = failure.length > 120 ? failure.substring(0, 120) : failure;
+    final episode = rec.episodeNumber?.toInt();
+    final at = hls == null
+        ? ''
+        : ' seg ${hls.segmentsWritten}/${hls.segmentsTotal}'
+              '${hls.resumedFrom > 0 ? ' (resumed at ${hls.resumedFrom})' : ''}';
+    AppLogger.instance.log(
+      '[download] HLS $reason — ${rec.showTitle} · '
+      '${episode == null ? rec.episodeTitle : 'E$episode'}$at',
+      level: failure == HlsDownloader.networkResult ? 'W' : 'E',
+    );
+  }
+
+  /// Windows HLS outcomes that should try again later on the same file
+  /// rather than move to another mirror. Returns true when handled.
+  Future<bool> _retryHlsLater(
+    DownloadRecord rec,
+    HlsDownloader hls,
+    String failure,
+    TransferLease? lease,
+  ) async {
+    switch (failure) {
+      case HlsDownloader.networkResult:
+        final strikes = hls.segmentsWritten > hls.resumedFrom
+            ? 1
+            : (_networkStrikes[rec.id] ?? 0) + 1;
+        _networkStrikes[rec.id] = strikes;
+        if (strikes > _networkStrikeLimit && !networkOffline()) return false;
+        lease?.release();
+        await _queueNetworkWait(rec);
+        return true;
+      case HlsDownloader.expiredResult:
+        // Counted only while no new segment is saved between refreshes: on
+        // a slow line, links that expire every so often must not end a
+        // download that keeps moving.
+        final refreshes = hls.segmentsWritten > hls.resumedFrom
+            ? 1
+            : (_linkRefreshes[rec.id] ?? 0) + 1;
+        _linkRefreshes[rec.id] = refreshes;
+        if (refreshes > _linkRefreshLimit) return false;
+        lease?.release();
+        // Fetch the stream link again now; the saved segments are kept.
+        await _queueNetworkWait(
+          rec,
+          delay: Duration.zero,
+          message: 'Refreshing the stream link',
+        );
+        return true;
+      case HlsDownloader.busyResult:
+        lease?.release();
+        await _queueNetworkWait(
+          rec,
+          delay: const Duration(seconds: 5),
+          message: 'Waiting for the earlier attempt to stop',
+        );
+        return true;
+      case HlsDownloader.finishLaterResult:
+        // Every segment is saved; only the final rename failed. Nothing is
+        // lost by waiting, and the next run only renames the file.
+        lease?.release();
+        await _queueNetworkWait(
+          rec,
+          delay: const Duration(seconds: 30),
+          message: 'Waiting to save the finished file (is it open somewhere?)',
+        );
+        return true;
+    }
+    return false;
+  }
+
+  /// Where the Windows HLS download of [rec] is saved.
+  String _windowsHlsOutput(DownloadRecord rec) =>
+      '${_windowsVideoDirectory(rec)}/${_mediaFileStem(rec)}.ts';
+
+  /// [_windowsHlsOutput], or null when the folder cannot be worked out (no
+  /// download folder chosen yet).
+  String? _windowsHlsOutputOrNull(DownloadRecord rec) {
+    try {
+      return _windowsHlsOutput(rec);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// The server and quality of [source], saved with HLS progress so a later
+  /// run can find the same server again. No link in it.
+  static String _hlsSourceTag(VideoSource source) =>
+      '${downloadServerName(source)}|${source.quality ?? ''}'.toLowerCase();
+
+  /// True when [rec] still owns a finished file at [path] (its saved file, or
+  /// an older copy it keeps until a replacement is done).
+  static bool _keepsMediaPath(DownloadRecord rec, String path) {
+    String norm(String value) =>
+        p.normalize(value).replaceAll('/', r'\').toLowerCase();
+    final target = norm(path);
+    return [
+      rec.filePath,
+      rec.supersededPath,
+      ...rec.retainedMediaPaths,
+    ].any((kept) => kept != null && norm(kept) == target);
+  }
+
+  /// Windows: moves the server the saved HLS progress of [rec] came from to
+  /// the front of [ranked]. Leaves the order alone when there is no saved
+  /// progress or that server is not offered this time.
+  Future<List<VideoSource>> _preferSavedHlsSource(
+    DownloadRecord rec,
+    List<VideoSource> ranked,
+  ) async {
+    if (rec.isTorrent || ranked.length < 2) return ranked;
+    final output = _windowsHlsOutputOrNull(rec);
+    if (output == null) return ranked;
+    final tag = await HlsDownloader.readSourceTag(output);
+    if (tag == null) return ranked;
+    final at = ranked.indexWhere((s) => _hlsSourceTag(s) == tag);
+    if (at <= 0) return ranked;
+    return [ranked[at], ...ranked.take(at), ...ranked.skip(at + 1)];
+  }
+
+  /// Windows: removes the resumable leftovers of an HLS download once its
+  /// running attempt (if any) has stopped. Used by cancel and delete.
+  Future<void> _discardHlsPartial(DownloadRecord rec) async {
+    if (!Platform.isWindows || rec.isTorrent) return;
+    try {
+      final output = _windowsHlsOutput(rec);
+      final running = _foregroundHlsAttempts[rec.id];
+      if (running != null && running.storageKey == rec.storageKey) {
+        await running.done.catchError((Object _) {});
+      }
+      await HlsDownloader.discardPartial(output);
+    } catch (_) {
+      // Best effort: a leftover partial is never shown as an episode.
+    }
   }
 
   /// Hand an HLS source to the foreground-service isolate so it downloads in
   /// true background. We resolve the path here (UI isolate owns path_provider),
   /// start the service, and dispatch the job; progress/done/failed come back via
   /// [_listenBackgroundService].
-  Future<void> _startHlsDownload(DownloadRecord rec, VideoSource source) async {
-    _put(rec.copyWith(status: DownloadStatus.downloading, progress: 0));
+  Future<void> _startHlsDownload(
+    DownloadRecord rec,
+    VideoSource source, {
+    TransferLease? lease,
+  }) async {
+    if (Platform.isWindows && !_ownsDownloadGeneration(rec)) {
+      lease?.release();
+      return;
+    }
+    // Windows keeps the row's progress: the download carries on from its
+    // saved segment and reports the real figure as soon as it starts.
+    _put(
+      rec.copyWith(
+        status: DownloadStatus.downloading,
+        progress: Platform.isWindows ? rec.progress : 0,
+      ),
+    );
     notifyListeners();
     HlsDownloadJournal? journal;
+    HlsDownloader? desktopHls;
+    String? audioFailure;
     try {
-      final docs = await getApplicationDocumentsDirectory();
+      final docs = Platform.isWindows
+          ? await getApplicationSupportDirectory()
+          : await getApplicationDocumentsDirectory();
       final safeShow = _safe(rec.showTitle);
       final dir = Directory('${docs.path}/$_sharedDir/$safeShow');
       await dir.create(recursive: true);
       // Download the concatenated TS to a local temp with an honest .ts name;
       // the main isolate finalizes it (remux → real .mp4 on Android, else keep
       // the .ts) once the service reports done — see _finalizeHls.
-      final outputPath =
-          '${dir.path}/${safeShow}_E${rec.episodeNumber?.toInt() ?? ''}'
-          '_${_safe(rec.quality)}.ts';
+      final outputPath = '${dir.path}/${_mediaFileStem(rec)}.ts';
+
+      if (Platform.isWindows) {
+        final folder = Directory(_windowsVideoDirectory(rec));
+        await folder.create(recursive: true);
+        final destination = '${folder.path}/${outputPath.split('/').last}';
+        if (!_ownsDownloadGeneration(rec)) return;
+        var lastProgressUpdate = 0;
+        // The last figure the downloader reported, even one the throttle
+        // below skipped, so a stopped run shows how far it really got.
+        var latestProgress = rec.progress;
+        final audioMux = DesktopAudioMux();
+        desktopHls = _desktopHlsDownloader(
+          muxAudio: audioMux.available ? audioMux.merge : null,
+          resilient: true,
+        );
+        final failure = await desktopHls.download(
+          url: source.url,
+          headers: source.headers ?? {},
+          outputPath: destination,
+          preferredQuality: rec.quality,
+          connections: _downloadPrefs.connectionsPerDownload,
+          preferredAudioLanguage: rec.serverPreference?.audioLanguage,
+          // Cancel, delete or a new Retry generation throws the partial
+          // away. A user pause (dl-5 Pause all / dl-6) or the app closing
+          // only stops it: the partial and its saved position stay, and the
+          // next run carries on from there.
+          canceled: () => !_disposed && !_ownsDownloadGeneration(rec),
+          paused: () => _disposed || _pausedByUser(rec.id),
+          resumeKey: '${rec.id}|${rec.storageKey}',
+          sourceTag: _hlsSourceTag(source),
+          // The older app wrote straight into the final name, so a file
+          // already there that no record keeps is a half episode: it goes
+          // once this run has its first bytes, and never looks finished.
+          discardStaleOutput: !_keepsMediaPath(rec, destination),
+          onProgress: (progress) {
+            if (!_ownsDownloadGeneration(rec)) return;
+            // A late tick must not flip a paused row back to downloading.
+            if (_pausedByUser(rec.id)) return;
+            latestProgress = progress;
+            final now = DateTime.now().millisecondsSinceEpoch;
+            if (progress < 1 && now - lastProgressUpdate < 250) return;
+            lastProgressUpdate = now;
+            // Keep the latest known size; speed is estimated (dl-5/7).
+            _putProgress(
+              (_records[rec.id] ?? rec).copyWith(
+                status: DownloadStatus.downloading,
+                progress: progress,
+              ),
+            );
+          },
+        );
+        if (!_ownsDownloadGeneration(rec)) return;
+        if (failure != null) {
+          final latest = _records[rec.id];
+          if (latest != null && latest.progress != latestProgress) {
+            _records[rec.id] = latest.copyWith(progress: latestProgress);
+          }
+        }
+        // Paused mid-stream: leave the record paused; the lease is released
+        // by the caller. Resume re-resolves the stream and carries on from
+        // the saved segment.
+        if (failure != null && _pausedByUser(rec.id)) return;
+        if (failure != null) {
+          _logHlsStop(rec, desktopHls, failure);
+          // A network drop, an expired link or a still-closing earlier run:
+          // wait and carry on with the same file, no next mirror.
+          if (await _retryHlsLater(rec, desktopHls, failure, lease)) return;
+          // Preserve only fixed audio diagnostics. Transport exceptions may
+          // contain signed URLs, so unexpected failures retain generic text.
+          const safeAudioErrors = {
+            'This stream requires the bundled audio merge engine',
+            'The bundled audio merge engine is unavailable',
+            'Audio merge timed out',
+            'The selected audio could not be merged with this video',
+            'The audio merge engine could not finish',
+            'The selected audio could not be saved',
+          };
+          if (safeAudioErrors.contains(failure) ||
+              RegExp(
+                r'^The selected audio language \([a-z]{2,3}\) is unavailable in this stream$',
+              ).hasMatch(failure)) {
+            audioFailure = failure;
+          }
+          throw StateError(failure);
+        }
+        _networkStrikes.remove(rec.id);
+        _linkRefreshes.remove(rec.id);
+        await _markDone(rec, destination);
+        notifyListeners();
+        return;
+      }
 
       // Background HLS isolate needs flutter_background_service (Android/iOS only).
       if (isAppleTv) {
@@ -843,16 +2894,115 @@ class DownloadManager extends ChangeNotifier {
       service.invoke('download', job);
     } catch (_) {
       await journal?.remove(rec.id);
-      if (_isCanceled(rec.id)) return;
-      if (await _tryNext(rec)) return;
+      if (_isCanceled(rec.id) ||
+          (Platform.isWindows && !_ownsDownloadGeneration(rec))) {
+        lease?.release();
+        return;
+      }
+      // A user pause that surfaced as an error keeps the row paused.
+      if (Platform.isWindows && _pausedByUser(rec.id)) {
+        lease?.release();
+        return;
+      }
+      final rateLimited = desktopHls?.rateLimited == true;
+      if (rateLimited) {
+        await _queueHostRetry(
+          rec,
+          desktopHls?.rateLimitedUri ?? Uri.parse(source.url),
+          received429: desktopHls?.receivedRateLimitResponse == true,
+        );
+        lease?.release();
+        return;
+      }
+      if (!rateLimited) {
+        lease?.release();
+        if (await _tryNext(rec)) return;
+      }
       _put(
         rec.copyWith(
           status: DownloadStatus.failed,
-          error: () => "Couldn't start download",
+          error: () => rateLimited
+              ? downloadFailureMessage(null, statusCode: 429)
+              : audioFailure ?? "Couldn't start download",
         ),
       );
       notifyListeners();
+      // A rate-limited predecessor must publish its final state before FIFO
+      // admits another episode; the persistent host deadline is already saved.
+      lease?.release();
     }
+  }
+
+  /// Windows: saves a DASH [source] as one MP4 at the record's picked
+  /// height (nearest lower when this episode lacks it) plus matching audio.
+  /// Mirrors the Windows half of [_startHlsDownload]: progress, pause,
+  /// cancel, next-mirror fallback and the same finished-file bookkeeping.
+  Future<void> _startDashDownload(
+    DownloadRecord rec,
+    VideoSource source, {
+    TransferLease? lease,
+  }) async {
+    if (!_ownsDownloadGeneration(rec)) {
+      lease?.release();
+      return;
+    }
+    _put(rec.copyWith(status: DownloadStatus.downloading, progress: 0));
+    notifyListeners();
+    String? failure;
+    try {
+      final folder = Directory(_windowsVideoDirectory(rec));
+      await folder.create(recursive: true);
+      final destination = p.join(folder.path, '${_mediaFileStem(rec)}.mp4');
+      if (!_ownsDownloadGeneration(rec)) return;
+      var lastProgressUpdate = 0;
+      failure = await _dashDownloader.download(
+        url: source.url,
+        headers: source.headers ?? const {},
+        outputPath: destination,
+        quality: rec.quality,
+        audioLanguage: rec.serverPreference?.audioLanguage,
+        // Pause stops the engine like a cancel; Resume starts it over.
+        canceled: () => !_ownsDownloadGeneration(rec) || _pausedByUser(rec.id),
+        onProgress: (progress) {
+          if (!_ownsDownloadGeneration(rec) || _pausedByUser(rec.id)) return;
+          // At most four row updates a second, like the HLS path.
+          final now = DateTime.now().millisecondsSinceEpoch;
+          if (progress < 1 && now - lastProgressUpdate < 250) return;
+          lastProgressUpdate = now;
+          _putProgress(
+            (_records[rec.id] ?? rec).copyWith(
+              status: DownloadStatus.downloading,
+              progress: progress,
+            ),
+          );
+        },
+      );
+      if (!_ownsDownloadGeneration(rec)) return;
+      // Paused mid-transfer: the row stays paused; the caller frees the slot.
+      if (failure != null && _pausedByUser(rec.id)) return;
+      if (failure == null) {
+        await _markDone(rec, destination);
+        notifyListeners();
+        return;
+      }
+    } catch (_) {
+      failure = 'The download engine could not finish';
+    }
+    if (!_ownsDownloadGeneration(rec) || _pausedByUser(rec.id)) {
+      lease?.release();
+      return;
+    }
+    AppLogger.instance.log(
+      '[download] DASH save failed (${rec.showTitle} · ${rec.episodeTitle}): '
+      '$failure',
+      level: 'E',
+    );
+    // The slot must be free before the next mirror asks for one.
+    lease?.release();
+    if (await _tryNext(rec)) return;
+    final reason = failure;
+    _put(rec.copyWith(status: DownloadStatus.failed, error: () => reason));
+    notifyListeners();
   }
 
   /// Native TS→MP4 remux channel (Android only). See MainActivity + TsRemuxer.
@@ -1041,26 +3191,90 @@ class DownloadManager extends ChangeNotifier {
   ///
   /// Best-effort: stored in private app storage, idempotent (skips if already
   /// saved), and any failure just leaves the download without sidecar subs.
+  /// Snapshot barrier for service ownership handover and deterministic shutdown
+  /// checks. Subtitle work stays independent of the video transfer queue.
+  @visibleForTesting
+  Future<void> get subtitleWorkCompleted => Future.wait(_subtitleWork.toList());
+
+  /// Snapshot barrier for foreground worker handover; no timers or new work.
+  @visibleForTesting
+  Future<void> get foregroundHlsWorkCompleted =>
+      Future.wait(_foregroundHlsWork.toList());
+
+  /// Retain background jobs until settled instead of losing their lifecycle.
+  void _scheduleSubtitles(DownloadRecord rec, VideoSource source) {
+    if (_disposed) return;
+    final work = _fetchSubtitles(rec, source).catchError((Object _) {});
+    _subtitleWork.add(work);
+    unawaited(work.whenComplete(() => _subtitleWork.remove(work)));
+  }
+
+  /// Stable IDs are reused on retry. Only the current media generation may
+  /// publish HLS results or subtitles, including after awaited I/O or disposal.
+  bool _ownsDownloadGeneration(DownloadRecord snapshot) {
+    if (_disposed) return false;
+    final current = _records[snapshot.id];
+    return current != null &&
+        current.status != DownloadStatus.canceled &&
+        current.sourceId == snapshot.sourceId &&
+        current.showId == snapshot.showId &&
+        current.episodeId == snapshot.episodeId &&
+        current.storageKey == snapshot.storageKey;
+  }
+
   Future<void> _fetchSubtitles(DownloadRecord rec, VideoSource source) async {
+    if (!_ownsDownloadGeneration(rec)) return;
+    final configured = GetIt.I.isRegistered<PlaybackPrefs>()
+        ? GetIt.I<PlaybackPrefs>().subtitlePreference
+        : '';
+    final language = configured.isEmpty
+        ? PlatformDispatcher.instance.locale.languageCode
+        : configured;
+    if (language == 'off') return;
     final fromHls = _isHls(source);
     if (source.subtitles.isEmpty && !fromHls) return;
     final live = _records[rec.id];
     if (live == null || live.status == DownloadStatus.canceled) return;
-    if (live.subtitles.isNotEmpty)
+    if (live.subtitles.isNotEmpty) {
       return; // already saved (e.g. a retry mirror)
+    }
+    final saved = <OfflineSubtitle>[];
     try {
-      final docs = await getApplicationDocumentsDirectory();
+      final docs = Platform.isWindows
+          ? await getApplicationSupportDirectory()
+          : await getApplicationDocumentsDirectory();
+      if (!_ownsDownloadGeneration(rec)) return;
       final safeShow = _safe(rec.showTitle);
-      final dir = Directory('${docs.path}/$_sharedDir/$safeShow/subs');
+      final dir = Platform.isWindows
+          ? Directory('${_windowsVideoDirectory(rec)}/Subtitles')
+          : Directory('${docs.path}/$_sharedDir/$safeShow/subs');
       await dir.create(recursive: true);
-      final epTag = 'E${rec.episodeNumber?.toInt() ?? ''}';
-      final saved = <OfflineSubtitle>[];
+      if (!_ownsDownloadGeneration(rec)) return;
+      final subtitleStem = Platform.isWindows
+          ? _mediaFileStem(rec)
+          : '${safeShow}_E${rec.episodeNumber?.toInt() ?? ''}';
       var idx = 0;
-      for (final sub in source.subtitles) {
+      for (final sub in downloadSubtitleSelection(
+        source.subtitles,
+        language,
+        language: (sub) => sub.lang,
+        label: (sub) => sub.label ?? '',
+      )) {
+        if (!_ownsDownloadGeneration(rec)) return;
+        if (Platform.isWindows) {
+          final uri = Uri.tryParse(sub.url);
+          if (uri == null ||
+              _downloadPrefs.hostCooldownUntil(
+                    uri,
+                    now: _retryScheduler.now(),
+                  ) !=
+                  null)
+            continue;
+        }
         idx++;
         try {
           final path =
-              '${dir.path}/${safeShow}_${epTag}_${_safe(sub.lang)}_$idx'
+              '${dir.path}/${subtitleStem}_${_safe(sub.lang)}_$idx'
               '${_subExt(sub.url, sub.format)}';
           final resp = await _dio.get<List<int>>(
             sub.url,
@@ -1069,6 +3283,21 @@ class DownloadManager extends ChangeNotifier {
               headers: source.headers,
             ),
           );
+          // Disposal or a fresh same-ID attempt retires this response.
+          if (!_ownsDownloadGeneration(rec)) return;
+          if (Platform.isWindows && resp.statusCode == 429) {
+            await _rememberDownloadHostCooldown(
+              resp.realUri,
+              resp.headers.value('retry-after'),
+            );
+            continue;
+          }
+          // A custom provider validator may accept error status codes; those
+          // bodies are never a completed Windows subtitle file.
+          if (Platform.isWindows &&
+              resp.statusCode != 200 &&
+              resp.statusCode != 206)
+            continue;
           final bytes = resp.data;
           if (bytes == null || bytes.isEmpty) continue;
           await File(path).writeAsBytes(bytes, flush: true);
@@ -1080,24 +3309,38 @@ class DownloadManager extends ChangeNotifier {
               isDefault: sub.isDefault,
             ),
           );
+        } on DioException catch (error) {
+          final response = error.response;
+          if (Platform.isWindows && response?.statusCode == 429) {
+            await _rememberDownloadHostCooldown(
+              response!.realUri,
+              response.headers.value('retry-after'),
+            );
+          }
+          // Subtitles remain optional; a separate video host is unaffected.
         } catch (_) {
           /* skip this track */
         }
       }
       // HLS renditions, merged into one .vtt each. After the sidecars so an
       // explicitly advertised track wins when a stream offers both.
-      if (fromHls) {
+      if (fromHls && saved.isEmpty) {
         final seen = saved.map((s) => '${s.lang}|${s.label}').toSet();
-        final tracks = await HlsDownloader(_dio).fetchSubtitleTracks(
+        final subtitleDownloader = Platform.isWindows
+            ? _desktopHlsDownloader()
+            : HlsDownloader(_dio);
+        final tracks = await subtitleDownloader.fetchSubtitleTracks(
           source.url,
           source.headers ?? const {},
-          canceled: () => _records[rec.id]?.status == DownloadStatus.canceled,
+          preferredLanguage: language,
+          canceled: () => !_ownsDownloadGeneration(rec),
         );
         for (final t in tracks) {
+          if (!_ownsDownloadGeneration(rec)) return;
           if (!seen.add('${t.lang}|${t.label}')) continue;
           idx++;
           try {
-            final path = '${dir.path}/${safeShow}_${epTag}_$idx.vtt';
+            final path = '${dir.path}/${subtitleStem}_$idx.vtt';
             await File(path).writeAsString(t.vtt, flush: true);
             saved.add(
               OfflineSubtitle(
@@ -1114,23 +3357,38 @@ class DownloadManager extends ChangeNotifier {
       }
       if (saved.isEmpty) return;
       // Re-read: the download may have been canceled/deleted while we fetched.
+      if (!_ownsDownloadGeneration(rec)) return;
       final cur = _records[rec.id];
-      if (cur == null || cur.status == DownloadStatus.canceled) {
-        for (final s in saved) {
-          try {
-            await File(s.path).delete();
-          } catch (_) {}
-        }
-        return;
-      }
+      if (cur == null) return;
       final updated = cur.copyWith(subtitles: saved);
       _put(updated);
       notifyListeners();
       if (updated.status == DownloadStatus.done) {
         await _publishExternalSubtitles(updated);
+        // Subtitles can finish after the video: refresh the manifest entry.
+        _syncFolder(updated);
       }
     } catch (_) {
       /* no subtitles offline — non-fatal */
+    } finally {
+      // A disk write can finish after cancellation. Clean only this retired
+      // attempt's unreferenced sidecars, never another manager's library.
+      if (Platform.isWindows &&
+          !_disposed &&
+          !_ownsDownloadGeneration(rec)) {
+        for (final subtitle in saved) {
+          if (_records.values.any(
+            (record) => record.subtitles.any(
+              (current) => _sameMediaPath(current.path, subtitle.path),
+            ),
+          )) {
+            continue;
+          }
+          try {
+            await File(subtitle.path).delete();
+          } catch (_) {}
+        }
+      }
     }
   }
 
@@ -1140,7 +3398,7 @@ class DownloadManager extends ChangeNotifier {
   /// copy because MX Player's local subtitle scanner expects common sidecar
   /// formats such as SRT.
   Future<void> _publishExternalSubtitles(DownloadRecord rec) async {
-    if (!Platform.isAndroid || isAppleTv) return;
+    if (_disposed || !Platform.isAndroid || isAppleTv) return;
     final current = _records[rec.id] ?? rec;
     if (current.status != DownloadStatus.done ||
         current.filePath == null ||
@@ -1279,6 +3537,7 @@ class DownloadManager extends ChangeNotifier {
                   : item,
             )
             .toList();
+        if (_disposed) return;
         _put(latest.copyWith(subtitles: subtitles));
         notifyListeners();
       }
@@ -1328,6 +3587,46 @@ class DownloadManager extends ChangeNotifier {
   // ── Controls ───────────────────────────────────────────────────────────────
 
   Future<void> pause(DownloadRecord rec) async {
+    final current = _records[rec.id];
+    _promoteWhenQueued.remove(rec.id);
+    // Windows: anything still waiting for a slot (or resolving its source)
+    // can be held back (dl-6). It leaves the FIFO and Resume re-resolves it.
+    // Local-audio work keeps its own branch below.
+    if (Platform.isWindows &&
+        current != null &&
+        current.pendingAudioFinalization != true &&
+        const {
+          DownloadStatus.queued,
+          DownloadStatus.resolving,
+        }.contains(current.status) &&
+        !_tasks.containsKey(rec.id)) {
+      _retryScheduler.cancel(rec.id);
+      _desktopTransferSlots?.cancelPending(rec.id);
+      _put(current.copyWith(status: DownloadStatus.paused));
+      notifyListeners();
+      return;
+    }
+    // Windows in-process HLS: mark paused; the stream polls this and stops
+    // between segments (dl-5 Pause all).
+    if (Platform.isWindows &&
+        current != null &&
+        current.status == DownloadStatus.downloading &&
+        !rec.isTorrent &&
+        !_tasks.containsKey(rec.id) &&
+        _foregroundHlsAttempts[rec.id]?.storageKey == current.storageKey) {
+      _put(current.copyWith(status: DownloadStatus.paused));
+      notifyListeners();
+      return;
+    }
+    if (Platform.isWindows && current?.pendingAudioFinalization == true) {
+      // Stop a local worker rather than asking a completed HTTP task to pause.
+      // Active workers release their lease after cleanup; queued ones leave FIFO.
+      _pendingAudioResumes.remove(rec.id);
+      _desktopTransferSlots?.cancelPending(rec.id);
+      _put(current!.copyWith(status: DownloadStatus.paused));
+      notifyListeners();
+      return;
+    }
     if (rec.isTorrent) {
       try {
         await _torrentSvc.pause(rec.id);
@@ -1341,6 +3640,32 @@ class DownloadManager extends ChangeNotifier {
   }
 
   Future<void> resume(DownloadRecord rec) async {
+    // A user resume starts the network give-up counts afresh.
+    _networkStrikes.remove(rec.id);
+    _linkRefreshes.remove(rec.id);
+    if (Platform.isWindows && !rec.isTorrent) await _awaitDesktopRecovery();
+    // A paused in-process HLS stream must finish winding down (and free its
+    // slot) before it can be started again.
+    final winding = Platform.isWindows ? _foregroundHlsAttempts[rec.id] : null;
+    if (winding != null && winding.storageKey == rec.storageKey) {
+      await winding.done;
+    }
+    if (Platform.isWindows && !_ownsDownloadGeneration(rec)) return;
+    // Resume only what is still paused; a newer state (cancel, retry) wins.
+    if (Platform.isWindows &&
+        winding != null &&
+        _records[rec.id]?.status != DownloadStatus.paused) {
+      return;
+    }
+    if (Platform.isWindows && _records[rec.id]?.retryAt != null) {
+      final waiting = _records[rec.id]!.copyWith(status: DownloadStatus.queued);
+      await _box.put(waiting.id, waiting.toMap());
+      if (!_ownsDownloadGeneration(waiting)) return;
+      _records[waiting.id] = waiting;
+      _armPendingRetry(waiting);
+      notifyListeners();
+      return;
+    }
     if (rec.isTorrent) {
       try {
         await _torrentSvc.resume(rec.id);
@@ -1349,29 +3674,277 @@ class DownloadManager extends ChangeNotifier {
       notifyListeners();
       return;
     }
+    if (Platform.isWindows && rec.pendingAudioFinalization) {
+      await _resumeLocalAudio(rec);
+      return;
+    }
     final t = _tasks[rec.id];
     if (t != null) {
-      await _fileDownloader.resume(t);
+      if (Platform.isWindows && await _hostCooldownBlocks(rec, t.url)) return;
+      final lease = Platform.isWindows ? await _acquireSlot(rec.id) : null;
+      if (Platform.isWindows && lease == null) return;
+      if (_isCanceled(rec.id)) {
+        lease?.release();
+        return;
+      }
+      if (Platform.isWindows && await _hostCooldownBlocks(rec, t.url)) {
+        lease?.release();
+        return;
+      }
+      try {
+        final started = await _fileDownloader.resume(t);
+        if (!started) lease?.release();
+      } catch (_) {
+        lease?.release();
+        rethrow;
+      }
     } else {
       // Task object lost (e.g. after restart) — re-resolve and enqueue.
       await _resolveAndEnqueue(rec.copyWith(status: DownloadStatus.queued));
     }
   }
 
+  /// Resume only an explicitly checkpointed, complete local file. This shares
+  /// transfer capacity and must not resolve providers or reuse expired URLs.
+  Future<void> _resumeLocalAudio(DownloadRecord rec) async {
+    if (_records[rec.id]?.pendingAudioFinalization != true) return;
+    if (_finalizingFiles.contains(rec.id)) {
+      // Remember a rapid resume while the paused worker is still cleaning up.
+      if (_records[rec.id]?.status == DownloadStatus.paused) {
+        _pendingAudioResumes.add(rec.id);
+      }
+      return;
+    }
+    if (_desktopSlots.contains(rec.id) || _isCanceled(rec.id) || _disposed) {
+      return;
+    }
+    _put(rec.copyWith(status: DownloadStatus.queued, error: () => null));
+    notifyListeners();
+    final lease = await _acquireSlot(rec.id);
+    if (lease == null) return;
+    final finished = Completer<void>();
+    _finalizationDone[rec.id] = finished;
+    _finalizingFiles.add(rec.id);
+    try {
+      if (_disposed || _isCanceled(rec.id)) return;
+      final path = rec.filePath;
+      final recovery = path == null
+          ? null
+          : await FileAudioTransaction.recover(path);
+      if (_disposed || _isCanceled(rec.id)) return;
+      if (recovery != null || path == null || !await File(path).exists()) {
+        _put(
+          rec.copyWith(
+            status: DownloadStatus.failed,
+            error: () =>
+                recovery ??
+                'The downloaded file is missing. Retry to download it again.',
+          ),
+        );
+        return;
+      }
+      if (await _selectLocalAudio(rec, path)) await _markDone(rec, path);
+    } finally {
+      _finalizingFiles.remove(rec.id);
+      lease.release();
+      _finalizationDone.remove(rec.id);
+      finished.complete();
+      _restartRequestedAudio(rec.id);
+      if (!_disposed) notifyListeners();
+    }
+  }
+
+  /// A stable episode ID may be reused only after its former media operation
+  /// has stopped touching files and released its lease. Cancellation remains
+  /// visible while callers wait, so a replacement cannot revive the old worker.
+  Future<bool> _waitForFinalization(String id) async {
+    while (!_disposed) {
+      final deleting = _deletionDone[id];
+      if (deleting != null) {
+        await deleting.future;
+        continue;
+      }
+      final finished = _finalizationDone[id];
+      if (finished != null) {
+        await finished.future;
+        continue;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /// Start one remembered resume only after the former worker released its
+  /// lease. A later Pause, Cancel, disposal or deletion revokes this request.
+  void _restartRequestedAudio(String id) {
+    if (!_pendingAudioResumes.remove(id) || _disposed) return;
+    final rec = _records[id];
+    if (rec?.status != DownloadStatus.paused ||
+        !rec!.pendingAudioFinalization) {
+      return;
+    }
+    unawaited(_resumeLocalAudio(rec));
+  }
+
   /// Re-download a failed record from scratch: forget any stale mirror list,
   /// clear the error, and resolve a fresh source. No-op for done/active
   /// downloads and for torrents (those are re-added from the detail screen).
   Future<void> retry(DownloadRecord rec) async {
+    if (_records[rec.id]?.isActive == true) return;
+    if (Platform.isWindows && !await _waitForFinalization(rec.id)) return;
+    final current = _records[rec.id];
+    if (current == null) return;
+    rec = current;
     if (rec.isTorrent || rec.status == DownloadStatus.done || rec.isActive) {
       return;
     }
     _candidates.remove(rec.id); // resolve fresh mirrors
+    _networkStrikes.remove(rec.id);
+    _linkRefreshes.remove(rec.id);
+    // Windows HLS with saved progress: keep the same storage key (and so the
+    // same file name and folder) so Retry carries on from the saved segment.
+    // A new key is used only when there is nothing to carry on from.
+    final hlsOutput = Platform.isWindows ? _windowsHlsOutputOrNull(rec) : null;
+    final carryOn =
+        hlsOutput != null &&
+        rec.filePath == null &&
+        !rec.pendingAudioFinalization &&
+        await HlsDownloader.hasResumableProgress(hlsOutput);
+    // Changed while the disk was checked (another retry, cancel, delete).
+    final latest = _records[rec.id];
+    if (latest == null ||
+        latest.status != rec.status ||
+        latest.storageKey != rec.storageKey) {
+      return;
+    }
+    // A new storage key means a new file name, so leftovers under the old
+    // name (a partial with no progress file, say) would never be cleaned.
+    // Not awaited: the new run writes under the new name, so nothing waits
+    // on this clean-up.
+    if (hlsOutput != null && !carryOn) {
+      unawaited(HlsDownloader.discardPartial(hlsOutput));
+    }
     await _resolveAndEnqueue(
-      rec.copyWith(status: DownloadStatus.queued, error: () => null),
+      rec.copyWith(
+        status: DownloadStatus.queued,
+        storageKey: Platform.isWindows && !carryOn
+            ? _randomNonce()
+            : rec.storageKey,
+        downloadRoot: Platform.isWindows && !carryOn
+            ? _downloadPrefs.locationUri
+            : rec.downloadRoot,
+        error: () => null,
+        pendingAudioFinalization: false,
+        filePath: () => null,
+        retainedMediaPaths: {
+          ...rec.retainedMediaPaths,
+          if (rec.filePath != null) rec.filePath!,
+        }.toList(),
+      ),
     );
   }
 
+  /// Joins the Windows slot queue for [id], jumping to the front when the
+  /// user asked for it with 'Download next' before it was waiting (dl-6).
+  Future<TransferLease?> _acquireSlot(String id) {
+    final pending = _desktopSlots.acquire(id);
+    // acquire() registers the waiter synchronously, so it can move now.
+    if (_promoteWhenQueued.remove(id)) {
+      _desktopSlots.moveToFront(id);
+      notifyListeners();
+    }
+    return pending;
+  }
+
+  /// 'Download next' (dl-6): puts [r] at the front of the Windows queue so
+  /// it starts as soon as a slot frees up. A paused or failed item is
+  /// resumed / retried and promoted once it joins the queue; one still
+  /// resolving its source is promoted when it gets there.
+  Future<void> moveToFront(DownloadRecord r) async {
+    if (!Platform.isWindows || r.isTorrent) return;
+    final current = _records[r.id];
+    if (current == null) return;
+    if (_desktopTransferSlots?.moveToFront(r.id) == true) {
+      notifyListeners();
+      return;
+    }
+    switch (current.status) {
+      case DownloadStatus.queued:
+      case DownloadStatus.resolving:
+        _promoteWhenQueued.add(r.id);
+      case DownloadStatus.paused:
+        _promoteWhenQueued.add(r.id);
+        await resume(current);
+      case DownloadStatus.failed:
+        _promoteWhenQueued.add(r.id);
+        await retry(current);
+      default:
+        // Running, finished or canceled: nothing to reorder.
+        break;
+    }
+  }
+
+  /// Pauses every running or waiting download (dl-5, tray 'Pause all').
+  /// Waiting items go first so freed slots are not handed to them.
+  Future<int> pauseAll() async {
+    final records = _records.values.toList();
+    final waiting = records.where(
+      (r) =>
+          r.status == DownloadStatus.queued ||
+          r.status == DownloadStatus.resolving,
+    );
+    final running = records.where(
+      (r) => r.status == DownloadStatus.downloading,
+    );
+    var count = 0;
+    for (final r in [...waiting, ...running]) {
+      try {
+        await pause(r);
+        count++;
+      } catch (_) {
+        // One stubborn task must not stop the rest from pausing.
+      }
+    }
+    if (!_disposed) notifyListeners();
+    return count;
+  }
+
+  /// Resumes every paused download, oldest first so the queue keeps its
+  /// order (dl-5). Resumes run detached: each waits for its own slot.
+  Future<int> resumeAll() async {
+    final paused =
+        _records.values.where((r) => r.status == DownloadStatus.paused).toList()
+          ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    for (final r in paused) {
+      unawaited(resume(r).catchError((Object _) {}));
+    }
+    return paused.length;
+  }
+
+  /// Retries every failed (non-torrent) download, oldest first (dl-5).
+  Future<int> retryFailed() async {
+    final failed =
+        _records.values
+            .where(
+              (r) =>
+                  r.status == DownloadStatus.failed &&
+                  !r.isTorrent &&
+                  !_isHiddenLink(r),
+            )
+            .toList()
+          ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    for (final r in failed) {
+      unawaited(retry(r).catchError((Object _) {}));
+    }
+    return failed.length;
+  }
+
   Future<void> cancel(DownloadRecord rec) async {
+    _retryScheduler.cancel(rec.id);
+    final nativeLease =
+        _tasks.containsKey(rec.id) && !_finalizingFiles.contains(rec.id)
+        ? _desktopTransferSlots?.activeLease(rec.id)
+        : null;
     _candidates.remove(rec.id); // user stopped it — don't auto-advance mirrors
     // Mark canceled FIRST so any in-flight resolve/update sees it and bails
     // (otherwise a resolve finishing after cancel would re-enqueue, leaving the
@@ -1383,9 +3956,11 @@ class DownloadManager extends ChangeNotifier {
         await _torrentSvc.cancel(rec.id);
       } catch (_) {}
       torrentProgress.remove(rec.id);
+      nativeLease?.release();
       _tasks.remove(rec.id);
       return;
     }
+    _desktopTransferSlots?.cancelPending(rec.id);
     _mp4Queue.removeTasksWithIds([rec.id]); // drop it if still waiting in line
     try {
       await _fileDownloader.cancelTaskWithId(
@@ -1402,8 +3977,16 @@ class DownloadManager extends ChangeNotifier {
         }); // HLS job (if any)
       } catch (_) {}
     }
+    nativeLease?.release();
     _tasks.remove(rec.id);
+    // A paused or waiting Windows HLS job has no worker to clean up after
+    // it, so its saved partial goes here (after any running attempt stops).
+    unawaited(_discardHlsPartial(rec));
   }
+
+  /// True while the user has this record paused (stops in-process HLS).
+  bool _pausedByUser(String id) =>
+      _records[id]?.status == DownloadStatus.paused;
 
   bool _isCanceled(String id) =>
       _records[id]?.status == DownloadStatus.canceled ||
@@ -1411,8 +3994,51 @@ class DownloadManager extends ChangeNotifier {
 
   /// Cancel (if active) and forget the record + delete the saved file.
   Future<void> delete(DownloadRecord rec) async {
-    _candidates.remove(rec.id);
+    if (!Platform.isWindows) return _deleteRecord(rec);
+    if (_disposed) return;
+    final retiring = _deletionDone[rec.id];
+    if (retiring != null) {
+      await retiring.future;
+      return;
+    }
     final current = _records[rec.id];
+    // Confirmation may outlive a retry/new download with the same stable ID.
+    if (current == null || current.storageKey != rec.storageKey) return;
+    final finished = Completer<void>();
+    _deletionDone[rec.id] = finished;
+    try {
+      await _deleteRecord(current);
+    } finally {
+      _deletionDone.remove(rec.id);
+      finished.complete();
+    }
+  }
+
+  /// Executes one deletion while its Windows ID barrier prevents replacement.
+  Future<void> _deleteRecord(DownloadRecord rec) async {
+    _retryScheduler.cancel(rec.id);
+    final nativeLease =
+        _tasks.containsKey(rec.id) && !_finalizingFiles.contains(rec.id)
+        ? _desktopTransferSlots?.activeLease(rec.id)
+        : null;
+    _candidates.remove(rec.id);
+    _promoteWhenQueued.remove(rec.id);
+    _desktopTransferSlots?.cancelPending(rec.id);
+    final current = _records[rec.id];
+    // Deleting a finished episode on Windows sends its files to the Recycle
+    // Bin so a misclick can be undone from Explorer (dl-2). Partial files of
+    // unfinished downloads are still removed for good.
+    // A failed entry can own a whole file too (its file was away, or only its
+    // audio choice is unfinished); that one is recycled as well.
+    final target = current ?? rec;
+    final recycle =
+        recycleDownloadDeletes &&
+        (target.status == DownloadStatus.done ||
+            target.isSavedFileAway ||
+            (target.status == DownloadStatus.failed &&
+                target.pendingAudioFinalization));
+    // Older copies kept during a re-download are always whole files.
+    final older = {...rec.olderMediaPaths, ...?current?.olderMediaPaths};
     if (current != null && current.status != DownloadStatus.canceled) {
       // Stop late callbacks/resolvers before cleanup awaits give them a chance
       // to persist progress or completion over the delete operation.
@@ -1438,14 +4064,24 @@ class DownloadManager extends ChangeNotifier {
         }); // stop HLS job
       } catch (_) {}
     }
+    nativeLease?.release();
     _tasks.remove(rec.id);
+    // Windows HLS: the saved partial and its progress file go too.
+    unawaited(_discardHlsPartial(current ?? rec));
     // Remove any saved subtitle sidecar files too.
     for (final s in rec.subtitles) {
       try {
         final f = File(s.path);
-        if (await f.exists()) await f.delete();
+        if (recycle) {
+          // Sidecars go to the Recycle Bin with their episode (dl-2).
+          await deleteDownloadedFile(f);
+        } else if (await f.exists()) {
+          await f.delete();
+        }
       } catch (_) {}
-      if (s.publicPath != null) await _deleteMediaFile(s.publicPath);
+      if (s.publicPath != null) {
+        await _deleteMediaFile(s.publicPath, recycle: recycle);
+      }
     }
     // Delete the actual media file on disk. Two cases:
     //  • SAF custom folder → a content:// URI, removed via UriUtils.
@@ -1454,14 +4090,27 @@ class DownloadManager extends ChangeNotifier {
     //    downloads left the file on disk (the "still in the folder" bug). Delete
     //    it directly; if scoped storage blocks the raw delete, fall back to the
     //    plugin's native (MediaStore-aware) delete. Then drop the empty show dir.
-    await _deleteMediaFile(rec.filePath);
-    // A re-download that never finished leaves the file it was going to
-    // replace pointed at here; it has no other owner, so it goes too.
-    if (rec.supersededPath != rec.filePath) {
-      await _deleteMediaFile(rec.supersededPath);
+    for (final path in {
+      rec.filePath,
+      current?.filePath,
+      ...older,
+    }.whereType<String>()) {
+      await _deleteUnreferencedMedia(
+        path,
+        rec.id,
+        recycle: recycle || (recycleDownloadDeletes && older.contains(path)),
+      );
     }
     _records.remove(rec.id);
+    _keptForShowLink.remove(rec.id);
+    // Forget its in-memory progress and speed (dl-5 / dl-7).
+    _unsavedProgress.remove(rec.id);
+    _lastProgressSave.remove(rec.id);
+    _liveStats.remove(rec.id);
+    _rateEstimators.remove(rec.id);
+    _progressNotifiers.remove(rec.id);
     await _box.delete(rec.id);
+    if (_registeredBackgroundWork) DesktopBackgroundWork.notifyChanged();
     notifyListeners();
   }
 
@@ -1543,25 +4192,42 @@ class DownloadManager extends ChangeNotifier {
   // failure rollback and record rewriting; it is a separate feature, and the
   // toggle says "applies to new downloads" for exactly this reason.
   Future<void> pruneMissing() async {
-    final gone = <String>[];
+    if (_disposed) return;
+    final gone = <DownloadRecord>[];
     // Downloads that finished before the size was recorded on completion. They
     // sat at "0 B" forever and dragged the storage total down with them, so
     // measure them here — this already stats every file, so it costs nothing
     // extra. Collected and applied after the loop rather than written inline,
     // to avoid mutating the map being iterated.
     final measured = <DownloadRecord>[];
-    for (final rec in _records.values) {
-      if (rec.status != DownloadStatus.done) continue;
+    // A file check yields to user actions: never mutate an entry replaced since
+    // this snapshot, even when its stable ID and storage generation match.
+    final snapshot = _records.values.toList();
+    for (final rec in snapshot) {
+      if (_disposed) return;
+      final missing =
+          Platform.isWindows &&
+          rec.status == DownloadStatus.failed &&
+          rec.error == missingSavedDownloadMessage;
+      if (rec.status != DownloadStatus.done && !missing) continue;
       final fp = rec.filePath;
       if (fp == null || fp.isEmpty) continue;
       try {
         if (isUriPath(fp)) {
-          if (!await _documentExists(fp)) gone.add(rec.id);
+          if (!await _documentExists(fp)) gone.add(rec);
           continue;
         }
         final f = File(fp);
         if (await f.exists()) {
-          if (rec.bytesTotal <= 0) {
+          if (missing) {
+            measured.add(
+              rec.copyWith(
+                status: DownloadStatus.done,
+                bytesTotal: await sizeOf(fp) ?? rec.bytesTotal,
+                error: () => null,
+              ),
+            );
+          } else if (rec.bytesTotal <= 0) {
             final len = await sizeOf(fp);
             if (len != null) measured.add(rec.copyWith(bytesTotal: len));
           }
@@ -1580,17 +4246,38 @@ class DownloadManager extends ChangeNotifier {
           if (up.path == d.path) break;
           d = up;
         }
-        if (storageOk) gone.add(rec.id);
+        if (storageOk) gone.add(rec);
       } catch (_) {}
     }
     if (measured.isNotEmpty) {
       for (final rec in measured) {
+        final original = snapshot.firstWhere((r) => r.id == rec.id);
+        if (_disposed) return;
+        if (!identical(_records[rec.id], original)) continue;
         _put(rec);
       }
       notifyListeners();
     }
     if (gone.isEmpty) return;
-    for (final id in gone) {
+    for (final original in gone) {
+      if (_disposed) return;
+      final id = original.id;
+      if (!identical(_records[id], original)) continue;
+      if (Platform.isWindows) {
+        final current = original;
+        // Keep identity, original path and progress across updates/offline drives.
+        // Reappearing files can be recognized instead of losing the only index.
+        final missing = current.copyWith(
+          status: DownloadStatus.failed,
+          error: () => missingSavedDownloadMessage,
+        );
+        // Publish before awaiting storage so a later user action wins in both
+        // memory and ordered Hive writes; never overwrite it after the await.
+        _records[id] = missing;
+        await _box.put(id, missing.toMap());
+        if (_disposed) return;
+        continue;
+      }
       _records.remove(id);
       _candidates.remove(id);
       _tasks.remove(id);
@@ -1601,17 +4288,117 @@ class DownloadManager extends ChangeNotifier {
 
   // ── Update stream ──────────────────────────────────────────────────────────
 
+  /// Task equality compares stable IDs only, so callbacks need an attempt tag.
+  /// Legacy restored tasks without our tag retain their serialized identity.
+  static bool _sameNativeAttempt(Task active, Task incoming) {
+    if (active.metaData.startsWith('zangetsu-attempt:')) {
+      return active.metaData == incoming.metaData;
+    }
+    return active.url == incoming.url &&
+        active.filename == incoming.filename &&
+        active.directory == incoming.directory &&
+        active.taskType == incoming.taskType &&
+        active.creationTime.millisecondsSinceEpoch ==
+            incoming.creationTime.millisecondsSinceEpoch;
+  }
+
+  /// Random, non-secret nonce survives native queue/retry serialization.
+  static String _nativeAttemptToken() => 'zangetsu-attempt:${_randomNonce()}';
+
+  /// Independent non-secret identifiers for file generations/native attempts.
+  static String _randomNonce() {
+    final random = Random.secure();
+    return base64Url.encode(List<int>.generate(18, (_) => random.nextInt(256)));
+  }
+
   Future<void> _onUpdate(TaskUpdate update) async {
     final id = update.task.taskId;
+    if (Platform.isWindows) {
+      // Restored native inventory defines ownership before callbacks are read.
+      try {
+        await _awaitDesktopRecovery();
+      } catch (_) {
+        return;
+      }
+      if (_disposed) return;
+      final active = _tasks[id];
+      if (active == null || !_sameNativeAttempt(active, update.task)) return;
+      // HTTP callbacks no longer own media processing or published files.
+      if (_finalizingFiles.contains(id) ||
+          _records[id]?.status == DownloadStatus.done) {
+        return;
+      }
+    }
+
+    // Capture the attempt's lease before any cooldown persistence await. An
+    // old callback must never release a new same-ID replacement's capacity.
+    final terminalLease = Platform.isWindows
+        ? _desktopTransferSlots?.activeLease(id)
+        : null;
+    if (Platform.isWindows &&
+        update is TaskStatusUpdate &&
+        const {
+          TaskStatus.failed,
+          TaskStatus.notFound,
+          TaskStatus.canceled,
+          TaskStatus.paused,
+        }.contains(update.status)) {
+      // Publish the host deadline before releasing capacity to a waiting job.
+      // The downloader normalizes response-header names to lowercase.
+      if (update.status == TaskStatus.failed ||
+          update.status == TaskStatus.notFound) {
+        final exception = update.exception;
+        final code =
+            update.responseStatusCode ??
+            (exception is TaskHttpException
+                ? exception.httpResponseCode
+                : null);
+        if (isDownloadRateLimit(exception?.description, statusCode: code)) {
+          final uri = Uri.tryParse(update.task.url);
+          if (uri != null) {
+            try {
+              await _rememberDownloadHostCooldown(
+                uri,
+                update.responseHeaders?['retry-after'],
+              );
+              final waiting = _records[id];
+              if (waiting != null) {
+                await _queueHostRetry(waiting, uri, received429: true);
+              }
+              terminalLease?.release();
+              return;
+            } catch (_) {
+              // A storage failure must not strand the transfer lease or hide429.
+              AppLogger.instance.log(
+                '[download] Could not save host cooldown',
+                level: 'E',
+              );
+            }
+          }
+        }
+      }
+      terminalLease?.release();
+    }
     final rec = _records[id];
-    if (rec == null) return;
+    if (rec == null) {
+      if (update is TaskStatusUpdate && update.status == TaskStatus.complete) {
+        _desktopSlots.release(id);
+      }
+      return;
+    }
     // Ignore late updates for a download the user canceled/deleted, so a
     // trailing progress/running event can't flip it back to "downloading".
-    if (rec.status == DownloadStatus.canceled) return;
+    if (rec.status == DownloadStatus.canceled) {
+      _desktopSlots.release(id);
+      return;
+    }
+    if (_finalizingFiles.contains(id)) return;
 
     if (update is TaskProgressUpdate) {
       if (update.progress >= 0) {
-        _put(
+        // Throttled save/notify plus the native speed + time left (dl-5/7).
+        // networkSpeed is MB/s (bytes per microsecond); negatives = unknown.
+        _putProgress(
           rec.copyWith(
             status: DownloadStatus.downloading,
             progress: update.progress,
@@ -1619,8 +4406,13 @@ class DownloadManager extends ChangeNotifier {
                 ? update.expectedFileSize
                 : null,
           ),
+          bytesPerSecond: update.networkSpeed > 0
+              ? update.networkSpeed * 1000000
+              : null,
+          timeLeft: update.timeRemaining.isNegative
+              ? null
+              : update.timeRemaining,
         );
-        notifyListeners();
       }
       return;
     }
@@ -1634,28 +4426,92 @@ class DownloadManager extends ChangeNotifier {
         case TaskStatus.paused:
           _put(rec.copyWith(status: DownloadStatus.paused));
         case TaskStatus.complete:
-          await _finish(rec, update.task as DownloadTask, update.mimeType);
+          final lease = _desktopSlots.activeLease(id);
+          final finished = Completer<void>();
+          _finalizationDone[id] = finished;
+          _finalizingFiles.add(id);
+          try {
+            await _finish(rec, update.task as DownloadTask, update.mimeType);
+          } finally {
+            _finalizingFiles.remove(id);
+            lease?.release();
+            _finalizationDone.remove(id);
+            finished.complete();
+            _restartRequestedAudio(id);
+          }
         case TaskStatus.canceled:
           _put(rec.copyWith(status: DownloadStatus.canceled));
         case TaskStatus.notFound:
         case TaskStatus.failed:
+          final exception = update.exception;
+          final httpCode =
+              update.responseStatusCode ??
+              (exception is TaskHttpException
+                  ? exception.httpResponseCode
+                  : null);
+          final rateLimited = isDownloadRateLimit(
+            exception?.description,
+            statusCode: httpCode,
+          );
+          final failureMessage = downloadFailureMessage(
+            exception?.description,
+            statusCode: httpCode,
+          );
+          // Windows: the connection failed, not the file. Neither the
+          // one-connection fallback nor the next mirror would help while the
+          // network is down; wait for it (woken on reconnect), then start
+          // again with the same file name. Capped so a host that is really
+          // down still reaches the normal fallbacks.
+          if (!rateLimited &&
+              Platform.isWindows &&
+              update.status == TaskStatus.failed &&
+              (networkOffline() || exception is TaskConnectionException)) {
+            final strikes = (_networkStrikes[rec.id] ?? 0) + 1;
+            _networkStrikes[rec.id] = strikes;
+            if (networkOffline() || strikes <= _networkStrikeLimit) {
+              AppLogger.instance.log(
+                '[download] MP4 network-wait — ${rec.showTitle} · '
+                '${rec.episodeTitle} [${rec.quality}]',
+                level: 'W',
+              );
+              await _queueNetworkWait(rec);
+              return;
+            }
+          }
+          if (!rateLimited &&
+              Platform.isWindows &&
+              update.task is ParallelDownloadTask &&
+              _singleConnectionIds.add(rec.id)) {
+            // A host can change range behavior after probing. Retry this same
+            // selected stream once without chunks before trying other mirrors.
+            await _enqueueTaskFor(
+              rec,
+              VideoSource(
+                url: update.task.url,
+                headers: update.task.headers,
+                container: SourceContainer.mp4,
+              ),
+            );
+            return;
+          }
           AppLogger.instance.log(
             '[download] MP4 ${update.status.name} — ${rec.showTitle} · '
             '${rec.episodeTitle} [${rec.quality}]: '
-            '${update.exception?.description ?? 'no detail'}',
+            '$failureMessage',
             level: 'E',
           );
-          if (await _tryNext(rec)) return; // fall through to the next mirror
+          if (!rateLimited && await _tryNext(rec)) return; // avoid retry storms
           _put(
             rec.copyWith(
               status: DownloadStatus.failed,
-              error: () => update.exception?.description ?? 'Download failed',
+              error: () => failureMessage,
             ),
           );
         case TaskStatus.waitingToRetry:
           _put(rec.copyWith(status: DownloadStatus.downloading));
       }
-      notifyListeners();
+      // Finalization can finish after the UI has replaced this manager.
+      if (!_disposed) notifyListeners();
     }
   }
 
@@ -1671,6 +4527,7 @@ class DownloadManager extends ChangeNotifier {
       // picked SAF folder, so it's already published as a content:// URI.
       path = task.fileUri?.toString();
       if (path == null) {
+        _desktopSlots.release(rec.id);
         if (await _tryNext(rec)) return;
         _put(
           rec.copyWith(
@@ -1691,6 +4548,7 @@ class DownloadManager extends ChangeNotifier {
         try {
           await _fileDownloader.uri.deleteFile(Uri.parse(path));
         } catch (_) {}
+        _desktopSlots.release(rec.id);
         if (await _tryNext(rec)) return;
         _put(
           rec.copyWith(
@@ -1716,6 +4574,7 @@ class DownloadManager extends ChangeNotifier {
           // <512KB or HTML → not a real video file; bin it and try the next
           // mirror before giving up.
           if (await f.exists()) await f.delete();
+          _desktopSlots.release(rec.id);
           if (await _tryNext(rec)) return;
           _put(
             rec.copyWith(
@@ -1734,7 +4593,9 @@ class DownloadManager extends ChangeNotifier {
         keepPrivate: _downloadPrefs.keepPrivate,
         locationUri: _downloadPrefs.locationUri,
       );
-      if (dest == VideoDestination.detectedVolume) {
+      if (Platform.isWindows) {
+        path = await task.filePath();
+      } else if (dest == VideoDestination.detectedVolume) {
         // Detected drive (USB/SSD/SD): move the file onto that volume.
         path = await _moveToVolume(
           await task.filePath(),
@@ -1758,11 +4619,145 @@ class DownloadManager extends ChangeNotifier {
       path ??= await task.filePath();
     }
 
+    if (Platform.isWindows &&
+        rec.serverPreference?.audioLanguage != null &&
+        !await _selectLocalAudio(rec, path)) {
+      return;
+    }
+
     _candidates.remove(rec.id); // success — no more fallbacks needed
     await _markDone(rec, path);
   }
 
+  /// Finish a complete local file without changing its download identity.
+  Future<bool> _selectLocalAudio(DownloadRecord rec, String path) async {
+    final language = rec.serverPreference?.audioLanguage;
+    if (language == null || language.isEmpty) {
+      _put(
+        rec.copyWith(
+          status: DownloadStatus.failed,
+          error: () =>
+              'Saved audio selection is unavailable. Retry to download again.',
+        ),
+      );
+      notifyListeners();
+      return false;
+    }
+    // A complete HTTP transfer is not complete media: select the actual
+    // spoken track before publishing success, holding the shared queue lease.
+    final checkpoint = rec.copyWith(
+      status: DownloadStatus.finalizing,
+      progress: 1,
+      filePath: () => path,
+      pendingAudioFinalization: true,
+    );
+    _records[rec.id] = checkpoint;
+    // This write is awaited exactly once. A failed disk write must not start
+    // mutation or be followed by an unhandled fire-and-forget retry.
+    try {
+      if (_writeAudioCheckpoint != null) {
+        await _writeAudioCheckpoint(checkpoint);
+      } else {
+        await _box.put(rec.id, checkpoint.toMap());
+      }
+    } catch (_) {
+      if (!_disposed && _records[rec.id]?.status == DownloadStatus.finalizing) {
+        // Storage is unavailable, so this error is deliberately memory-only.
+        _records[rec.id] = checkpoint.copyWith(
+          status: DownloadStatus.failed,
+          error: () =>
+              'Could not save download recovery data. Check storage and resume.',
+        );
+        notifyListeners();
+      }
+      return false;
+    }
+    if (_disposed) return false;
+    notifyListeners();
+    String? failure;
+    try {
+      failure = await _fileAudio.finalize(
+        path,
+        language,
+        () =>
+            _disposed ||
+            _isCanceled(rec.id) ||
+            _records[rec.id]?.status == DownloadStatus.paused,
+      );
+    } catch (_) {
+      // Cleanup/decoder failures must not escape an async native callback.
+      // Raw diagnostics may include private file paths or signed URLs.
+      failure =
+          'Audio processing could not finish. Resume or retry this download.';
+    }
+    // A replacement manager recovers the persisted job. The old instance
+    // must neither publish success nor delete recoverable media on disposal.
+    if (_disposed) return false;
+    if (_isCanceled(rec.id)) {
+      await _deleteMediaFile(path);
+      final current = _records[rec.id];
+      if (current?.status == DownloadStatus.canceled) {
+        _put(
+          current!.copyWith(
+            filePath: () => null,
+            pendingAudioFinalization: false,
+          ),
+        );
+      }
+      return false;
+    }
+    // Pausing is resumable and keeps the complete local file and its marker.
+    if (_records[rec.id]?.status == DownloadStatus.paused) return false;
+    if (failure != null) {
+      _put(
+        rec.copyWith(
+          status: DownloadStatus.failed,
+          error: () => failure,
+          filePath: () => path,
+          pendingAudioFinalization: true,
+        ),
+      );
+      notifyListeners();
+      return false;
+    }
+    return true;
+  }
+
   // ── Helpers ──────────────────────────────────────────────────────────────
+
+  /// Retry cleanup must not erase a file still owned by another library entry.
+  /// [recycle] sends the file to the Windows Recycle Bin (user delete, dl-2).
+  Future<void> _deleteUnreferencedMedia(
+    String? path,
+    String ownerId, {
+    bool recycle = false,
+  }) async {
+    if (path == null || path.isEmpty) return;
+    if (_records.values.any(
+      (record) =>
+          record.id != ownerId &&
+          ((record.filePath != null &&
+                  _sameMediaPath(record.filePath!, path)) ||
+              (record.supersededPath != null &&
+                  _sameMediaPath(record.supersededPath!, path)) ||
+              record.retainedMediaPaths.any(
+                (saved) => _sameMediaPath(saved, path),
+              )),
+    )) {
+      return;
+    }
+    // An active native transfer owns its destination even before the final
+    // filePath has been published on its library record.
+    for (final task in _tasks.values.toList()) {
+      if (task.taskId == ownerId) continue;
+      try {
+        if (_sameMediaPath(await task.filePath(), path)) return;
+      } catch (_) {
+        return; // Unknown transport destination: keep the recoverable copy.
+      }
+    }
+    await _deleteMediaFile(path, recycle: recycle);
+  }
 
   /// Delete a downloaded media file. Two cases:
   ///  • SAF custom folder → a content:// URI, removed via UriUtils.
@@ -1771,7 +4766,9 @@ class DownloadManager extends ChangeNotifier {
   ///    downloads left the file on disk (the "still in the folder" bug). Delete
   ///    it directly; if scoped storage blocks the raw delete, fall back to the
   ///    plugin's native (MediaStore-aware) delete. Then drop the empty show dir.
-  Future<void> _deleteMediaFile(String? fp) async {
+  ///  [recycle] moves a plain file to the Windows Recycle Bin instead (dl-2);
+  ///  it falls back to a permanent delete when the shell refuses.
+  Future<void> _deleteMediaFile(String? fp, {bool recycle = false}) async {
     if (fp == null || fp.isEmpty) return;
     try {
       if (isUriPath(fp)) {
@@ -1779,12 +4776,21 @@ class DownloadManager extends ChangeNotifier {
       } else {
         final f = File(fp);
         try {
-          if (await f.exists()) await f.delete();
+          if (recycle) {
+            await deleteDownloadedFile(f);
+          } else if (await f.exists()) {
+            await f.delete();
+          }
         } catch (_) {}
         if (await f.exists()) {
           try {
             await _fileDownloader.uri.deleteFile(f.uri);
           } catch (_) {}
+        }
+        // Drop this episode from the show folder's manifest (and remove the
+        // manifest itself once no episode is left) so the folder can go.
+        if (Platform.isWindows && !await f.exists()) {
+          await _folderSync.onFileDeleted(f);
         }
         try {
           final dir = f.parent;
@@ -1824,46 +4830,354 @@ class DownloadManager extends ChangeNotifier {
   /// each. Deleted only once the replacement is safely on disk, so a failed
   /// re-download doesn't cost the copy that already worked.
   Future<void> _markDone(DownloadRecord rec, String? path) async {
+    // A retired Windows worker cannot attach its file to a replacement attempt.
+    // Preserve its file on handover; the new manager owns recovery/cleanup.
+    if (Platform.isWindows &&
+        (_disposed ||
+            (_records[rec.id] != null &&
+                _records[rec.id]!.storageKey != rec.storageKey))) {
+      return;
+    }
     var latest = _records[rec.id];
     if (latest == null || latest.status == DownloadStatus.canceled) {
       await _deleteMediaFile(path);
       return;
     }
-    final bytesTotal = latest.bytesTotal > 0 ? null : await sizeOf(path);
+    // Remuxing may remove unwanted audio tracks, so HTTP Content-Length is
+    // not the saved file size. Keep native accounting only for unreadable URIs.
+    final bytesTotal = await sizeOf(path);
+    if (Platform.isWindows &&
+        (_disposed ||
+            (_records[rec.id] != null &&
+                _records[rec.id]!.storageKey != rec.storageKey))) {
+      return;
+    }
     latest = _records[rec.id];
     if (latest == null || latest.status == DownloadStatus.canceled) {
       await _deleteMediaFile(path);
       return;
     }
-    final done = latest.copyWith(
+    final retained = {
+      ...rec.retainedMediaPaths,
+      ...latest.retainedMediaPaths,
+      if (rec.supersededPath != null) rec.supersededPath!,
+      if (latest.supersededPath != null) latest.supersededPath!,
+    };
+    var done = latest.copyWith(
       status: DownloadStatus.done,
+      pendingAudioFinalization: false,
+      retryAt: () => null,
+      retryHost: () => null,
+      retryCount: 0,
+      autoResumePending: false,
+      error: () => null,
       progress: 1,
       filePath: () => path,
       bytesTotal: bytesTotal,
       supersededPath: () => null,
+      retainedMediaPaths: retained
+          .where((previous) => previous != path)
+          .toList(),
     );
-    _put(done);
+    // Commit the new library path before removing any recoverable old media.
+    // Retired paths remain in the committed record across a cleanup interruption.
+    try {
+      final committed = await _commitCompletedRecord(done);
+      if (committed == null) {
+        if (!_disposed && _isCanceled(rec.id)) await _deleteMediaFile(path);
+        return;
+      }
+      done = committed;
+    } catch (_) {
+      if (!_disposed &&
+          _records[rec.id]?.status != DownloadStatus.canceled &&
+          _records.containsKey(rec.id)) {
+        _records[rec.id] = (_records[rec.id] ?? latest).copyWith(
+          status: DownloadStatus.failed,
+          filePath: () => path,
+          retainedMediaPaths: done.retainedMediaPaths,
+          error: () =>
+              'The file was saved, but the download library could not be updated. Check storage and retry.',
+        );
+      }
+      return;
+    }
+    if (_disposed) return;
+    final current = _records[rec.id];
+    if (current == null || current.status == DownloadStatus.canceled) {
+      // The awaited save may have crossed a user cancellation/deletion.
+      // Reassert that newer intent after the older completion write.
+      try {
+        if (current == null) {
+          await _box.delete(rec.id);
+        } else {
+          await _box.put(rec.id, current.toMap());
+        }
+      } catch (_) {}
+      await _deleteMediaFile(path);
+      return;
+    }
     await _publishExternalSubtitles(done);
-    final superseded = rec.supersededPath;
-    if (superseded != null && superseded.isNotEmpty && superseded != path) {
-      await _deleteMediaFile(superseded);
+    _syncFolder(done);
+    // Windows: an HLS attempt that moved on to another server or a direct
+    // file can leave its partial behind (hundreds of MB). The episode is
+    // done now, so those leftovers go. The finished file is never touched.
+    if (Platform.isWindows && !done.isTorrent) {
+      final hlsOutput = _windowsHlsOutputOrNull(done);
+      if (hlsOutput != null) await HlsDownloader.discardPartial(hlsOutput);
+    }
+    for (final previous in retained) {
+      if (previous != path) await _deleteUnreferencedMedia(previous, rec.id);
+    }
+    // Keep paths whose deletion failed or which another record still owns.
+    final remaining = <String>[];
+    for (final previous in done.retainedMediaPaths) {
+      if (isUriPath(previous) || await File(previous).exists()) {
+        remaining.add(previous);
+      }
+    }
+    if (remaining.length != done.retainedMediaPaths.length) {
+      final cleaned = done.copyWith(retainedMediaPaths: remaining);
+      try {
+        await _commitCompletedRecord(cleaned);
+      } catch (_) {
+        // The verified media/library entry remains valid. Stale retired paths
+        // stay recoverable rather than becoming an unhandled background error.
+      }
     }
   }
 
-  void _put(DownloadRecord rec) {
-    _records[rec.id] = rec;
-    _box.put(rec.id, rec.toMap());
+  /// Subtitle downloads finish independently of video. Reconcile their latest
+  /// metadata across each awaited save before publishing a completion snapshot.
+  /// Newer cancel/delete/pause intent wins every retry of the critical save.
+  Future<DownloadRecord?> _commitCompletedRecord(DownloadRecord desired) async {
+    while (!_disposed) {
+      final before = _records[desired.id];
+      if (before == null ||
+          before.status == DownloadStatus.canceled ||
+          before.status == DownloadStatus.paused) {
+        return null;
+      }
+      desired = desired.copyWith(subtitles: before.subtitles);
+      await _persistCompletedRecord(desired);
+      if (_disposed) return null;
+      final after = _records[desired.id];
+      if (after == null ||
+          after.status == DownloadStatus.canceled ||
+          after.status == DownloadStatus.paused) {
+        if (after == null) {
+          await _box.delete(desired.id);
+        } else {
+          await _box.put(desired.id, after.toMap());
+        }
+        return null;
+      }
+      if (!listEquals(after.subtitles, desired.subtitles)) continue;
+      _records[desired.id] = desired;
+      return desired;
+    }
+    return null;
   }
 
-  /// Deterministic record id. Includes the SHOW id because providers like
-  /// AllAnime reuse episode ids ('sub:1', 'sub:2', …) across every show — so
-  /// without the show id, episode 1 of one anime collides with episode 1 of
-  /// another and the second download gets skipped.
-  String _idFor(String sourceId, String showId, String episodeId) =>
-      _safe('${sourceId}_${showId}_$episodeId');
+  /// Critical completion saves are awaited; ordinary progress remains batched.
+  Future<void> _persistCompletedRecord(DownloadRecord rec) =>
+      _writeCompletedRecord?.call(rec) ?? _box.put(rec.id, rec.toMap());
+
+  void _put(DownloadRecord rec) {
+    final previous = _records[rec.id];
+    _records[rec.id] = rec;
+    _box.put(rec.id, rec.toMap());
+    // A full save also carries the latest progress (dl-7).
+    _unsavedProgress.remove(rec.id);
+    _lastProgressSave[rec.id] = progressClock();
+    _progressNotifiers[rec.id]?.value = rec.progress;
+    if (previous?.status != rec.status) _onStatusChanged(rec);
+  }
+
+  /// Bookkeeping when a record changes status: drop stale speed numbers and
+  /// tell the Windows close guard / tray that the running count may differ.
+  void _onStatusChanged(DownloadRecord rec) {
+    if (rec.status != DownloadStatus.downloading) {
+      _liveStats.remove(rec.id);
+      _rateEstimators.remove(rec.id);
+    }
+    if (_registeredBackgroundWork) DesktopBackgroundWork.notifyChanged();
+  }
+
+  /// Applies a progress tick (dl-7). On Windows progress stays in memory:
+  /// the record is saved only when its status (or size) changes or every
+  /// [progressSaveIntervalMs], the record's own [progressListenable] updates
+  /// on every tick, and the whole manager notifies at most once per
+  /// [progressNotifyIntervalMs]. Phone keeps the original save-and-notify.
+  ///
+  /// [bytesPerSecond] / [timeLeft] come from transports that measure them;
+  /// when both are null a rate is estimated from the progress samples (dl-5).
+  void _putProgress(
+    DownloadRecord rec, {
+    double? bytesPerSecond,
+    Duration? timeLeft,
+  }) {
+    if (!Platform.isWindows) {
+      _put(rec);
+      notifyListeners();
+      return;
+    }
+    final previous = _records[rec.id];
+    final now = progressClock();
+    final statusChanged = previous?.status != rec.status;
+    final shouldSave =
+        statusChanged ||
+        previous?.bytesTotal != rec.bytesTotal ||
+        now - (_lastProgressSave[rec.id] ?? 0) >= progressSaveIntervalMs;
+    if (shouldSave) {
+      _put(rec);
+    } else {
+      // Memory only; the next save (or dispose) persists it.
+      _records[rec.id] = rec;
+      _unsavedProgress.add(rec.id);
+      _progressNotifiers[rec.id]?.value = rec.progress;
+    }
+    _updateLiveStats(rec, now, bytesPerSecond, timeLeft);
+    if (statusChanged ||
+        now - _lastProgressNotify >= progressNotifyIntervalMs) {
+      _lastProgressNotify = now;
+      notifyListeners();
+    }
+  }
+
+  /// Records speed / time left for a downloading record (dl-5).
+  void _updateLiveStats(
+    DownloadRecord rec,
+    int now,
+    double? bytesPerSecond,
+    Duration? timeLeft,
+  ) {
+    if (rec.status != DownloadStatus.downloading) {
+      _liveStats.remove(rec.id);
+      _rateEstimators.remove(rec.id);
+      return;
+    }
+    if (bytesPerSecond == null && timeLeft == null) {
+      // Fraction-only transports: estimate from the progress samples.
+      _liveStats[rec.id] = _rateEstimators
+          .putIfAbsent(rec.id, ProgressRateEstimator.new)
+          .add(rec.progress, now, bytesTotal: rec.bytesTotal);
+      return;
+    }
+    _liveStats[rec.id] = DownloadLiveStats(
+      bytesPerSecond: bytesPerSecond,
+      timeLeft: timeLeft,
+    );
+  }
+
+  /// Writes progress that so far only lived in memory (dl-7).
+  void _flushUnsavedProgress() {
+    if (_unsavedProgress.isEmpty || !Hive.isBoxOpen(boxName)) return;
+    for (final id in _unsavedProgress.toList()) {
+      final rec = _records[id];
+      if (rec != null) {
+        try {
+          _box.put(id, rec.toMap());
+        } catch (_) {
+          // Closing down; the next launch recovers from the last save.
+        }
+      }
+    }
+    _unsavedProgress.clear();
+  }
+
+  /// All files of a Windows job share its captured root. Legacy native tasks
+  /// and completed files already encode an authoritative destination; preserve
+  /// it when they predate downloadRoot instead of following today's default.
+  String _windowsVideoDirectory(DownloadRecord rec) {
+    if (rec.downloadRoot?.isNotEmpty == true) {
+      return p.join(rec.downloadRoot!, 'Videos', _safe(rec.showTitle));
+    }
+    final task = _tasks[rec.id];
+    if (task != null && task.baseDirectory == BaseDirectory.root) {
+      return task.directory;
+    }
+    final saved = rec.filePath;
+    if (saved != null && saved.isNotEmpty && !isUriPath(saved)) {
+      return p.dirname(saved);
+    }
+    return p.join(_downloadPrefs.locationUri!, 'Videos', _safe(rec.showTitle));
+  }
+
+  /// Windows IDs encode the complete tuple without punctuation or boundary
+  /// loss. Keep exact legacy records under their original IDs so native resume,
+  /// saved paths and offline progress need no migration. Other platforms retain
+  /// their existing identity format.
+  String _idFor(
+    String sourceId,
+    String showId,
+    String episodeId, {
+    String? category,
+  }) {
+    final legacy = _safe('${sourceId}_${showId}_$episodeId');
+    if (!Platform.isWindows) return legacy;
+    String key(List<String> tuple) =>
+        'download_${sha256.convert(utf8.encode(jsonEncode(tuple)))}';
+    final primary = key([sourceId, showId, episodeId]);
+    final cut = category == null
+        ? null
+        : key([sourceId, showId, episodeId, category]);
+    // Preserve exact old keys, native task identities and progress. New cuts
+    // receive separate identities even when metadata URLs/episode IDs coincide.
+    for (final id in [?cut, legacy, primary]) {
+      final saved = _records[id];
+      if (saved != null &&
+          saved.sourceId == sourceId &&
+          saved.showId == showId &&
+          saved.episodeId == episodeId &&
+          (category == null || saved.category == category)) {
+        return id;
+      }
+    }
+    if (category != null) return cut!;
+    // Compatibility for callers without cut intent; new playback/UI callers
+    // pass it explicitly so this fallback cannot silently substitute audio.
+    for (final saved in _records.values.toList().reversed) {
+      if (saved.sourceId == sourceId &&
+          saved.showId == showId &&
+          saved.episodeId == episodeId)
+        return saved.id;
+    }
+    return primary;
+  }
 
   static String _safe(String s) =>
       s.replaceAll(RegExp(r'[^A-Za-z0-9_.-]'), '_');
+
+  /// A readable Windows name plus stable identity for this saved generation.
+  /// Preserve old mobile naming and stored paths; native resume uses its saved
+  /// task filename. Fractional/missing episode numbers never define identity.
+  static String _mediaFileStem(DownloadRecord rec) {
+    if (!Platform.isWindows) {
+      return '${_safe(rec.showTitle)}_E${rec.episodeNumber?.toInt() ?? ''}_${_safe(rec.quality)}';
+    }
+    final number = rec.episodeNumber;
+    final label = number == null || !number.isFinite
+        ? ''
+        : number == number.truncateToDouble()
+        ? number.toInt().toString()
+        : number.toString();
+    final season = rec.season == null ? '' : 'S${rec.season}';
+    final key = sha256
+        .convert(
+          utf8.encode(
+            jsonEncode([
+              rec.sourceId,
+              rec.showId,
+              rec.episodeId,
+              rec.storageKey,
+            ]),
+          ),
+        )
+        .toString()
+        .substring(0, 32);
+    return '${_safe(rec.showTitle)}_${season}E${_safe(label)}_${_safe(rec.quality)}_$key';
+  }
 
   /// File extension (incl. dot) from a url path, defaulting to .mp4.
   static String _ext(String url) {

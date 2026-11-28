@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
+import '../../core/desktop/desktop_focus_repair.dart';
 import '../../core/di/injector.dart';
 import '../../core/mode/content_mode_cubit.dart';
 import '../../core/playback/search_scope.dart';
@@ -71,7 +72,7 @@ Future<MetaFilters?> pickMetaFilters(
     showAppToast(context, context.l10n.filtersNeedProvider(needed));
     return null;
   }
-  FocusScope.of(context).unfocus();
+  DesktopFocusRepair.dropFocus(context);
   if (useDialog) {
     return showMetaFilterDialog(context, kind, current);
   }

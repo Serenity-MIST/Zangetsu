@@ -1,6 +1,7 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart' show listEquals;
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, listEquals;
 import 'package:flutter/material.dart';
 
 import '../../core/di/injector.dart';
@@ -22,6 +23,7 @@ import '../../core/ui/row_skeleton.dart';
 import '../detail/detail_screen.dart';
 import '../search/browse_source_screen.dart' show canonicalTargetFor;
 import '../sources/providers_hub_screen.dart';
+import '../sources/sources_screen.dart' show SourcesScreen;
 import '../sources/stremio_sources_screen.dart';
 import 'see_all_screen.dart';
 
@@ -659,7 +661,13 @@ class SourceCatalogueHomeContentState
     ),
   );
 
-  void _openSources() => Navigator.of(
-    context,
-  ).push(MaterialPageRoute<void>(builder: (_) => const ProvidersHubScreen()));
+  void _openSources() => Navigator.of(context).push(
+    MaterialPageRoute<void>(
+      // Windows opens the same desktop Sources manager as Settings >
+      // Providers; every other platform keeps the Providers hub.
+      builder: (_) => defaultTargetPlatform == TargetPlatform.windows
+          ? const SourcesScreen()
+          : const ProvidersHubScreen(),
+    ),
+  );
 }

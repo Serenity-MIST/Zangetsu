@@ -1,6 +1,66 @@
 // Episodes tab: list and grid rows, season sheet, range chips, jump dialog.
 part of 'detail_screen.dart';
 
+/// Windows downloaded show page: an image saved next to the download comes
+/// as a `file:` URI and is drawn straight from disk (works offline). Returns
+/// null for any other URL so the caller keeps its network image; `file:`
+/// URIs only ever appear in that mode, so the phone and the online page are
+/// unaffected. A missing or broken file shows the usual grey box.
+@visibleForTesting
+Widget? localDetailImage(String url, {int? cacheWidth}) {
+  if (!url.startsWith('file:')) return null;
+  final uri = Uri.tryParse(url);
+  if (uri == null) return null;
+  final File file;
+  try {
+    file = File.fromUri(uri);
+  } catch (_) {
+    return ColoredBox(color: AppColors.surface2);
+  }
+  return Image.file(
+    file,
+    fit: BoxFit.cover,
+    cacheWidth: cacheWidth,
+    gaplessPlayback: true,
+    errorBuilder: (_, _, _) => ColoredBox(color: AppColors.surface2),
+  );
+}
+
+/// Windows: the show's wide picture (landscape poster, then banner) for an
+/// episode tile with no still of its own, so a 16:9 tile shows wide art
+/// before falling back to the portrait poster. Null on phone and TV.
+String? _desktopWideEpisodeArt(MediaItem item, MediaDetail detail) {
+  if (!_windowsDesktopUi) return null;
+  for (final url in [item.landscapePoster, detail.banner, item.banner]) {
+    final trimmed = url?.trim();
+    if (trimmed != null && trimmed.isNotEmpty) return trimmed;
+  }
+  return null;
+}
+
+/// Whether an episode row shows as watched (row tick, thumbnail check,
+/// dimming): finished locally, OR at/below the tracker's watched count.
+/// The tracker rule only applies to single-season shows, where episode
+/// numbers map cleanly to the tracker's per-entry progress. An explicit
+/// "Mark as unwatched" override ([ResumeMark.markedUnwatched], Windows)
+/// beats the tracker: trackers only keep a high-water mark, so without the
+/// veto an unmarked episode at or below it kept every watched indicator.
+/// Shared by the row and the episode menu so both always agree.
+@visibleForTesting
+bool episodeShowsWatched({
+  required ResumeMark? mark,
+  required int? episodeNumber,
+  required int? trackerProgress,
+  required bool hasMultipleSeasons,
+}) {
+  if (mark?.markedUnwatched ?? false) return false;
+  if (mark?.finished ?? false) return true;
+  return trackerProgress != null &&
+      !hasMultipleSeasons &&
+      episodeNumber != null &&
+      episodeNumber <= trackerProgress;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Episodes tab — season selector (multi-season) + rich episode rows. PRESERVES
 // season filtering and _openPlayer.
@@ -10,6 +70,8 @@ class _EpisodesTab extends StatefulWidget {
   const _EpisodesTab({
     required this.loading,
     this.versionPicker,
+    this.downloadedFallback = const [],
+    required this.category,
     required this.eps,
     required this.seasonEps,
     required this.fillerEps,
@@ -19,6 +81,7 @@ class _EpisodesTab extends StatefulWidget {
     required this.onSelectSeason,
     required this.coverUrl,
     required this.coverHeaders,
+    this.wideCoverUrl,
     required this.sourceId,
     required this.downloadSourceId,
     required this.showId,
@@ -33,18 +96,35 @@ class _EpisodesTab extends StatefulWidget {
     this.onRefresh,
     required this.onDownload,
     this.onDownloadMany,
+    this.onDeleteMany,
     this.resumeChapter,
     this.onSwitchSource,
     this.isReading = false,
     this.filmMeta,
     this.filmTitle,
     this.hasScheduledVideos = false,
+    this.malId,
+    this.anyCutFallback = false,
   });
 
   /// The catalogue knows episodes exist but none are released yet — the empty
   /// state says "not yet aired" instead of "no episodes". Defaults off so
   /// every existing caller is unchanged.
   final bool hasScheduledVideos;
+
+  /// The page's MAL id, handed to each row's download tick for the Windows
+  /// any-cut lookup (B1). Null when the show has none.
+  final int? malId;
+
+  /// True only on the Windows online show page: a row's tick also shows a
+  /// copy saved in another cut (B1). False on phone, TV and the downloaded
+  /// show page, matching the right-click menu and Play.
+  final bool anyCutFallback;
+
+  /// Windows downloaded show page: deletes the saved files of the selected
+  /// episodes. When set, the selection bar offers Delete instead of
+  /// Download. Null on the normal page.
+  final Future<void> Function(List<Episode> eps)? onDeleteMany;
 
   /// Opens the source picker for this title. Set only for catalogue titles,
   /// which are the ones that HAVE another source to try: when the one they
@@ -58,6 +138,11 @@ class _EpisodesTab extends StatefulWidget {
   final bool loading;
   final Widget? versionPicker;
 
+  /// Windows: this show's finished downloads, listed in place of "No
+  /// episodes available" when the source returned no episodes (offline).
+  final List<DownloadRecord> downloadedFallback;
+  final String category;
+
   final List<Episode> eps;
   final List<Episode> seasonEps;
   final Set<int> fillerEps; // episode numbers that are filler
@@ -67,6 +152,10 @@ class _EpisodesTab extends StatefulWidget {
   final ValueChanged<int> onSelectSeason;
   final String coverUrl;
   final Map<String, String>? coverHeaders;
+
+  /// Windows: the show's wide picture for episode rows with no still (see
+  /// [_desktopWideEpisodeArt]). Null on phone and TV.
+  final String? wideCoverUrl;
   final String sourceId;
 
   /// The source that owns the chapter FILES, which for a metadata title is
@@ -126,11 +215,44 @@ class _EpisodesTab extends StatefulWidget {
 }
 
 class _EpisodesTabState extends State<_EpisodesTab> {
-  bool _grid = false;
+  /// Windows (show-10) opens in the view last used on any show; phone keeps
+  /// starting in the list.
+  bool _grid = _windowsDesktopUi && DetailPrefs.episodeGridView;
 
   /// Starts from the Behaviour setting — newest-first on every detail screen
-  /// when on. The list button still flips it; that only lasts this visit.
+  /// when on. The list button still flips it; on phone that only lasts this
+  /// visit, on Windows (show-10) the choice is saved back as that setting.
   bool _reverseList = DetailPrefs.reverseEpisodesDefault;
+
+  // ── Windows: filter box (show-7) ─────────────────────────────────────────
+  final _filterCtrl = TextEditingController();
+  final _filterFocus = FocusNode(debugLabel: 'episode-filter');
+
+  /// Live filter text; non-empty shows every match across all chunks.
+  String _query = '';
+
+  // ── Windows: multi-select (show-6) ───────────────────────────────────────
+  /// Selected episodes by id (Ctrl/Shift-click or the hover checkbox).
+  final _selection = DesktopSelection<String>();
+
+  /// Holds focus inside the list while selecting, so Esc / Ctrl+A reach the
+  /// selection shortcuts instead of the page or the window.
+  final _listFocus = FocusNode(debugLabel: 'episode-list', skipTraversal: true);
+
+  /// On-screen order of the rows last built, for Shift ranges and Ctrl+A.
+  List<String> _orderedIds = const [];
+
+  // ── Windows: "Go to episode" reveal (show-7 B) ───────────────────────────
+  /// Rows currently mounted, by their index in the shown list; tells the
+  /// jump which way to scroll until the target row exists.
+  final Map<int, BuildContext> _mountedRows = {};
+
+  /// Index (in the shown list) of the row the last jump landed on.
+  int? _highlightIndex;
+  Timer? _highlightTimer;
+
+  /// A context inside the CustomScrollView, to reach its scroll position.
+  BuildContext? _scrollContext;
 
   /// Selected scanlation group, or null for "All". Several groups release the
   /// same chapter number, so an unfiltered list legitimately reads 1, 1, 2, 2
@@ -143,6 +265,27 @@ class _EpisodesTabState extends State<_EpisodesTab> {
   void initState() {
     super.initState();
     _rangeIndex = _initialRange();
+    if (_windowsDesktopUi) {
+      _selection.addListener(_onSelectionChanged);
+      // F5 / Ctrl+F work wherever focus is on the page (show-8), so they
+      // listen globally and check that this tab is the one on screen.
+      HardwareKeyboard.instance.addHandler(_onHardwareKey);
+    }
+  }
+
+  @override
+  void dispose() {
+    // Unconditional: both are no-ops when nothing was added, and the platform
+    // check could differ from initState's (tests reset the override before
+    // the tree is torn down), which would leak the global key handler.
+    HardwareKeyboard.instance.removeHandler(_onHardwareKey);
+    _selection.removeListener(_onSelectionChanged);
+    _highlightTimer?.cancel();
+    _selection.dispose();
+    _listFocus.dispose();
+    _filterCtrl.dispose();
+    _filterFocus.dispose();
+    super.dispose();
   }
 
   @override
@@ -153,7 +296,308 @@ class _EpisodesTabState extends State<_EpisodesTab> {
         old.seasonEps.length != widget.seasonEps.length) {
       _rangeIndex = _initialRange();
       _highlightEpId = null;
+      _highlightIndex = null;
+      // A selection only makes sense within the episodes it was made in.
+      if (old.currentSeason != widget.currentSeason) _selection.clear();
     }
+  }
+
+  // ── Windows helpers (show-6 / show-7 / show-8 / show-10) ─────────────────
+
+  /// Repaints the rows and pulls focus into the list once a selection starts,
+  /// so Esc clears it and Ctrl+A selects all.
+  void _onSelectionChanged() {
+    if (!mounted) return;
+    setState(() {});
+    if (_selection.isActive &&
+        !_listFocus.hasFocus &&
+        !_filterFocus.hasFocus) {
+      _listFocus.requestFocus();
+    } else if (!_selection.isActive && _listFocus.hasPrimaryFocus) {
+      // Selection over: hand focus back to the page so its Enter/Space
+      // (play) keys work again.
+      _listFocus.unfocus(disposition: UnfocusDisposition.scope);
+    }
+  }
+
+  /// True when this tab is the visible page of the tab view (a kept-alive
+  /// neighbour sits a full page width to the side).
+  bool _onScreen() {
+    final box = context.findRenderObject();
+    if (box is! RenderBox || !box.attached || !box.hasSize) return false;
+    final left = box.localToGlobal(Offset.zero).dx;
+    final screen = MediaQuery.sizeOf(context).width;
+    return left > -box.size.width / 2 && left < screen - box.size.width / 2;
+  }
+
+  /// show-8 keys for this tab: F5 refreshes the episode list, Ctrl+F jumps
+  /// into the filter box. Only while this page is the top route and the
+  /// Episodes tab is showing.
+  bool _onHardwareKey(KeyEvent event) {
+    if (event is! KeyDownEvent || !mounted) return false;
+    final route = ModalRoute.of(context);
+    if (route != null && !route.isCurrent) return false;
+    if (!_onScreen()) return false;
+    // The filter box only exists for a non-empty episode list (not films);
+    // F5 below still works on an empty or failed list, where it helps most.
+    final hasFilter = widget.seasonEps.isNotEmpty && widget.filmMeta == null;
+    if (hasFilter && DesktopShortcuts.matches('show.filter', event)) {
+      _filterFocus.requestFocus();
+      // Select what is there, so typing replaces the last search.
+      _filterCtrl.selection = TextSelection(
+        baseOffset: 0,
+        extentOffset: _filterCtrl.text.length,
+      );
+      return true;
+    }
+    final refresh = widget.onRefresh;
+    if (refresh != null &&
+        DesktopShortcuts.matches('show.refreshEpisodes', event)) {
+      unawaited(refresh());
+      showAppToast(
+        context,
+        widget.isReading
+            ? context.l10n.refreshingChapters
+            : context.l10n.refreshingEpisodes,
+      );
+      return true;
+    }
+    return false;
+  }
+
+  /// show-10: list/grid is remembered for every show on Windows.
+  void _toggleView() {
+    setState(() => _grid = !_grid);
+    if (_windowsDesktopUi) unawaited(DetailPrefs.setEpisodeGridView(_grid));
+  }
+
+  /// show-10: newest-first is saved back as the app-wide default on Windows.
+  void _saveReverse(bool value) {
+    if (!_windowsDesktopUi) return;
+    unawaited(DetailPrefs.rememberReverseEpisodes(value));
+  }
+
+  /// show-7: the filter text changed; leave any jump highlight behind.
+  void _onFilterChanged(String value) {
+    setState(() {
+      _query = value;
+      _highlightEpId = null;
+      _highlightIndex = null;
+    });
+  }
+
+  /// Second Esc in the filter box: hand the keyboard back to the page (the
+  /// list while selecting, so Esc can then clear the selection).
+  void _closeFilter() {
+    if (_selection.isActive) {
+      _listFocus.requestFocus();
+    } else {
+      _filterFocus.unfocus(disposition: UnfocusDisposition.scope);
+    }
+  }
+
+  /// Episodes currently selected, in list order.
+  List<Episode> get _selectedEpisodes {
+    final ids = _selection.selected;
+    return [
+      for (final e in widget.seasonEps)
+        if (ids.contains(e.id)) e,
+    ];
+  }
+
+  /// show-6: Mark watched / unwatched (read / unread) for the selection.
+  /// Writes the same stores and keys as the single-episode menu.
+  Future<void> _markSelection(bool watched) async {
+    final picked = _selectedEpisodes;
+    if (picked.isEmpty) return;
+    final readSource = widget.downloadSourceId.isNotEmpty
+        ? widget.downloadSourceId
+        : widget.sourceId;
+    for (final ep in picked) {
+      if (widget.isReading) {
+        await sl<ReadStore>().setRead(
+          readSource,
+          widget.showId,
+          ep.id,
+          read: watched,
+        );
+      } else {
+        await sl<ResumeStore>().setWatched(
+          widget.sourceId,
+          widget.showUrl,
+          ep.id,
+          watched: watched,
+        );
+      }
+    }
+    if (!mounted) return;
+    _selection.clear();
+    setState(() {});
+    // Trackers hold a high-water mark: one write for the highest episode,
+    // and nothing for "unwatched" (same rule as the episode menu).
+    final host = context.findAncestorStateOfType<_DetailViewState>();
+    final detail = _currentDetail();
+    if (watched && host != null && detail != null) {
+      final top = picked.reduce(
+        (a, b) => (b.number ?? -1) > (a.number ?? -1) ? b : a,
+      );
+      unawaited(host._scrobbleUpTo(top, detail));
+    }
+    final n = picked.length;
+    showAppToast(
+      context,
+      widget.isReading
+          ? (watched
+                ? context.l10n.markedChaptersAsRead(n)
+                : context.l10n.markedChaptersAsUnread(n))
+          : (watched
+                ? context.l10n.markedEpisodesAsWatched(n)
+                : context.l10n.markedEpisodesAsUnwatched(n)),
+    );
+  }
+
+  /// The loaded detail from the page's cubit, or null outside the page.
+  MediaDetail? _currentDetail() {
+    try {
+      return context.read<DetailCubit>().state.detail;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Downloaded show page: Delete for the selection (the page confirms).
+  Future<void> _deleteSelection() async {
+    final picked = _selectedEpisodes;
+    final delete = widget.onDeleteMany;
+    if (picked.isEmpty || delete == null) return;
+    await delete(picked);
+    if (mounted) _selection.clear();
+  }
+
+  /// show-6: Download for the selection. Chapters queue straight away;
+  /// episodes go through the page's existing batch download dialog with only
+  /// the selected ones in it (all ticked), so quality/server/size and the
+  /// already-downloaded check work exactly as from the Download button.
+  Future<void> _downloadSelection() async {
+    final picked = _selectedEpisodes;
+    if (picked.isEmpty) return;
+    if (widget.isReading) {
+      if (widget.onDownloadMany == null) return;
+      _selection.clear();
+      await _enqueueAll(picked);
+      return;
+    }
+    final host = context.findAncestorStateOfType<_DetailViewState>();
+    final detail = _currentDetail();
+    if (host == null || detail == null) return;
+    _selection.clear();
+    await host._openDownloadSheet(
+      detail: detail,
+      category: widget.category,
+      episodesBySeason: {widget.currentSeason: picked},
+      initialSeason: widget.currentSeason,
+    );
+  }
+
+  /// Windows "Go to episode" (show-7 B): keep the current view, scroll the
+  /// landed-on row into view and outline it for a moment. The row may not be
+  /// built yet (lazy list), so this steps a screen at a time towards it.
+  void _revealHighlight() {
+    _highlightTimer?.cancel();
+    var tries = 0;
+    void step(Duration _) {
+      final target = _highlightIndex;
+      if (!mounted || target == null || tries++ > 40) return;
+      final row = _mountedRows[target];
+      if (row != null && row.mounted) {
+        unawaited(
+          Scrollable.ensureVisible(
+            row,
+            alignment: 0.3,
+            duration: const Duration(milliseconds: 250),
+          ),
+        );
+        return;
+      }
+      final scrollContext = _scrollContext;
+      final position = scrollContext == null || !scrollContext.mounted
+          ? null
+          : Scrollable.maybeOf(scrollContext)?.position;
+      if (position == null || _mountedRows.isEmpty) return;
+      final built = _mountedRows.keys;
+      final down = target > built.reduce((a, b) => a > b ? a : b);
+      final next =
+          (position.pixels +
+                  position.viewportDimension * 0.8 * (down ? 1 : -1))
+              .clamp(position.minScrollExtent, position.maxScrollExtent);
+      if (next == position.pixels) return; // already at the end
+      position.jumpTo(next);
+      WidgetsBinding.instance.addPostFrameCallback(step);
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback(step);
+    // "Briefly": the outline fades after a few seconds.
+    _highlightTimer = Timer(const Duration(seconds: 3), () {
+      if (!mounted) return;
+      setState(() {
+        _highlightEpId = null;
+        _highlightIndex = null;
+      });
+    });
+  }
+
+  /// Windows row wrapper: registers the row for [_revealHighlight], outlines
+  /// a jump target and adds the selection wash + hover checkbox (show-6).
+  Widget _desktopFrame({
+    required int index,
+    required Episode ep,
+    required Widget child,
+    required Offset checkboxOffset,
+    double checkboxSize = 20,
+    double radius = 10,
+    // Grid tiles draw their own jump outline.
+    bool outline = true,
+  }) {
+    final selectable = widget.filmMeta == null;
+    final highlighted = outline && _highlightEpId == ep.id;
+    Widget body = child;
+    if (selectable) {
+      body = EpisodeSelectableTile(
+        selected: _selection.isSelected(ep.id),
+        selectionActive: _selection.isActive,
+        onCheckbox: () => _selection.toggle(ep.id),
+        checkboxOffset: checkboxOffset,
+        checkboxSize: checkboxSize,
+        radius: radius,
+        child: body,
+      );
+    }
+    return _MountedRow(
+      index: index,
+      rows: _mountedRows,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        foregroundDecoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(radius),
+          border: Border.all(
+            color: highlighted ? AppColors.accent : Colors.transparent,
+            width: 2,
+          ),
+        ),
+        child: body,
+      ),
+    );
+  }
+
+  /// Row click on Windows: Ctrl/Shift (or any click while selecting) selects
+  /// instead of opening the episode.
+  void _openOrSelect(Episode ep, int fullIndex) {
+    if (_windowsDesktopUi &&
+        widget.filmMeta == null &&
+        _selection.handleClick(ep.id, _orderedIds)) {
+      return;
+    }
+    widget.onOpen(fullIndex);
   }
 
   /// The chunk holding the resume episode, so the tab opens where the user left
@@ -249,13 +693,12 @@ class _EpisodesTabState extends State<_EpisodesTab> {
     // Watched = finished locally, OR at/below the tracker's watched count.
     // Only applied to single-season shows, where episode numbers map cleanly
     // to the tracker's per-entry progress (avoids mis-greying across seasons).
-    final epNum = ep.number?.toInt();
-    final watched =
-        (mark != null && mark.finished) ||
-        (widget.trackerProgress != null &&
-            !widget.hasMultipleSeasons &&
-            epNum != null &&
-            epNum <= widget.trackerProgress!);
+    final watched = episodeShowsWatched(
+      mark: mark,
+      episodeNumber: ep.number?.toInt(),
+      trackerProgress: widget.trackerProgress,
+      hasMultipleSeasons: widget.hasMultipleSeasons,
+    );
     final resume =
         widget.hasAnyMark && fullIndex == widget.resumeIndex(widget.eps);
     final fraction = inProgress
@@ -287,21 +730,52 @@ class _EpisodesTabState extends State<_EpisodesTab> {
       local = episodePositionForNumber(n, eps.length, reversed: _reverseList);
     }
     if (local < 0) return;
+    final rangeIndex = episodeRangeIndex(
+      local,
+      total: eps.length,
+      reversed: _reverseList,
+    );
     setState(() {
-      _rangeIndex = episodeRangeIndex(
-        local,
-        total: eps.length,
-        reversed: _reverseList,
-      );
-      _grid = true; // the grid makes the jumped-to episode easy to spot
+      _rangeIndex = rangeIndex;
+      // Phone: the grid makes the jumped-to episode easy to spot. Windows
+      // (show-7 B) keeps the chosen view and scrolls to the row instead.
+      if (!_windowsDesktopUi) _grid = true;
       _highlightEpId = eps[local].id;
+      if (_windowsDesktopUi) {
+        // A filter would hide the target: clear it so the chunk shows.
+        _filterCtrl.clear();
+        _query = '';
+        _highlightIndex =
+            local - episodeRangeSlice(rangeIndex, eps.length,
+                reversed: _reverseList).start;
+      }
     });
+    if (_windowsDesktopUi) _revealHighlight();
   }
 
   @override
   Widget build(BuildContext context) {
     if (widget.seasonEps.isEmpty) {
       if (widget.loading) return const _EpisodeListSkeleton();
+      final saved = widget.downloadedFallback;
+      if (saved.isNotEmpty) {
+        return DesktopDownloadedEpisodes(
+          records: saved,
+          onPlay: (i) => unawaited(launchDownloadedEpisode(
+            context,
+            saved[i],
+            episodes: episodesFromDownloads(saved),
+            startIndex: i,
+          )),
+        );
+      }
+      // Windows: "Chapters" for reading titles and the desktop chip.
+      if (_windowsDesktopUi && !widget.hasScheduledVideos) {
+        return SourceEmptyState(
+          isReading: widget.isReading,
+          onSwitchSource: widget.onSwitchSource,
+        );
+      }
       return EmptyState(
         icon: Icons.video_library_outlined,
         message: widget.hasScheduledVideos
@@ -322,42 +796,120 @@ class _EpisodesTabState extends State<_EpisodesTab> {
     final maxRange = _rangeCount == 0 ? 0 : _rangeCount - 1;
     final rangeIndex = _rangeIndex.clamp(0, maxRange);
     final slice = episodeRangeSlice(rangeIndex, total, reversed: _reverseList);
-    final visible = displayEps.sublist(slice.start, slice.end);
+    // Windows filter (show-7): every match across all chunks, in the shown
+    // order, with no range chips. Empty text keeps the chunked list.
+    final filtering =
+        _windowsDesktopUi &&
+        widget.filmMeta == null &&
+        _query.trim().isNotEmpty;
+    final visible = filtering
+        ? filterEpisodes(displayEps, _query)
+        : displayEps.sublist(slice.start, slice.end);
     final showRanges = _rangeCount > 1;
     final groups = _scanlators;
+    // Number shown for a row whose episode has none: its place in the list.
+    // The filtered view looks the place up, the chunked one counts from the
+    // chunk start (unchanged phone maths).
+    final int Function(int i, Episode ep) fallbackNumber = filtering
+        ? (i, ep) {
+            final at = displayEps.indexOf(ep);
+            return _reverseList ? total - at : at + 1;
+          }
+        : (i, ep) => _reverseList ? total - slice.start - i : slice.start + i + 1;
+    // Shift ranges and Ctrl+A follow what is on screen right now.
+    _orderedIds = [for (final e in visible) e.id];
+    final selecting = _windowsDesktopUi && _selection.isActive;
 
     // One scrollable (slivers): the header + chips scroll with the list so the
     // tab can never overflow when the NestedScrollView hands it a tiny height
     // during a layout pass (the Column+Expanded version did).
-    return CustomScrollView(
+    final scroll = CustomScrollView(
       slivers: [
         SliverToBoxAdapter(
-          child: _EpisodesHeader(
-            movieLabel: widget.filmMeta,
-            versionPicker: widget.versionPicker,
-            hasMultipleSeasons:
-                widget.hasMultipleSeasons && widget.filmMeta == null,
-            seasons: widget.seasonSet.toList()..sort(),
-            currentSeason: widget.currentSeason,
-            onSelectSeason: widget.onSelectSeason,
-            onRefresh: widget.onRefresh,
-            reverseList: _reverseList,
-            onToggleReverseList: () => setState(() {
-              _reverseList = !_reverseList;
-              if (_rangeCount > 0) {
-                _rangeIndex = _rangeCount - 1 - _rangeIndex;
-              }
-              _highlightEpId = null;
-            }),
-            grid: _grid,
-            onToggleView: () => setState(() => _grid = !_grid),
-            onJump: showRanges ? _jump : null,
-            isReading: widget.isReading,
-            onBulkDownload: widget.onDownloadMany != null && !sl<AppMode>().isTv
-                ? () => _openBulkDownload(eps)
-                : null,
+          child: Builder(
+            builder: (scrollContext) {
+              // Remembered for the jump reveal, which scrolls this view.
+              _scrollContext = scrollContext;
+              return _EpisodesHeader(
+                movieLabel: widget.filmMeta,
+                versionPicker: widget.versionPicker,
+                hasMultipleSeasons:
+                    widget.hasMultipleSeasons && widget.filmMeta == null,
+                seasons: widget.seasonSet.toList()..sort(),
+                currentSeason: widget.currentSeason,
+                onSelectSeason: widget.onSelectSeason,
+                onRefresh: widget.onRefresh,
+                reverseList: _reverseList,
+                onToggleReverseList: () {
+                  setState(() {
+                    _reverseList = !_reverseList;
+                    if (_rangeCount > 0) {
+                      _rangeIndex = _rangeCount - 1 - _rangeIndex;
+                    }
+                    _highlightEpId = null;
+                    _highlightIndex = null;
+                  });
+                  _saveReverse(_reverseList);
+                },
+                grid: _grid,
+                onToggleView: _toggleView,
+                onJump: showRanges ? _jump : null,
+                isReading: widget.isReading,
+                onBulkDownload:
+                    widget.onDownloadMany != null && !sl<AppMode>().isTv
+                    ? () => _openBulkDownload(eps)
+                    : null,
+                // Windows only: search box and the "Select" button beside it.
+                // Placeholder: EpisodeFilterField's "Search episodes" /
+                // "Search chapters" ("filter" read oddly to users).
+                filter: _windowsDesktopUi && widget.filmMeta == null
+                    ? EpisodeFilterField(
+                        controller: _filterCtrl,
+                        focusNode: _filterFocus,
+                        onChanged: _onFilterChanged,
+                        onClose: _closeFilter,
+                        hint: widget.isReading
+                            ? EpisodeFilterField.chapterHint
+                            : null,
+                      )
+                    : null,
+                onStartSelecting: _windowsDesktopUi && widget.filmMeta == null
+                    ? _selection.startSelecting
+                    : null,
+              );
+            },
           ),
         ),
+        // show-6: the selection toolbar stays pinned while the list scrolls.
+        if (selecting)
+          SliverPersistentHeader(
+            pinned: true,
+            delegate: PinnedBoxDelegate(
+              height: 52,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+                child: EpisodeSelectionBar(
+                  count: _selection.selected.length,
+                  isReading: widget.isReading,
+                  onMarkWatched: () => unawaited(_markSelection(true)),
+                  onMarkUnwatched: () => unawaited(_markSelection(false)),
+                  onSelectAll: () => _selection.selectAll(_orderedIds),
+                  onClear: _selection.clear,
+                  // Downloaded show page: Delete takes Download's place.
+                  onDownload: widget.onDeleteMany != null
+                      ? null
+                      : widget.isReading
+                      ? (widget.onDownloadMany == null
+                            ? null
+                            : () => unawaited(_downloadSelection()))
+                      : () => unawaited(_downloadSelection()),
+                  onDelete: widget.onDeleteMany == null
+                      ? null
+                      : () => unawaited(_deleteSelection()),
+                ),
+              ),
+            ),
+          ),
         // Only when the tracker says the show is still airing. Sits under the
         // header so it reads as part of the episode list rather than another
         // thing competing with the hero.
@@ -405,10 +957,12 @@ class _EpisodesTabState extends State<_EpisodesTab> {
                 _scanlator = i == 0 ? null : groups[i - 1];
                 _rangeIndex = 0;
                 _highlightEpId = null;
+                _highlightIndex = null;
               }),
             ),
           ),
-        if (showRanges)
+        // Chunks mean nothing while a filter lists every match.
+        if (showRanges && !filtering)
           SliverToBoxAdapter(
             child: _RangeChips(
               count: _rangeCount,
@@ -419,15 +973,38 @@ class _EpisodesTabState extends State<_EpisodesTab> {
               onSelect: (i) => setState(() {
                 _rangeIndex = i;
                 _highlightEpId = null;
+                _highlightIndex = null;
               }),
             ),
           ),
+        // show-7: say so when the filter matches nothing.
+        if (filtering && visible.isEmpty)
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 24, 16, 0),
+              child: Text(
+                widget.isReading
+                    ? context.l10n.noChaptersMatchQuery(_query.trim())
+                    : context.l10n.noEpisodesMatchQuery(_query.trim()),
+                textAlign: TextAlign.center,
+                style: AppText.body.copyWith(color: AppColors.textSecondary),
+              ),
+            ),
+          ),
         if (_grid && widget.filmMeta == null)
-          _buildGrid(store, visible, slice.start, total)
+          _buildGrid(store, visible, fallbackNumber)
         else
-          _buildList(store, visible, slice.start, total),
+          _buildList(store, visible, fallbackNumber),
         const SliverToBoxAdapter(child: SizedBox(height: 48)),
       ],
+    );
+    if (!_windowsDesktopUi) return scroll;
+    // Windows (show-6): Ctrl+A / Esc / Shift+arrows for the selection while
+    // focus is in the list; the inner Focus is what a selection pulls focus to.
+    return DesktopSelectionShortcuts<String>(
+      selection: _selection,
+      orderedKeys: () => _orderedIds,
+      child: Focus(focusNode: _listFocus, child: scroll),
     );
   }
 
@@ -478,10 +1055,15 @@ class _EpisodesTabState extends State<_EpisodesTab> {
           n,
     ];
 
-    showModalBottomSheet<void>(
-      context: context,
+    // show-2: phone keeps its bottom sheet; Windows gets the graphite dialog
+    // with the heading in its title bar (showAdaptiveSheet forwards
+    // everything unchanged off Windows).
+    showAdaptiveSheet<void>(
+      context,
+      title: context.l10n.downloadChapters,
+      subtitle: context.l10n.notSavedCount(pending.length),
+      desktopWidth: 440,
       backgroundColor: AppColors.surface,
-      barrierColor: Colors.black54,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
@@ -489,32 +1071,37 @@ class _EpisodesTabState extends State<_EpisodesTab> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Container(
-              margin: const EdgeInsets.only(top: 12, bottom: 8),
-              width: 36,
-              height: 4,
-              decoration: BoxDecoration(
-                color: AppColors.textTertiary.withValues(alpha: 0.5),
-                borderRadius: BorderRadius.circular(2),
+            // The desktop dialog already has the title bar, so the handle and
+            // heading are phone-only.
+            if (!DesktopSheetScope.of(sheetContext)) ...[
+              Container(
+                margin: const EdgeInsets.only(top: 12, bottom: 8),
+                width: 36,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: AppColors.textTertiary.withValues(alpha: 0.5),
+                  borderRadius: BorderRadius.circular(2),
+                ),
               ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      context.l10n.downloadChapters,
-                      style: AppText.headline,
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        context.l10n.downloadChapters,
+                        style: AppText.headline,
+                      ),
                     ),
-                  ),
-                  Text(
-                    context.l10n.notSavedCount(pending.length),
-                    style: AppText.caption,
-                  ),
-                ],
+                    Text(
+                      context.l10n.notSavedCount(pending.length),
+                      style: AppText.caption,
+                    ),
+                  ],
+                ),
               ),
-            ),
+            ] else
+              const SizedBox(height: 6),
             for (final n in counts)
               Builder(
                 builder: (context) {
@@ -559,11 +1146,13 @@ class _EpisodesTabState extends State<_EpisodesTab> {
               ),
               onTap: () async {
                 Navigator.pop(sheetContext);
-                final range = await showModalBottomSheet<({int from, int to})>(
-                  context: context,
+                // show-2: graphite dialog on Windows, sheet on phone.
+                final range = await showAdaptiveSheet<({int from, int to})>(
+                  context,
+                  title: context.l10n.custom,
+                  desktopWidth: 460,
                   isScrollControlled: true,
                   backgroundColor: AppColors.surface,
-                  barrierColor: Colors.black54,
                   shape: const RoundedRectangleBorder(
                     borderRadius: BorderRadius.vertical(
                       top: Radius.circular(20),
@@ -633,78 +1222,98 @@ class _EpisodesTabState extends State<_EpisodesTab> {
   Widget _buildList(
     ResumeStore store,
     List<Episode> visible,
-    int offset,
-    int total,
+    int Function(int i, Episode ep) fallbackNumber,
   ) {
     return SliverList.builder(
       itemCount: visible.length,
       itemBuilder: (context, i) {
-        final ep = visible[i];
-        final fullIndex = widget.eps.indexOf(ep);
-        final st = _stateFor(store, ep, fullIndex);
-        final fallbackNumber = _reverseList
-            ? total - offset - i
-            : offset + i + 1;
-        final epNum = ep.number?.toInt() ?? fallbackNumber;
-        final singleMovie = widget.filmMeta != null && widget.eps.length == 1;
-        final displayTitle =
-            singleMovie && (widget.filmTitle?.isNotEmpty ?? false)
-            ? widget.filmTitle!
-            : widget.hasMultipleSeasons
-            ? cleanTitle(ep.title)
-            : ep.title;
-        if (widget.isReading) {
-          return RepaintBoundary(
-            child: _ChapterRow(
-              ep: ep,
-              number: epNum,
-              displayTitle: displayTitle,
-              coverUrl: widget.coverUrl,
-              coverHeaders: widget.coverHeaders,
-              isRead: st.watched,
-              isInProgress: st.inProgress,
-              fraction: st.fraction,
-              onTap: () => widget.onOpen(fullIndex),
-              onLongPress: widget.onEpisodeMenu == null
-                  ? null
-                  : () => widget.onEpisodeMenu!(fullIndex),
-              onDownload: () => widget.onDownload(ep),
-              sourceId: widget.sourceId,
-              downloadSourceId: widget.downloadSourceId,
-            ),
-          );
-        }
-        return RepaintBoundary(
-          child: _EpisodeRow(
-            ep: ep,
-            epNum: epNum,
-            isMovie: singleMovie,
-            displayTitle: displayTitle,
-            filler: isFillerEpisode(ep, widget.fillerEps, fallbackNumber: epNum),
-            coverUrl: widget.coverUrl,
-            coverHeaders: widget.coverHeaders,
-            isWatched: st.watched,
-            isInProgress: st.inProgress,
-            isResume: st.resume,
-            fraction: st.fraction,
-            onTap: () => widget.onOpen(fullIndex),
-            onLongPress: widget.onEpisodeMenu == null
-                ? null
-                : () => widget.onEpisodeMenu!(fullIndex),
-            onDownload: () => widget.onDownload(ep),
-            sourceId: widget.sourceId,
-            showId: widget.showId,
-          ),
+        final row = _buildListRow(store, visible, i, fallbackNumber);
+        if (!_windowsDesktopUi) return row;
+        // Windows: selection wash, hover checkbox (over the thumbnail) and
+        // the jump outline (show-6 / show-7).
+        return _desktopFrame(
+          index: i,
+          ep: visible[i],
+          checkboxOffset: widget.isReading
+              ? const Offset(20, 8)
+              : const Offset(22, 14),
+          checkboxSize: widget.isReading ? 18 : 20,
+          child: row,
         );
       },
+    );
+  }
+
+  /// One list row (episode or chapter); identical to before on phone.
+  Widget _buildListRow(
+    ResumeStore store,
+    List<Episode> visible,
+    int i,
+    int Function(int i, Episode ep) fallbackNumber,
+  ) {
+    final ep = visible[i];
+    final fullIndex = widget.eps.indexOf(ep);
+    final st = _stateFor(store, ep, fullIndex);
+    final epNum = ep.number?.toInt() ?? fallbackNumber(i, ep);
+    final singleMovie = widget.filmMeta != null && widget.eps.length == 1;
+    final displayTitle = singleMovie && (widget.filmTitle?.isNotEmpty ?? false)
+        ? widget.filmTitle!
+        : widget.hasMultipleSeasons
+        ? cleanTitle(ep.title)
+        : ep.title;
+    if (widget.isReading) {
+      return RepaintBoundary(
+        child: _ChapterRow(
+          ep: ep,
+          number: epNum,
+          displayTitle: displayTitle,
+          coverUrl: widget.coverUrl,
+          coverHeaders: widget.coverHeaders,
+          isRead: st.watched,
+          isInProgress: st.inProgress,
+          fraction: st.fraction,
+          onTap: () => _openOrSelect(ep, fullIndex),
+          onLongPress: widget.onEpisodeMenu == null
+              ? null
+              : () => widget.onEpisodeMenu!(fullIndex),
+          onDownload: () => widget.onDownload(ep),
+          sourceId: widget.sourceId,
+          downloadSourceId: widget.downloadSourceId,
+        ),
+      );
+    }
+    return RepaintBoundary(
+      child: _EpisodeRow(
+        category: widget.category,
+        ep: ep,
+        epNum: epNum,
+        isMovie: singleMovie,
+        displayTitle: displayTitle,
+        filler: isFillerEpisode(ep, widget.fillerEps, fallbackNumber: epNum),
+        coverUrl: widget.coverUrl,
+        coverHeaders: widget.coverHeaders,
+        wideCoverUrl: widget.wideCoverUrl,
+        isWatched: st.watched,
+        isInProgress: st.inProgress,
+        isResume: st.resume,
+        fraction: st.fraction,
+        onTap: () => _openOrSelect(ep, fullIndex),
+        onLongPress: widget.onEpisodeMenu == null
+            ? null
+            : () => widget.onEpisodeMenu!(fullIndex),
+        onDownload: () => widget.onDownload(ep),
+        sourceId: widget.sourceId,
+        showId: widget.showId,
+        malId: widget.malId,
+        anyCutFallback: widget.anyCutFallback,
+      ),
     );
   }
 
   Widget _buildGrid(
     ResumeStore store,
     List<Episode> visible,
-    int offset,
-    int total,
+    int Function(int i, Episode ep) fallbackNumber,
   ) {
     return SliverPadding(
       padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
@@ -720,11 +1329,8 @@ class _EpisodesTabState extends State<_EpisodesTab> {
           final ep = visible[i];
           final fullIndex = widget.eps.indexOf(ep);
           final st = _stateFor(store, ep, fullIndex);
-          final fallbackNumber = _reverseList
-              ? total - offset - i
-              : offset + i + 1;
-          final epNum = ep.number?.toInt() ?? fallbackNumber;
-          return _EpisodeGridTile(
+          final epNum = ep.number?.toInt() ?? fallbackNumber(i, ep);
+          final tile = _EpisodeGridTile(
             number: epNum,
             isWatched: st.watched,
             isInProgress: st.inProgress,
@@ -733,15 +1339,73 @@ class _EpisodesTabState extends State<_EpisodesTab> {
             highlight: _highlightEpId == ep.id,
             fraction: st.fraction,
             available: ep.available,
-            onTap: () => widget.onOpen(fullIndex),
+            onTap: () => _openOrSelect(ep, fullIndex),
             onLongPress: widget.onEpisodeMenu == null
                 ? null
                 : () => widget.onEpisodeMenu!(fullIndex),
+          );
+          if (!_windowsDesktopUi) return tile;
+          // Windows: selection wash + hover checkbox in the corner; the tile
+          // draws its own jump outline.
+          return _desktopFrame(
+            index: i,
+            ep: ep,
+            checkboxOffset: const Offset(5, 5),
+            checkboxSize: 16,
+            outline: false,
+            child: tile,
           );
         },
       ),
     );
   }
+}
+
+/// Windows: registers a mounted episode row by its index in the shown list,
+/// so "Go to episode" knows which way to scroll until its target exists.
+class _MountedRow extends StatefulWidget {
+  const _MountedRow({
+    required this.index,
+    required this.rows,
+    required this.child,
+  });
+
+  final int index;
+  final Map<int, BuildContext> rows;
+  final Widget child;
+
+  @override
+  State<_MountedRow> createState() => _MountedRowState();
+}
+
+/// Registers its row while mounted so the jump reveal can find it.
+class _MountedRowState extends State<_MountedRow> {
+  @override
+  void initState() {
+    super.initState();
+    widget.rows[widget.index] = context;
+  }
+
+  @override
+  void didUpdateWidget(covariant _MountedRow old) {
+    super.didUpdateWidget(old);
+    // A reused element can move to another index (new chunk / filter).
+    if (old.index != widget.index) {
+      if (identical(old.rows[old.index], context)) old.rows.remove(old.index);
+      widget.rows[widget.index] = context;
+    }
+  }
+
+  @override
+  void dispose() {
+    if (identical(widget.rows[widget.index], context)) {
+      widget.rows.remove(widget.index);
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -764,9 +1428,20 @@ class _EpisodesHeader extends StatelessWidget {
     this.onJump,
     this.isReading = false,
     this.onBulkDownload,
+    this.filter,
+    this.onStartSelecting,
   });
 
+  /// Windows (show-7): the episode filter box, shown before the buttons.
+  final Widget? filter;
+
+  /// Windows (show-6): the "Select" button beside the search box; null
+  /// hides it.
+  final VoidCallback? onStartSelecting;
+
   final String? movieLabel;
+
+  /// The episode version (Sub / Dub) picker shown in the header, if any.
   final Widget? versionPicker;
   final bool hasMultipleSeasons;
   final List<int> seasons;
@@ -811,6 +1486,24 @@ class _EpisodesHeader extends StatelessWidget {
       );
 
   Future<void> _openSheet(BuildContext context) async {
+    // show-2: on Windows the season picker is a dropdown under the pill,
+    // ticking the current season, instead of a phone bottom sheet.
+    if (_windowsDesktopUi) {
+      final picked = await showDesktopContextMenu<int>(
+        context,
+        anchor: context,
+        items: [
+          for (final s in seasons)
+            DesktopMenuItem<int>(
+              label: context.l10n.seasonNumber(s),
+              value: s,
+              checked: s == currentSeason,
+            ),
+        ],
+      );
+      if (picked != null && picked != currentSeason) onSelectSeason(picked);
+      return;
+    }
     final picked = await showModalBottomSheet<int>(
       context: context,
       backgroundColor: AppColors.surface,
@@ -825,6 +1518,65 @@ class _EpisodesHeader extends StatelessWidget {
     if (picked != null) onSelectSeason(picked);
   }
 
+  /// Windows: the ⋮ button opens the graphite desktop menu (same rows as the
+  /// phone popup, with key hints).
+  Widget _desktopMore(BuildContext context) {
+    final l10n = context.l10n;
+    // Shown next to the row so the remappable key is discoverable.
+    String? keyHint(String id) => DesktopShortcuts.spec(id) == null
+        ? null
+        : DesktopShortcuts.describeAll(id);
+    return Builder(
+      builder: (buttonContext) => IconButton(
+        tooltip: l10n.more,
+        icon: const Icon(Icons.more_vert_rounded, size: 20),
+        padding: EdgeInsets.zero,
+        style: IconButton.styleFrom(
+          backgroundColor: AppColors.surface2,
+          fixedSize: const Size.square(36),
+          minimumSize: const Size.square(36),
+          maximumSize: const Size.square(36),
+          padding: EdgeInsets.zero,
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          shape: const CircleBorder(),
+        ),
+        onPressed: () => unawaited(
+          showDesktopContextMenu<void>(
+            buttonContext,
+            anchor: buttonContext,
+            items: [
+              if (onRefresh != null)
+                DesktopMenuItem(
+                  label: isReading ? l10n.refreshChapters : l10n.refreshEpisodes,
+                  icon: Icons.refresh_rounded,
+                  shortcut: keyHint('show.refreshEpisodes'),
+                  onTap: () {
+                    unawaited(onRefresh!());
+                    if (context.mounted) {
+                      showAppToast(
+                        context,
+                        isReading
+                            ? l10n.refreshingChapters
+                            : l10n.refreshingEpisodes,
+                      );
+                    }
+                  },
+                ),
+              DesktopMenuItem(
+                label: l10n.reverseList,
+                icon: Icons.swap_vert_rounded,
+                checked: reverseList,
+                onTap: onToggleReverseList,
+              ),
+              // "Select episodes" moved out of this menu to the "Select"
+              // button beside the search box.
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Padding(
@@ -836,12 +1588,15 @@ class _EpisodesHeader extends StatelessWidget {
             child: Align(
               alignment: AlignmentDirectional.centerStart,
               child: hasMultipleSeasons
-                  ? Material(
+                  ? Builder(
+                      // The pill's own context, so the Windows dropdown opens
+                      // right under it.
+                      builder: (pillContext) => Material(
                       color: AppColors.surface2,
                       borderRadius: BorderRadius.circular(10),
                       clipBehavior: Clip.antiAlias,
                       child: InkWell(
-                        onTap: () => _openSheet(context),
+                        onTap: () => _openSheet(pillContext),
                         child: Padding(
                           padding: const EdgeInsets.fromLTRB(16, 10, 12, 10),
                           child: Row(
@@ -865,6 +1620,7 @@ class _EpisodesHeader extends StatelessWidget {
                           ),
                         ),
                       ),
+                    ),
                     )
                   : Text(
                       movieLabel ??
@@ -881,6 +1637,31 @@ class _EpisodesHeader extends StatelessWidget {
             const SizedBox(width: 8),
           ],
           // Right: episode actions.
+          // Windows (show-7): the search box, shrinking on a narrow window,
+          // with the "Select" button right before it (show-6).
+          if (filter != null)
+            Flexible(
+              child: Padding(
+                padding: const EdgeInsetsDirectional.only(start: 8, end: 8),
+                child: Align(
+                  alignment: AlignmentDirectional.centerEnd,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (onStartSelecting != null) ...[
+                        EpisodeSelectButton(
+                          isReading: isReading,
+                          onPressed: onStartSelecting!,
+                        ),
+                        const SizedBox(width: 8),
+                      ],
+                      Flexible(child: filter!),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          // Right: jump-to-episode (long seasons) · list/grid toggle · ⓘ info.
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -910,6 +1691,9 @@ class _EpisodesHeader extends StatelessWidget {
                 ),
                 const SizedBox(width: 8),
               ],
+              if (_windowsDesktopUi)
+                _desktopMore(context)
+              else
               PopupMenuButton<_EpisodesHeaderAction>(
                 tooltip: context.l10n.more,
                 icon: const Icon(Icons.more_vert_rounded, size: 20),
@@ -1087,6 +1871,7 @@ class _SeasonSheet extends StatelessWidget {
 // big anime stay navigable without endless scrolling. Selected chip is coral.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Horizontal episode ranges; Windows also accepts mouse dragging like Home rows.
 class _RangeChips extends StatelessWidget {
   const _RangeChips({
     required this.count,
@@ -1106,36 +1891,47 @@ class _RangeChips extends StatelessWidget {
   Widget build(BuildContext context) {
     return SizedBox(
       height: episodeRanges ? 40 : 42,
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-        itemCount: count,
-        separatorBuilder: (_, _) => const SizedBox(width: 8),
-        itemBuilder: (context, i) {
-          final sel = i == selected;
-          return Material(
-            color: sel ? AppColors.accent : AppColors.surface2,
-            borderRadius: BorderRadius.circular(episodeRanges ? 999 : 9),
-            clipBehavior: Clip.antiAlias,
-            child: InkWell(
-              onTap: () => onSelect(i),
-              child: Padding(
-                padding: EdgeInsets.symmetric(
-                  horizontal: episodeRanges ? 12 : 14,
-                ),
-                child: Center(
-                  child: Text(
-                    labelFor(i),
-                    style: AppText.caption.copyWith(
-                      color: sel ? Colors.white : AppColors.textSecondary,
-                      fontWeight: FontWeight.w700,
+      child: ScrollConfiguration(
+        behavior: _windowsDesktopUi
+            ? ScrollConfiguration.of(context).copyWith(
+                dragDevices: {
+                  ...ScrollConfiguration.of(context).dragDevices,
+                  PointerDeviceKind.mouse,
+                  PointerDeviceKind.trackpad,
+                },
+              )
+            : ScrollConfiguration.of(context),
+        child: ListView.separated(
+          scrollDirection: Axis.horizontal,
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          itemCount: count,
+          separatorBuilder: (_, _) => const SizedBox(width: 8),
+          itemBuilder: (context, i) {
+            final sel = i == selected;
+            return Material(
+              color: sel ? AppColors.accent : AppColors.surface2,
+              borderRadius: BorderRadius.circular(episodeRanges ? 999 : 9),
+              clipBehavior: Clip.antiAlias,
+              child: InkWell(
+                onTap: () => onSelect(i),
+                child: Padding(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: episodeRanges ? 12 : 14,
+                  ),
+                  child: Center(
+                    child: Text(
+                      labelFor(i),
+                      style: AppText.caption.copyWith(
+                        color: sel ? Colors.white : AppColors.textSecondary,
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
                   ),
                 ),
               ),
-            ),
-          );
-        },
+            );
+          },
+        ),
       ),
     );
   }
@@ -1205,7 +2001,8 @@ class _EpisodeGridTile extends StatelessWidget {
       clipBehavior: Clip.antiAlias,
       child: InkWell(
         onTap: onTap,
-        onLongPress: onLongPress,
+        onLongPress: _windowsDesktopUi ? null : onLongPress,
+        onSecondaryTap: _windowsDesktopUi ? onLongPress : null,
         child: Stack(
           children: [
             Center(
@@ -1375,17 +2172,23 @@ class _ChapterRow extends StatelessWidget {
 
     return InkWell(
       onTap: onTap,
-      onLongPress: onLongPress,
+      onLongPress: _windowsDesktopUi ? null : onLongPress,
+      onSecondaryTap: _windowsDesktopUi ? onLongPress : null,
       splashColor: AppColors.accentSoft,
       highlightColor: AppColors.surface,
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+        padding: EdgeInsets.fromLTRB(
+          16,
+          _windowsDesktopUi ? 5 : 8,
+          16,
+          _windowsDesktopUi ? 5 : 8,
+        ),
         child: Row(
           children: [
             SizedBox(
               key: coverKey,
-              width: 44,
-              height: 62,
+              width: _windowsDesktopUi ? 32 : 44,
+              height: _windowsDesktopUi ? 44 : 62,
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(8),
                 child: Opacity(
@@ -1420,7 +2223,7 @@ class _ChapterRow extends StatelessWidget {
                           : AppColors.textPrimary,
                       fontWeight: FontWeight.w600,
                     ),
-                    maxLines: 2,
+                    maxLines: _windowsDesktopUi ? 1 : 2,
                     overflow: TextOverflow.ellipsis,
                   ),
                   // Dropped entirely when the source gives us nothing to put
@@ -1485,10 +2288,12 @@ class _EpisodeRow extends StatelessWidget {
   const _EpisodeRow({
     this.isMovie = false,
     required this.ep,
+    required this.category,
     required this.epNum,
     required this.displayTitle,
     required this.coverUrl,
     required this.coverHeaders,
+    this.wideCoverUrl,
     required this.isWatched,
     required this.isInProgress,
     required this.isResume,
@@ -1499,15 +2304,28 @@ class _EpisodeRow extends StatelessWidget {
     required this.sourceId,
     required this.showId,
     this.filler = false,
+    this.malId,
+    this.anyCutFallback = false,
   });
+
+  /// Passed on to the row's download tick for the Windows any-cut lookup
+  /// (B1); see [_EpisodeDownloadIcon.malId] and
+  /// [_EpisodeDownloadIcon.anyCutFallback].
+  final int? malId;
+  final bool anyCutFallback;
 
   final bool isMovie;
   final Episode ep;
+  final String category;
   final int epNum;
   final String displayTitle;
   final bool filler;
   final String coverUrl;
   final Map<String, String>? coverHeaders;
+
+  /// Windows: the show's wide picture, used before the portrait poster
+  /// when the episode has no still. Null on phone and TV.
+  final String? wideCoverUrl;
   final bool isWatched;
   final bool isInProgress;
   final bool isResume;
@@ -1535,9 +2353,25 @@ class _EpisodeRow extends StatelessWidget {
         ? AppColors.accent
         : (isWatched ? AppColors.textSecondary : AppColors.textPrimary);
 
-    final thumbUrl = (ep.thumbnail != null && ep.thumbnail!.isNotEmpty)
+    final hasStill = ep.thumbnail != null && ep.thumbnail!.isNotEmpty;
+    // Windows: with no still, the show's wide picture comes before the
+    // portrait poster, and a poster that is left is shown whole over a soft
+    // fill instead of cropped to 16:9. Phone and TV keep the poster as is.
+    // The downloaded show page draws its saved poster from disk (works
+    // offline), so it never swaps to an online wide picture.
+    final wide = hasStill || coverUrl.startsWith('file:')
+        ? ''
+        : (wideCoverUrl?.trim() ?? '');
+    final useWide = wide.isNotEmpty;
+    final thumbUrl = hasStill
         ? ep.thumbnail!
+        : useWide
+        ? wide
         : coverUrl;
+    final wholePoster = _windowsDesktopUi && !hasStill && !useWide;
+    // The wide picture comes from a public artwork site, so the source's
+    // cover headers are not sent with it.
+    final thumbHeaders = useWide ? null : coverHeaders;
 
     // Air date stays as a small line next to the title; the episode synopsis
     // (AniZip/TMDB, ~3 lines) spans full width below the row — under the image
@@ -1572,7 +2406,8 @@ class _EpisodeRow extends StatelessWidget {
 
     return InkWell(
       onTap: onTap,
-      onLongPress: onLongPress,
+      onLongPress: _windowsDesktopUi ? null : onLongPress,
+      onSecondaryTap: _windowsDesktopUi ? onLongPress : null,
       splashColor: AppColors.accentSoft,
       highlightColor: AppColors.surface,
       child: Padding(
@@ -1595,18 +2430,40 @@ class _EpisodeRow extends StatelessWidget {
                         fit: StackFit.expand,
                         children: [
                           thumbUrl.isNotEmpty
-                              ? CachedNetworkImage(
-                                  imageUrl: thumbUrl,
-                                  cacheManager:
-                                      AppImageCache.cacheManagerOrDefault,
-                                  httpHeaders: coverHeaders,
-                                  fit: BoxFit.cover,
-                                  memCacheWidth: 320,
-                                  placeholder: (c, u) =>
-                                      ColoredBox(color: AppColors.surface2),
-                                  errorWidget: (c, u, e) =>
-                                      ColoredBox(color: AppColors.surface2),
-                                )
+                              // Downloaded show page: a thumbnail saved next
+                              // to the download (file: URI) loads from disk.
+                              ? localDetailImage(thumbUrl, cacheWidth: 320) ??
+                                    (wholePoster
+                                        ? ProgressiveArtwork(
+                                            preview: ResizeImage(
+                                              CachedNetworkImageProvider(
+                                                thumbUrl,
+                                                headers: thumbHeaders,
+                                                cacheManager: AppImageCache
+                                                    .cacheManagerOrDefault,
+                                              ),
+                                              width: 320,
+                                            ),
+                                            fitWhole: true,
+                                            fallback: ColoredBox(
+                                              color: AppColors.surface2,
+                                            ),
+                                          )
+                                        : null) ??
+                                    CachedNetworkImage(
+                                      imageUrl: thumbUrl,
+                                      cacheManager:
+                                          AppImageCache.cacheManagerOrDefault,
+                                      httpHeaders: thumbHeaders,
+                                      fit: BoxFit.cover,
+                                      memCacheWidth: 320,
+                                      placeholder: (c, u) => ColoredBox(
+                                        color: AppColors.surface2,
+                                      ),
+                                      errorWidget: (c, u, e) => ColoredBox(
+                                        color: AppColors.surface2,
+                                      ),
+                                    )
                               : ColoredBox(color: AppColors.surface2),
                           if (isWatched)
                             const DecoratedBox(
@@ -1748,9 +2605,14 @@ class _EpisodeRow extends StatelessWidget {
                 if (!sl<AppMode>().isTv) ...[
                   const SizedBox(width: 8),
                   _EpisodeDownloadIcon(
+                    category: category,
                     sourceId: sourceId,
                     showId: showId,
                     episodeId: ep.id,
+                    episodeNumber: ep.number,
+                    season: ep.season,
+                    malId: malId,
+                    anyCutFallback: anyCutFallback,
                     onTap: onDownload,
                   ),
                 ],
@@ -1818,13 +2680,16 @@ class _ChapterDownloadIcon extends StatelessWidget {
           );
         }
         if (store.isDownloaded(sourceId, chapterUrl)) {
-          return _button(
-            tooltip: context.l10n.downloaded,
-            onPressed: () => _offerDelete(context, store, id),
-            icon: Icon(
-              Icons.check_circle_rounded,
-              color: AppColors.accent,
-              size: 24,
+          // Builder: the Windows delete dropdown anchors to this tick.
+          return Builder(
+            builder: (iconContext) => _button(
+              tooltip: context.l10n.downloaded,
+              onPressed: () => _offerDelete(iconContext, store, id),
+              icon: Icon(
+                Icons.check_circle_rounded,
+                color: AppColors.accent,
+                size: 24,
+              ),
             ),
           );
         }
@@ -1858,6 +2723,25 @@ class _ChapterDownloadIcon extends StatelessWidget {
     ChapterDownloadStore store,
     String id,
   ) {
+    // show-2: on Windows a one-row choice is a small dropdown under the tick
+    // rather than a bottom sheet.
+    if (_windowsDesktopUi) {
+      unawaited(
+        showDesktopContextMenu<void>(
+          context,
+          anchor: context,
+          items: [
+            DesktopMenuItem(
+              label: context.l10n.deleteDownload,
+              icon: Icons.delete_outline_rounded,
+              destructive: true,
+              onTap: () => unawaited(store.remove(id)),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
     showModalBottomSheet<void>(
       context: context,
       backgroundColor: AppColors.surface,
@@ -1892,4 +2776,286 @@ class _ChapterDownloadIcon extends StatelessWidget {
 
 // Per-episode download icon — self-updates from the DownloadManager so the
 // row reflects live progress without the whole list rebuilding.
-typedef _EpisodeDownloadIcon = EpisodeDownloadIcon;
+/// Per-episode download tick. Phone and TV use the shared [EpisodeDownloadIcon]
+/// unchanged; Windows keys the record by sub/dub [category], finds copies saved
+/// in another cut and opens the finished-download menu.
+class _EpisodeDownloadIcon extends StatelessWidget {
+  const _EpisodeDownloadIcon({
+    required this.sourceId,
+    required this.showId,
+    required this.episodeId,
+    required this.category,
+    required this.onTap,
+    this.episodeNumber,
+    this.season,
+    this.malId,
+    this.anyCutFallback = false,
+  });
+
+  final String sourceId;
+  final String showId;
+  final String episodeId;
+  final String category;
+  final VoidCallback onTap;
+
+  /// Episode number and season, used only by the Windows any-cut fallback
+  /// (B1) to also find files that were recovered from disk.
+  final double? episodeNumber;
+  final int? season;
+
+  /// The page's MAL id, for the same any-cut lookup (matches a copy saved
+  /// from another source page of this show).
+  final int? malId;
+
+  /// True only on the Windows online show page: look for this episode saved
+  /// in another cut when this cut has nothing (B1). False on the phone, TV
+  /// and the downloaded show page.
+  final bool anyCutFallback;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_windowsDesktopUi) {
+      return EpisodeDownloadIcon(
+        sourceId: sourceId,
+        showId: showId,
+        episodeId: episodeId,
+        onTap: onTap,
+      );
+    }
+    final manager = sl<DownloadManager>();
+    return ListenableBuilder(
+      listenable: Listenable.merge([manager, SavedStubCheck.changes]),
+      builder: (context, _) {
+        final exactFound = manager.recordFor(
+          sourceId,
+          showId,
+          episodeId,
+          category: category,
+        );
+        // Windows online page: a finished stub (by its recorded size, or by
+        // its file on disk) is not shown as downloaded, the same as the
+        // right-click menu (Download / Delete) and Play (streams).
+        final exact =
+            anyCutFallback &&
+                tickCopyIsStub(exactFound, _DetailViewState._savedFileSize)
+            ? null
+            : exactFound;
+        // B1 (Windows only): nothing live or finished in this cut, so look
+        // for this episode saved in another cut (e.g. a Dub download on a
+        // page that looks things up as Sub) and show that file's tick,
+        // labelled with its cut. The manager lookup itself stays cut-exact.
+        // Same malId as the right-click menu and Play use, so all three
+        // agree; one shared record list per manager change (not per row).
+        // Off on the downloaded show page, like the menu and Play.
+        final other = anyCutFallback && !_liveOrDone(exact?.status)
+            ? savedEpisodeAnyCut(
+                SavedRecordsSnapshot.of(manager),
+                sourceId: sourceId,
+                showId: showId,
+                episodeId: episodeId,
+                episodeNumber: episodeNumber,
+                season: season,
+                malId: malId,
+                preferredCategory: category,
+              )
+            : null;
+        final rec = other ?? exact;
+        final otherCut = other != null && other.category != category
+            ? savedCutName(other.category, context.l10n)
+            : null;
+        // Windows: a failed or unsupported download shows as not downloaded.
+        final s = shownDownloadStatus(rec?.status);
+        // While a download is live (or paused/queued/resolving), tapping the ring
+        // opens a Pause/Cancel menu instead of re-opening the server picker.
+        final inProgress =
+            rec != null &&
+            (s == DownloadStatus.downloading ||
+                s == DownloadStatus.paused ||
+                s == DownloadStatus.queued ||
+                s == DownloadStatus.resolving);
+        // Windows (show-1): a finished tick opens Play offline / Show in
+        // folder / Delete download / Download again instead of a new
+        // source search.
+        final finished =
+            _windowsDesktopUi && rec != null && s == DownloadStatus.done;
+        return Builder(
+          // Builder: the menu anchors to the tick itself.
+          builder: (iconContext) => _glyph(
+            context.l10n,
+            s,
+            rec?.progress ?? 0,
+            otherCut: otherCut,
+            onPressed: inProgress
+                ? () => EpisodeDownloadIcon.showDownloadMenu(
+                    context,
+                    manager,
+                    rec,
+                  )
+                : finished
+                ? () => unawaited(
+                    EpisodeDownloadIcon.showFinishedMenu(
+                      iconContext,
+                      manager,
+                      rec,
+                      onDownloadAgain: onTap,
+                    ),
+                  )
+                : onTap,
+          ),
+        );
+      },
+    );
+  }
+
+  /// True when this cut's own record is moving or finished, so the Windows
+  /// any-cut fallback must not hide it (B1).
+  static bool _liveOrDone(DownloadStatus? s) => switch (s) {
+    DownloadStatus.done ||
+    DownloadStatus.downloading ||
+    DownloadStatus.paused ||
+    DownloadStatus.queued ||
+    DownloadStatus.resolving ||
+    DownloadStatus.finalizing => true,
+    _ => false,
+  };
+
+  Widget _glyph(
+    AppLocalizations l10n,
+    DownloadStatus? status,
+    double progress, {
+    required VoidCallback onPressed,
+    // Windows (B1): the cut of a file saved in another cut, for the tooltip
+    // "Downloaded · Dub". Null keeps the plain wording.
+    String? otherCut,
+  }) {
+    final child = switch (status) {
+      DownloadStatus.done => Icon(
+        Icons.download_done_rounded,
+        color: AppColors.accent,
+        size: 24,
+      ),
+      DownloadStatus.downloading || DownloadStatus.paused => SizedBox(
+        width: 20,
+        height: 20,
+        child: CircularProgressIndicator(
+          value: progress > 0 ? progress : null,
+          strokeWidth: 2.4,
+          color: AppColors.accent,
+          backgroundColor: AppColors.surface2,
+        ),
+      ),
+      DownloadStatus.queued || DownloadStatus.resolving => const SizedBox(
+        width: 18,
+        height: 18,
+        child: CircularProgressIndicator(
+          strokeWidth: 2,
+          color: AppColors.textSecondary,
+        ),
+      ),
+      DownloadStatus.unsupported => const Icon(
+        Icons.cloud_off_outlined,
+        color: AppColors.textTertiary,
+        size: 22,
+      ),
+      DownloadStatus.failed => Icon(
+        Icons.refresh_rounded,
+        color: AppColors.accent,
+        size: 24,
+      ),
+      // null (never downloaded) or canceled → offer to download.
+      _ => const Icon(
+        Icons.file_download_outlined,
+        color: AppColors.textPrimary,
+        size: 24,
+      ),
+    };
+    final label = switch (status) {
+      DownloadStatus.done =>
+        otherCut == null ? l10n.downloaded : l10n.desktopDownloadedCut(otherCut),
+      DownloadStatus.downloading || DownloadStatus.paused => l10n.downloading,
+      DownloadStatus.queued || DownloadStatus.resolving => l10n.downloading,
+      DownloadStatus.unsupported => l10n.downloadUnsupported,
+      DownloadStatus.failed => l10n.retryDownload,
+      _ => l10n.downloadEpisode,
+    };
+    return IconButton(
+      onPressed: onPressed,
+      visualDensity: VisualDensity.compact,
+      splashRadius: 22,
+      tooltip: label,
+      icon: child,
+    );
+  }
+}
+
+/// Empty state of the Episodes/Chapters tab when the source returned nothing.
+/// Reading titles (manga, novels) say "chapters"; anime/movies say
+/// "episodes". Phone keeps the shared [EmptyState] (red FilledButton)
+/// unchanged. Windows mirrors that layout (icon over message) but swaps the
+/// button for the hero's graphite [_IconAction] chip so the switch action
+/// matches the other desktop detail buttons. Public for widget tests.
+class SourceEmptyState extends StatelessWidget {
+  const SourceEmptyState({
+    super.key,
+    required this.isReading,
+    required this.onSwitchSource,
+  });
+
+  /// Manga/novel title: chapters wording and (Windows) a book icon.
+  final bool isReading;
+
+  /// Opens the source picker. Null when the title has no alternative
+  /// sources, so no button is shown.
+  final VoidCallback? onSwitchSource;
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = context.l10n;
+    final message = isReading
+        ? l10n.noChaptersAvailableFromThisSource
+        : l10n.noEpisodesAvailableFromThisSource;
+    final switchSource = onSwitchSource;
+    if (!_windowsDesktopUi) {
+      // Phone: the shared empty state, exactly as before (wording aside).
+      return EmptyState(
+        icon: Icons.video_library_outlined,
+        message: message,
+        actionLabel: switchSource == null ? null : l10n.switchSource,
+        onAction: switchSource,
+      );
+    }
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              isReading
+                  ? Icons.menu_book_outlined
+                  : Icons.video_library_outlined,
+              size: 44,
+              color: AppColors.textTertiary,
+            ),
+            const SizedBox(height: 12),
+            Text(message, textAlign: TextAlign.center, style: AppText.body),
+            if (switchSource != null) ...[
+              const SizedBox(height: 16),
+              // Same chip as the hero's My List / Tracking / Share row.
+              // KeyedSubtree gives tests a handle without touching _IconAction.
+              KeyedSubtree(
+                key: const ValueKey('desktop-empty-switch-source'),
+                child: _IconAction(
+                  icon: Icons.swap_horiz_rounded,
+                  label: context.l10n.switchSource,
+                  tooltip: context.l10n.switchSource,
+                  onTap: switchSource,
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}

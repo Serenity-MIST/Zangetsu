@@ -10,6 +10,7 @@ import '../../core/tracker/mal_service.dart';
 import '../../core/tracker/mangabaka_service.dart';
 import '../../core/tracker/simkl_service.dart';
 import '../../core/tracker/tracker.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import '../../core/ui/settings_widgets.dart';
 import '../../l10n/l10n.dart';
 import '../../l10n/ui_strings.dart';
@@ -112,17 +113,26 @@ class _ConnectedServicesScreenState extends State<ConnectedServicesScreen> {
     final discordStatus = discord != null && discord.loggedIn && discord.enabled
         ? l10n.on
         : l10n.off;
+    // Windows settings workspace: laid out like the Reader page, a plain list
+    // from the left edge whose cards cap themselves at the shared settings
+    // width (centred only when the page fills the window on its own). Phone
+    // and TV keep the centred 680 column.
+    final desktop = !widget.isTv && DesktopSettingsScope.contains(context);
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: desktop ? settingsPageBackground(context) : AppColors.bg,
       appBar: settingsAppBar(
         settingsSectionTitle(l10n, SettingsSection.account),
       ),
       body: Center(
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 680),
+          constraints: desktop
+              ? const BoxConstraints()
+              : const BoxConstraints(maxWidth: 680),
           child: ListView(
             clipBehavior: widget.isTv ? Clip.none : Clip.hardEdge,
-            padding: const EdgeInsets.only(top: 8, bottom: 24),
+            padding: desktop
+                ? DesktopSettingsScope.listPadding(context, top: 16, bottom: 28)
+                : const EdgeInsets.only(top: 8, bottom: 24),
             children: [
               const SettingsSectionLabel('Watch tracking', first: true),
               SettingsCard(

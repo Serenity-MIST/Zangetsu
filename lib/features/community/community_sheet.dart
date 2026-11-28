@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
 import 'package:hive_flutter/hive_flutter.dart';
@@ -9,6 +10,7 @@ import '../../core/di/injector.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/tv/tv_alert_dialog.dart' show TvFocusClaim;
+import '../../core/ui/desktop_settings_surface.dart' show GraphiteSettingsColors;
 import '../../core/tv/tv_list_focusable.dart';
 
 const _telegramUrl = 'https://t.me/ZangetsuStream';
@@ -39,6 +41,16 @@ Future<void> maybeShowCommunitySheet(BuildContext context) async {
 /// Show the community sheet directly (bypasses the seen-flag) — e.g. a future
 /// "Community" entry in Settings could reuse this.
 Future<void> showCommunitySheet(BuildContext context) {
+  // Windows: a centred graphite dialog (Esc / click outside / X close it)
+  // instead of a phone bottom sheet. Same content and links.
+  if (defaultTargetPlatform == TargetPlatform.windows) {
+    return showDialog<void>(
+      context: context,
+      useRootNavigator: true,
+      barrierColor: Colors.black.withValues(alpha: 0.6),
+      builder: (_) => const _CommunitySheet(desktop: true),
+    );
+  }
   return showModalBottomSheet<void>(
     context: context,
     backgroundColor: AppColors.surface,
@@ -51,8 +63,18 @@ Future<void> showCommunitySheet(BuildContext context) {
   );
 }
 
+/// Graphite dialog surface and edge on Windows (matches the desktop settings
+/// dialogs and the media info dialog).
+// A getter (set-9) so it follows Pure black and custom backgrounds.
+Color get _kDesktopSurface => GraphiteSettingsColors.dialog;
+Color get _kDesktopEdge => GraphiteSettingsColors.dialogEdge;
+
 class _CommunitySheet extends StatefulWidget {
-  const _CommunitySheet();
+  const _CommunitySheet({this.desktop = false});
+
+  /// Windows dialog presentation: no grab handle, a close button and
+  /// desktop-sized buttons.
+  final bool desktop;
 
   @override
   State<_CommunitySheet> createState() => _CommunitySheetState();
@@ -60,6 +82,9 @@ class _CommunitySheet extends StatefulWidget {
 
 class _CommunitySheetState extends State<_CommunitySheet> {
   final FocusNode _firstNode = FocusNode(debugLabel: 'community-telegram');
+
+  /// Windows dialog presentation; see [_CommunitySheet.desktop].
+  bool get desktop => widget.desktop;
 
   @override
   void dispose() {
@@ -79,6 +104,7 @@ class _CommunitySheetState extends State<_CommunitySheet> {
 
   @override
   Widget build(BuildContext context) {
+    if (desktop) return _desktopDialog(context);
     final isTv = sl<AppMode>().isTv;
     final sheet = SafeArea(
       top: false,
@@ -108,8 +134,11 @@ class _CommunitySheetState extends State<_CommunitySheet> {
                     color: AppColors.accent.withValues(alpha: 0.14),
                     borderRadius: BorderRadius.circular(12),
                   ),
-                  child: Icon(Icons.groups_rounded,
-                      color: AppColors.accent, size: 24),
+                  child: Icon(
+                    Icons.groups_rounded,
+                    color: AppColors.accent,
+                    size: 24,
+                  ),
                 ),
                 const SizedBox(width: 14),
                 Expanded(
@@ -163,6 +192,115 @@ class _CommunitySheetState extends State<_CommunitySheet> {
     return TvFocusClaim(targets: [_firstNode], child: sheet);
   }
 
+  /// Windows: bounded centred card with a header close button. The links and
+  /// "Maybe later" behave exactly as on phone.
+  Widget _desktopDialog(BuildContext context) {
+    return Dialog(
+      backgroundColor: _kDesktopSurface,
+      surfaceTintColor: Colors.transparent,
+      insetPadding: const EdgeInsets.all(32),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(20),
+        side: BorderSide(color: _kDesktopEdge),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 520),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 18, 14, 22),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(9),
+                    decoration: BoxDecoration(
+                      color: AppColors.accent.withValues(alpha: 0.14),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Icon(
+                      Icons.groups_rounded,
+                      color: AppColors.accent,
+                      size: 22,
+                    ),
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Text(
+                      'Join the Zangetsu community',
+                      style: AppText.headline.copyWith(
+                        fontSize: 20,
+                        color: AppColors.textPrimary,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: MaterialLocalizations.of(
+                      context,
+                    ).closeButtonTooltip,
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: const Icon(Icons.close_rounded),
+                    color: AppColors.textSecondary,
+                  ),
+                ],
+              ),
+              // Body keeps clear of the close button's extra right inset.
+              Padding(
+                padding: const EdgeInsets.only(right: 10),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const SizedBox(height: 12),
+                    Text(
+                      'Updates, requests, and help — come say hi.',
+                      style: AppText.body.copyWith(
+                        color: AppColors.textSecondary,
+                        height: 1.4,
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    Divider(height: 1, color: _kDesktopEdge),
+                    const SizedBox(height: 18),
+                    _linkButton(
+                      context,
+                      icon: Icons.send_rounded,
+                      label: 'Telegram  ·  @ZangetsuStream',
+                      color: const Color(0xFF229ED9),
+                      url: _telegramUrl,
+                      autofocus: false,
+                      isTv: false,
+                      desktop: true,
+                    ),
+                    const SizedBox(height: 10),
+                    _linkButton(
+                      context,
+                      icon: Icons.forum_rounded,
+                      label: 'Discord',
+                      color: const Color(0xFF5865F2),
+                      url: _discordUrl,
+                      autofocus: false,
+                      isTv: false,
+                      desktop: true,
+                    ),
+                    const SizedBox(height: 12),
+                    Align(
+                      alignment: AlignmentDirectional.centerEnd,
+                      child: _laterButton(context, isTv: false),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _linkButton(
     BuildContext context, {
     required IconData icon,
@@ -171,6 +309,7 @@ class _CommunitySheetState extends State<_CommunitySheet> {
     required String url,
     required bool autofocus,
     required bool isTv,
+    bool desktop = false,
   }) {
     void go() {
       Navigator.of(context).pop();
@@ -181,8 +320,12 @@ class _CommunitySheetState extends State<_CommunitySheet> {
       style: FilledButton.styleFrom(
         backgroundColor: color,
         foregroundColor: Colors.white,
-        minimumSize: const Size.fromHeight(50),
+        // Windows: desktop-height button with the settings corner radius.
+        minimumSize: Size.fromHeight(desktop ? 44 : 50),
         alignment: AlignmentDirectional.centerStart,
+        shape: desktop
+            ? RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))
+            : null,
       ),
       onPressed: go,
       icon: Icon(icon),
@@ -203,8 +346,10 @@ class _CommunitySheetState extends State<_CommunitySheet> {
     void dismiss() => Navigator.of(context).pop();
     final button = TextButton(
       onPressed: dismiss,
-      child: Text('Maybe later',
-          style: AppText.body.copyWith(color: AppColors.textTertiary)),
+      child: Text(
+        'Maybe later',
+        style: AppText.body.copyWith(color: AppColors.textTertiary),
+      ),
     );
     if (!isTv) return button;
     return TvListFocusable(onTap: dismiss, child: ExcludeFocus(child: button));

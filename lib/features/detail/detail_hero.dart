@@ -12,6 +12,8 @@ class _Hero extends StatelessWidget {
     required this.coverHeaders,
     required this.hasCover,
     this.trailer,
+    this.title = '',
+    this.onTitleTap,
     this.collapsed = false,
     this.onTapFullscreen,
     this.tint,
@@ -23,6 +25,9 @@ class _Hero extends StatelessWidget {
   /// trailer) zoom with it; the buttons on top do not.
   final ValueListenable<double>? pull;
 
+  /// The title shown with the hero, and what tapping it does (Windows layout).
+  final String title;
+  final VoidCallback? onTitleTap;
   final String coverUrl;
   final Map<String, String>? coverHeaders;
   final bool hasCover;
@@ -44,6 +49,9 @@ class _Hero extends StatelessWidget {
   /// trailer, and as the placeholder/fallback underneath the player.
   Widget _coverBackdrop() {
     if (!hasCover) return ColoredBox(color: AppColors.surface2);
+    // Downloaded show page: the cover/banner saved next to the download.
+    final local = localDetailImage(coverUrl, cacheWidth: imageDecodeWidth);
+    if (local != null) return local;
     // Aniyomi/Mihon path: when the x-ani-src / x-mihon-src marker is present,
     // fetch image bytes through the source's own OkHttpClient (which carries the
     // CF session) instead of CachedNetworkImage which cannot pass Cloudflare.
@@ -59,6 +67,8 @@ class _Hero extends StatelessWidget {
               : MihonImage(int.parse(mihonSrcId!), coverUrl),
           width: imageDecodeWidth,
         ),
+        // The Windows card now gets landscape art (desktopHeroArt), so it
+        // fills the card like the phone hero instead of letterboxing a poster.
         fit: BoxFit.cover,
         loadingBuilder: (_, child, progress) =>
             progress == null ? child : ColoredBox(color: AppColors.surface2),
@@ -66,11 +76,49 @@ class _Hero extends StatelessWidget {
             ColoredBox(color: AppColors.surface2),
       );
     }
+    if (_windowsDesktopUi) {
+      // The Windows card gets landscape art (desktopHeroArt), so it fills the
+      // card like the phone hero instead of letterboxing a poster.
+      return CachedNetworkImage(
+        imageUrl: coverUrl,
+        httpHeaders: coverHeaders,
+        fit: BoxFit.cover,
+        memCacheWidth: imageDecodeWidth,
+        placeholder: (c, u) => ColoredBox(color: AppColors.surface2),
+        errorWidget: (c, u, e) => ColoredBox(color: AppColors.surface2),
+      );
+    }
     return _FocusedCover(url: coverUrl, headers: coverHeaders);
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_windowsDesktopUi) {
+      // The desktop card is exclusively media. Title/metadata are rendered
+      // beneath it by the detail page instead of narrowing the trailer.
+      return ClipRRect(
+        borderRadius: const BorderRadius.vertical(bottom: Radius.circular(12)),
+        child: ColoredBox(
+          color: AppColors.surface2,
+          // The trailer id arrives through the shared lookup future.
+          child: FutureBuilder<String?>(
+            future: trailer,
+            builder: (context, snapshot) {
+              final id = snapshot.data;
+              if (id == null || id.isEmpty) return _coverBackdrop();
+              return _HeroTrailer(
+                videoId: id,
+                collapsed: collapsed,
+                onTapFullscreen: onTapFullscreen == null
+                    ? null
+                    : () => onTapFullscreen!(id),
+                placeholder: _coverBackdrop(),
+              );
+            },
+          ),
+        ),
+      );
+    }
     return Stack(
       fit: StackFit.expand,
       children: [
@@ -192,10 +240,32 @@ class _HeroTrailerState extends State<_HeroTrailer> with RouteAware {
   String? _resolvedUrl;
   bool _resolvedUrlIsHd = false;
 
+  // Windows only (show-4): a dialog/popup/panel route sits above this page.
+  // appRouteObserver only reports PageRoutes, so dialogs never reach
+  // didPushNext; ModalRoute.isCurrentOf catches every route kind.
+  bool _popupCovered = false;
+  // Windows only (show-4): the window is minimised, hidden or not focused.
+  bool _appInactive = false;
+  // Windows only: reports minimise / focus loss for the [_appInactive] hold.
+  AppLifecycleListener? _lifecycleListener;
+
+  /// True while a Windows-only hold (popup or inactive window) keeps the
+  /// trailer paused. Separate from [_paused] so the user's own pause survives.
+  bool get _desktopHeld => _popupCovered || _appInactive;
+
   @override
   void initState() {
     super.initState();
     _paused = !sl<PlaybackPrefs>().autoplayTrailer;
+    if (_windowsDesktopUi) {
+      // Pause on minimise / focus loss and resume when the window is back.
+      _lifecycleListener = AppLifecycleListener(
+        onStateChange: (state) =>
+            _setDesktopHold(appInactive: state != AppLifecycleState.resumed),
+      );
+      final state = WidgetsBinding.instance.lifecycleState;
+      _appInactive = state != null && state != AppLifecycleState.resumed;
+    }
     _resolveAndOpen();
   }
 
@@ -206,6 +276,33 @@ class _HeroTrailerState extends State<_HeroTrailer> with RouteAware {
     // can pause instead of decoding video behind the player or a stacked title.
     final route = ModalRoute.of(context);
     if (route is PageRoute) appRouteObserver.subscribe(this, route);
+    if (_windowsDesktopUi) {
+      // Rebuilds whenever any route (dialog, menu, docked panel) is pushed
+      // above or popped off this page, so popups pause the trailer too.
+      final isCurrent = ModalRoute.isCurrentOf(context) ?? true;
+      _setDesktopHold(popupCovered: !isCurrent);
+    }
+  }
+
+  /// Updates the Windows holds and pauses / resumes the existing player.
+  /// Never opens a new player: re-opening stays with didPopNext and
+  /// didUpdateWidget, so a hold can't race them into a second player.
+  void _setDesktopHold({bool? popupCovered, bool? appInactive}) {
+    final wasHeld = _desktopHeld;
+    _popupCovered = popupCovered ?? _popupCovered;
+    _appInactive = appInactive ?? _appInactive;
+    final held = _desktopHeld;
+    if (held == wasHeld) return;
+    final player = _player;
+    if (player == null || _errored) return;
+    if (held) {
+      unawaited(player.pause());
+    } else if (!_paused &&
+        !widget.collapsed &&
+        !_routeLifecycle.isCovered) {
+      // Back in front: resume unless the user paused it themselves.
+      unawaited(player.play());
+    }
   }
 
   // Another screen (the player, or a title tapped from this page) was pushed on
@@ -283,6 +380,7 @@ class _HeroTrailerState extends State<_HeroTrailer> with RouteAware {
           mounted &&
           !widget.collapsed &&
           !_paused &&
+          !_desktopHeld &&
           !_routeLifecycle.isCovered &&
           player == _player) {
         _player?.seek(Duration.zero);
@@ -310,6 +408,7 @@ class _HeroTrailerState extends State<_HeroTrailer> with RouteAware {
       // collapsed handler in didUpdateWidget start it later.
       if (!_paused &&
           !widget.collapsed &&
+          !_desktopHeld &&
           !_routeLifecycle.isCovered &&
           player == _player) {
         await player.play();
@@ -352,6 +451,7 @@ class _HeroTrailerState extends State<_HeroTrailer> with RouteAware {
         );
         if (!_paused &&
             !widget.collapsed &&
+            !_desktopHeld &&
             !_routeLifecycle.isCovered &&
             player == _player) {
           await player.play();
@@ -381,7 +481,8 @@ class _HeroTrailerState extends State<_HeroTrailer> with RouteAware {
         _player?.pause();
       } else if (_player == null && _resolvedUrl != null) {
         unawaited(_openResolvedUrl(_resolvedUrl!, usedHd: _resolvedUrlIsHd));
-      } else if (!_paused) {
+      } else if (!_paused && !_desktopHeld) {
+        // A Windows hold (popup / inactive window) still wins here.
         _player?.play();
       }
     }
@@ -453,13 +554,15 @@ class _HeroTrailerState extends State<_HeroTrailer> with RouteAware {
     if (widget.collapsed || _errored) return;
     if (_player == null && _resolvedUrl != null) {
       unawaited(_openResolvedUrl(_resolvedUrl!, usedHd: _resolvedUrlIsHd));
-    } else if (!_paused) {
+    } else if (!_paused && !_desktopHeld) {
+      // Skip while a Windows hold is active; clearing the hold resumes it.
       _player?.play();
     }
   }
 
   @override
   void dispose() {
+    _lifecycleListener?.dispose();
     appRouteObserver.unsubscribe(this);
     _routeLifecycle.beginDispose();
     unawaited(_disposePlayer());
@@ -521,7 +624,9 @@ class _HeroTrailerState extends State<_HeroTrailer> with RouteAware {
                       ? Icons.play_arrow_rounded
                       : Icons.pause_rounded,
                   onTap: _togglePlay,
-                  semanticLabel: _paused ? 'Play trailer' : 'Pause trailer',
+                  semanticLabel: _paused
+                      ? context.l10n.playTrailer
+                      : context.l10n.pauseTrailer,
                 ),
                 if (_ready) ...[
                   const SizedBox(width: 8),
@@ -530,7 +635,9 @@ class _HeroTrailerState extends State<_HeroTrailer> with RouteAware {
                         ? Icons.volume_off_rounded
                         : Icons.volume_up_rounded,
                     onTap: _toggleMute,
-                    semanticLabel: _muted ? 'Unmute' : 'Mute',
+                    semanticLabel: _muted
+                        ? context.l10n.unmute
+                        : context.l10n.shortcutPlayerMute,
                   ),
                 ],
               ],
@@ -560,7 +667,7 @@ class _HeroCircleButton extends StatelessWidget {
     // painted child) so the whole 48dp square absorbs the tap — otherwise taps
     // in the ring around the icon fall through to the banner's fullscreen
     // gesture behind, which is what made the buttons feel unresponsive.
-    return Semantics(
+    final button = Semantics(
       button: true,
       label: semanticLabel,
       child: GestureDetector(
@@ -581,6 +688,40 @@ class _HeroCircleButton extends StatelessWidget {
           ),
         ),
       ),
+    );
+    final label = semanticLabel;
+    if (!_windowsDesktopUi) return button;
+    // Windows (show-12): a hand cursor and a hover tooltip, so the round
+    // icon-only buttons say what they do. The tooltip's own semantics are
+    // excluded because the Semantics label above already names the button.
+    final withCursor = MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: button,
+    );
+    if (label == null || label.isEmpty) return withCursor;
+    return Tooltip(
+      message: label,
+      excludeFromSemantics: true,
+      waitDuration: const Duration(milliseconds: 400),
+      child: withCursor,
+    );
+  }
+}
+
+/// Windows (show-12): small spinner shown in place of the Play / Download
+/// icon while the episode list is still loading.
+class _HeroButtonSpinner extends StatelessWidget {
+  const _HeroButtonSpinner({required this.color});
+
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      key: const ValueKey('detail-hero-button-spinner'),
+      width: 16,
+      height: 16,
+      child: CircularProgressIndicator(strokeWidth: 2, color: color),
     );
   }
 }
@@ -614,8 +755,12 @@ class _PlayButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final enabled = onPressed != null;
+    // Windows (show-12): while episodes load and the button can't act yet,
+    // show a spinner and a slightly faded button so an early click doesn't
+    // look like a silent dead click. Phones keep the full-bright look.
+    final busy = _windowsDesktopUi && loading && !enabled;
     return Opacity(
-      opacity: enabled || loading ? 1.0 : 0.4,
+      opacity: busy ? 0.7 : (enabled || loading ? 1.0 : 0.4),
       child: Material(
         color: Colors.white,
         borderRadius: BorderRadius.circular(pill ? 26 : 8),
@@ -623,16 +768,27 @@ class _PlayButton extends StatelessWidget {
           borderRadius: BorderRadius.circular(pill ? 26 : 8),
           onTap: onPressed,
           child: SizedBox(
-            height: 52,
+            height: _windowsDesktopUi ? 40 : 52,
             width: double.infinity,
             child: Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                Icon(icon, color: Colors.black, size: 26),
+                if (busy)
+                  const _HeroButtonSpinner(color: Colors.black)
+                else
+                  Icon(
+                    icon,
+                    color: Colors.black,
+                    size: _windowsDesktopUi ? 20 : 26,
+                  ),
                 const SizedBox(width: 8),
-                Text(
-                  label,
-                  style: AppText.button.copyWith(color: Colors.black),
+                Flexible(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: AppText.button.copyWith(color: Colors.black),
+                  ),
                 ),
               ],
             ),
@@ -696,8 +852,10 @@ class _DownloadButton extends StatelessWidget {
         ),
       );
     }
+    // Windows (show-12): spinner + faded while episodes load (see _PlayButton).
+    final busy = _windowsDesktopUi && loading && onPressed == null;
     return Opacity(
-      opacity: onPressed != null || loading ? 1.0 : 0.4,
+      opacity: busy ? 0.7 : (onPressed != null || loading ? 1.0 : 0.4),
       child: Material(
         color: AppColors.surface2,
         borderRadius: BorderRadius.circular(8),
@@ -705,20 +863,27 @@ class _DownloadButton extends StatelessWidget {
           borderRadius: BorderRadius.circular(8),
           onTap: onPressed,
           child: SizedBox(
-            height: 52,
+            height: _windowsDesktopUi ? 40 : 52,
             width: double.infinity,
             child: Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                const Icon(
-                  Icons.file_download_outlined,
-                  color: Colors.white,
-                  size: 24,
-                ),
+                if (busy)
+                  const _HeroButtonSpinner(color: Colors.white)
+                else
+                  const Icon(
+                    Icons.file_download_outlined,
+                    color: Colors.white,
+                    size: 24,
+                  ),
                 const SizedBox(width: 8),
-                Text(
-                  label,
-                  style: AppText.button.copyWith(color: Colors.white),
+                Flexible(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: AppText.button.copyWith(color: Colors.white),
+                  ),
                 ),
               ],
             ),

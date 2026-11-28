@@ -4,6 +4,9 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/models/media_item.dart';
+import 'package:watch_app/core/models/episode.dart';
+import 'package:watch_app/core/error/exceptions.dart';
+import 'package:watch_app/core/provider/cf_solve_needed.dart';
 import 'package:watch_app/core/models/provider_info.dart';
 import 'package:watch_app/core/repository/source_repository.dart';
 import 'package:watch_app/core/zmode/match_store.dart';
@@ -32,6 +35,27 @@ class _FakeSources implements SourceRepository {
   final Map<String, List<MediaItem>> bySource;
   final Set<String> installed;
   final searched = <String>[];
+  final chapterLists = <String, List<Episode>>{};
+  final blockedChapters = <String>{};
+
+  @override
+  Future<List<Episode>> episodes(
+    String url, {
+    String category = 'sub',
+    String? sourceId,
+  }) async {
+    if (blockedChapters.contains(sourceId))
+      throw const CloudflareRequiredException('https://blocked.test/');
+    return chapterLists[sourceId] ??
+        const [
+          Episode(
+            id: '1',
+            title: 'Chapter 1',
+            number: 1,
+            url: 'https://chapter/1',
+          ),
+        ];
+  }
 
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
@@ -98,6 +122,128 @@ void main() {
     await Hive.close();
     await dir.delete(recursive: true);
   });
+
+  test(
+    'reading Auto Resolve continues after the last good source misses',
+    () async {
+      const c = ZCanonical(ZKind.manga, 'mal:13');
+      await prefs.rememberLastGood(c.kind, 'mihon:first');
+      final repo = _FakeSources({
+        'mihon:first': [],
+        'mihon:second': [_hit('raw-id', 'Solo Leveling')],
+      });
+      final matcher = SourceMatcher(
+        sources: repo,
+        store: store,
+        prefs: prefs,
+        candidates: (_) => [
+          (id: 'mihon:first', name: 'First'),
+          (id: 'mihon:second', name: 'Second'),
+        ],
+      );
+      expect(
+        (await matcher.resolve(c, title: 'Solo Leveling'))?.sourceId,
+        'mihon:second',
+      );
+      expect(repo.searched, ['mihon:first', 'mihon:second']);
+    },
+  );
+
+  test('explicit Auto Resolve retries sources with cached misses', () async {
+    await Hive.box<Map>(MatchStore.boxName).put('miss:${fma.key}@allanime', {});
+    final repo = _FakeSources({
+      'allanime': [_hit('wrong-owner', 'FMA')],
+    });
+    final matcher = SourceMatcher(
+      sources: repo,
+      store: store,
+      prefs: prefs,
+      candidates: (_) => two,
+    );
+    await matcher.clearAuto(fma);
+    expect((await matcher.resolve(fma, title: 'FMA'))?.sourceId, 'allanime');
+    expect(repo.searched, ['allanime']);
+  });
+
+  test('manga Auto Resolve skips blocked and empty chapter lists', () async {
+    const c = ZCanonical(ZKind.manga, 'mal:13');
+    final repo = _FakeSources({
+      'mihon:blocked': [_hit('mihon:blocked', 'Solo Leveling')],
+      'mihon:empty': [_hit('mihon:empty', 'Solo Leveling')],
+      'mihon:working': [_hit('mihon:working', 'Solo Leveling')],
+    });
+    repo.blockedChapters.add('mihon:blocked');
+    repo.chapterLists['mihon:empty'] = [];
+    await prefs.rememberLastGood(c.kind, 'mihon:blocked');
+    final matcher = SourceMatcher(
+      sources: repo,
+      store: store,
+      prefs: prefs,
+      candidates: (_) => [
+        for (final id in repo.bySource.keys) (id: id, name: id),
+      ],
+    );
+    final match = await matcher.resolve(c, title: 'Solo Leveling');
+    expect(match?.sourceId, 'mihon:working');
+    expect(
+      matcher.sourceForTitle(c),
+      isNull,
+      reason: 'A resolved source must still be labelled Auto Resolve',
+    );
+    expect((await matcher.chaptersFor(c, match!)).length, 1);
+    expect(repo.searched, ['mihon:blocked', 'mihon:empty', 'mihon:working']);
+    CfSolveNeeded.clear('blocked.test');
+  });
+
+  test(
+    'a manual manga source stays selected until Auto Resolve is chosen',
+    () async {
+      const c = ZCanonical(ZKind.manga, 'mal:13');
+      final repo = _FakeSources({
+        'mihon:first': [_hit('mihon:first', 'Solo Leveling')],
+        'mihon:second': [_hit('mihon:second', 'Solo Leveling')],
+      });
+      repo.chapterLists['mihon:first'] = [];
+      final matcher = SourceMatcher(
+        sources: repo,
+        store: store,
+        prefs: prefs,
+        candidates: (_) => [
+          for (final id in repo.bySource.keys) (id: id, name: id),
+        ],
+      );
+      await matcher.pinTitleToSource(c, 'mihon:first', title: 'Solo Leveling');
+      expect(matcher.sourceForTitle(c), 'mihon:first');
+      expect(
+        (await matcher.resolve(c, title: 'Solo Leveling'))?.sourceId,
+        'mihon:first',
+      );
+      await matcher.clearAuto(c);
+      expect(
+        (await matcher.resolve(c, title: 'Solo Leveling'))?.sourceId,
+        'mihon:second',
+      );
+      expect(matcher.sourceForTitle(c), isNull);
+    },
+  );
+
+  test(
+    'legacy numeric extension matches recover their provider namespace',
+    () async {
+      await Hive.box<Map>(MatchStore.boxName).put(
+        '${fma.key}@123',
+        const SourceMatch(
+          sourceId: '123',
+          showUrl: 'https://example.com/title',
+          showId: '42',
+          showTitle: 'FMA',
+          pinned: true,
+        ).toMap(),
+      );
+      expect(store.pinnedFor(fma)?.sourceId, 'ani:123');
+      expect(store.get(fma, 'ani:123')?.sourceId, 'ani:123');
+    },
+  );
 
   group('resolveOn', () {
     test('matches on exactly the named source', () async {

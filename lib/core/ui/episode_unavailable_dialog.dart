@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
 
 import '../app_mode.dart';
+import '../desktop/desktop_dialogs.dart';
 import '../di/injector.dart';
 import '../models/episode.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text.dart';
 import '../tv/tv_focusable.dart';
+import 'desktop_docked_panel.dart';
 
 /// Shown when the catalogue lists an episode that the ONE matched source does
 /// not have. Returns true when the viewer wants every other installed source
@@ -26,6 +28,18 @@ Future<bool> showEpisodeUnavailable(
   final what = reading ? 'chapter' : 'episode';
   final n = ep.number?.toInt();
   final reason = ep.unavailable ?? 'Not available';
+  // Windows: the graphite confirm dialog (left-aligned text, right-aligned
+  // buttons, Enter checks other sources, Esc means not now) instead of the
+  // phone card with its big icon and stacked full-width buttons.
+  if (desktopPanelsEnabled) {
+    return showDesktopConfirm(
+      context,
+      title: reason,
+      message: _onlyOneCheckedText(what, n),
+      confirmLabel: 'Check other sources',
+      cancelLabel: 'Not now',
+    );
+  }
   final out = await showDialog<bool>(
     context: context,
     builder: (ctx) => Dialog(
@@ -100,6 +114,21 @@ Future<bool> showPlaybackDeadEnd(BuildContext context, String message) async {
   final lines = message.split('\n');
   final headline = lines.first;
   final detail = lines.skip(1).join('\n');
+  // Windows: graphite confirm dialog. Enter tries again, Esc / Go back
+  // returns false so the player hands the viewer back, same as the phone.
+  if (desktopPanelsEnabled) {
+    return showDesktopConfirm(
+      context,
+      title: headline,
+      // The confirm dialog always shows a message line; give a short hint
+      // rather than an empty gap when the error had no detail.
+      message: detail.isNotEmpty
+          ? detail
+          : 'Try again, or go back and pick another episode or source.',
+      confirmLabel: 'Try again',
+      cancelLabel: 'Go back',
+    );
+  }
   final out = await showDialog<bool>(
     context: context,
     builder: (ctx) => Dialog(
@@ -150,6 +179,13 @@ Future<bool> showPlaybackDeadEnd(BuildContext context, String message) async {
   );
   return out ?? false;
 }
+
+/// The Windows dialog's message; same wording as the phone card's caption.
+String _onlyOneCheckedText(String what, int? n) => n == null
+    ? 'Only one source has been checked for this $what. The rest '
+          'can be searched now if you want.'
+    : 'Only one source has been checked for $what $n. The rest '
+          'can be searched now if you want.';
 
 class _DeadEndButton extends StatelessWidget {
   const _DeadEndButton({

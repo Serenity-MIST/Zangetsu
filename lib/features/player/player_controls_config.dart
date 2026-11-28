@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
 
 /// The set of player bottom-bar controls the user can arrange.
@@ -46,6 +47,17 @@ const List<PlayerControl> kPlayerControls = [
   PlayerControl('pip', 'Picture-in-picture', Icons.picture_in_picture_alt_rounded),
 ];
 
+/// Controls the Windows desktop player can never show: Cast needs the
+/// Android Cast framework and PiP is Android's floating window.
+const Set<String> kWindowsUnavailableControls = {'cast', 'pip'};
+
+/// Controls this build cannot render. Read through [defaultTargetPlatform]
+/// so widget tests can switch it on. Empty on phone and TV.
+Set<String> unavailablePlayerControls() =>
+    defaultTargetPlatform == TargetPlatform.windows
+    ? kWindowsUnavailableControls
+    : const {};
+
 /// Where a control can be put.
 enum ControlSlot { top, left, right, hidden }
 
@@ -77,11 +89,17 @@ class PlayerControlsConfig {
     required this.top,
     required this.left,
     required this.right,
+    this.unavailable = const {},
   });
 
   final List<String> top;
   final List<String> left;
   final List<String> right;
+
+  /// Controls this platform cannot render. They are left out of every slot,
+  /// Hidden included, so the editor never offers them and they never take
+  /// one of the [maxTop] top-bar places. Empty on phone and TV.
+  final Set<String> unavailable;
 
   /// What the player looks like out of the box — exactly the layout that
   /// shipped before this screen existed, so nobody's player changes unless
@@ -110,7 +128,8 @@ class PlayerControlsConfig {
   /// Everything not placed anywhere, in registry order.
   List<String> get hidden => [
     for (final c in kPlayerControls)
-      if (!top.contains(c.id) &&
+      if (!unavailable.contains(c.id) &&
+          !top.contains(c.id) &&
           !left.contains(c.id) &&
           !right.contains(c.id))
         c.id,
@@ -134,11 +153,16 @@ class PlayerControlsConfig {
   /// control since removed), removes any duplicate that ended up in two slots,
   /// and forces the pinned ones back if they've gone missing — so a stale or
   /// bad save can't leave someone with no route to what they put away.
-  PlayerControlsConfig sanitised() {
+  ///
+  /// [unavailable] (see [unavailablePlayerControls]) also drops controls this
+  /// platform cannot render, before the top-bar cap is applied, so on Windows
+  /// a saved or default Cast never costs a top slot.
+  PlayerControlsConfig sanitised({Set<String>? unavailable}) {
+    final skip = unavailable ?? this.unavailable;
     final seen = <String>{};
     List<String> clean(List<String> ids) => [
       for (final id in ids)
-        if (controlById(id) != null && seen.add(id)) id,
+        if (controlById(id) != null && !skip.contains(id) && seen.add(id)) id,
     ];
     final t = clean(top);
     final l = clean(left);
@@ -150,6 +174,6 @@ class PlayerControlsConfig {
     for (final c in kPlayerControls) {
       if (c.pinned && !seen.contains(c.id)) l.add(c.id);
     }
-    return PlayerControlsConfig(top: t, left: l, right: r);
+    return PlayerControlsConfig(top: t, left: l, right: r, unavailable: skip);
   }
 }

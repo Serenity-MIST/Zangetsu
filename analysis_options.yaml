@@ -16,6 +16,10 @@ analyzer:
     - windows/**
     - macos/**
     - linux/**
+    # Vendored upstream media_kit_video (Windows black-screen fix only; see
+    # packages/media_kit_video/PATCHES.txt). Kept byte-identical to
+    # upstream, so its own lints are not ours to fix.
+    - packages/media_kit_video/**
 include: package:flutter_lints/flutter.yaml
 
 linter:

@@ -145,6 +145,73 @@ void main() {
       );
     });
 
+    // Windows: the same choices in a centred, bounded dialog with a close
+    // button, never a phone bottom sheet with a drag handle.
+    testWidgets(
+      'Windows shows a bounded dialog with the same choices',
+      (tester) async {
+        await tester.binding.setSurfaceSize(const Size(1920, 1080));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        HomeCatalogueSelection? selection;
+        var closed = false;
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Builder(
+              builder: (context) => Scaffold(
+                body: FilledButton(
+                  onPressed: () async {
+                    selection = await showMetadataSwitchSheet(context);
+                    closed = true;
+                  },
+                  child: const Text('Choose catalogue'),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.tap(find.text('Choose catalogue'));
+        await tester.pumpAndSettle();
+        final dialog = find.byKey(const ValueKey('metadata-switch-dialog'));
+        expect(dialog, findsOneWidget);
+        expect(find.byType(BottomSheet), findsNothing);
+        expect(
+          tester
+              .getSize(
+                find.descendant(of: dialog, matching: find.byType(Material)).first,
+              )
+              .width,
+          lessThanOrEqualTo(560),
+        );
+        for (final name in [
+          'AniList',
+          'MyAnimeList',
+          'TMDB',
+          'Simkl',
+          'Source Catalogue',
+          'Stremio',
+        ]) {
+          expect(
+            find.descendant(of: dialog, matching: find.text(name)),
+            findsOneWidget,
+            reason: name,
+          );
+        }
+        // Close changes nothing.
+        await tester.tap(find.byTooltip('Close'));
+        await tester.pumpAndSettle();
+        expect(closed, isTrue);
+        expect(selection, isNull);
+        // A choice still returns through the same path as the phone sheet.
+        await tester.tap(find.text('Choose catalogue'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Source Catalogue'));
+        await tester.pumpAndSettle();
+        expect(selection, HomeCatalogueSelection.source);
+        expect(find.byType(Dialog), findsNothing);
+      },
+      variant: TargetPlatformVariant.only(TargetPlatform.windows),
+    );
+
     testWidgets('source mode does not mark saved metadata choices active', (
       tester,
     ) async {

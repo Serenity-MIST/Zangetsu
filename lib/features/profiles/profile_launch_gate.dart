@@ -1,16 +1,21 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 
+import '../../core/desktop/desktop_window.dart';
 import '../../core/di/injector.dart';
+import '../../core/profiles/profile_pin_store.dart';
 import '../../core/profiles/profile_shell_scope.dart';
 import '../../core/profiles/viewer_profile.dart';
 import '../../core/profiles/profile_lock_store.dart';
 import '../../core/profiles/profile_lock_remote.dart';
 import '../../core/theme/app_colors.dart';
 import '../../l10n/l10n.dart';
+import 'desktop_profile_relock.dart';
+import 'profile_unlock.dart' show profileHasPin, hasLegacyPcPin;
 import 'viewer_profiles_screen.dart';
 import '../auth/auth_screens.dart' show LoginScreen;
 import '../auth/auth_cubit.dart';
+import '../player/desktop_floating_player.dart';
 
 class ProfileLaunchGate extends StatefulWidget {
   const ProfileLaunchGate({super.key, required this.child});
@@ -22,9 +27,12 @@ class ProfileLaunchGate extends StatefulWidget {
 }
 
 class _ProfileLaunchGateState extends State<ProfileLaunchGate> {
+  // Content waits for [_ensureGate] whenever a lock store exists, so the
+  // synced lock (the one profile lock on every platform) decides there.
   late bool _deferContent =
       sl<ViewerProfileStore>().askOnLaunch ||
-      sl.isRegistered<ProfileLockStore>();
+      sl.isRegistered<ProfileLockStore>() ||
+      sl.isRegistered<ProfilePinStore>();
   bool _pickerShown = false;
   Object? _lockError;
   late final ViewerProfileStore _profiles = sl<ViewerProfileStore>();
@@ -33,9 +41,16 @@ class _ProfileLaunchGateState extends State<ProfileLaunchGate> {
   String? _authUserId;
   int _checkGeneration = 0;
 
+  // Windows (acct-11): Ctrl+L, idle time and Windows locking relock the
+  // active profile. start() is a no-op on phone and TV.
+  late final DesktopProfileRelock _relock = DesktopProfileRelock(
+    onLockRequested: _relockActiveProfile,
+  );
+
   @override
   void initState() {
     super.initState();
+    _relock.start();
     _profileContext = (_profiles.ownerKey, _profiles.activeId);
     _profiles.active.addListener(_onProfileChanged);
     if (sl.isRegistered<AuthCubit>()) {
@@ -87,9 +102,53 @@ class _ProfileLaunchGateState extends State<ProfileLaunchGate> {
 
   @override
   void dispose() {
+    _relock.dispose();
     _profiles.active.removeListener(_onProfileChanged);
     _authSubscription?.cancel();
     super.dispose();
+  }
+
+  /// Windows "Lock profile now" / auto-lock (acct-11). When the active
+  /// profile has a PIN, forget that it was unlocked and stop at the profile
+  /// picker, exactly like a locked launch: picking it again asks the PIN.
+  /// A profile without a PIN has nothing to lock; a manual request says so.
+  Future<void> _relockActiveProfile(ProfileRelockReason reason) async {
+    if (!mounted || _pickerShown || _deferContent) return;
+    final locks = sl.isRegistered<ProfileLockStore>()
+        ? sl<ProfileLockStore>()
+        : null;
+    final active = _profiles.activeProfile;
+    final hasPin = await profileHasPin(active.id, locks);
+    if (!mounted || _pickerShown || _deferContent) return;
+    if (!hasPin) {
+      if (reason == ProfileRelockReason.manual) {
+        ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+          SnackBar(
+            content: Text(
+              context.l10n.setPinToLock,
+            ),
+          ),
+        );
+      }
+      return;
+    }
+    locks?.clearSwitchApprovals();
+    locks?.lockEntry(active.id);
+    // The picker needs the full window, not the mini player.
+    if (DesktopWindow.miniPlayer.value) {
+      await DesktopWindow.exitMiniPlayer();
+    }
+    // Windows: the floating mini player sits above every page and would show
+    // over the PIN picker. Stop it (progress is saved) before locking.
+    await DesktopFloatingPlayer.instance.close();
+    if (!mounted || _pickerShown) return;
+    _checkGeneration++;
+    setState(() {
+      _deferContent = true;
+      _lockError = null;
+    });
+    _pickerShown = true;
+    unawaited(_showPicker());
   }
 
   /// Decides whether launch stops at the picker. Asking off means straight
@@ -112,6 +171,20 @@ class _ProfileLaunchGateState extends State<ProfileLaunchGate> {
     if (checkLaunchPreference && store.askOnLaunch && !onlyOne) {
       _pickerShown = true;
       if (mounted) _showPicker();
+      return;
+    }
+    // Windows: an old PC-only PIN that has not been moved into the synced
+    // lock yet kept its launch promise (stop at the picker whatever "ask on
+    // launch" says), so protection is not silently lost. Choosing the profile
+    // there asks that PIN once and moves it ([ensureProfileAccess]); after
+    // that launch behaves exactly like the phone. Checked on every gate run
+    // (also after a sign-in or an unapproved active-profile change), not only
+    // at launch, so such a profile never opens without its PIN.
+    if (sl.isRegistered<ProfilePinStore>() &&
+        await hasLegacyPcPin(store.activeId)) {
+      if (!mounted || generation != _checkGeneration || _pickerShown) return;
+      _pickerShown = true;
+      _showPicker();
       return;
     }
     try {

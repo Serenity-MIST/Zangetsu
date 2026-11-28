@@ -52,6 +52,7 @@ class ReadStore {
     await _box.put(key, {
       'pos': pos,
       'total': total,
+      'updatedMs': DateTime.now().millisecondsSinceEpoch,
       if (wasMarkedRead) 'read': true,
     });
   }
@@ -68,6 +69,14 @@ class ReadStore {
       pos: (m['pos'] as num?)?.toInt() ?? 0,
       total: (m['total'] as num?)?.toInt() ?? 0,
     );
+  }
+
+  /// Timestamp used to compare this device's position with synced history.
+  /// Legacy marks have no timestamp and remain readable with their old shape.
+  int updatedMs(String sourceId, String showId, String chapterId) {
+    if (!Hive.isBoxOpen(boxName)) return 0;
+    final raw = _box.get(_key(sourceId, showId, chapterId));
+    return (raw?['updatedMs'] as num?)?.toInt() ?? 0;
   }
 
   /// True when the chapter is effectively done: last page (manga) or ≥95%
@@ -100,6 +109,7 @@ class ReadStore {
       m.remove('read');
       m['pos'] = 0;
     }
+    m['updatedMs'] = DateTime.now().millisecondsSinceEpoch;
     await _box.put(key, m);
   }
 

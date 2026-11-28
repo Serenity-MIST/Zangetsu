@@ -1,3 +1,6 @@
+import 'dart:math' as math;
+
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import '../../core/ui/settings_widgets.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -29,53 +32,69 @@ class DonateScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar(context.l10n.supportTitle),
-      body: ListView(
-        padding: const EdgeInsets.fromLTRB(24, 32, 24, 28),
-        children: [
-          Center(
-            child: Container(
-              width: 88,
-              height: 88,
-              decoration: BoxDecoration(
-                color: AppColors.accentSoft,
-                borderRadius: BorderRadius.circular(24),
-              ),
-              alignment: Alignment.center,
-              child: Icon(
-                Icons.favorite_rounded,
-                color: AppColors.accent,
-                size: 40,
-              ),
-            ),
+      // Windows: keep the message and the button in a ~520px column centred in
+      // the wide settings pane instead of stretching edge to edge. The list
+      // still spans the pane, so the wheel scrolls it from anywhere.
+      body: LayoutBuilder(
+        builder: (context, bounds) => ListView(
+          padding: EdgeInsets.fromLTRB(
+            _sideInset(bounds.maxWidth),
+            32,
+            _sideInset(bounds.maxWidth),
+            28,
           ),
-          const SizedBox(height: 22),
-          Center(
-            child: Text(
-              context.l10n.enjoyingApp(kAppName),
-              style: AppText.largeTitle.copyWith(fontSize: 23),
-              textAlign: TextAlign.center,
-            ),
-          ),
-          const SizedBox(height: 12),
-          Text(
-            context.l10n.donateBlurb(kAppName),
-            style: AppText.body.copyWith(height: 1.5),
-            textAlign: TextAlign.center,
-          ),
-          const SizedBox(height: 28),
-          _DonateButton(
-            label: context.l10n.buyMeACoffee,
-            icon: Icons.coffee_rounded,
-            bg: const Color(0xFFFFDD00),
-            fg: const Color(0xFF13110A),
-            onTap: () => _open(_bmcUrl),
-          ),
-        ],
+          children: _content(context),
+        ),
       ),
     );
   }
+
+  /// Horizontal padding: 24 on phone and TV; on Windows, enough to centre a
+  /// 520px column once the pane is wider than that.
+  static double _sideInset(double width) {
+    if (defaultTargetPlatform != TargetPlatform.windows) return 24;
+    return math.max(24, (width - 520) / 2);
+  }
+
+  /// The page body, unchanged from the phone layout.
+  List<Widget> _content(BuildContext context) => [
+    Center(
+      child: Container(
+        width: 88,
+        height: 88,
+        decoration: BoxDecoration(
+          color: AppColors.accentSoft,
+          borderRadius: BorderRadius.circular(24),
+        ),
+        alignment: Alignment.center,
+        child: Icon(Icons.favorite_rounded, color: AppColors.accent, size: 40),
+      ),
+    ),
+    const SizedBox(height: 22),
+    Center(
+      child: Text(
+        context.l10n.enjoyingApp(kAppName),
+        style: AppText.largeTitle.copyWith(fontSize: 23),
+        textAlign: TextAlign.center,
+      ),
+    ),
+    const SizedBox(height: 12),
+    Text(
+      context.l10n.donateBlurb(kAppName),
+      style: AppText.body.copyWith(height: 1.5),
+      textAlign: TextAlign.center,
+    ),
+    const SizedBox(height: 28),
+    _DonateButton(
+      label: context.l10n.buyMeACoffee,
+      icon: Icons.coffee_rounded,
+      bg: const Color(0xFFFFDD00),
+      fg: const Color(0xFF13110A),
+      onTap: () => _open(_bmcUrl),
+    ),
+  ];
 }
 
 /// A pill donate button — brand-coloured, icon + label.
@@ -120,7 +139,7 @@ class _DonateButton extends StatelessWidget {
               label,
               style: TextStyle(
                 fontFamily: AppText.fontFamily,
-          fontFamilyFallback: AppText.fontFamilyFallback,
+                fontFamilyFallback: AppText.fontFamilyFallback,
                 fontWeight: FontWeight.w700,
                 fontSize: 16,
                 letterSpacing: -0.2,

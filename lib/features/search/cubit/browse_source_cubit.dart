@@ -1,8 +1,11 @@
+import 'dart:async';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
 import '../../../core/models/home_section.dart';
 import '../../../core/models/media_item.dart';
 import '../../../core/repository/catalogue_repository.dart';
+import '../../../core/error/exceptions.dart';
+import '../../../core/provider/cf_solve_needed.dart';
 
 class BrowseSourceState {
   const BrowseSourceState({
@@ -17,7 +20,18 @@ class BrowseSourceState {
     this.page = 1,
     this.loadingMore = false,
     this.atEnd = false,
+    this.loadMoreFailed = false,
+    this.loadError,
+    this.searchError,
   });
+
+  /// What the catalogue load threw, kept with [failed] so Windows can tell a
+  /// source time-out from other failures (src-11). Null otherwise.
+  final Object? loadError;
+
+  /// What the search, filter browse or next page threw, kept with
+  /// [searchFailed] / [loadMoreFailed] for the same reason (src-11).
+  final Object? searchError;
 
   final List<HomeSection> sections;
   final bool loading;
@@ -55,6 +69,11 @@ class BrowseSourceState {
   /// rarely report a total, so the end is something you discover.
   final bool atEnd;
 
+  /// The last next-page request threw (search-8). Recorded so the screen can
+  /// show the failure with a Retry instead of the list quietly stopping.
+  /// Cleared as soon as another page request starts or succeeds.
+  final bool loadMoreFailed;
+
   /// Whether the screen should be showing search results/spinner/failure
   /// instead of the catalogue rows.
   bool get isSearchActive => searching || searchFailed || searchResults != null;
@@ -67,12 +86,57 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
   BrowseSourceCubit({
     required CatalogueRepository repo,
     required this.sourceId,
+    this.sourceAvailable,
+    Stream<void>? inventoryChanges,
     this.timeout = const Duration(seconds: 40),
   }) : _repo = repo,
-       super(const BrowseSourceState());
+       super(const BrowseSourceState()) {
+    _inventorySubscription = inventoryChanges?.listen((_) => _invalidateSource());
+  }
+  StreamSubscription<void>? _inventorySubscription;
+
+  /// Same-ID reinstalls retire the previous plugin's pending work too.
+  void _invalidateSource() {
+    if (isClosed) return;
+    _requestVersion++;
+    _homeVersion++;
+    _catalogue = const BrowseSourceState(loading: false, failed: true);
+    emit(_catalogue);
+  }
+
+  @override
+  Future<void> close() async {
+    await _inventorySubscription?.cancel();
+    await super.close();
+  }
 
   final CatalogueRepository _repo;
   final String sourceId;
+  final bool Function()? sourceAvailable;
+
+  /// Retire cached/in-flight content when its provider has been removed.
+  /// The optional seam keeps non-source catalogue fixtures independent.
+  bool checkSourceAvailability() {
+    if (isClosed) return false;
+    if (sourceAvailable?.call() ?? true) return true;
+    _invalidateSource();
+    return false;
+  }
+
+  /// Every new catalogue intent retires earlier asynchronous completions.
+  int _requestVersion = 0;
+  int _homeVersion = 0;
+  // Base rows have their own lifetime: searching must not discard a pending
+  // catalogue that Clear will need, nor may its completion replace a search.
+  BrowseSourceState _catalogue = const BrowseSourceState();
+  bool _current(int version) => !isClosed && version == _requestVersion && checkSourceAvailability();
+
+  /// Capture the provider/request generation before an asynchronous title tap.
+  /// Availability alone cannot distinguish a removed and reinstalled plugin.
+  bool Function() retainSourceIntent() {
+    final version = _requestVersion;
+    return () => _current(version);
+  }
 
   /// How long a source gets before the screen gives up on it.
   ///
@@ -82,30 +146,58 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
   /// pays for the challenge solve before the real request even starts.
   final Duration timeout;
 
+  /// Native extensions throw a typed challenge instead of setting the JS
+  /// host flag. Preserve its exact URL so Browse offers verification too.
+  void _recordChallenge(Object error) {
+    if (error is CloudflareRequiredException) {
+      final host = Uri.tryParse(error.url)?.host;
+      if (host != null && host.isNotEmpty) {
+        CfSolveNeeded.needsSolve(host, error.url, sourceId: sourceId);
+      }
+    }
+  }
+
   Future<void> load() async {
-    emit(const BrowseSourceState());
+    if (!checkSourceAvailability()) return;
+    ++_requestVersion;
+    final version = ++_homeVersion;
+    _catalogue = const BrowseSourceState();
+    emit(_catalogue);
     try {
       final sections = await _repo.home(sourceId: sourceId).timeout(timeout);
-      if (isClosed) return;
-      emit(BrowseSourceState(sections: sections, loading: false));
-    } catch (_) {
-      if (isClosed) return;
-      emit(const BrowseSourceState(loading: false, failed: true));
+      if (isClosed || version != _homeVersion || !checkSourceAvailability()) return;
+      _catalogue = BrowseSourceState(sections: sections, loading: false);
+      if (!state.isSearchActive) emit(_catalogue);
+    } catch (error) {
+      if (isClosed || version != _homeVersion || !checkSourceAvailability()) return;
+      _catalogue = BrowseSourceState(
+        loading: false,
+        failed: true,
+        loadError: error, // src-11: lets the screen spot a time-out
+      );
+      // This base request is still current even if Search owns the visible
+      // results. Recording a target never opens a solver; Clear can offer it.
+      _recordChallenge(error);
+      if (!state.isSearchActive) {
+        emit(_catalogue);
+      }
     }
   }
 
   /// Runs a search scoped to [sourceId]. An empty/blank [query] just clears
   /// back to the catalogue, same as [clearSearch].
   Future<void> search(String query) async {
+    if (!checkSourceAvailability()) return;
     final q = query.trim();
     final filters = state.filtersJson;
     if (q.isEmpty) {
       clearSearch();
       return;
     }
+    final version = ++_requestVersion;
     emit(
       BrowseSourceState(
-        sections: state.sections,
+        sections: _catalogue.sections,
         loading: false,
         searching: true,
         filtersJson: state.filtersJson,
@@ -113,29 +205,32 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
       ),
     );
     try {
+      // Upstream: Mangayomi applies the active filters to the text search too.
       final results = filters.isNotEmpty && sourceId.startsWith('mg:')
           ? (await _repo
                     .searchStatus(q, sourceId: sourceId, filtersJson: filters)
                     .timeout(timeout))
                 .items
           : await _repo.search(q, sourceId: sourceId).timeout(timeout);
-      if (isClosed) return;
+      if (!_current(version)) return;
       emit(
         BrowseSourceState(
-          sections: state.sections,
+          sections: _catalogue.sections,
           loading: false,
           searchResults: results,
           filtersJson: filters,
           query: q,
         ),
       );
-    } catch (_) {
-      if (isClosed) return;
+    } catch (error) {
+      if (!_current(version)) return;
+      _recordChallenge(error);
       emit(
         BrowseSourceState(
-          sections: state.sections,
+          sections: _catalogue.sections,
           loading: false,
           searchFailed: true,
+          searchError: error, // src-11: lets the screen spot a time-out
           filtersJson: filters,
           query: q,
         ),
@@ -149,13 +244,15 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
   /// That isn't a workaround: the extensions treat no-query-plus-filters as an
   /// ordinary search and implement it that way, so we ask for the same thing.
   Future<void> applyFilters(String filtersJson) async {
+    if (!checkSourceAvailability()) return;
     if (filtersJson.isEmpty) {
       clearSearch();
       return;
     }
+    final version = ++_requestVersion;
     emit(
       BrowseSourceState(
-        sections: state.sections,
+        sections: _catalogue.sections,
         loading: false,
         searching: true,
         filtersJson: filtersJson,
@@ -166,23 +263,25 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
         '',
         sourceId: sourceId,
         filtersJson: filtersJson,
-      );
-      if (isClosed) return;
+      ).timeout(timeout);
+      if (!_current(version)) return;
       emit(
         BrowseSourceState(
-          sections: state.sections,
+          sections: _catalogue.sections,
           loading: false,
           searchResults: res.items,
           filtersJson: filtersJson,
         ),
       );
-    } catch (_) {
-      if (isClosed) return;
+    } catch (error) {
+      if (!_current(version)) return;
+      _recordChallenge(error);
       emit(
         BrowseSourceState(
-          sections: state.sections,
+          sections: _catalogue.sections,
           loading: false,
           searchFailed: true,
+          searchError: error, // src-11: lets the screen spot a time-out
           filtersJson: filtersJson,
         ),
       );
@@ -196,7 +295,11 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
   /// how many pages exist, and several answer an out-of-range page with the
   /// first one again, which would otherwise scroll forever.
   Future<void> loadMore() async {
-    if (state.loadingMore || state.atEnd || !state.isSearchActive) return;
+    if (!checkSourceAvailability() || state.loadingMore || state.searching ||
+        state.atEnd || state.searchResults == null) {
+      return;
+    }
+    final version = _requestVersion;
     final current = state.searchResults ?? const [];
     emit(_copy(loadingMore: true));
     try {
@@ -205,8 +308,8 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
         sourceId: sourceId,
         filtersJson: state.filtersJson.isEmpty ? null : state.filtersJson,
         page: state.page + 1,
-      );
-      if (isClosed) return;
+      ).timeout(timeout);
+      if (!_current(version)) return;
       final seen = {for (final i in current) i.url};
       final fresh = [
         for (final i in res.items)
@@ -220,10 +323,11 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
           atEnd: fresh.isEmpty,
         ),
       );
-    } catch (_) {
-      if (isClosed) return;
-      // A failed page is not the end — the next scroll may work.
-      emit(_copy(loadingMore: false));
+    } catch (error) {
+      if (!_current(version)) return;
+      // A failed page is not the end — the next scroll may work. The flag
+      // lets the screen say so instead of silently stopping (search-8).
+      emit(_copy(loadingMore: false, loadMoreFailed: true, searchError: error));
     }
   }
 
@@ -232,8 +336,10 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
     int? page,
     bool? loadingMore,
     bool? atEnd,
+    bool loadMoreFailed = false,
+    Object? searchError,
   }) => BrowseSourceState(
-    sections: state.sections,
+    sections: _catalogue.sections,
     loading: false,
     searchResults: searchResults ?? state.searchResults,
     filtersJson: state.filtersJson,
@@ -241,17 +347,17 @@ class BrowseSourceCubit extends Cubit<BrowseSourceState> {
     page: page ?? state.page,
     loadingMore: loadingMore ?? state.loadingMore,
     atEnd: atEnd ?? state.atEnd,
+    // Any other emission (page start / success) clears a previous failure.
+    loadMoreFailed: loadMoreFailed,
+    // Only the failing page keeps its error; other emissions clear it.
+    searchError: searchError,
   );
 
   /// Drops the search results and returns to the already-loaded catalogue
   /// rows — never re-fetches [home].
   void clearSearch() {
-    emit(
-      BrowseSourceState(
-        sections: state.sections,
-        loading: state.loading,
-        failed: state.failed,
-      ),
-    );
+    if (isClosed) return;
+    _requestVersion++;
+    emit(_catalogue);
   }
 }

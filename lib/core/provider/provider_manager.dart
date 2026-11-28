@@ -1,3 +1,6 @@
+import '../desktop/desktop_cf_flag_recovery.dart';
+import '../desktop/desktop_cloudflare.dart';
+import '../desktop/desktop_flaresolverr.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show Platform;
@@ -75,10 +78,9 @@ bool looksLikeCloudflareBlock(int status, String body) {
 /// So Cloudflare has to actually say it is challenging: the `cf-mitigated`
 /// header it sets on a real one, or the interstitial's own markup.
 ///
-/// Scope is deliberately the JS providers only. CloudStream keeps its own
-/// predicate in PluginHost.kt, and Aniyomi/Mihon/LNReader theirs — none of
-/// them route through here.
-@visibleForTesting
+/// Shared by JS providers and the Windows LNReader Dio fallback. Mobile
+/// LNReader, CloudStream and Aniyomi/Mihon retain their native predicates.
+/// Public because both production HTTP adapters use the same classification.
 bool looksLikeCfChallenge({
   required int status,
   required String body,
@@ -115,9 +117,11 @@ class _JsHost {
   /// the app instead of just its own screen.
   static const Duration maxProviderCallTimeout = Duration(seconds: 25);
 
-  _JsHost({required this.dio}) {
+  _JsHost({required this.dio, this.clearanceSolver}) {
     _engine = JsEngine(onChannel: _onChannel, polling: isAppleTv);
   }
+
+  final Future<Map<String, dynamic>?> Function(String)? clearanceSolver;
 
   /// Everything the runtime asks Dart for. Deliberately all still on THIS
   /// isolate even when the engine is on its own: fetch needs Dio, the native
@@ -528,7 +532,54 @@ class _JsHost {
       // OWNER-DISABLED 2026-10-03 (see above): nothing is ever attached now.
       // final sentClearance = _cfCookie.containsKey(host);
       debugPrint('[fetch] $method $url${wantCf ? ' (cf)' : ''}');
+      if (Platform.isWindows) {
+        _ensureCfRestored();
+        _applyCf(host, hdr);
+      }
       var resp = await _request(url, method, hdr, body, follow, tMs);
+      if (Platform.isWindows && _looksLikeCfChallenge(resp) &&
+          DesktopFlareSolverr.hasVerifiedUrl(url) &&
+          const ['GET', 'POST'].contains(method.toUpperCase())) {
+        // A clearance can be valid in WebView2 while the site's protection
+        // rejects Dio's separate connection. Replay only a manually verified
+        // host in that same profile; never open a surprise verification tab.
+        try {
+          final replay = await DesktopFlareSolverr.requestVerified({
+            'url': url, 'cmd': method.toUpperCase() == 'POST' ? 'request.post' : 'request.get',
+            'headers': hdr, 'postData': body is String ? body : jsonEncode(body),
+          });
+          final solution = replay['solution'];
+          if (solution is Map && replay['status'] == 'ok') {
+            resp = Response<dynamic>(requestOptions: RequestOptions(path: url),
+              data: solution['response'], statusCode: (solution['status'] as num?)?.toInt(),
+              headers: Headers.fromMap({
+                for (final entry in (solution['headers'] as Map? ?? {}).entries)
+                  '${entry.key}': ['${entry.value}'],
+              }));
+          }
+        } catch (_) {
+          // Preserve the original failure so the existing Verify UI remains
+          // available; a browser failure must never be presented as content.
+        }
+      }
+      if (Platform.isWindows && _looksLikeCfChallenge(resp)) {
+        _cfCookie.remove(host);
+        _cfStore.forget(host);
+        CfSolveNeeded.needsSolve(host, url, sourceId: srcId);
+      } else if (Platform.isWindows &&
+          desktopShouldClearCfFlag(
+            hostFlagged: CfSolveNeeded.hostFlagged(host),
+            usesJsSolver: CfSolveNeeded.usesJsSolver(host),
+            challenged: false,
+            status: resp.statusCode ?? 0,
+            url: url,
+            challengeUrl: CfSolveNeeded.urlForHost(host),
+          )) {
+        // Windows: the page this flagged host challenged just answered
+        // normally, so it works again; lift its Verify flag so the banner
+        // stops asking.
+        CfSolveNeeded.clear(host);
+      }
       // OWNER-DISABLED 2026-10-03 (see above): no blocked-lane retry, no
       // challenge solve + replay, no needs-solve recording. The raw response
       // goes straight to the provider.
@@ -619,7 +670,10 @@ class _JsHost {
     bool follow,
     int tMs,
   ) {
-    final key = '$method\u0000$url\u0000${body ?? ''}';
+    // Requests with different cookies, languages, or redirect policies are
+    // distinct. Sharing them could undo a fresh verification or mix sources.
+    final key = jsonEncode([method, url, '${body ?? ''}', follow,
+      for (final name in headers.keys.toList()..sort()) [name, headers[name]]]);
     final running = _inFlightFetches[key];
     if (running != null) return running;
     final started = _requestUnshared(url, method, headers, body, follow, tMs);
@@ -722,16 +776,23 @@ class _JsHost {
       // a challenge it cannot pass leaves this await hanging for good. Every
       // fetch waiting on it hangs with it, which is what turned one stubborn
       // host into a screen that span forever with nothing to act on.
-      final res = await _cf
-          .invokeMapMethod<String, dynamic>('solveCloudflare', {'url': url})
-          .timeout(solveTimeout);
+      final res = clearanceSolver != null
+          ? await clearanceSolver!(url)
+          : Platform.isWindows
+          ? await DesktopCloudflare.solve(url)
+          : await _cf
+                .invokeMapMethod<String, dynamic>('solveCloudflare', {
+                  'url': url,
+                })
+                .timeout(solveTimeout);
       final cookie = res?['cookie'] as String?;
       final ua = res?['userAgent'] as String?;
-      if (cookie != null && cookie.isNotEmpty) {
-        _cfCookie[host] = cookie;
+      final browserVerified = Platform.isWindows && res?['verified'] == true;
+      if ((cookie != null && cookie.isNotEmpty) || browserVerified) {
+        _cfCookie[host] = cookie ?? '';
         _cfFailedAt.remove(host); // solved → clear any negative-cache mark
         if (ua != null && ua.isNotEmpty) _cfUa[host] = ua;
-        _cfStore.remember(host, cookie, ua); // reuse across restarts
+        _cfStore.remember(host, cookie ?? '', ua, browserVerified: browserVerified);
         CfSolveNeeded.clear(host); // whatever needed the solve can retry now
         debugPrint('[cf] solved $host (ua=${(ua ?? '').split(')').first})');
       } else {
@@ -760,6 +821,9 @@ class _JsHost {
   }
 
   /// True if a CF solve for [host] failed within the last [_cfFailTtlMs].
+  // Kept for the parked Cloudflare-solve call in the request path (commented
+  // out for now), so the analyzer's unused warning is silenced on purpose.
+  // ignore: unused_element
   bool _cfRecentlyFailed(String host) {
     final at = _cfFailedAt[host];
     if (at == null) return false;
@@ -793,6 +857,9 @@ class _JsHost {
   }
 
   /// True when a response is a Cloudflare interstitial rather than real content.
+  // Kept for the parked Android native retry (commented out in the request
+  // path), so the analyzer's unused warning is silenced on purpose.
+  // ignore: unused_element
   bool _looksLikeBlocked(Response<dynamic> resp) => looksLikeCloudflareBlock(
     resp.statusCode ?? 0,
     resp.data?.toString() ?? '',
@@ -805,6 +872,8 @@ class _JsHost {
   /// client for the same class of problem, so this borrows it rather than
   /// standing up a second stack. Android-only; null on any failure, and the
   /// caller then keeps the original response.
+  // Parked with the commented-out Android retry above; silenced on purpose.
+  // ignore: unused_element
   Future<Response<dynamic>?> _retryOverNative(
     String url,
     String method,
@@ -1248,7 +1317,10 @@ class ProviderManager implements ProviderRuntimeLoader {
   static Future<T> inBackground<T>(Future<T> Function() body) =>
       runZoned(body, zoneValues: {backgroundKey: true});
 
-  ProviderManager({required Dio dio}) : _host = _JsHost(dio: dio);
+  ProviderManager({
+    required Dio dio,
+    Future<Map<String, dynamic>?> Function(String)? clearanceSolver,
+  }) : _host = _JsHost(dio: dio, clearanceSolver: clearanceSolver);
 
   final _JsHost _host;
 

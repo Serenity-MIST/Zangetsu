@@ -15,11 +15,11 @@ class _DownloadManager extends Fake implements DownloadManager {
 }
 
 void main() {
-  late Directory _dir;
+  late Directory tempDir;
 
   setUp(() async {
-    _dir = await Directory.systemTemp.createTemp();
-    Hive.init(_dir.path);
+    tempDir = await Directory.systemTemp.createTemp();
+    Hive.init(tempDir.path);
     await Hive.openBox(DownloadPrefs.boxName);
     GetIt.instance.registerSingleton<DownloadPrefs>(DownloadPrefs());
     GetIt.instance.registerSingleton<DownloadManager>(_DownloadManager());
@@ -28,7 +28,7 @@ void main() {
   tearDown(() async {
     await GetIt.instance.reset();
     await Hive.deleteFromDisk();
-    if (_dir.existsSync()) await _dir.delete(recursive: true);
+    if (tempDir.existsSync()) await tempDir.delete(recursive: true);
   });
 
   testWidgets('renders Choose folder tile and default current-location label',
@@ -39,6 +39,7 @@ void main() {
     await tester.pump();
 
     expect(find.text('Choose folder…'), findsOneWidget);
+    // Phone target (Windows has its own page and test), whatever the host.
     expect(find.text('Downloads › Zangetsu'), findsOneWidget);
   });
 

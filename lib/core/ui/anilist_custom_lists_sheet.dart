@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../anilist/anilist_service.dart';
+import '../desktop/desktop_dialogs.dart';
+import '../desktop/desktop_sheet.dart';
 import '../models/media_item.dart';
 import '../models/provider_info.dart';
 import '../theme/app_colors.dart';
@@ -22,31 +24,13 @@ Future<List<String>?> _promptNewList(
   AniListService service,
   MediaKind kind,
 ) async {
-  final controller = TextEditingController();
-  final name = await showDialog<String>(
-    context: context,
-    builder: (ctx) => AlertDialog(
-      backgroundColor: AppColors.surface,
-      title: Text('New AniList list', style: AppText.title),
-      content: TextField(
-        controller: controller,
-        autofocus: true,
-        style: AppText.body.copyWith(color: AppColors.textPrimary),
-        decoration: const InputDecoration(hintText: 'Rewatching, Favourites, …'),
-        onSubmitted: (v) => Navigator.pop(ctx, v),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(ctx),
-          child: const Text('Cancel'),
-        ),
-        FilledButton(
-          onPressed: () => Navigator.pop(ctx, controller.text),
-          style: FilledButton.styleFrom(backgroundColor: AppColors.accent),
-          child: const Text('Create'),
-        ),
-      ],
-    ),
+  // Graphite prompt on Windows, the same AlertDialog as before on phone.
+  final name = await showAdaptiveTextPrompt(
+    context,
+    title: 'New AniList list',
+    hint: 'Rewatching, Favourites, …',
+    cancelLabel: 'Cancel',
+    confirmLabel: 'Create',
   );
   if (name == null || name.trim().isEmpty) return null;
   final next = await service.createCustomList(name, kind: kind);
@@ -89,8 +73,13 @@ Future<void> showAniListCustomListsSheet(
   final selected = current.toSet();
   final before = current.toSet();
 
-  await showModalBottomSheet<void>(
-    context: context,
+  // Windows: graphite dialog with a title bar (centred, and without a second
+  // scrim when opened from the tracker dialog); phone/TV: the bottom sheet.
+  await showAdaptiveSheet<void>(
+    context,
+    title: 'AniList custom lists',
+    subtitle: 'Saved to your AniList account',
+    desktopStyle: DesktopSheetStyle.dialog,
     backgroundColor: AppColors.surface,
     shape: const RoundedRectangleBorder(
       borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
@@ -100,23 +89,26 @@ Future<void> showAniListCustomListsSheet(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 18, 20, 2),
-              child: Align(
-                alignment: AlignmentDirectional.centerStart,
-                child: Text('AniList custom lists', style: AppText.title),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 6),
-              child: Align(
-                alignment: AlignmentDirectional.centerStart,
-                child: Text(
-                  'Saved to your AniList account',
-                  style: AppText.caption,
+            // Phone heading + caption; on desktop the title bar shows both.
+            if (!DesktopSheetScope.of(ctx)) ...[
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 18, 20, 2),
+                child: Align(
+                  alignment: AlignmentDirectional.centerStart,
+                  child: Text('AniList custom lists', style: AppText.title),
                 ),
               ),
-            ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 6),
+                child: Align(
+                  alignment: AlignmentDirectional.centerStart,
+                  child: Text(
+                    'Saved to your AniList account',
+                    style: AppText.caption,
+                  ),
+                ),
+              ),
+            ],
             Flexible(
               child: ListView(
                 shrinkWrap: true,

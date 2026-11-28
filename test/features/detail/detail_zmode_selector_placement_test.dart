@@ -1,3 +1,6 @@
+import 'package:watch_app/core/metadata/episode_metadata_service.dart';
+import 'package:watch_app/core/zmode/metadata_repository.dart';
+import 'package:watch_app/core/zmode/zmode_ids.dart';
 // Task 18 Part B: MatchLine moved from below the synopsis into the actions
 // column, right under Play/Download. Harness mirrors
 // reading_detail_routing_test.dart's lightweight GetIt stubs (no Hive boxes
@@ -28,6 +31,7 @@ import 'package:watch_app/core/models/media_item.dart';
 import 'package:watch_app/core/models/provider_info.dart';
 import 'package:watch_app/core/models/watch_status.dart';
 import 'package:watch_app/core/playback/list_status_store.dart';
+import 'package:watch_app/core/playback/filler_service.dart';
 import 'package:watch_app/core/playback/my_list.dart';
 import 'package:watch_app/core/playback/playback_prefs.dart';
 import 'package:watch_app/core/playback/resume_store.dart';
@@ -47,7 +51,6 @@ import 'package:watch_app/core/trailer/trailer_service.dart';
 import 'package:watch_app/core/zmode/match_store.dart';
 import 'package:watch_app/core/zmode/zmode_source_prefs.dart';
 import 'package:watch_app/core/zmode/source_matcher.dart';
-import 'package:watch_app/core/zmode/zmode_ids.dart';
 import 'package:watch_app/features/detail/detail_screen.dart';
 import 'package:watch_app/features/detail/wrong_title_sheet.dart';
 
@@ -128,6 +131,16 @@ class _PreviewPlatform extends VideoPlayerPlatform {
 }
 
 // ── Minimal stubs — same shapes as reading_detail_routing_test.dart ────────
+
+/// Supplies the catalogue label used by canonical detail actions.
+class _MetadataLabel implements MetadataRepository {
+  @override
+  String nameForKind(ZKind kind) => 'AniList';
+  @override
+  String displayName(String sourceId) => 'AniList';
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
 
 class _StubSourceRepository implements SourceRepository {
   _StubSourceRepository(
@@ -215,7 +228,6 @@ class _FakeMyListStore implements MyListStore {
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
@@ -230,7 +242,6 @@ class _FakeListStatusStore implements ListStatusStore {
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
@@ -245,7 +256,6 @@ class _FakeResumeStore implements ResumeStore {
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
@@ -257,7 +267,6 @@ class _FakeProviderRegistry implements ProviderRegistry {
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
@@ -273,7 +282,6 @@ class _FakeCloudStreamManager extends ChangeNotifier
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
@@ -291,11 +299,10 @@ class _FakeDownloadManager extends ChangeNotifier implements DownloadManager {
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
-  DownloadRecord? recordFor(String sourceId, String showId, String episodeId) =>
+  DownloadRecord? recordFor(String sourceId, String showId, String episodeId, {String? category}) =>
       null;
 
   @override
@@ -305,7 +312,12 @@ class _FakeDownloadManager extends ChangeNotifier implements DownloadManager {
     required String episodeId,
     String? episodeUrl,
     int? malId,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    int? anilistId,
     double? episodeNumber,
+    String? category,
+    int? season,
   }) async => null;
 }
 
@@ -409,6 +421,9 @@ void main() {
   });
 
   setUp(() async {
+    // Canonical MAL ids are now recovered from the URL; keep this layout
+    // fixture independent of the unrelated live Jikan enrichment request.
+    FillerService.instance.debugSeedCache(5114, const {});
     TestWidgetsFlutterBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(
           const MethodChannel('plugins.flutter.io/path_provider'),
@@ -428,11 +443,14 @@ void main() {
     sl.registerSingleton<TitlePrefsStore>(_FakeTitlePrefs());
     sl.registerSingleton<PlaybackPrefs>(_FakePlaybackPrefs());
     sl.registerSingleton<TrailerService>(_FakeTrailerService());
+    sl.registerSingleton<EpisodeMetadataService>(EpisodeMetadataService(Dio()));
+    sl.registerSingleton<MetadataRepository>(_MetadataLabel());
     sl.registerSingleton<TrackerHub>(TrackerHub(const []));
 
     tempDir = await Directory.systemTemp.createTemp('detail_zmode_test');
     Hive.init(tempDir.path);
     await ReaderPrefs.init();
+    await ReadHistory.init();
     sl.registerSingleton<ReaderPrefs>(ReaderPrefs());
     await ChapterDownloadStore.init();
     sl.registerSingleton<ChapterDownloadStore>(ChapterDownloadStore());
@@ -969,6 +987,10 @@ void main() {
     expect(source.searchQueries, isEmpty);
 
     detailGate.complete();
+    // Real metadata enrichment can complete on an I/O event after the gate.
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 40)),
+    );
     await tester.pump();
     await tester.pump();
     await tester.pump();

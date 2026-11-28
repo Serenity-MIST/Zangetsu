@@ -1,12 +1,18 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import '../../core/boot_network.dart';
+import '../../core/desktop/desktop_chrome_colors.dart';
+import '../../core/desktop/desktop_dialogs.dart';
 import '../../core/di/injector.dart';
 import '../../core/playback/my_list.dart';
 import '../../core/playback/watch_history.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/ui/buttons.dart';
+import '../../core/ui/desktop_docked_panel.dart';
 import 'auth_cubit.dart';
+import '../player/desktop_floating_player.dart';
 import '../../l10n/l10n.dart';
 import '../../l10n/ui_strings.dart';
 
@@ -22,6 +28,19 @@ Future<bool> ensureLiveSession(BuildContext context) async {
   // revives it silently when the refresh token is alive (no password needed).
   if (await cubit.ensureFreshSession()) return true;
   if (!context.mounted) return false;
+  // Windows: no connection is not a dead session. Asking for a password would
+  // not help and would blame the account for a network problem. (The flag is
+  // only ever set on Windows; phone and TV go straight to the dialog.)
+  if (cubit.lastRefreshWasNetworkError ||
+      (defaultTargetPlatform == TargetPlatform.windows &&
+          BootConnectivity.instance.offline.value)) {
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      const SnackBar(
+        content: Text("You're offline. Try again once you're connected."),
+      ),
+    );
+    return false;
+  }
   final ok = await showReconnectDialog(context);
   return ok ?? false;
 }
@@ -69,46 +88,61 @@ Future<bool> safeLogout(BuildContext context) async {
   final userId = cubit.state.user?.id;
   final hasLocal =
       sl<WatchHistory>().all().isNotEmpty || sl<MyListStore>().all().isNotEmpty;
+  // Windows (acct-5): logging out is never a single click. The "back up
+  // first?" warning below is already a confirmation, so only the other paths
+  // ask here, keeping it to one question either way.
+  final warnsAboutBackup = hasLocal && !cubit.hasLiveSession;
+  if (desktopPanelsEnabled && !warnsAboutBackup) {
+    if (!await confirmLogout(context)) return false;
+    if (!context.mounted) return false;
+  }
   if (hasLocal) {
     if (cubit.hasLiveSession) {
       // Back the library up before the logout wipes the local cache.
       if (!await _backupForLogout(context, userId)) return false;
     } else {
-      final choice = await showDialog<String>(
-        context: context,
-        builder: (_) => AlertDialog(
-          backgroundColor: AppColors.surface,
-          title: Text(
-            context.l10n.backUpBeforeLoggingOut,
-            style: AppText.title,
-          ),
-          content: Text(
-            "Your library isn't saved to the cloud yet, so logging out will "
-            'remove it from this device. Reconnect to back it up first?',
-            style: AppText.caption,
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, 'cancel'),
-              child: Text(context.l10n.cancel, style: AppText.button),
-            ),
-            TextButton(
-              onPressed: () => Navigator.pop(context, 'anyway'),
-              child: Text(
-                context.l10n.logOutAnyway,
-                style: AppText.button.copyWith(color: AppColors.textSecondary),
+      // Windows: graphite three-button dialog; the phone keeps the
+      // AlertDialog below unchanged. Both return 'cancel' / 'anyway' /
+      // 'reconnect' (or null when dismissed).
+      final choice = desktopPanelsEnabled
+          ? await showBackupBeforeLogoutDesktop(context)
+          : await showDialog<String>(
+              context: context,
+              builder: (_) => AlertDialog(
+                backgroundColor: AppColors.surface,
+                title: Text(
+                  context.l10n.backUpBeforeLoggingOut,
+                  style: AppText.title,
+                ),
+                content: Text(
+                  "Your library isn't saved to the cloud yet, so logging out will "
+                  'remove it from this device. Reconnect to back it up first?',
+                  style: AppText.caption,
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, 'cancel'),
+                    child: Text(context.l10n.cancel, style: AppText.button),
+                  ),
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, 'anyway'),
+                    child: Text(
+                      context.l10n.logOutAnyway,
+                      style: AppText.button.copyWith(
+                        color: AppColors.textSecondary,
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, 'reconnect'),
+                    child: Text(
+                      context.l10n.reconnect,
+                      style: AppText.button.copyWith(color: AppColors.accent),
+                    ),
+                  ),
+                ],
               ),
-            ),
-            TextButton(
-              onPressed: () => Navigator.pop(context, 'reconnect'),
-              child: Text(
-                context.l10n.reconnect,
-                style: AppText.button.copyWith(color: AppColors.accent),
-              ),
-            ),
-          ],
-        ),
-      );
+            );
       if (choice == null || choice == 'cancel') return false;
       if (choice == 'reconnect') {
         if (!context.mounted) return false;
@@ -122,9 +156,127 @@ Future<bool> safeLogout(BuildContext context) async {
     }
   }
   if (!context.mounted || cubit.state.user?.id != userId) return false;
+  // Windows: a video in the floating mini player is saved and stopped while
+  // still signed in, so it does not go on playing over the sign-in page.
+  if (DesktopFloatingPlayer.instance.isActive) {
+    await closeFloatingPlayerBeforeProfileSwitch();
+  }
   await cubit.logout();
   return true;
 }
+
+/// Windows logout confirmation (acct-5): names the signed-in account and says
+/// the library is kept in the account. Enter confirms, Esc cancels.
+@visibleForTesting
+Future<bool> confirmLogout(BuildContext context) {
+  final email = sl<AuthCubit>().state.user?.email ?? '';
+  return showDesktopConfirm(
+    context,
+    title: context.l10n.logOut,
+    message: email.isEmpty
+        ? context.l10n.logOutLibraryStays
+        : context.l10n.logOutOfEmailLibraryStays(email),
+    confirmLabel: context.l10n.logOut,
+    cancelLabel: context.l10n.cancel,
+    destructive: true,
+  );
+}
+
+/// Windows "Back up before logging out" dialog: the graphite frame of
+/// [showDesktopConfirm] with three right-aligned buttons. Returns 'cancel',
+/// 'anyway' or 'reconnect', or null when dismissed. Reconnect (the safe
+/// choice) has focus, so Enter reconnects; Esc closes without logging out.
+@visibleForTesting
+Future<String?> showBackupBeforeLogoutDesktop(BuildContext context) =>
+    showDialog<String>(
+      context: context,
+      // Same navigator as showDesktopConfirm, so it sits over the shell.
+      useRootNavigator: false,
+      builder: (dialogContext) => Dialog(
+        backgroundColor: DesktopPanelColors.surface,
+        surfaceTintColor: Colors.transparent,
+        insetPadding: const EdgeInsets.all(24),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(20),
+          side: BorderSide(color: DesktopPanelColors.edge),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: ConstrainedBox(
+          // Wider than the two-button confirm so three labels fit on a row.
+          constraints: const BoxConstraints(maxWidth: 520),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(22, 18, 22, 18),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  context.l10n.backUpBeforeLoggingOut,
+                  style: AppText.headline.copyWith(
+                    fontSize: 20,
+                    color: AppColors.textPrimary,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  "Your library isn't saved to the cloud yet, so logging out "
+                  'will remove it from this device. Reconnect to back it up '
+                  'first?',
+                  style: AppText.body.copyWith(
+                    color: AppColors.textSecondary,
+                    height: 1.45,
+                  ),
+                ),
+                const SizedBox(height: 20),
+                // Wrap keeps the buttons right-aligned and lets them drop to
+                // a second line in a narrow window instead of overflowing.
+                Align(
+                  alignment: AlignmentDirectional.centerEnd,
+                  child: Wrap(
+                    alignment: WrapAlignment.end,
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      TextButton(
+                        onPressed: () =>
+                            Navigator.of(dialogContext).pop('cancel'),
+                        style: TextButton.styleFrom(
+                          foregroundColor: AppColors.textSecondary,
+                        ),
+                        child: Text(context.l10n.cancel),
+                      ),
+                      // Losing the local library is the risky path: an
+                      // outlined red button, never the focused default.
+                      OutlinedButton(
+                        onPressed: () =>
+                            Navigator.of(dialogContext).pop('anyway'),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: const Color(0xFFE06A6A),
+                          side: BorderSide(color: DesktopPanelColors.edge),
+                        ),
+                        child: Text(context.l10n.logOutAnyway),
+                      ),
+                      FilledButton(
+                        autofocus: true,
+                        onPressed: () =>
+                            Navigator.of(dialogContext).pop('reconnect'),
+                        style: FilledButton.styleFrom(
+                          backgroundColor: AppColors.accent,
+                          foregroundColor: DesktopChrome.onAccent(
+                            AppColors.accent,
+                          ),
+                        ),
+                        child: Text(context.l10n.reconnect),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
 
 class _ReconnectDialog extends StatefulWidget {
   const _ReconnectDialog();

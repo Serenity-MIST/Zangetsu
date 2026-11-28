@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:hive/hive.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../desktop/desktop_oauth.dart';
 import '../environment.dart';
 import '../models/media_item.dart';
 import '../models/provider_info.dart';
@@ -15,6 +16,7 @@ import '../zmode/simkl_catalogue.dart';
 import '../platform/apple_tv.dart';
 import 'tracker.dart';
 import 'simkl_playback_session.dart';
+import 'tracker_sync_queue.dart' show TrackerWriteScope;
 
 /// Simkl tracker (movies + TV + anime). OAuth2 authorization-code with a client
 /// secret; tokens don't expire. Every API call carries `Authorization: Bearer`
@@ -25,9 +27,12 @@ class SimklService extends ChangeNotifier implements Tracker {
     // app_links has no tvOS impl; TV connects trackers via phone QR pairing.
     if (isAppleTv) return;
     _linkSub = _appLinks.uriLinkStream.listen(_onLink, onError: (_) {});
-    _appLinks.getInitialLink().then((uri) {
-      if (uri != null) _onLink(uri);
-    }).catchError((_) {});
+    _appLinks
+        .getInitialLink()
+        .then((uri) {
+          if (uri != null) _onLink(uri);
+        })
+        .catchError((_) {});
   }
 
   final Dio _dio;
@@ -77,24 +82,52 @@ class SimklService extends ChangeNotifier implements Tracker {
 
   // ── OAuth (authorization code + secret) ─────────────────────────────────────
 
+  /// Safe, user-facing reason the last [connect] failed; null on success or
+  /// when there is nothing more specific than "cancelled".
+  String? lastConnectionError;
+
+  /// Abandons a sign-in that is still waiting for the browser redirect.
+  void cancelConnect() {
+    if (_pending == null) return;
+    lastConnectionError = 'Sign-in cancelled.';
+    _resolvePending(false);
+  }
+
   @override
   Future<bool> connect() async {
+    final active = _pending;
+    if (active != null) return active.future;
+    lastConnectionError = null;
+    // Windows: point zangetsu:// at this exe before the browser can redirect.
+    final callbackError = await DesktopOAuth.ensureBrowserCallback();
+    if (callbackError != null) {
+      lastConnectionError = callbackError;
+      return false;
+    }
     final url = Uri.parse(
       'https://simkl.com/oauth/authorize?response_type=code'
       '&client_id=${Environment.simklClientId}'
       '&redirect_uri=${Uri.encodeComponent(Environment.simklRedirectUri)}',
     );
-    _pending = Completer<bool>();
+    final pending = Completer<bool>();
+    _pending = pending;
     final ok = await launchUrl(url, mode: LaunchMode.externalApplication);
     if (!ok) {
-      _pending = null;
+      if (identical(_pending, pending)) _pending = null;
+      lastConnectionError = 'The sign-in browser could not be opened.';
       return false;
     }
     try {
-      return await _pending!.future.timeout(const Duration(minutes: 3));
-    } catch (_) {
-      _pending = null;
+      // Hold the local future: a fast redirect may already have cleared
+      // _pending by the time launchUrl returns.
+      return await pending.future.timeout(const Duration(minutes: 3));
+    } on TimeoutException {
+      lastConnectionError = DesktopOAuth.noCallbackMessage(displayName);
       return false;
+    } catch (_) {
+      return false;
+    } finally {
+      if (identical(_pending, pending)) _pending = null;
     }
   }
 
@@ -124,7 +157,9 @@ class SimklService extends ChangeNotifier implements Tracker {
         },
         options: Options(validateStatus: (s) => s != null && s < 500),
       );
-      final token = (res.data is Map) ? res.data['access_token'] as String? : null;
+      final token = (res.data is Map)
+          ? res.data['access_token'] as String?
+          : null;
       if (token == null || token.isEmpty) {
         _resolvePending(false);
         return;
@@ -202,7 +237,8 @@ class SimklService extends ChangeNotifier implements Tracker {
           validateStatus: (s) => s != null && s < 500,
         ),
       );
-      final ok = res.statusCode != null &&
+      final ok =
+          res.statusCode != null &&
           (res.statusCode! < 300 ||
               (path.startsWith('/scrobble/') && res.statusCode == 409));
       // A rejected sync used to be completely silent — the bool came back
@@ -212,9 +248,17 @@ class SimklService extends ChangeNotifier implements Tracker {
       if (!ok) {
         debugPrint('[simkl] POST $path → ${res.statusCode} ${res.data}');
       }
+      // Tell the sync outbox (track-2) how it went: a 401 means the login is
+      // gone, anything else is queued or recorded. No-op outside a hub write.
+      if (ok) {
+        TrackerWriteScope.reportSent();
+      } else {
+        TrackerWriteScope.reportStatus(res.statusCode);
+      }
       return ok;
     } catch (e) {
       debugPrint('[simkl] POST $path failed: $e');
+      TrackerWriteScope.reportError(e);
       return false;
     }
   }
@@ -414,8 +458,11 @@ class SimklService extends ChangeNotifier implements Tracker {
     int? seasonEpisode,
     int? malId,
   ) {
-    if (season == null || season <= 0 || seasonEpisode == null ||
-        seasonEpisode <= 0 || malId != null) {
+    if (season == null ||
+        season <= 0 ||
+        seasonEpisode == null ||
+        seasonEpisode <= 0 ||
+        malId != null) {
       return {'episodes': _upTo(episode)};
     }
     return {
@@ -547,7 +594,6 @@ class SimklService extends ChangeNotifier implements Tracker {
     _listCacheAt = null;
   }
 
-
   /// Read the connected user's full Simkl library — anime, TV shows AND movies —
   /// as metadata stubs + status. Best-effort: `[]` when disconnected or on ANY
   /// error (never throws).
@@ -595,8 +641,8 @@ class SimklService extends ChangeNotifier implements Tracker {
           final media = (e['show'] is Map)
               ? e['show'] as Map
               : (e['movie'] is Map)
-                  ? e['movie'] as Map
-                  : e;
+              ? e['movie'] as Map
+              : e;
 
           final ids = (media['ids'] is Map) ? media['ids'] as Map : const {};
           // Simkl is inconsistent about this key: the sync endpoints answer
@@ -611,7 +657,8 @@ class SimklService extends ChangeNotifier implements Tracker {
           if (tmdbId != null && simklId != null) {
             SimklCatalogue.rememberSimklId(tmdbId, simklId);
           }
-          final title = (media['title'] as String?) ??
+          final title =
+              (media['title'] as String?) ??
               (e['title'] as String?) ??
               'Unknown';
 
@@ -621,42 +668,57 @@ class SimklService extends ChangeNotifier implements Tracker {
           // Simkl dates arrive as strings; last_watched_at is the meaningful
           // "updated", with the watchlist-added date as the fallback for
           // something planned but never watched.
-          final updatedRaw = (e['last_watched_at'] ?? e['added_to_watchlist_at'])
-              ?.toString();
-          out.add(TrackerListItem(
-            updatedAt: updatedRaw == null
-                ? null
-                : DateTime.tryParse(updatedRaw.replaceFirst(' ', 'T')),
-            item: MediaItem(
-              id: 'tracker:simkl:${simklId ?? malId ?? tmdbId ?? out.length}',
-              title: title,
-              cover: _posterUrl(media['poster']),
-              url: '',
-              type: type,
-              sourceId: '',
-              malId: malId,
-              tmdbId: tmdbId,
+          final updatedRaw =
+              (e['last_watched_at'] ?? e['added_to_watchlist_at'])?.toString();
+          out.add(
+            TrackerListItem(
+              updatedAt: updatedRaw == null
+                  ? null
+                  : DateTime.tryParse(updatedRaw.replaceFirst(' ', 'T')),
+              item: MediaItem(
+                id: 'tracker:simkl:${simklId ?? malId ?? tmdbId ?? out.length}',
+                title: title,
+                cover: _posterUrl(media['poster']),
+                url: '',
+                type: type,
+                sourceId: '',
+                malId: malId,
+                tmdbId: tmdbId,
+                tmdbIsTv: isTv,
+              ),
+              status: status,
+              progress: _asInt(e['watched_episodes_count']),
+              score: score,
               tmdbIsTv: isTv,
+              // `extended=full` carries the total on both the entry and the
+              // nested media; take whichever is present. No next-airing field
+              // exists on this endpoint, so that stays null.
+              totalEpisodes: _asInt(
+                e['total_episodes_count'] ?? media['total_episodes_count'],
+              ),
             ),
-            status: status,
-            progress: _asInt(e['watched_episodes_count']),
-            score: score,
-            tmdbIsTv: isTv,
-            // `extended=full` carries the total on both the entry and the
-            // nested media; take whichever is present. No next-airing field
-            // exists on this endpoint, so that stays null.
-            totalEpisodes: _asInt(
-                e['total_episodes_count'] ?? media['total_episodes_count']),
-          ));
+          );
         }
       }
 
-      parseBucket(data['anime'],
-          type: ProviderType.anime, anime: true, isTv: false);
-      parseBucket(data['shows'],
-          type: ProviderType.movie, anime: false, isTv: true);
-      parseBucket(data['movies'],
-          type: ProviderType.movie, anime: false, isTv: false);
+      parseBucket(
+        data['anime'],
+        type: ProviderType.anime,
+        anime: true,
+        isTv: false,
+      );
+      parseBucket(
+        data['shows'],
+        type: ProviderType.movie,
+        anime: false,
+        isTv: true,
+      );
+      parseBucket(
+        data['movies'],
+        type: ProviderType.movie,
+        anime: false,
+        isTv: false,
+      );
 
       debugPrint(
         '[simkl] fetchList: ${out.length} items '
@@ -707,9 +769,8 @@ class SimklService extends ChangeNotifier implements Tracker {
       // TMDB numbers a film and a series independently, so the same id is two
       // different titles depending on which. Matching the number alone would
       // hand back somebody else's entry — the kind has to agree too.
-      final matchesTmdb = tmdbId != null &&
-          it.item.tmdbId == tmdbId &&
-          it.tmdbIsTv == tmdbIsTv;
+      final matchesTmdb =
+          tmdbId != null && it.item.tmdbId == tmdbId && it.tmdbIsTv == tmdbIsTv;
       if (matchesMal || matchesPinned || matchesTmdb) {
         // Library ids are stored as `tracker:simkl:<id>`; the trailing id is
         // what simkl.com puts in a url. Anything else shape-wise → no link.
@@ -767,13 +828,21 @@ class SimklService extends ChangeNotifier implements Tracker {
     if (score != null) {
       await _post(
         '/sync/ratings',
-        _body(target, {'ids': target.ids, 'rating': score.round().clamp(1, 10)}),
+        _body(target, {
+          'ids': target.ids,
+          'rating': score.round().clamp(1, 10),
+        }),
       );
     }
     if (progress != null && progress > 0) {
       // Simkl counts distinct watched episodes, so mark 1..N to set progress N.
-      final eps = [for (var n = 1; n <= progress; n++) <String, dynamic>{'number': n}];
-      await _post('/sync/history', _body(target, {'ids': target.ids, 'episodes': eps}));
+      final eps = [
+        for (var n = 1; n <= progress; n++) <String, dynamic>{'number': n},
+      ];
+      await _post(
+        '/sync/history',
+        _body(target, {'ids': target.ids, 'episodes': eps}),
+      );
     }
   }
 
@@ -782,7 +851,9 @@ class SimklService extends ChangeNotifier implements Tracker {
     String query, {
     MediaKind kind = MediaKind.anime,
   }) async {
-    if (kind == MediaKind.manga) return const []; // Simkl has no manga/novel API
+    if (kind == MediaKind.manga) {
+      return const []; // Simkl has no manga/novel API
+    }
     if (query.trim().isEmpty) return const [];
     // Simkl keeps anime, movies and TV in SEPARATE catalogues. Searching
     // /search/anime for a movie is how "Change match" came back empty for
@@ -813,14 +884,16 @@ class SimklService extends ChangeNotifier implements Tracker {
         if (simkl == null) continue;
         final total = _asInt(e['total_episodes']) ?? _asInt(e['episodes']);
         final year = _asInt(e['year']);
-        out.add(TrackerSearchResult(
-          trackerName: displayName,
-          id: '$simkl',
-          title: '${e['title'] ?? 'Unknown'}',
-          cover: _posterUrl(e['poster']),
-          subtitle: year == null ? null : '$year',
-          maxEpisodes: (total != null && total > 0) ? total : null,
-        ));
+        out.add(
+          TrackerSearchResult(
+            trackerName: displayName,
+            id: '$simkl',
+            title: '${e['title'] ?? 'Unknown'}',
+            cover: _posterUrl(e['poster']),
+            subtitle: year == null ? null : '$year',
+            maxEpisodes: (total != null && total > 0) ? total : null,
+          ),
+        );
       }
       return out;
     } catch (_) {

@@ -279,9 +279,11 @@ class HomeCubit extends Cubit<HomeState> {
     int? limitedSeconds;
     try {
       final homeFuture = _repo.home();
-      sections = isAppleTv
-          ? await homeFuture.timeout(const Duration(seconds: 20))
-          : await homeFuture;
+      // Bounded everywhere: on a dead network an unbounded fetch left skeleton
+      // rows spinning for as long as the slowest request took to give up.
+      sections = await homeFuture.timeout(
+        isAppleTv ? const Duration(seconds: 20) : const Duration(seconds: 25),
+      );
     } on TimeoutException catch (_) {
       debugPrint('[home] load timed out · source=$sourceId');
       sections = const <HomeSection>[];
@@ -319,8 +321,28 @@ class HomeCubit extends Cubit<HomeState> {
 
     // A newer load started while we were fetching — discard this stale result.
     if (isClosed || gen != _gen) return;
-    // Remember the good load so the next cold start paints instantly.
-    if (sections.isNotEmpty) {
+
+    // A failed refresh must never wipe rows that are already on screen. When
+    // nothing came back (no connection, a timeout, a dead source) keep the rows
+    // the page was showing, or else the last good load saved on disk, instead of
+    // replacing them with an empty "offline" screen. Not when a Cloudflare
+    // challenge needs solving: that prompt takes priority over old rows.
+    var keptOldRows = false;
+    if (sections.isEmpty && cloudflareUrl == null) {
+      final held = state.sections;
+      final keep = (held != null && held.isNotEmpty)
+          ? held
+          : HomeCache.read(sourceId, cacheKey);
+      if (keep != null && keep.isNotEmpty) {
+        debugPrint('[home] load returned nothing · keeping ${keep.length} rows');
+        sections = keep;
+        keptOldRows = true;
+      }
+    }
+
+    // Remember the good load so the next cold start paints instantly (never the
+    // old rows kept above: they are already what is saved).
+    if (sections.isNotEmpty && !keptOldRows) {
       unawaited(HomeCache.write(sourceId, cacheKey, sections));
     }
     emit(
@@ -369,6 +391,34 @@ class HomeCubit extends Cubit<HomeState> {
       }
     }
     emit(state.copyWith(rows: _mergedRows(sections, kind, library, tracker)));
+  }
+
+  /// Desktop's fixed library panel uses the already-fetched tracker cache,
+  /// independently of the old optional horizontal-row arrangement. Never
+  /// substitute another tracker's account or fetch a second library here.
+  NewEpisodesHomeRow? get desktopReleaseRow {
+    final cached = _trackerCache;
+    final kind = _browseKind;
+    final preferred = layoutTrackerName(_layoutKey);
+    if (cached == null ||
+        kind == null ||
+        (preferred != null && cached.$1 != preferred)) {
+      return null;
+    }
+    for (final row in buildTrackerHomeRows(
+      trackerName: cached.$1,
+      library: cached.$2,
+      kind: kind,
+    )) {
+      if (row is NewEpisodesHomeRow) {
+        // Desktop shows only genuinely recent releases, newest first.
+        final fresh = freshReleases(row.items, kind);
+        return fresh.isEmpty
+            ? null
+            : NewEpisodesHomeRow(items: fresh, trackerName: row.trackerName);
+      }
+    }
+    return null;
   }
 
   /// The sanitized, merged arrangement of one load. Pure given its inputs;

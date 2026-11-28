@@ -1,3 +1,6 @@
+import 'dart:io';
+import 'package:hive/hive.dart';
+import 'package:watch_app/core/zmode/zmode_prefs.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -45,6 +48,8 @@ class _FS implements ComingSoonService {
 
 class _FM implements MyListStore {
   @override
+  final ValueNotifier<int> revision = ValueNotifier<int>(0);
+  @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
 }
 
@@ -71,6 +76,51 @@ class _FakeTracker extends ChangeNotifier implements Tracker {
 }
 
 void main() {
+  testWidgets('retained Schedule follows shell kind without resetting manual tabs', (tester) async {
+    final directory = await tester.runAsync(() async {
+      final directory = await Directory.systemTemp.createTemp('schedule-kind-');
+      Hive.init(directory.path);
+      await ZModePrefs.init();
+      return directory;
+    });
+    final cubit = _StubCubit(_FA(),_FS(),_FM(),const ScheduleState(
+      loadingAiring:false,loadingSoon:false,
+    ));
+    try {
+      await tester.pumpWidget(MaterialApp(
+        localizationsDelegates:AppLocalizations.localizationsDelegates,
+        supportedLocales:AppLocalizations.supportedLocales,
+        home:BlocProvider<ScheduleCubit>.value(value:cubit,child:const ScheduleBody()),
+      ));
+      await tester.pumpAndSettle();
+      final state = tester.state(find.byType(ScheduleBody));
+      TabController controller() => tester.widget<TabBar>(find.byType(TabBar)).controller!;
+      expect(controller().index,0);
+      await tester.runAsync(()=>ZModePrefs.setStreamKind(StreamKind.movie));
+      await tester.pumpAndSettle();
+      expect(controller().index,1);
+      expect(tester.state(find.byType(ScheduleBody)),same(state));
+      await tester.tap(find.text('Anime')); await tester.pumpAndSettle();
+      expect(controller().index,0);
+      ZModePrefs.revision.value++;
+      await tester.pumpAndSettle();
+      expect(controller().index,0);
+      await tester.runAsync(()=>ZModePrefs.setStreamKind(StreamKind.anime));
+      await tester.pumpAndSettle();
+      expect(controller().index,0);
+      await tester.pumpWidget(const SizedBox());
+      ZModePrefs.revision.value++;
+      await tester.pump();
+      expect(tester.takeException(),isNull);
+    } finally {
+      await tester.pumpWidget(const SizedBox());
+      await cubit.close();
+      await tester.runAsync(() async {
+        await Hive.close(); await directory!.delete(recursive:true);
+      });
+    }
+  });
+
   testWidgets('renders Anime timeline + Movies & TV segment', (tester) async {
     // Key the seed to today's local midnight so the selected day matches.
     final n = DateTime.now();

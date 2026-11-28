@@ -85,11 +85,22 @@ void main() {
     );
   });
 
-  test('a server that answered still reads as nothing, not a throw', () async {
-    // A GraphQL error envelope is the server replying; every caller already
-    // treats that as "no data" and must keep doing so.
+  test('a GraphQL error envelope escapes so the backup provider can answer',
+      () async {
+    // Windows fork divergence from upstream (which returned null here): an
+    // error envelope with no data is AniList failing, and only a throw lets
+    // MetadataRepository fall back to MAL instead of showing an empty search.
     final dio = _dioThatAnswers(200, '{"errors":[{"message":"nope"}]}');
-    expect(await AniListCatalogue.dioGql(dio)('query{ x }', const {}), isNull);
+    await expectLater(
+      AniListCatalogue.dioGql(dio)('query{ x }', const {}),
+      throwsA(
+        isA<DioException>().having(
+          (e) => e.type,
+          'type',
+          DioExceptionType.badResponse,
+        ),
+      ),
+    );
   });
 
   test('a good response still parses', () async {

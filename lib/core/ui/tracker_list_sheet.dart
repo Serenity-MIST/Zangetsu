@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../desktop/desktop_context_menu.dart';
+import '../desktop/desktop_sheet.dart';
 import '../di/injector.dart';
 import '../mode/content_mode.dart';
 import '../models/watch_status.dart';
@@ -11,6 +13,7 @@ import '../tracker/tracker.dart';
 import '../tracker/tracker_binding_store.dart';
 import '../tracker/tracker_hub.dart';
 import 'app_dialog.dart';
+import 'desktop_docked_panel.dart';
 import 'global_messenger.dart';
 import 'tracker_badge.dart';
 import 'tracker_sync_sheet.dart';
@@ -37,8 +40,9 @@ Future<int?> showTrackerListSheet(
   String? imdbId,
   String? bindingKey,
 }) {
-  return showModalBottomSheet<int?>(
-    context: context,
+  // Windows (show-2): a centred graphite dialog; phone/TV keep the sheet.
+  return showAdaptiveSheet<int?>(
+    context,
     isScrollControlled: true,
     backgroundColor: AppColors.surface,
     shape: const RoundedRectangleBorder(
@@ -248,6 +252,26 @@ class _TrackerListSheetState extends State<TrackerListSheet> {
   Widget _rowMenu(_Row r) {
     final hasUrl = r.entry?.url != null;
     final onList = r.entry?.onList ?? false;
+    if (desktopPanelsEnabled) {
+      // Windows: the compact graphite menu, dropped below the button like the
+      // other converted dialogs, instead of a Material popup.
+      return Builder(
+        builder: (anchor) => IconButton(
+          key: ValueKey('tracker-row-menu-${r.tracker.displayName}'),
+          icon: Icon(
+            Icons.more_vert_rounded,
+            color: AppColors.textSecondary,
+            size: 20,
+          ),
+          tooltip: '${r.tracker.displayName} options',
+          onPressed: () => showDesktopContextMenu<Object?>(
+            context,
+            anchor: anchor,
+            items: _desktopMenuItems(r),
+          ),
+        ),
+      );
+    }
     return PopupMenuButton<String>(
       icon: Icon(
         Icons.more_vert_rounded,
@@ -289,6 +313,36 @@ class _TrackerListSheetState extends State<TrackerListSheet> {
     );
   }
 
+  /// Windows menu rows for one tracker: the same three actions as the phone
+  /// popup, used by the ⋮ button, right-click and Menu key / Shift+F10.
+  List<DesktopMenuItem<Object?>> _desktopMenuItems(_Row r) {
+    final hasUrl = r.entry?.url != null;
+    final onList = r.entry?.onList ?? false;
+    return [
+      DesktopMenuItem(
+        label: 'Open in browser',
+        icon: Icons.open_in_new_rounded,
+        enabled: hasUrl,
+        onTap: () => _openInBrowser(r),
+      ),
+      DesktopMenuItem(
+        label: 'Copy link',
+        icon: Icons.link_rounded,
+        enabled: hasUrl,
+        onTap: () => _copyLink(r),
+      ),
+      if (onList) ...[
+        const DesktopMenuItem.divider(),
+        DesktopMenuItem(
+          label: 'Remove tracking',
+          icon: Icons.delete_outline_rounded,
+          destructive: true,
+          onTap: () => _remove(r),
+        ),
+      ],
+    ];
+  }
+
   /// "Watching · 5/12 · 8" — whatever this tracker actually knows.
   String _subtitleFor(TrackerEntry e) {
     final bits = <String>[];
@@ -313,17 +367,20 @@ class _TrackerListSheetState extends State<TrackerListSheet> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Center(
-              child: Container(
-                width: 36,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: AppColors.textSecondary.withValues(alpha: 0.3),
-                  borderRadius: BorderRadius.circular(2),
+            // Phone drag handle; the Windows dialog has nothing to drag.
+            if (!DesktopSheetScope.of(context)) ...[
+              Center(
+                child: Container(
+                  width: 36,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: AppColors.textSecondary.withValues(alpha: 0.3),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(height: 14),
+              const SizedBox(height: 14),
+            ],
             Text('Tracking', style: AppText.title),
             const SizedBox(height: 2),
             Text(
@@ -383,66 +440,76 @@ class _TrackerListSheetState extends State<TrackerListSheet> {
     final matched = e?.title;
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
-      child: Material(
-        color: AppColors.bg,
+      // Windows: right-click (or Menu key / Shift+F10 on a focused row) opens
+      // the same menu as the ⋮ button. A no-op wrapper on phone and TV.
+      child: DesktopContextMenuRegion(
+        items: () => _desktopMenuItems(r),
+        child: _rowCard(r, e, matched),
+      ),
+    );
+  }
+
+  /// The tappable card for one tracker row (opens that tracker's editor).
+  Widget _rowCard(_Row r, TrackerEntry? e, String? matched) {
+    return Material(
+      color: AppColors.bg,
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        onTap: () => _openOne(r.tracker),
         borderRadius: BorderRadius.circular(12),
-        child: InkWell(
-          onTap: () => _openOne(r.tracker),
-          borderRadius: BorderRadius.circular(12),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-            child: Row(
-              children: [
-                TrackerBadge(name: r.tracker.displayName),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Row(
-                        children: [
-                          Text(
-                            r.tracker.displayName,
-                            style: AppText.body.copyWith(
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                          // Only a pinned match gets a marker — the user chose
-                          // it. An automatic match is the norm and doesn't need
-                          // decorating.
-                          if (e != null && r.pinned) ...[
-                            const SizedBox(width: 6),
-                            Icon(
-                              Icons.push_pin_rounded,
-                              size: 13,
-                              color: AppColors.textSecondary,
-                            ),
-                          ],
-                        ],
-                      ),
-                      const SizedBox(height: 3),
-                      if (e == null)
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          child: Row(
+            children: [
+              TrackerBadge(name: r.tracker.displayName),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
                         Text(
-                          'Add tracking',
-                          style: AppText.body.copyWith(color: AppColors.accent),
-                        )
-                      else ...[
-                        if (matched != null)
-                          Text(
-                            matched,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: AppText.body,
+                          r.tracker.displayName,
+                          style: AppText.body.copyWith(
+                            fontWeight: FontWeight.w600,
                           ),
-                        Text(_subtitleFor(e), style: AppText.caption),
+                        ),
+                        // Only a pinned match gets a marker — the user chose
+                        // it. An automatic match is the norm and doesn't need
+                        // decorating.
+                        if (e != null && r.pinned) ...[
+                          const SizedBox(width: 6),
+                          Icon(
+                            Icons.push_pin_rounded,
+                            size: 13,
+                            color: AppColors.textSecondary,
+                          ),
+                        ],
                       ],
+                    ),
+                    const SizedBox(height: 3),
+                    if (e == null)
+                      Text(
+                        'Add tracking',
+                        style: AppText.body.copyWith(color: AppColors.accent),
+                      )
+                    else ...[
+                      if (matched != null)
+                        Text(
+                          matched,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: AppText.body,
+                        ),
+                      Text(_subtitleFor(e), style: AppText.caption),
                     ],
-                  ),
+                  ],
                 ),
-                _rowMenu(r),
-              ],
-            ),
+              ),
+              _rowMenu(r),
+            ],
           ),
         ),
       ),

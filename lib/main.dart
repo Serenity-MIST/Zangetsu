@@ -4,7 +4,8 @@ import 'dart:io' show File, Platform;
 import 'dart:ui' show PlatformDispatcher;
 
 import 'package:firebase_core/firebase_core.dart';
-import 'package:flutter/foundation.dart' show ValueListenable, ValueNotifier;
+import 'package:flutter/foundation.dart'
+    show ValueListenable, ValueNotifier, TargetPlatform, defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
@@ -18,7 +19,14 @@ import 'package:supabase_flutter/supabase_flutter.dart' hide AuthState;
 import 'core/analytics/analytics.dart';
 import 'core/app_config.dart';
 import 'core/app_mode.dart';
+import 'core/backup/auto_backup_runner.dart';
 import 'core/boot_network.dart';
+import 'core/desktop/desktop_context_menu.dart';
+import 'core/desktop/desktop_frame_log.dart';
+import 'core/desktop/desktop_hang_watch.dart';
+import 'core/desktop/desktop_image_cache.dart';
+import 'core/desktop/desktop_storage.dart';
+import 'core/desktop/desktop_window.dart';
 import 'core/di/injector.dart';
 import 'core/ui/splash_style.dart';
 import 'core/hive/safe_box.dart';
@@ -33,6 +41,7 @@ import 'core/platform/apple_tv.dart';
 import 'core/platform/android_mpv.dart';
 import 'core/platform/trusted_certificates.dart';
 import 'core/notify/cs_notify.dart';
+import 'core/notify/new_episode_inbox.dart';
 import 'core/notify/notification_service.dart';
 import 'core/notify/push_service.dart';
 import 'core/ui/home_rows_prefs.dart';
@@ -41,12 +50,15 @@ import 'core/ui/poster_card.dart';
 import 'core/notify/subscription_checker.dart';
 import 'core/notify/subscription_store.dart';
 import 'core/playback/category_store.dart';
-import 'core/playback/series_groups.dart';
 import 'core/playback/my_list.dart';
 import 'core/playback/history_merge.dart';
+import 'core/playback/list_idle_runner.dart';
+import 'core/playback/series_groups.dart';
 import 'core/playback/resume_store.dart';
 import 'core/playback/watch_history.dart';
+import 'core/profiles/account_local_data.dart';
 import 'core/profiles/viewer_profile.dart';
+import 'core/sync/sync_status.dart';
 import 'core/reading/read_history.dart';
 import 'core/state/active_source_cubit.dart';
 import 'core/locale/locale_controller.dart';
@@ -58,24 +70,54 @@ import 'core/theme/app_font_prefs.dart';
 import 'core/theme/theme_controller.dart';
 import 'core/tv/tv_route_pop_guard.dart';
 import 'core/tv/tv_viewport.dart';
-import 'features/player/in_app_mini_player.dart';
-import 'features/player/native_player_freeze.dart';
-import 'l10n/app_localizations.dart';
 import 'core/ui/global_messenger.dart';
 import 'core/theme/theme_repaint_observer.dart';
 import 'features/auth/auth_cubit.dart';
 import 'features/home/cubit/home_cubit.dart';
 import 'features/onboarding/boot_error_screen.dart';
 import 'features/onboarding/onboarding_screen.dart';
+import 'features/player/desktop_floating_player.dart';
+import 'features/player/in_app_mini_player.dart';
+import 'features/player/native_player_freeze.dart';
 import 'features/profiles/profile_launch_gate.dart';
 import 'features/shell/root_shell.dart';
 import 'features/watch_together/ui/party_bar.dart';
 import 'features/watch_together/watch_together_controller.dart';
+import 'l10n/l10n.dart';
 
 final _authConnectionPhase = ValueNotifier(AuthConnectionPhase.idle);
 bool _authConnectionVerified = false;
 bool _hadStoredAuthSession = false;
 String? _expectedAuthUserId;
+
+/// Windows shows the splash first and runs the network probe and account
+/// start-up behind it (shell-4), so clicking the icon offline never looks
+/// like nothing happened. Phone and TV keep the probe-before-runApp order.
+bool get _splashFirst => defaultTargetPlatform == TargetPlatform.windows;
+
+/// Windows-only boot behaviour (connectivity watcher, sync status, reconnect
+/// sync, boot-stage log) is gated on this; phone and TV keep upstream's boot.
+bool get _windowsBoot => defaultTargetPlatform == TargetPlatform.windows;
+
+/// Image cache budget in MB: about 2% of the phone's RAM, kept between 80 and
+/// 200. Android only (reads /proc/meminfo); anywhere else it is the old 80.
+int _imageCacheBudgetMb() {
+  if (!Platform.isAndroid) return 80;
+  try {
+    final line = File(
+      '/proc/meminfo',
+    ).readAsLinesSync().firstWhere((l) => l.startsWith('MemTotal:'));
+    final kb = int.parse(RegExp(r'\d+').firstMatch(line)!.group(0)!);
+    return (kb / 1024 * 0.02).round().clamp(80, 200);
+  } catch (_) {
+    return 80;
+  }
+}
+
+/// Splash-first only: the pending "Try again" of an unreadable auth-route
+/// cache. The app is already running, so instead of replacing it with a
+/// second runApp the retry screen is drawn over it while this is non-null.
+final _authRouteRetry = ValueNotifier<Completer<void>?>(null);
 
 Future<AuthRouteDecision> _selectLaunchAuthRoute() async {
   // Explicit build overrides are for staging and remain authoritative.
@@ -92,6 +134,14 @@ Future<AuthRouteDecision> _selectLaunchAuthRoute() async {
     } catch (_) {
       // An unreadable routing cache must never silently select the old authority.
       final retry = Completer<void>();
+      if (_splashFirst) {
+        // The splash is already up: show the retry screen over it (see
+        // _AuthRouteRetryOverlay) and wait for the button.
+        _authRouteRetry.value = retry;
+        await retry.future;
+        _authRouteRetry.value = null;
+        continue;
+      }
       runApp(
         MaterialApp(
           theme: ThemeData.dark(useMaterial3: true),
@@ -159,27 +209,13 @@ Future<bool> _verifyLaunchAuthConnection() async {
   }
 }
 
-/// Image cache budget in MB: about 2% of the phone's RAM, kept between 80 and
-/// 200. Android only (reads /proc/meminfo); anywhere else it is the old 80.
-int _imageCacheBudgetMb() {
-  if (!Platform.isAndroid) return 80;
-  try {
-    final line = File(
-      '/proc/meminfo',
-    ).readAsLinesSync().firstWhere((l) => l.startsWith('MemTotal:'));
-    final kb = int.parse(RegExp(r'\d+').firstMatch(line)!.group(0)!);
-    return (kb / 1024 * 0.02).round().clamp(80, 200);
-  } catch (_) {
-    return 80;
-  }
-}
-
 Future<void> main() async {
   // Run inside a guarded zone so uncaught async errors land in the shareable
   // in-app log (binding + runApp must share this zone — hence both inside).
   runZonedGuarded(
     () async {
       WidgetsFlutterBinding.ensureInitialized();
+      await DesktopStorage.initialize();
       unawaited(LiquidGlassWidgets.initialize(enablePerformanceMonitor: false));
       await AppLogger.instance.init();
       // Mirror debugPrint into the log (still prints to the console too).
@@ -227,6 +263,16 @@ Future<void> main() async {
       PaintingBinding.instance.imageCache.maximumSize = imageCacheMb >= 120
           ? 600
           : 300;
+      // Windows only: size the image cache from the PC's memory, so scrolling
+      // back to a Home shelf finds its posters still decoded instead of
+      // decoding them again (which shows as stutter on high-DPI screens).
+      if (Platform.isWindows) await applyDesktopImageCacheBudget();
+      // Windows only, and only when started with ZANGETSU_FRAME_LOG=1:
+      // writes frame times to the log every 2 s while drawing.
+      if (Platform.isWindows) DesktopFrameLog.startIfAsked();
+      // Windows only: writes down what the app was doing when it stops
+      // responding, and shows it in the log on the next start.
+      if (Platform.isWindows) unawaited(DesktopHangWatch.start());
       // Fire the list-reveal animations promptly as items scroll in — the
       // detector defaults to a 500ms batch interval, which would blank-flash each
       // card before it reveals.
@@ -235,89 +281,39 @@ Future<void> main() async {
       );
       // Firebase Analytics. Guarded so a build without google-services.json (or a
       // device without Play Services) still boots — analytics just stays off.
-      try {
-        await Firebase.initializeApp().timeout(const Duration(seconds: 8));
-        Analytics.enabled = true;
-        // After initializeApp, and only if it worked — a build with no
-        // google-services.json has no Firebase to report to.
-        await CrashReports.enable();
-      } catch (e, st) {
-        AppLogger.instance.logError(e, st);
+      // This Windows port has no desktop Firebase project configuration.
+      if (!Platform.isWindows) {
+        try {
+          await Firebase.initializeApp().timeout(const Duration(seconds: 8));
+          Analytics.enabled = true;
+          // After initializeApp, and only if it worked — a build with no
+          // google-services.json has no Firebase to report to.
+          await CrashReports.enable();
+        } catch (e, st) {
+          AppLogger.instance.logError(e, st);
+        }
       }
       // Resolve Apple TV before Supabase / media_kit — Dart reports tvOS as iOS,
       // and the version string often has no "tvos" token, so we ask the native
       // runner. Must run before Supabase: its default auth deep-link observer uses
       // app_links, which has no tvOS plugin (MissingPluginException).
       final appleTv = await resolveAppleTv();
-      // Bounded + guarded like Firebase/MediaKit: on a dead/slow network the
-      // session-restore inside initialize can HANG (a hang never throws, so a
-      // try/catch alone wouldn't save us), and this runs BEFORE runApp — an
-      // unbounded hang here traps the app on the splash forever. Time it out so
-      // boot always proceeds; cloud features degrade to local-only until the next
-      // launch on a live network (SupabaseService.currentUserId tolerates an
-      // uninitialized client).
-      // Probe once: on a blackholed network (Wi-Fi with no internet) every
-      // cloud stage below hangs until its multi-second timeout instead of
-      // failing fast, stacking ~40s of serial waiting before the shell shows.
-      // When the probe says offline, boot stays local-only; the retry loop,
-      // resume sync, and lock-status cache cover the reconnect.
-      final bootOffline = await probeBootOffline(
-        host: Uri.tryParse(Environment.vpsSyncUrl)?.host ?? '',
-      );
-      final authDecision = await authRouteFuture;
-      AuthRoute.active = authDecision.route;
-      if (authDecision.changed) {
-        final storedSession = (await SharedPreferences.getInstance()).getString(
-          Environment.supabaseSessionStorageKey,
+      // shell-4: Windows puts the splash up first and runs the network half
+      // of boot behind it (WatchApp awaits [bootNetwork] before opening the
+      // local stores). Phone and TV still finish it before runApp.
+      Future<bool>? bootNetwork;
+      var bootOffline = false;
+      if (_splashFirst) {
+        bootNetwork = _bootNetwork(
+          appleTv: appleTv,
+          authRouteFuture: authRouteFuture,
         );
-        _hadStoredAuthSession = storedSession?.isNotEmpty ?? false;
-        if (_hadStoredAuthSession) {
-          try {
-            final stored = jsonDecode(storedSession!);
-            _expectedAuthUserId = stored['user']['id'] as String?;
-          } catch (_) {
-            /* A malformed saved session must not produce a success message. */
-          }
-        }
-        _authConnectionPhase.value = AuthConnectionPhase.preparing;
-        runApp(
-          MaterialApp(
-            theme: ThemeData.dark(useMaterial3: true),
-            home: const AuthConnectionScreen(
-              phase: AuthConnectionPhase.preparing,
-            ),
-          ),
+      } else {
+        bootOffline = await _bootNetwork(
+          appleTv: appleTv,
+          authRouteFuture: authRouteFuture,
         );
       }
-      var supabaseOk = false;
-      try {
-        // initialize() sets the singleton's client synchronously and only
-        // then awaits session restore — a timeout still leaves a usable
-        // client behind (registrations below dereference it), so even a
-        // probed-offline boot runs it with a short fuse instead of skipping.
-        await Supabase.initialize(
-          url: AuthRoute.active.url,
-          anonKey: AuthRoute.active.anonKey,
-          // TV auth uses QR pairing, not OAuth redirect deep links.
-          // Keep the same saved session across auth hosts and startup retries.
-          authOptions: FlutterAuthClientOptions(
-            detectSessionInUri: !appleTv,
-            localStorage: SharedPreferencesLocalStorage(
-              persistSessionKey: Environment.supabaseSessionStorageKey,
-            ),
-          ),
-        ).timeout(Duration(seconds: bootOffline ? 2 : 8));
-        supabaseOk = true;
-      } catch (e, st) {
-        AppLogger.instance.logError(e, st);
-      }
-      if (authDecision.changed) {
-        _authConnectionVerified =
-            supabaseOk && await _verifyLaunchAuthConnection();
-      }
-      // Boot init failed (dead/slow network) → keep retrying in the background so
-      // login + cloud sync self-heal when the network returns, no restart needed.
-      if (!supabaseOk) unawaited(_retrySupabaseInit());
       // media_kit (libmpv) has no tvOS libs — Apple TV plays via AVPlayer instead.
       // Calling ensureInitialized here prints + throws and used to derail boot.
       // On old Android 8 / Fire TV the native libs can also fail to load; guard
@@ -348,15 +344,136 @@ Future<void> main() async {
       } catch (e, st) {
         AppLogger.instance.logError(e, st);
       }
+      // Windows desktop extras: remember click positions so context menus
+      // open at the cursor, and load the new-episode inbox (needs Hive,
+      // which is ready above). Bounded and guarded like the splash box.
+      if (Platform.isWindows) {
+        DesktopPointer.install();
+        try {
+          await NewEpisodeInbox.init().timeout(const Duration(seconds: 2));
+        } catch (e, st) {
+          AppLogger.instance.logError(e, st);
+        }
+      }
       // Dependency init happens inside the boot gate so the splash shows
       // immediately instead of a blank screen.
-      runApp(WatchApp(bootOffline: bootOffline));
+      runApp(WatchApp(bootOffline: bootOffline, bootNetwork: bootNetwork));
     },
     (error, stack) {
       AppLogger.instance.logError(error, stack);
       CrashReports.record(error, stack, fatal: true);
     },
   );
+}
+
+/// The network half of boot: one connectivity probe, the auth-route choice,
+/// Supabase init and (after an auth host move) the connection check.
+/// Returns whether the probe found the network down. Phone and TV await this
+/// before runApp; Windows runs it behind the splash (shell-4).
+Future<bool> _bootNetwork({
+  required bool appleTv,
+  required Future<AuthRouteDecision> authRouteFuture,
+}) async {
+  // Bounded + guarded like Firebase/MediaKit: on a dead/slow network the
+  // session-restore inside initialize can HANG (a hang never throws, so a
+  // try/catch alone wouldn't save us), and this runs BEFORE runApp — an
+  // unbounded hang here traps the app on the splash forever. Time it out so
+  // boot always proceeds; cloud features degrade to local-only until the next
+  // launch on a live network (SupabaseService.currentUserId tolerates an
+  // uninitialized client).
+  // One short connectivity probe before any cloud work. On a dead network
+  // (Wi-Fi with no internet) each cloud stage used to wait out its own
+  // timeout one after another, so the splash stalled and then failed. When
+  // the probe says offline, boot stays local-only and BootConnectivity
+  // re-checks in the background, then runs the skipped sync on reconnect.
+  // The app's own backends: the network counts as down only when none of
+  // them can be reached, so one service outage never flips the app offline.
+  // Phone and TV: upstream's single probe of the sync host, with no watcher.
+  final bool bootOffline;
+  if (_windowsBoot) {
+    final probeHosts = [
+      Uri.tryParse(Environment.vpsSyncUrl)?.host ?? '',
+      Uri.tryParse(Environment.supabaseUrl)?.host ?? '',
+      'graphql.anilist.co',
+    ];
+    bootOffline = await probeAllUnreachable(probeHosts);
+    if (bootOffline) {
+      AppLogger.instance.log('[boot] offline — starting local-only');
+    }
+    // Windows keeps watching for the rest of the session, in both
+    // directions: a Wi-Fi drop or an ISP outage later switches the app to
+    // offline mode by itself, and the network returning switches it back.
+    BootConnectivity.instance.start(
+      () => probeAllUnreachable(probeHosts),
+      offline: bootOffline,
+      // Wi-Fi off / on is noticed within ~2 s instead of the next probe.
+      linkDown: localLinkDown,
+    );
+  } else {
+    bootOffline = await probeBootOffline(
+      host: Uri.tryParse(Environment.vpsSyncUrl)?.host ?? '',
+    );
+  }
+  // Upstream auth-route selection (auth host migration) runs after the
+  // connectivity probe so its connection screen sees the probe result.
+  final authDecision = await authRouteFuture;
+  AuthRoute.active = authDecision.route;
+  if (authDecision.changed) {
+    final storedSession = (await SharedPreferences.getInstance()).getString(
+      Environment.supabaseSessionStorageKey,
+    );
+    _hadStoredAuthSession = storedSession?.isNotEmpty ?? false;
+    if (_hadStoredAuthSession) {
+      try {
+        final stored = jsonDecode(storedSession!);
+        _expectedAuthUserId = stored['user']['id'] as String?;
+      } catch (_) {
+        /* A malformed saved session must not produce a success message. */
+      }
+    }
+    _authConnectionPhase.value = AuthConnectionPhase.preparing;
+    // Splash-first (Windows): WatchApp is already running and its
+    // AuthConnectionOverlay draws this phase, so no second runApp.
+    if (!_splashFirst) {
+      runApp(
+        MaterialApp(
+          theme: ThemeData.dark(useMaterial3: true),
+          home: const AuthConnectionScreen(
+            phase: AuthConnectionPhase.preparing,
+          ),
+        ),
+      );
+    }
+  }
+  var supabaseOk = false;
+  try {
+    // initialize() sets the singleton's client synchronously and only
+    // then awaits session restore — a timeout still leaves a usable
+    // client behind (registrations below dereference it), so even a
+    // probed-offline boot runs it with a short fuse instead of skipping.
+    await Supabase.initialize(
+      url: AuthRoute.active.url,
+      anonKey: AuthRoute.active.anonKey,
+      // TV auth uses QR pairing, not OAuth redirect deep links.
+      // Keep the same saved session across auth hosts and startup retries.
+      authOptions: FlutterAuthClientOptions(
+        detectSessionInUri: !appleTv,
+        localStorage: SharedPreferencesLocalStorage(
+          persistSessionKey: Environment.supabaseSessionStorageKey,
+        ),
+      ),
+    ).timeout(Duration(seconds: bootOffline ? 2 : 8));
+    supabaseOk = true;
+  } catch (e, st) {
+    AppLogger.instance.logError(e, st);
+  }
+  if (authDecision.changed) {
+    _authConnectionVerified = supabaseOk && await _verifyLaunchAuthConnection();
+  }
+  // Boot init failed (dead/slow network) → keep retrying in the background so
+  // login + cloud sync self-heal when the network returns, no restart needed.
+  if (!supabaseOk) unawaited(_retrySupabaseInit());
+  return bootOffline;
 }
 
 /// True once Supabase.initialize has set up its singleton. Accessing
@@ -418,11 +535,15 @@ Future<void> _retrySupabaseInit() async {
 /// so pushed routes (login, profile, …) can read them. Providing them below the
 /// Navigator would scope them out of any `Navigator.push`ed route.
 class WatchApp extends StatefulWidget {
-  const WatchApp({super.key, this.bootOffline = false});
+  const WatchApp({super.key, this.bootOffline = false, this.bootNetwork});
 
   /// True when the pre-runApp probe found no connectivity: boot stays
-  /// local-only instead of burning serial network timeouts on the splash.
+  /// local-only instead of waiting out serial network timeouts on the splash.
   final bool bootOffline;
+
+  /// Splash-first boot (Windows): the still-running network half of boot.
+  /// Its result replaces [bootOffline]. Null when it finished before runApp.
+  final Future<bool>? bootNetwork;
 
   @override
   State<WatchApp> createState() => _WatchAppState();
@@ -446,10 +567,39 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
 
   final ValueNotifier<bool> _tvShellGate = ValueNotifier<bool>(false);
   bool _bootFailed = false;
+  bool _reconnectRegistered = false;
   Object? _bootError;
   StackTrace? _bootStack;
+  String _bootStage = 'initializing local services';
 
-  Future<void> _startBoot() => _run().timeout(const Duration(seconds: 45));
+  /// Whether boot found the network down. Starts from the widget value and,
+  /// on a splash-first boot, is replaced by the result of the network half.
+  late bool _bootOffline = widget.bootOffline;
+
+  Future<void> _startBoot() async {
+    // The splash is already on screen; when started this way, finish the
+    // network half of boot first. It is outside the 45 s watchdog because it
+    // can wait on the user (the auth-route "Try again" screen) and every
+    // network step inside it is bounded already.
+    final start = DateTime.now();
+    await _awaitBootNetwork();
+    await _run(start: start).timeout(const Duration(seconds: 45));
+  }
+
+  /// Waits for [WatchApp.bootNetwork] (splash-first boot only). A failure
+  /// counts as offline so boot still goes ahead local-only; the connectivity
+  /// watcher corrects it once a real check runs.
+  Future<void> _awaitBootNetwork() async {
+    final network = widget.bootNetwork;
+    if (network == null) return;
+    _bootStage = 'checking the network';
+    try {
+      _bootOffline = await network;
+    } catch (e, st) {
+      AppLogger.instance.logError(e, st);
+      _bootOffline = true;
+    }
+  }
 
   void _watchBoot(Future<void> boot) {
     boot
@@ -480,6 +630,21 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted) unawaited(_syncBootCloud());
           });
+          // acct-10: run a scheduled backup once boot is done (Windows only).
+          // Platform.isWindows because it writes real files; the target
+          // check keeps widget tests (pretending to be Android) timer-free.
+          // A few seconds after the first frame so startup is not slowed.
+          // runIfDue never throws and is a no-op when backups are off/not due.
+          if (Platform.isWindows &&
+              defaultTargetPlatform == TargetPlatform.windows) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              unawaited(
+                Future<void>.delayed(
+                  const Duration(seconds: 5),
+                ).then((_) => AutoBackupRunner.runIfDue()),
+              );
+            });
+          }
           if (!_handledLaunchTaps) {
             _handledLaunchTaps = true;
             WidgetsBinding.instance.addPostFrameCallback(
@@ -488,6 +653,11 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
           }
         })
         .catchError((Object e, StackTrace st) {
+          AppLogger.instance.log(
+            'Startup failed during $_bootStage',
+            level: 'E',
+          );
+          AppLogger.instance.logError(e, st);
           if (!mounted) return;
           if (_authConnectionPhase.value == AuthConnectionPhase.preparing) {
             _authConnectionPhase.value = AuthConnectionPhase.failed;
@@ -555,12 +725,28 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
   static const Duration _syncFreshness = Duration(minutes: 10);
   static const Duration _subscriptionCheckCooldown = Duration(minutes: 15);
 
+  /// Windows runs the new-episode checker while the app is open (track-1):
+  /// on a timer, on window focus and from Check now. Results go to the
+  /// in-app inbox and, when enabled, to a Windows notification.
+  static bool get _desktopEpisodeChecks =>
+      defaultTargetPlatform == TargetPlatform.windows;
+
+  /// How often Windows re-checks subscriptions while the app stays open.
+  static const Duration _desktopSubscriptionInterval = Duration(minutes: 30);
+
+  /// The Windows periodic subscription check (null elsewhere).
+  Timer? _subscriptionTimer;
+
   Future<void> _checkSubscriptions({bool syncCloudStream = false}) async {
-    if (!Platform.isAndroid ||
+    if (!(Platform.isAndroid || _desktopEpisodeChecks) ||
         !sl.isRegistered<SubscriptionChecker>() ||
         !sl.isRegistered<SubscriptionStore>()) {
       return;
     }
+    // Windows: a window focus during the splash must not sweep before the
+    // sources are loaded; it would fail every show and then start the
+    // cooldown, holding back the real boot check.
+    if (_desktopEpisodeChecks && !_bootReady) return;
     final now = DateTime.now();
     if (_lastSubscriptionCheck != null &&
         now.difference(_lastSubscriptionCheck!) < _subscriptionCheckCooldown) {
@@ -635,7 +821,62 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
     ZModePrefs.revision.addListener(_onStreamKindChanged);
     MetadataProviderPrefs.revision.addListener(_onMetadataProviderChanged);
     HomeRowsPrefs.revision.addListener(_onHomeRowsChanged);
+    // acct-3: the title-bar sync icon (click / F5) asks for a sync through
+    // SyncStatus; this app owns the library sync, so it answers. Going
+    // offline is reported there too so the icon reflects it at once.
+    if (_windowsBoot) {
+      SyncStatus.onSyncRequested = _syncNow;
+      BootConnectivity.instance.offline.addListener(_onConnectivityChanged);
+    }
     _watchBoot(_boot);
+  }
+
+  /// Manual "Sync now" (acct-3): re-test a session we only assumed was dead,
+  /// then pull and push the whole library regardless of how fresh it is.
+  Future<void> _syncNow() async {
+    if (sl.isRegistered<AuthCubit>()) {
+      try {
+        await sl<AuthCubit>().revalidateIfFlagged(force: true);
+      } catch (_) {
+        /* the sync below reports the outcome */
+      }
+    }
+    // Offline: ask the connectivity watcher to look again now, so a network
+    // that just came back is noticed without waiting for its timer.
+    if (BootConnectivity.instance.offline.value) {
+      await BootConnectivity.instance.checkNow();
+    }
+    if (sl.isRegistered<StremioSync>()) {
+      unawaited(sl<StremioSync>().refresh(maxAge: Duration.zero));
+    }
+    await _runLibrarySync(maxAge: Duration.zero);
+  }
+
+  /// Mirrors the connectivity watcher into the sync status: offline shows
+  /// at once; coming back is reported by the reconnect sync itself.
+  void _onConnectivityChanged() {
+    if (BootConnectivity.instance.offline.value && _signedIn) {
+      SyncStatus.report(SyncState.offline);
+    }
+  }
+
+  /// True when an account is signed in (and the cubit exists yet).
+  bool get _signedIn =>
+      sl.isRegistered<AuthCubit>() && sl<AuthCubit>().state.isLoggedIn;
+
+  /// Reports the resting state after a sync attempt: needs sign-in when the
+  /// session looked dead or nobody is signed in, offline when the network is
+  /// down, otherwise synced.
+  void _reportSyncDone() {
+    if (!_signedIn) {
+      SyncStatus.report(SyncState.needsSignIn);
+    } else if (sl<AuthCubit>().state.needsReconnect) {
+      SyncStatus.report(SyncState.needsSignIn);
+    } else if (BootConnectivity.instance.offline.value) {
+      SyncStatus.report(SyncState.offline);
+    } else {
+      SyncStatus.report(SyncState.synced);
+    }
   }
 
   @override
@@ -647,12 +888,20 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
     MetadataProviderPrefs.revision.removeListener(_onMetadataProviderChanged);
     HomeRowsPrefs.revision.removeListener(_onHomeRowsChanged);
     WidgetsBinding.instance.removeObserver(this);
+    _subscriptionTimer?.cancel();
+    BootConnectivity.instance.offline.removeListener(_onConnectivityChanged);
+    SyncStatus.onSyncRequested = null;
     _tvShellGate.dispose();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Windows only: hidden, inactive and resumed look alike in the log
+    // without this.
+    if (Platform.isWindows) {
+      AppLogger.instance.log('[ui] lifecycle ${state.name}');
+    }
     final discord = sl.isRegistered<DiscordRpc>() ? sl<DiscordRpc>() : null;
     if (state == AppLifecycleState.resumed) {
       discord?.onForeground();
@@ -682,9 +931,23 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
   /// the DB). Also retries locally queued cloud writes.
   void _syncOnResume() => _syncLibrary(maxAge: _syncFreshness);
 
+  /// True while a focus-triggered library sync is running, so refocusing the
+  /// window repeatedly (especially offline, where each sync hangs) never stacks
+  /// overlapping syncs.
+  bool get _librarySyncing => _librarySync != null;
+
+  /// The library sync in flight, so a manual "Sync now" can wait for the one
+  /// a window focus already started instead of being dropped.
+  Future<void>? _librarySync;
+
   void _syncLibrary({required Duration maxAge}) {
     if (sl.isRegistered<StremioSync>()) {
       unawaited(sl<StremioSync>().refresh(maxAge: maxAge));
+    }
+    // Windows reports each sync to the title-bar sync icon (acct-3).
+    if (_windowsBoot) {
+      unawaited(_runLibrarySync(maxAge: maxAge));
+      return;
     }
     if (!sl.isRegistered<AuthCubit>() || !sl<AuthCubit>().state.isLoggedIn) {
       return;
@@ -707,19 +970,92 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
     }());
   }
 
+  /// Pulls the library if older than [maxAge] and retries queued writes,
+  /// reporting each step to [SyncStatus] (acct-3) instead of only the debug
+  /// log. Never throws.
+  Future<void> _runLibrarySync({required Duration maxAge}) {
+    if (!_signedIn) {
+      SyncStatus.report(SyncState.needsSignIn);
+      return Future.value();
+    }
+    // Nothing to sync with while the connection is down; the reconnect task does
+    // it the moment the network returns.
+    if (BootConnectivity.instance.offline.value) {
+      SyncStatus.report(SyncState.offline);
+      return Future.value();
+    }
+    final running = _librarySync;
+    if (_librarySyncing && running != null) return running;
+    SyncStatus.report(SyncState.syncing);
+    Future<void> run() async {
+      try {
+        await Future.wait([
+          sl<MyListStore>().pullFromCloudIfStale(maxAge: maxAge),
+          sl<WatchHistory>().pullFromCloudIfStale(maxAge: maxAge),
+          sl<ReadHistory>().pullFromCloudIfStale(maxAge: maxAge),
+          // My List categories ride the same trigger — two small SELECTs, and
+          // they have to arrive with the list they label.
+          sl<CategoryStore>().pullFromCloudIfStale(maxAge: maxAge),
+          sl<SeriesGroupStore>().pullFromCloudIfStale(maxAge: maxAge),
+        ]);
+        await Future.wait([
+          sl<MyListStore>().retryPending(),
+          sl<WatchHistory>().retryPending(),
+          sl<ReadHistory>().retryPending(),
+        ]);
+        _reportSyncDone();
+      } catch (e) {
+        debugPrint('[sync] library sync failed: $e');
+        // A request that failed because the network vanished is "offline",
+        // not an error the user has to act on.
+        if (isNetworkFailure(e)) {
+          BootConnectivity.instance.suspectOffline();
+          SyncStatus.report(SyncState.offline, error: '$e');
+        } else {
+          SyncStatus.report(SyncState.error, error: '$e');
+        }
+      } finally {
+        _librarySync = null;
+      }
+    }
+
+    // Started on the next event, so _librarySync is set before run() can
+    // finish (and clear it) even if the stores throw synchronously.
+    return _librarySync = Future<void>(run);
+  }
+
   /// Init deps, then (for returning users) kick off the Home fetch so its rows
   /// stream in WHILE the splash plays — Home appears already populated. Holds
   /// the splash for a minimum so the intro animation reads even on fast boots.
-  Future<void> _run() async {
-    final start = DateTime.now();
+  Future<void> _run({DateTime? start}) async {
+    // [start] is when the splash went up (splash-first boot passes it so the
+    // network wait counts towards the minimum splash time).
+    start ??= DateTime.now();
     // Boot-gate offline hint expires after a couple of minutes: the launch
     // lock check happens seconds after boot, while later checks (profile
     // switches) are user-initiated and should see remote lock changes.
     final offlineUntil = start.add(const Duration(minutes: 2));
     await initDependencies(
+      onProgress: (stage) {
+        _bootStage = stage;
+        if (_windowsBoot) AppLogger.instance.log('[boot] $stage');
+      },
+      // Windows glue: the live connectivity watcher also counts as offline,
+      // so a connection lost mid-session uses the lock cache instead of
+      // hanging.
       isOffline: () =>
-          widget.bootOffline && DateTime.now().isBefore(offlineUntil),
+          (_windowsBoot && BootConnectivity.instance.offline.value) ||
+          (_bootOffline && DateTime.now().isBefore(offlineUntil)),
     );
+    _bootStage = 'reading app version';
+    // Registered once even when "Try again" re-runs boot. It runs every time the
+    // network returns after being down (at boot or later in the session); the
+    // task restores sign-in itself, so it does not matter whether a session was
+    // found while offline.
+    if (_windowsBoot && !_reconnectRegistered) {
+      _reconnectRegistered = true;
+      BootConnectivity.instance.addReconnectTask(_resyncAfterReconnect);
+    }
     if (mounted) {
       setState(() => _depsReady = true);
       if (_bootReady) {
@@ -740,8 +1076,17 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
     // Restore cached identity and profiles before mounting the profile/PIN gate.
     // Remote profile and library requests run after the splash is dismissed.
     try {
+      _bootStage = 'restoring sign-in';
       await sl<AuthCubit>().restore().timeout(const Duration(seconds: 5));
     } catch (_) {}
+    // acct-1: record which account the live library belongs to (or bring
+    // back its snapshot) even if the auth listener was not mounted yet.
+    if (sl<AuthCubit>().state.isLoggedIn) {
+      await _adoptAccountLocalData(sl<AuthCubit>().state.user?.id);
+    }
+    // Local profiles only: the cloud merge and library sync run after the
+    // splash in [_syncBootCloud] (online boot) or [_resyncAfterReconnect]
+    // (when the network returns after an offline boot).
     await sl<ViewerProfileStore>().loadForUser(
       displayName: sl<AuthCubit>().state.displayName,
       attemptRemote: false,
@@ -749,7 +1094,8 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
     // Rows saved under a source before the browse screen started resolving
     // titles to the catalogue: move them onto the show they belong to.
     // Online startup does this after cloud sync so imported rows are covered.
-    if ((widget.bootOffline || !sl<AuthCubit>().state.isLoggedIn) &&
+    _bootStage = 'opening home';
+    if ((_bootOffline || !sl<AuthCubit>().state.isLoggedIn) &&
         sl.isRegistered<MatchStore>()) {
       unawaited(
         HistoryCanonicalMerge.runOnce(
@@ -773,6 +1119,21 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
           await _checkSubscriptions(syncCloudStream: true);
         } catch (_) {}
       });
+      // Windows keeps checking while the app stays open (track-1). The
+      // cooldown inside _checkSubscriptions stops this and window focus
+      // from doubling up. Re-running boot ("Try again") replaces the timer.
+      if (_desktopEpisodeChecks) {
+        _subscriptionTimer?.cancel();
+        _subscriptionTimer = Timer.periodic(
+          _desktopSubscriptionInterval,
+          (_) => unawaited(_checkSubscriptions()),
+        );
+      }
+      // R5: auto Paused/Dropped for idle My List titles. First sweep ~20 s
+      // after boot (never blocks startup), then a cheap hourly tick that
+      // sweeps at most every 6 h. No-op while the setting is off (the
+      // default outside Windows). A boot retry replaces the timers.
+      if (_desktopEpisodeChecks) ListIdleRunner.instance.start();
     }
     // FCM broadcasts: subscribe every device to the `all` topic so we can push
     // a custom notification to all users from the Firebase Console. Independent
@@ -782,13 +1143,87 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
     // The intro animation is 1600ms, so anything past that is just dead
     // waiting. Give it a hair over (1700) so the logo lands, then go — used
     // to be 2000ms, which sat there doing nothing for ~400ms.
-    const minSplash = Duration(milliseconds: 1700);
+    // shell-4 C: on Windows a returning user whose Home is already cached
+    // (HomeCubit.load painted the remembered rows above) skips the hold:
+    // the window should open straight into their library.
+    final minSplash = _skipSplashHold()
+        ? Duration.zero
+        : const Duration(milliseconds: 1700);
     if (elapsed < minSplash) await Future.delayed(minSplash - elapsed);
+  }
+
+  /// True on Windows when the user is onboarded and Home already has cached
+  /// rows to show, so holding the intro animation would only delay them.
+  bool _skipSplashHold() {
+    if (defaultTargetPlatform != TargetPlatform.windows) return false;
+    if (!isOnboarded() || !sl.isRegistered<HomeCubit>()) return false;
+    return sl<HomeCubit>().state.sections?.isNotEmpty ?? false;
+  }
+
+  /// Pushes unsynced rows up and pulls the cloud library into the local cache.
+  /// Shared by normal boot and by the reconnect path after an offline boot.
+  Future<void> _syncCloudLibrary() async {
+    await Future.wait([
+      sl<MyListStore>().seedCloudIfNeeded(),
+      sl<WatchHistory>().seedCloudIfNeeded(),
+      sl<ReadHistory>().seedCloudIfNeeded(),
+    ]).timeout(const Duration(seconds: 8));
+    await Future.wait([
+      sl<MyListStore>().pullFromCloudIfStale(maxAge: _syncFreshness),
+      sl<WatchHistory>().pullFromCloudIfStale(maxAge: _syncFreshness),
+      sl<ReadHistory>().pullFromCloudIfStale(maxAge: _syncFreshness),
+      sl<CategoryStore>().pullFromCloudIfStale(maxAge: _syncFreshness),
+      sl<SeriesGroupStore>().pullFromCloudIfStale(maxAge: _syncFreshness),
+    ]).timeout(const Duration(seconds: 6));
+    unawaited(
+      Future.wait([
+        sl<MyListStore>().retryPending(),
+        sl<WatchHistory>().retryPending(),
+        sl<ReadHistory>().retryPending(),
+      ]),
+    );
+  }
+
+  /// Guards [_resyncAfterReconnect] so two network returns in quick succession
+  /// (a flaky connection) never run two syncs at once.
+  bool _resyncing = false;
+
+  /// Runs every time the network returns after being down, whether the app
+  /// started offline or lost the connection later: reloads Home, restores the
+  /// session, merges cloud profiles, then syncs the library.
+  Future<void> _resyncAfterReconnect() async {
+    if (_resyncing) return;
+    _resyncing = true;
+    try {
+      AppLogger.instance.log('[net] back online — syncing');
+      // Home first, for everyone: it should recover even when signed out.
+      if (sl.isRegistered<HomeCubit>()) unawaited(sl<HomeCubit>().load());
+      if (_supabaseReady() && sl.isRegistered<AuthCubit>()) {
+        await sl<AuthCubit>().restore().timeout(const Duration(seconds: 8));
+      }
+      if (!sl.isRegistered<AuthCubit>() || !sl<AuthCubit>().state.isLoggedIn) {
+        return;
+      }
+      await sl<ViewerProfileStore>()
+          .loadForUser(displayName: sl<AuthCubit>().state.displayName)
+          .timeout(const Duration(seconds: 15));
+      // acct-3: the title-bar icon shows this catch-up sync.
+      SyncStatus.report(SyncState.syncing);
+      try {
+        await _syncCloudLibrary();
+        _reportSyncDone();
+      } catch (e) {
+        SyncStatus.report(SyncState.error, error: '$e');
+        rethrow;
+      }
+    } finally {
+      _resyncing = false;
+    }
   }
 
   /// Refresh cloud data after local startup has released the splash.
   Future<void> _syncBootCloud() async {
-    if (widget.bootOffline || !mounted) return;
+    if (_bootOffline || !mounted) return;
     final auth = sl<AuthCubit>();
     final userId = auth.state.user?.id;
     if (!auth.state.isLoggedIn || userId == null) return;
@@ -798,6 +1233,8 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
           .loadForUser(displayName: auth.state.displayName)
           .timeout(const Duration(seconds: 15));
       if (!isCurrentUser()) return;
+      // acct-3: report the boot sync to the title-bar sync icon.
+      SyncStatus.report(SyncState.syncing);
       final profileId = sl<ViewerProfileStore>().activeId;
       await Future.wait([
         sl<MyListStore>().seedCloudIfNeeded(),
@@ -822,9 +1259,17 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
         sl<WatchHistory>().retryPending(),
         sl<ReadHistory>().retryPending(),
       ]);
+      _reportSyncDone();
     } catch (error, stack) {
       AppLogger.instance.logError(error, stack);
+      SyncStatus.report(
+        isNetworkFailure(error) ? SyncState.offline : SyncState.error,
+        error: '$error',
+      );
     } finally {
+      // An early return (account or profile switched mid-sync) must not
+      // leave the icon spinning.
+      if (SyncStatus.state.value == SyncState.syncing) _reportSyncDone();
       if (isCurrentUser() && sl.isRegistered<MatchStore>()) {
         unawaited(
           HistoryCanonicalMerge.runOnce(
@@ -841,6 +1286,9 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
   /// local cache on logout. Boot-time restore uses [_run] and [_syncBootCloud].
   Future<void> _onAuthChange(BuildContext context, AuthState state) async {
     if (state.status == AuthStatus.authenticated) {
+      // acct-1: on Windows, bring back this account's local library from
+      // its sign-out snapshot before the cloud sync, so it shows instantly.
+      await _adoptAccountLocalData(state.user?.id);
       await sl<ViewerProfileStore>().loadForUser(
         displayName: state.displayName,
       );
@@ -871,13 +1319,66 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
           sync().timeout(const Duration(seconds: 20)).catchError((_) {}),
         );
       } else {
-        await sync();
+        // acct-3: the sign-in sync shows on the title-bar sync icon.
+        SyncStatus.report(SyncState.syncing);
+        try {
+          await sync();
+          _reportSyncDone();
+        } catch (e) {
+          SyncStatus.report(SyncState.error, error: '$e');
+          rethrow;
+        }
       }
     } else if (state.status == AuthStatus.unauthenticated) {
+      // Windows: signed out by any path (log out, session expired). A video
+      // still in the floating mini player is saved and stopped before the
+      // library below is put away. Nothing floats on phone or TV.
+      if (DesktopFloatingPlayer.instance.isActive) {
+        await closeFloatingPlayerBeforeProfileSwitch();
+      }
+      // acct-1: on Windows, keep the signed-out account's library on disk
+      // (a per-account snapshot) before the live copy is cleared below.
+      if (_keepAccountData) {
+        try {
+          await AccountLocalData.onSignedOut();
+        } catch (e, st) {
+          AppLogger.instance.logError(e, st);
+        }
+      }
       await sl<ViewerProfileStore>().loadForUser();
-      await sl<MyListStore>().clearLocal();
-      await sl<WatchHistory>().clearLocal();
-      await sl<ReadHistory>().clearLocal();
+      await _clearLocalLibrary();
+      SyncStatus.report(SyncState.needsSignIn);
+    }
+  }
+
+  /// acct-1 is Windows only: phone keeps wiping the library on sign-out.
+  static bool get _keepAccountData =>
+      defaultTargetPlatform == TargetPlatform.windows;
+
+  /// Drops the live local library (My List, Continue Watching, reading
+  /// history). The cloud copy is untouched.
+  Future<void> _clearLocalLibrary() async {
+    await sl<MyListStore>().clearLocal();
+    await sl<WatchHistory>().clearLocal();
+    await sl<ReadHistory>().clearLocal();
+  }
+
+  /// Windows: makes the live library belong to [userId]. Same account as
+  /// before: nothing to do. A sign-out snapshot for it: restored at once.
+  /// A different account still holding the live copy: that copy is saved
+  /// to its own snapshot and cleared first, so the new account starts clean.
+  Future<void> _adoptAccountLocalData(String? userId) async {
+    if (!_keepAccountData || userId == null || userId.isEmpty) return;
+    try {
+      final restored = await AccountLocalData.onSignedIn(
+        userId,
+        clearLive: _clearLocalLibrary,
+      );
+      // My List caches a revision counter its screens listen to; the
+      // history boxes are watched directly, so only this one needs a nudge.
+      if (restored) sl<MyListStore>().revision.value++;
+    } catch (e, st) {
+      AppLogger.instance.logError(e, st);
     }
   }
 
@@ -930,7 +1431,10 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
     if (_bootFailed) {
       AppLogger.instance.logError(_bootError ?? 'startup failed', _bootStack);
       return BootErrorScreen(
-        details: '$_bootError\n\n${_bootStack ?? ''}'.trim(),
+        details: _windowsBoot
+            ? 'Startup step: $_bootStage\n$_bootError\n\n${_bootStack ?? ''}'
+                  .trim()
+            : '$_bootError\n\n${_bootStack ?? ''}'.trim(),
         onRetry: _retryBoot,
       );
     }
@@ -985,21 +1489,41 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
                           ),
                         ),
                       ),
+                    // Windows: the floating mini player card, above every
+                    // page, sidebar page and dialog of the app's Navigator.
+                    if (defaultTargetPlatform == TargetPlatform.windows)
+                      const Positioned.fill(
+                        child: DesktopFloatingPlayerLayer(),
+                      ),
                   ],
                 )
               : (child ?? const SizedBox.shrink());
           final isTv = sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
-          return PosterCardScope(
-            child: AuthConnectionOverlay(
-              phase: _authConnectionPhase,
-              child: isTv
-                  ? TvViewport(child: content)
-                  : (Platform.isAndroid || Platform.isIOS) && shellFeatures
-                  ? InAppMiniPlayerHost(
-                      dockedPlayer: dockedPlayer,
-                      child: NativePlayerFreeze(child: content),
-                    )
-                  : content,
+          // Windows title bar / window chrome wraps upstream's auth overlay.
+          return DesktopWindow(
+            // Windows keeps its own titlebar from the splash onward, so the
+            // plain OS caption never shows first (the runner starts without it).
+            enableChrome: !isTv,
+            child: PosterCardScope(
+              // Splash-first boot draws the auth-route retry screen here
+              // instead of replacing the app (never set elsewhere).
+              child: _AuthRouteRetryOverlay(
+                child: AuthConnectionOverlay(
+                  phase: _authConnectionPhase,
+                  child: isTv
+                      ? TvViewport(child: content)
+                      // Windows: Space toggles the floating mini player
+                      // when no page used the key. Phone is unchanged.
+                      : defaultTargetPlatform == TargetPlatform.windows
+                      ? DesktopFloatingPlayerKeys(child: content)
+                      : (Platform.isAndroid || Platform.isIOS) && shellFeatures
+                      ? InAppMiniPlayerHost(
+                          dockedPlayer: dockedPlayer,
+                          child: NativePlayerFreeze(child: content),
+                        )
+                      : content,
+                ),
+              ),
             ),
           );
         },
@@ -1027,6 +1551,58 @@ class _WatchAppState extends State<WatchApp> with WidgetsBindingObserver {
         listener: _onAuthChange,
         child: app,
       ),
+    );
+  }
+}
+
+/// Splash-first boot (Windows): the "Connection settings unavailable" screen
+/// that [_selectLaunchAuthRoute] used to show with its own runApp, drawn over
+/// the running app while [_authRouteRetry] holds a pending retry.
+class _AuthRouteRetryOverlay extends StatelessWidget {
+  const _AuthRouteRetryOverlay({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<Completer<void>?>(
+      valueListenable: _authRouteRetry,
+      builder: (context, retry, child) {
+        if (retry == null) return child!;
+        return Stack(
+          children: [
+            // Keep the app mounted (and its boot running) underneath.
+            ExcludeSemantics(child: child!),
+            Positioned.fill(
+              child: Material(
+                color: Theme.of(context).colorScheme.surface,
+                child: Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(context.l10n.connectionSettingsUnavailable),
+                      Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: Text(
+                          context.l10n.connectToInternetTryAgain,
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                      FilledButton(
+                        onPressed: () {
+                          if (!retry.isCompleted) retry.complete();
+                        },
+                        child: Text(context.l10n.tryAgain),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+      child: child,
     );
   }
 }

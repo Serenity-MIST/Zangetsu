@@ -54,7 +54,8 @@ class PageFileCache {
     try {
       final cbz = CbzImage.tryParse(url);
       if (cbz != null) {
-        return _cacheBytes(
+        // Awaited so a failure lands in the catch below (this never throws).
+        return await _cacheBytes(
           url,
           () => _readCbzEntry(cbz.archivePath, cbz.index),
         );
@@ -72,7 +73,11 @@ class PageFileCache {
         final id = int.tryParse(marker);
         if (id == null) return null;
         final channel = mihonId != null ? 'zangetsu/mihon' : 'zangetsu/aniyomi';
-        return _cacheBytes(url, () => _fetchNativeBytes(channel, id, url));
+        // Awaited so a failure lands in the catch below (this never throws).
+        return await _cacheBytes(
+          url,
+          () => _fetchNativeBytes(channel, id, url),
+        );
       }
 
       return await _lookupCachedFile(url);
@@ -147,8 +152,18 @@ class PageFileCache {
     if (bytes == null || bytes.isEmpty) return null;
 
     await file.writeAsBytes(bytes, flush: true);
-    unawaited(trim());
+    unawaited(_trimBestEffort());
     return file;
+  }
+
+  /// Cache cleanup may race storage removal or shutdown after returning a page.
+  /// Such filesystem failures must not escape a detached cleanup future.
+  Future<void> _trimBestEffort() async {
+    try {
+      await trim();
+    } on FileSystemException {
+      // A later cache write retries cleanup when the directory is available.
+    }
   }
 
   Future<Directory> _resolveDir() async {

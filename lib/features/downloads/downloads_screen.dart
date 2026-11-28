@@ -1,4 +1,35 @@
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter_svg/flutter_svg.dart';
+import 'desktop_download_bulk_delete.dart';
+import 'desktop_download_settings_dialog.dart';
+import '../../core/download/folder_manifest_scanner.dart';
+import 'download_thumbnail.dart';
+import 'desktop_download_selection.dart';
+import '../../core/download/chapter_downloader.dart';
+import 'desktop_download_library.dart';
+import '../../core/download/download_failure.dart';
+// Rate / time-left text for the live Windows rows (dl-7).
+import '../../core/download/download_live_stats.dart'
+    show formatTimeLeft, formatTransferRate;
 import 'dart:async';
+import 'dart:io' show FileSystemEntity;
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform;
+import 'package:flutter/services.dart' show LogicalKeyboardKey;
+// Windows desktop helpers: right-click menus, Explorer, drag-and-drop,
+// shortcuts, free disk space and the queue panel (dl-4, dl-5, dl-9, dl-13,
+// dl-14).
+import '../../core/desktop/desktop_chrome_colors.dart';
+import '../../core/desktop/desktop_context_menu.dart';
+import '../../core/desktop/desktop_drop_target.dart';
+import '../../core/desktop/desktop_native.dart' show DesktopDropEvent;
+import '../../core/desktop/desktop_reveal.dart';
+import '../../core/desktop/desktop_shortcuts.dart';
+import '../../core/download/windows_download_storage.dart';
+import '../../core/models/media_item.dart';
+import '../../core/models/provider_info.dart' show ProviderType;
+import '../detail/detail_screen.dart' show DetailScreen;
+import 'desktop_active_downloads_panel.dart';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
@@ -10,6 +41,7 @@ import '../../core/ui/settings_widgets.dart';
 
 import '../../core/app_mode.dart';
 import '../../core/di/injector.dart';
+import '../../core/download/chapter_download.dart';
 import '../../core/download/chapter_download_store.dart';
 import '../../core/download/download_manager.dart';
 import '../../core/download/download_prefs.dart';
@@ -30,9 +62,107 @@ import '../player/episode_player_route.dart';
 import '../player/player_screen.dart';
 import '../player/tv_playback_launch.dart';
 import 'downloaded_episode_playback.dart';
+import 'downloaded_my_list_add.dart';
 import 'chapter_downloads_screen.dart';
 import 'downloads_screen_tv.dart';
 import 'download_library_widgets.dart';
+
+/// One-line, plain-language summary of a folder scan for a toast.
+String describeFolderScan(FolderScanResult result) {
+  if (result.folders == 0) return 'No Zangetsu download folders found there.';
+  final parts = [
+    if (result.added > 0)
+      '${result.added} added',
+    if (result.relinked > 0)
+      '${result.relinked} reconnected',
+    if (result.skipped > 0)
+      '${result.skipped} already in your library',
+  ];
+  final folders = result.folders == 1 ? '1 folder' : '${result.folders} folders';
+  return parts.isEmpty
+      ? 'Found $folders, nothing new.'
+      : 'Found $folders: ${parts.join(', ')}.';
+}
+
+/// Route to one downloaded show's page. Shared by the Downloads library and
+/// Home's offline shelf so both open exactly the same screen.
+Route<void> desktopDownloadCollectionRoute(
+    DesktopDownloadCollection collection) {
+  // Windows: a downloaded video show opens the real show page in its
+  // downloaded mode (saved episodes, cached details, works offline).
+  if (collection.key.kind == 'video' &&
+      defaultTargetPlatform == TargetPlatform.windows) {
+    return DetailScreen.downloadsRoute(
+      downloadedShowItem(collection),
+      downloads: liveCollectionRecords(collection.key),
+    );
+  }
+  return MaterialPageRoute<void>(
+    builder: (_) => collection.key.kind == 'video'
+        ? _DesktopVideoDownloadsPage(collection: collection)
+        : ChapterDownloadsScreen(
+            mode: collection.key.kind == ContentMode.novel.name
+                ? ContentMode.novel
+                : ContentMode.manga,
+            sourceId: collection.key.sourceId,
+            showId: collection.key.showId),
+  );
+}
+
+/// Reads the current records of the downloaded show [key] from the live
+/// download manager, grouped exactly like the library grid (so recovered
+/// files attached to the show come along). Regroups only when the library
+/// really changed, not on progress ticks.
+List<DownloadRecord> Function() liveCollectionRecords(DownloadLibraryKey key) {
+  final cache = DesktopDownloadCollectionsCache();
+  return () {
+    final live = sl<DownloadManager>().all;
+    final byId = {for (final r in live) r.id: r};
+    final current = cache
+        .collections(videos: live, chapters: const [])
+        .where((c) => c.key == key)
+        .firstOrNull;
+    // The cached grouping may hold older copies; hand out the live ones.
+    return [
+      for (final r in current?.videos ?? const <DownloadRecord>[])
+        byId[r.id] ?? r,
+    ];
+  };
+}
+
+/// The title a downloaded show stands for: its provider page (when it has
+/// one), artwork and the ids saved with the files. Used both for the
+/// downloaded show page and its "Open show page" / "Show online".
+MediaItem downloadedShowItem(DesktopDownloadCollection collection) {
+  final type = switch (collection.key.kind) {
+    'manga' => ProviderType.manga,
+    'novel' => ProviderType.novel,
+    _ => ProviderType.anime,
+  };
+  // First record that carries each id (recovered files may carry none).
+  T? firstOf<T>(T? Function(DownloadRecord) pick) {
+    for (final r in [...collection.videos, ...collection.failedVideos]) {
+      final v = pick(r);
+      if (v != null) return v;
+    }
+    return null;
+  }
+  return MediaItem(
+    id: collection.key.showId,
+    title: collection.title,
+    cover: collection.cover,
+    coverHeaders: collection.coverHeaders,
+    url: collection.showUrl ?? '',
+    type: type,
+    sourceId: collection.key.sourceId,
+    malId: firstOf((r) => r.malId),
+    anilistId: firstOf((r) => r.anilistId),
+    tmdbId: firstOf((r) => r.tmdbId),
+    tmdbIsTv: [...collection.videos, ...collection.failedVideos]
+        .any((r) => r.tmdbIsTv),
+    imdbId: firstOf((r) => r.imdbId),
+  );
+}
 
 /// Poster library for saved shows, opening the existing episode controls.
 class DownloadsScreen extends StatefulWidget {
@@ -52,6 +182,32 @@ class _DownloadsScreenState extends State<DownloadsScreen>
   bool _searching = false;
   ContentMode _kind = ContentMode.anime;
   late final TabController _tabs;
+
+  /// Windows: when the disk was last reconciled, so focus changes (Alt-Tab)
+  /// rescan at most once a minute (dl-13).
+  DateTime? _lastRefresh;
+
+  /// The reconcile that is running, shared by focus, F5 and the button.
+  Future<void>? _refreshRun;
+
+  /// Free space on the download drive and its name ("D:") for the library's
+  /// storage line (dl-9); null until read or when unreadable.
+  int? _freeBytes;
+  String? _freeDrive;
+
+  /// Finished downloads when free space was last read; a change (a download
+  /// finished or was deleted) reads it again.
+  int _freeForDone = -1;
+
+  /// A drag from Explorer is over the library (dl-14).
+  bool _dropHover = false;
+
+  /// Grouping of the Windows library, redone only when records really
+  /// change, not on every progress tick (dl-7).
+  final _collectionsCache = DesktopDownloadCollectionsCache();
+
+  /// Minimum gap between focus-triggered rescans on Windows (dl-13).
+  static const _focusRefreshGap = Duration(minutes: 1);
 
   @override
   void initState() {
@@ -74,16 +230,150 @@ class _DownloadsScreenState extends State<DownloadsScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     // Coming back from a file manager (where a file may have been deleted) →
     // reconcile the list with disk. This is the case initState alone missed.
+    if (state != AppLifecycleState.resumed) return;
+    // Windows reports "resumed" on every Alt-Tab back to the window, and each
+    // rescan probes every saved file (slow on network drives), so rescan at
+    // most once a minute there; F5 / Refresh still work any time (dl-13).
+    final last = _lastRefresh;
+    if (defaultTargetPlatform == TargetPlatform.windows && last != null &&
+        DateTime.now().difference(last) < _focusRefreshGap) {
+      return;
+    }
+    _prune();
     // Also pick up HLS jobs the background service finished while away, so a
     // download that hit 100% off-screen finalizes now instead of stalling.
-    if (state == AppLifecycleState.resumed) {
-      _prune();
-      unawaited(sl<DownloadManager>().reconcileBackgroundResults());
-    }
+    unawaited(sl<DownloadManager>().reconcileBackgroundResults());
   }
 
   /// Drop downloads whose file was deleted outside the app. Non-blocking.
-  void _prune() => unawaited(sl<DownloadManager>().pruneMissing());
+  /// Windows also recovers app-owned files first (see [_refreshLocalFiles]).
+  void _prune() => defaultTargetPlatform == TargetPlatform.windows
+      ? unawaited(_refreshLocalFiles())
+      : unawaited(sl<DownloadManager>().pruneMissing());
+
+  /// Updates may retain media while an older download index is absent. Recover
+  /// known app-owned local files before reconciling the displayed library.
+  /// Calls made while one is running join it instead of scanning twice.
+  Future<void> _refreshLocalFiles() {
+    final running = _refreshRun;
+    if (running != null) return running;
+    _lastRefresh = DateTime.now();
+    Future<void> run() async {
+      try {
+        final manager = sl<DownloadManager>();
+        await manager.recoverLocalFiles();
+        await manager.pruneMissing();
+      } finally {
+        _refreshRun = null;
+        if (mounted) setState(() {});
+      }
+      // Files may have appeared or gone; the free space follows.
+      if (defaultTargetPlatform == TargetPlatform.windows) {
+        unawaited(_loadFreeSpace());
+      }
+    }
+    final future = run();
+    _refreshRun = future;
+    return future;
+  }
+
+  /// Refresh button and F5 (dl-13): rescans now, whatever the focus timer
+  /// says, with a spinner on the button while it runs.
+  Future<void> _manualRefresh() async {
+    if (_refreshRun != null) return;
+    final future = _refreshLocalFiles();
+    setState(() {});
+    await future;
+  }
+
+  /// F5 / Ctrl+R (the remappable "downloads.refresh" action). Falls back to
+  /// F5 when the shortcut catalogue was not registered (tests).
+  Map<ShortcutActivator, VoidCallback> _refreshBindings() {
+    void refresh() => unawaited(_manualRefresh());
+    final bound = DesktopShortcuts.bindings({'downloads.refresh': refresh});
+    return bound.isNotEmpty
+        ? bound
+        : {const SingleActivator(LogicalKeyboardKey.f5): refresh};
+  }
+
+  /// Reads the free space of the drive downloads are saved to (dl-9).
+  Future<void> _loadFreeSpace() async {
+    final location = sl<DownloadPrefs>().locationUri;
+    final free = await windowsDownloadFreeBytes(location);
+    if (!mounted) return;
+    // "D:" for a drive letter, "\\server" for a network share.
+    final drive = location == null ? null
+        : RegExp(r'^([A-Za-z]:)').firstMatch(location)?.group(1) ??
+          RegExp(r'^(\\\\[^\\]+)').firstMatch(location)?.group(1);
+    setState(() {
+      _freeBytes = free;
+      _freeDrive = drive?.toUpperCase();
+    });
+  }
+
+  /// Reads free space again once the number of finished downloads changed.
+  void _maybeReloadFreeSpace(int doneCount) {
+    if (doneCount == _freeForDone) return;
+    _freeForDone = doneCount;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_loadFreeSpace());
+    });
+  }
+
+  /// Folders dropped from Explorer (dl-14): each one is scanned for Zangetsu
+  /// show folders like "Scan a folder" does, then one summary is shown.
+  Future<void> _onDrop(DesktopDropEvent event) async {
+    final folders = <String>[];
+    for (final path in event.paths) {
+      if (await FileSystemEntity.isDirectory(path)) folders.add(path);
+    }
+    if (!mounted) return;
+    if (folders.isEmpty) {
+      showAppToast(context, context.l10n.dropFolderToImport);
+      return;
+    }
+    showAppToast(context, folders.length == 1
+        ? context.l10n.scanningEllipsis
+        : context.l10n.scanningNFolders(folders.length));
+    final manager = sl<DownloadManager>();
+    var total = const FolderScanResult();
+    for (final folder in folders) {
+      final r = await manager.scanFolderForDownloads(folder);
+      total = FolderScanResult(
+        folders: total.folders + r.folders,
+        added: total.added + r.added,
+        relinked: total.relinked + r.relinked,
+        skipped: total.skipped + r.skipped,
+      );
+    }
+    if (!mounted) return;
+    showAppToast(context, describeFolderScan(total));
+  }
+
+  /// "Show in Explorer" for a whole show (dl-4).
+  Future<void> _revealCollection(DesktopDownloadCollection collection) async {
+    final folder = collection.folder;
+    final shown = folder != null && await revealInExplorer(folder);
+    if (!shown && mounted) {
+      showAppToast(context, context.l10n.folderNoLongerOnDisk);
+    }
+  }
+
+  /// Finished episodes of [collection] not yet watched to the end, for the
+  /// "Most unwatched" sort (dl-9). One count per episode, not per file.
+  int _unwatchedCount(DesktopDownloadCollection collection) {
+    if (!sl.isRegistered<ResumeStore>()) return 0;
+    final resume = sl<ResumeStore>();
+    final unwatched = <String>{};
+    for (final r in collection.videos) {
+      if (r.status != DownloadStatus.done) continue;
+      final mark = resume.get(r.sourceId, r.showUrl, r.episodeId);
+      if (!(mark?.finished ?? false)) {
+        unwatched.add('${r.season ?? 0}:${r.episodeNumber ?? r.episodeId}');
+      }
+    }
+    return unwatched.length;
+  }
 
   void _toggleSearch() => setState(() {
     _searching = !_searching;
@@ -232,9 +522,82 @@ class _DownloadsScreenState extends State<DownloadsScreen>
     );
   }
 
+  /// A Lucide icon from the bundled set, tinted like a secondary icon.
+  Widget _lucide(String name, {double size = 20}) => SvgPicture.asset(
+    'assets/icons/lucide/$name.svg', width: size, height: size,
+    colorFilter: const ColorFilter.mode(AppColors.textSecondary, BlendMode.srcIn));
+
+  /// Windows: the save location as one compact pill (folder icon, shortened
+  /// path, Change) that lives in the library toolbar instead of its own row.
+  Widget _locationPill() {
+    final l10n = context.l10n;
+    final prefs = sl<DownloadPrefs>();
+    final label = downloadDestinationLabel(
+      keepPrivate: prefs.keepPrivate,
+      locationLabel: prefs.locationLabel,
+      // Windows has no shared "Downloads › Zangetsu" fallback: without a
+      // folder the first download asks for one, so say exactly that.
+      publicFallback: defaultTargetPlatform == TargetPlatform.windows
+          ? 'Choose a folder before your first download'
+          : l10n.downloadsZangetsu,
+    );
+    return Tooltip(
+      message: '${l10n.savingTo} $label',
+      child: InkWell(
+        key: const ValueKey('downloads-location-pill'),
+        borderRadius: BorderRadius.circular(24),
+        onTap: () async {
+          await Navigator.of(context).push(
+            MaterialPageRoute<void>(builder: (_) => const DownloadLocationScreen()),
+          );
+          if (mounted) setState(() {});
+          // A new folder may sit on another drive: re-read its free space.
+          if (mounted) unawaited(_loadFreeSpace());
+        },
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 300),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+          decoration: BoxDecoration(
+            color: AppColors.surface,
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: AppColors.textSecondary.withValues(alpha: .25)),
+          ),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            _lucide('folder', size: 16),
+            const SizedBox(width: 8),
+            // Start of the path is the least useful part, so ellipsize the start.
+            Flexible(child: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis,
+              style: AppText.caption.copyWith(color: AppColors.textSecondary))),
+            const SizedBox(width: 8),
+            Text(l10n.change, style: AppText.caption.copyWith(
+              color: AppColors.accent, fontWeight: FontWeight.w600)),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  /// Lets the user pick a folder (a downloads folder, a drive, or one show) and
+  /// brings any Zangetsu show folders found inside it into the library. Moved
+  /// folders are re-linked; nothing is moved, renamed or deleted.
+  Future<void> _scanFolder() async {
+    final path = await FilePicker.getDirectoryPath(
+      dialogTitle: 'Choose a folder to scan for Zangetsu downloads',
+    );
+    if (path == null || !mounted) return;
+    showAppToast(context, 'Scanning…');
+    final result = await sl<DownloadManager>().scanFolderForDownloads(path);
+    if (!mounted) return;
+    showAppToast(context, describeFolderScan(result));
+  }
+
   /// Bottom sheet with the CloudStream-style download concurrency sliders.
   /// Applies to the NEXT downloads started (running HLS jobs aren't retimed).
   void _openDownloadSettings() {
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      unawaited(_openDesktopDownloadSettings());
+      return;
+    }
     final l10n = context.l10n;
     final prefs = sl<DownloadPrefs>();
     // Hold the live drag value in local state so the sliders move smoothly —
@@ -350,6 +713,44 @@ class _DownloadsScreenState extends State<DownloadsScreen>
     );
   }
 
+  /// Windows: the same two download settings as a centered graphite dialog
+  /// (no phone bottom sheet or drag handle). Values save when a slider is
+  /// released, by mouse or keyboard, and once more when the dialog closes,
+  /// so nothing set here is ever lost.
+  Future<void> _openDesktopDownloadSettings() async {
+    final prefs = sl<DownloadPrefs>();
+    var parallel = prefs.parallelDownloads;
+    var connections = prefs.connectionsPerDownload;
+    // Parallel applies live: the manager raises/lowers its running slots.
+    void commitParallel(int n) {
+      if (n == prefs.parallelDownloads) return;
+      unawaited(prefs.setParallelDownloads(n));
+      sl<DownloadManager>().setParallel(n);
+    }
+
+    // Connections are read when each download starts.
+    void commitConnections(int n) {
+      if (n == prefs.connectionsPerDownload) return;
+      unawaited(prefs.setConnectionsPerDownload(n));
+    }
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, update) => DesktopDownloadSettingsDialog(
+          parallel: parallel,
+          connections: connections,
+          onParallelChanged: (n) => update(() => parallel = n),
+          onParallelCommit: commitParallel,
+          onConnectionsChanged: (n) => update(() => connections = n),
+          onConnectionsCommit: commitConnections,
+        ),
+      ),
+    );
+    commitParallel(parallel);
+    commitConnections(connections);
+  }
+
   @override
   Widget build(BuildContext context) {
     if (sl<AppMode>().isTv) {
@@ -359,7 +760,123 @@ class _DownloadsScreenState extends State<DownloadsScreen>
     final store = sl<ChapterDownloadStore>();
     return Scaffold(
       backgroundColor: AppColors.bg,
-      body: ListenableBuilder(
+      // Windows keeps its app bar and desktop library; phones get upstream's
+      // in-body header (SafeArea + _header) instead of an app bar.
+      appBar: defaultTargetPlatform != TargetPlatform.windows
+          ? null
+          : settingsAppBar(
+            showBack: widget.showBack,
+            context.l10n.downloads,
+            actions: [
+              // Windows only: bring in show folders that carry a Zangetsu manifest,
+              // for example ones moved to another drive.
+              if (defaultTargetPlatform == TargetPlatform.windows)
+                IconButton(
+                  key: const ValueKey('downloads-scan-folder'),
+                  tooltip: 'Scan a folder for downloads',
+                  icon: _lucide('folder-search'),
+                  onPressed: _scanFolder,
+                ),
+              // Windows: rescan the disk now (also F5); focus changes only
+              // rescan once a minute (dl-13).
+              if (defaultTargetPlatform == TargetPlatform.windows)
+                IconButton(
+                  key: const ValueKey('downloads-refresh'),
+                  tooltip: '${context.l10n.refresh} (F5)',
+                  icon: _refreshRun != null
+                      ? const SizedBox.square(dimension: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : _lucide('rotate-cw'),
+                  onPressed: _refreshRun != null ? null : _manualRefresh,
+                ),
+              IconButton(
+                tooltip: context.l10n.downloadSettings,
+                // Lucide sliders on Windows; the Material icon stays on other platforms.
+                icon: defaultTargetPlatform == TargetPlatform.windows
+                    ? _lucide('sliders-horizontal')
+                    : const Icon(Icons.tune_rounded),
+                onPressed: _openDownloadSettings,
+              ),
+            ],
+            ),
+      body: defaultTargetPlatform == TargetPlatform.windows
+          ? CallbackShortcuts(
+              // F5 rescans the disk (dl-13); keys reach it from the library,
+              // which keeps keyboard focus.
+              bindings: _refreshBindings(),
+              child: DesktopDropTarget(
+              // Folders dragged in from Explorer are imported (dl-14).
+              onDrop: (event) => unawaited(_onDrop(event)),
+              onHoverChanged: (over) => setState(() => _dropHover = over),
+              child: Stack(children: [
+              Positioned.fill(child: Column(children: [
+              Expanded(child: ListenableBuilder(
+                listenable: Listenable.merge([manager, store.listenable(), sl<ChapterDownloader>()]),
+                builder: (context, _) {
+                  // Live chapter records override persisted interrupted states.
+                  final chapters = {for (final c in store.all()) c.id: c,
+                    ...sl<ChapterDownloader>().inFlight};
+                  final videos = manager.all;
+                  _maybeReloadFreeSpace(videos
+                      .where((r) => r.status == DownloadStatus.done).length);
+                  return DesktopDownloadLibrary(
+                    trailing: _locationPill(),
+                    // Running / waiting / failed downloads across all shows,
+                    // with speed, time left and bulk actions (dl-5).
+                    // Failed chapters too: the grid below leaves them out.
+                    header: DesktopActiveDownloadsPanel(
+                      manager: manager,
+                      failedChapters: [
+                        for (final c in chapters.values)
+                          if (c.status == ChapterDownloadStatus.failed) c,
+                      ],
+                      onRetryChapter: (c) =>
+                          unawaited(sl<ChapterDownloader>().retry(c.id)),
+                      onRetryFailedChapters: () =>
+                          unawaited(sl<ChapterDownloader>().retryFailed()),
+                      onDeleteChapter: (c) {
+                        // A retry started meanwhile still owns its files.
+                        if (sl<ChapterDownloader>().isBusy(c.id)) return;
+                        unawaited(store.remove(c.id));
+                      },
+                    ),
+                    // Regrouped only when records change, not on progress
+                    // ticks (dl-7).
+                    collections: _collectionsCache.collections(videos: videos,
+                      chapters: chapters.values.toList()),
+                    freeBytes: _freeBytes,
+                    freeDrive: _freeDrive,
+                    unwatchedCount: _unwatchedCount,
+                    onRevealCollection: (c) => unawaited(_revealCollection(c)),
+                    onOpenShowPage: (c) => openDownloadedShowPage(context, c),
+                    onOpen: (collection) => Navigator.of(context)
+                        .push(desktopDownloadCollectionRoute(collection)),
+                    // Select several shows and delete them together. Videos go
+                    // through the manager (which cancels active transfers);
+                    // chapters are cancelled first when still running.
+                    onDeleteCollections: (collections) async {
+                      final plan = planBulkDelete(collections);
+                      final downloader = sl<ChapterDownloader>();
+                      final failed = await executeBulkDelete(plan,
+                        deleteVideos: manager.deleteAll,
+                        deleteChapter: (c) async {
+                          if (downloader.isBusy(c.id)) await downloader.cancel(c.id);
+                          await store.remove(c.id);
+                        });
+                      if (failed > 0 && context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                          content: Text('$failed downloads could not be removed.')));
+                      }
+                    },
+                  );
+                },
+              )),
+            ])),
+              // Drop hint while a drag from Explorer hovers the library.
+              if (_dropHover) Positioned.fill(child: IgnorePointer(
+                child: _DropHint(key: const ValueKey('downloads-drop-hint')))),
+            ])))
+          : ListenableBuilder(
         listenable: manager,
         builder: (context, _) {
           final groups = manager.byShow;
@@ -584,6 +1101,180 @@ class _DownloadsScreenState extends State<DownloadsScreen>
   );
 }
 
+/// Dashed accent frame shown while folders are dragged over the library
+/// (dl-14), so the user knows a drop imports them.
+class _DropHint extends StatelessWidget {
+  const _DropHint({super.key});
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.all(12),
+    child: DecoratedBox(
+      decoration: BoxDecoration(
+        color: DesktopChrome.selectedFill(AppColors.accent, strength: .10),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: AppColors.accent, width: 2),
+      ),
+      child: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+        const Icon(Icons.drive_folder_upload_outlined, size: 40,
+          color: AppColors.textPrimary),
+        const SizedBox(height: 10),
+        Text(context.l10n.dropFoldersToImport,
+          style: AppText.headline.copyWith(fontSize: 15)),
+        const SizedBox(height: 4),
+        Text(context.l10n.showFoldersAddedOrReconnected,
+          style: AppText.caption),
+      ])),
+    ),
+  );
+}
+
+/// Opens the provider page of a downloaded show (dl-4 menu, dl-8 header).
+/// Does nothing for files recovered from disk, which have no page.
+void openDownloadedShowPage(BuildContext context,
+    DesktopDownloadCollection collection) {
+  if (collection.showUrl == null) return;
+  unawaited(Navigator.of(context).push(
+      DetailScreen.route(downloadedShowItem(collection))));
+}
+
+/// Where "Continue" should start in a downloaded show (dl-8): the first
+/// finished episode, in season/episode order, that is not watched to the
+/// end. Null when every saved episode has been watched (or none is saved).
+/// [started] tells whether that episode, or any before it, was watched,
+/// so the button can say "Continue" instead of "Play".
+({DownloadRecord record, bool started})? downloadedContinueTarget(
+  List<DownloadRecord> records,
+  ResumeMark? Function(DownloadRecord) markOf,
+) {
+  final done = records.where((r) => r.status == DownloadStatus.done).toList()
+    ..sort((a, b) {
+      final season = (a.season ?? 0).compareTo(b.season ?? 0);
+      return season != 0
+          ? season
+          : (a.episodeNumber ?? 0).compareTo(b.episodeNumber ?? 0);
+    });
+  var started = false;
+  for (final r in done) {
+    final mark = markOf(r);
+    if (mark?.finished ?? false) {
+      started = true;
+      continue;
+    }
+    return (record: r, started: started || (mark?.position ?? Duration.zero) > Duration.zero);
+  }
+  return null;
+}
+
+/// Title-focused Windows workspace; existing row handlers retain offline
+/// playback, retry, audio-finalization and cancel/delete ownership semantics.
+class _DesktopVideoDownloadsPage extends StatefulWidget {
+  const _DesktopVideoDownloadsPage({required this.collection});
+  final DesktopDownloadCollection collection;
+
+  @override
+  State<_DesktopVideoDownloadsPage> createState() =>
+      _DesktopVideoDownloadsPageState();
+}
+
+class _DesktopVideoDownloadsPageState extends State<_DesktopVideoDownloadsPage> {
+  /// Regroups only when records change, not on progress ticks (dl-7).
+  final _cache = DesktopDownloadCollectionsCache();
+
+  /// Set once the page decided to go back after its last episode went.
+  bool _leaving = false;
+
+  /// Back to the grid once nothing is left, like the phone page (dl-8).
+  void _leaveWhenEmpty() {
+    if (_leaving) return;
+    _leaving = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && ModalRoute.of(context)?.isCurrent == true) {
+        Navigator.of(context).pop();
+      }
+    });
+  }
+
+  /// Cover, "X of Y downloaded - size", delete-all, plus Continue and Open
+  /// show page (dl-8).
+  Widget _header(BuildContext context, DesktopDownloadCollection current,
+      List<DownloadRecord> records, DownloadManager manager) {
+    final l10n = context.l10n;
+    final resume = sl.isRegistered<ResumeStore>() ? sl<ResumeStore>() : null;
+    final target = downloadedContinueTarget(records, (r) =>
+        resume?.get(r.sourceId, r.showUrl, r.episodeId));
+    final number = target?.record.episodeNumber?.toInt();
+    final label = target == null ? null
+        : target.started
+            ? (number != null ? l10n.continueEpisode(number) : l10n.resume)
+            : (number != null ? l10n.playEpisodeShort(number) : l10n.play);
+    return DownloadTitleSummary(
+      title: current.title,
+      heroTag: ('download-video-desktop', current.key),
+      cover: current.cover,
+      coverHeaders: current.coverHeaders,
+      subtitle: '${l10n.ofTotalDownloaded(current.saved, current.total)} · '
+          '${fmtDownloadSize(current.bytes)}',
+      deleteTooltip: l10n.deleteAllEpisodesTooltip,
+      onDelete: () => _confirmDeleteShow(context, records, manager,
+          failed: current.failedVideos),
+      actions: [
+        if (target != null && label != null)
+          FilledButton.icon(
+            key: const ValueKey('downloads-continue'),
+            onPressed: () => unawaited(
+                playDownloadedRecord(context, target.record, manager)),
+            icon: const Icon(Icons.play_arrow_rounded, size: 18),
+            label: Text(label),
+          ),
+        if (current.showUrl != null)
+          OutlinedButton.icon(
+            key: const ValueKey('downloads-open-show'),
+            onPressed: () => openDownloadedShowPage(context, current),
+            icon: const Icon(Icons.info_outline_rounded, size: 18),
+            label: Text(context.l10n.openShowPage),
+          ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final manager = sl<DownloadManager>();
+    final collection = widget.collection;
+    return Scaffold(backgroundColor: AppColors.bg,
+      appBar: settingsAppBar(collection.title),
+      body: ListenableBuilder(listenable: manager, builder: (context, _) {
+        final live = manager.all;
+        final byId = {for (final r in live) r.id: r};
+        // Recompute presentation membership so recovered siblings and newly
+        // queued episodes stay together without changing their original IDs.
+        final current = _cache.collections(videos: live, chapters: const [])
+            .where((c) => c.key == collection.key).firstOrNull;
+        // The cached grouping may hold older copies; rows show the live ones.
+        final records = [for (final r in current?.videos ?? const <DownloadRecord>[])
+            byId[r.id] ?? r]..sort((a,b) {
+          final season = (a.season ?? 0).compareTo(b.season ?? 0);
+          return season != 0 ? season : (a.episodeNumber ?? 0).compareTo(b.episodeNumber ?? 0);
+        });
+        if (records.isEmpty || current == null) _leaveWhenEmpty();
+        return DesktopDownloadSelection(records: records,
+          header: current == null || records.isEmpty ? null
+              : _header(context, current, records, manager),
+          onDelete: (selected) async {
+            await manager.deleteAll(selected);
+            final remaining = {for (final r in manager.all) r.id: r.storageKey};
+            if (selected.any((r) => remaining.containsKey(r.id) &&
+                remaining[r.id] == r.storageKey)) {
+              throw StateError('Some selected downloads could not be removed');
+            }
+          },
+          rowBuilder: (record) => DownloadTile(record: record,
+            manager: manager, resume: sl<ResumeStore>()));
+      }));
+  }
+}
+
 /// Lowercased text a download is matched against when searching.
 String _episodeSearchText(DownloadRecord r) {
   final n = r.episodeNumber?.toInt();
@@ -651,20 +1342,23 @@ class _DownloadPoster extends StatelessWidget {
 Future<void> _confirmDeleteShow(
   BuildContext context,
   List<DownloadRecord> records,
-  DownloadManager manager,
-) async {
+  DownloadManager manager, {
+  // Failed entries the page does not list; they go with the show.
+  List<DownloadRecord> failed = const [],
+}) async {
   final l10n = context.l10n;
   final ok = await AppDialog.confirm(
     context,
     title: l10n.deleteAllDownloads,
     message: l10n.removeAllEpisodesOfShow(
-      records.length,
+      // Failed entries count when they still own a saved file.
+      records.length + failed.where((r) => r.ownsSavedMedia).length,
       records.first.showTitle,
     ),
     confirmLabel: l10n.deleteAll,
     destructive: true,
   );
-  if (ok == true) await manager.deleteAll(records);
+  if (ok == true) await manager.deleteAll([...records, ...failed]);
 }
 
 class _DownloadedShowScreen extends StatefulWidget {
@@ -906,6 +1600,11 @@ Future<void> launchDownloadedEpisode(
   Future<({List<VideoSource> sources, bool done})> Function(String episodeUrl)?
   pollSources,
   String? playerOverride,
+  // Continue watching passes its saved spot as a fallback resume position.
+  Duration resumePosition = Duration.zero,
+  // The online show page passes its own item, so a saved file played from
+  // there lands in My List as the same entry online Play would add.
+  MediaItem? listItem,
 }) async {
   final path = record.filePath;
   if (path == null) return;
@@ -951,6 +1650,8 @@ Future<void> launchDownloadedEpisode(
         episodeUrl: episode.url,
         malId: record.malId,
         episodeNumber: episode.number,
+        category: record.category,
+        season: episode.season,
       );
     }
     if (downloaded == null || !await manager.filePresent(downloaded)) {
@@ -989,6 +1690,10 @@ Future<void> launchDownloadedEpisode(
     return;
   }
 
+  // Playing a saved file adds the show to My List as Watching, just like
+  // pressing Play online does (Windows only; the phone is unchanged).
+  maybeAddDownloadedShowToMyList(record, listItem: listItem);
+
   await Navigator.of(context).push(
     episodePlayerRoute(
       builder: (_) => PlayerScreen(
@@ -1008,10 +1713,42 @@ Future<void> launchDownloadedEpisode(
         downloadShowId: record.showId,
         category: record.category,
         malId: record.malId,
+        // The ids saved with the download let subtitle search find this exact
+        // show instead of guessing from the title.
+        tmdbId: record.tmdbId,
+        tmdbIsTv: record.tmdbIsTv,
+        imdbId: record.imdbId,
         scrobbleTitle: scrobbleTitle,
         playerOverride: playerOverride,
+        resumePosition: resumePosition,
       ),
     ),
+  );
+}
+
+/// Plays a finished download with its downloaded siblings queued after it.
+/// Shared by the row, its right-click menu and the show page's Continue
+/// button (dl-8).
+Future<void> playDownloadedRecord(
+  BuildContext context,
+  DownloadRecord record,
+  DownloadManager manager,
+) async {
+  // The whole downloaded season, not just this row — otherwise Next has
+  // nowhere to go and the user is bounced back out to pick manually.
+  final queue = await downloadedSiblingQueue(
+    showRecords: manager.byShow[record.showId] ?? const [],
+    record: record,
+    filePresent: manager.filePresent,
+    // Windows keeps Next inside the tapped season (desktop behaviour).
+    sameSeason: defaultTargetPlatform == TargetPlatform.windows,
+  );
+  if (!context.mounted) return;
+  await launchDownloadedEpisode(
+    context,
+    record,
+    episodes: queue.episodes,
+    startIndex: queue.startIndex,
   );
 }
 
@@ -1053,13 +1790,19 @@ class DownloadTile extends StatelessWidget {
     return (t.isEmpty || t == generic) ? generic : '$generic · $t';
   }
 
-  String _subtitle(AppLocalizations l10n) {
+  /// [progress] overrides the record's saved value with the live one the
+  /// Windows row listens to (dl-7).
+  String _subtitle(AppLocalizations l10n, [double? progress]) {
     // A finished torrent is streamed into the user's folder — surface that phase.
     if (record.isTorrent &&
         manager.torrentProgress[record.id]?.status == 'copying') {
       return l10n.savingToYourFolder;
     }
-    final pct = (record.progress * 100).round();
+    if (defaultTargetPlatform == TargetPlatform.windows &&
+        record.status == DownloadStatus.queued && record.retryAt != null) {
+      return record.error ?? 'Waiting for source cooldown; retrying automatically.';
+    }
+    final pct = ((progress ?? record.progress) * 100).round();
     return switch (record.status) {
       DownloadStatus.done =>
         record.bytesTotal > 0
@@ -1078,9 +1821,28 @@ class DownloadTile extends StatelessWidget {
       DownloadStatus.queued => l10n.downloadQueued,
       DownloadStatus.resolving => l10n.downloadPreparing,
       DownloadStatus.unsupported => record.error ?? l10n.notAvailableOfflineYet,
-      DownloadStatus.failed => record.error ?? l10n.downloadFailedStatus,
+      // Windows rewrites raw errors into plain language; other platforms
+      // show the error as stored.
+      DownloadStatus.failed => defaultTargetPlatform == TargetPlatform.windows
+          ? downloadFailureMessage(
+              record.error, fallback: l10n.downloadFailedStatus)
+          : record.error ?? l10n.downloadFailedStatus,
       DownloadStatus.canceled => l10n.downloadCanceled,
     };
+  }
+
+  /// " · 2.1 MB/s · 3 min left" for a downloading Windows row (dl-7). Empty
+  /// for torrents (their suffix already has the rate) or when unknown.
+  String _liveStatsSuffix() {
+    if (record.isTorrent || record.status != DownloadStatus.downloading) {
+      return '';
+    }
+    final speed = manager.speedOf(record.id);
+    final left = manager.timeLeftOf(record.id);
+    return [
+      if (speed != null && speed > 0) ' · ${formatTransferRate(speed)}',
+      if (left != null) ' · ${formatTimeLeft(left)}',
+    ].join();
   }
 
   /// " · N peers · X MB/s" for an active torrent download (empty otherwise).
@@ -1101,27 +1863,18 @@ class DownloadTile extends StatelessWidget {
     return parts.isEmpty ? '' : ' · ${parts.join(' · ')}';
   }
 
-  Future<void> _play(BuildContext context) async {
-    // The whole downloaded season, not just this row — otherwise Next has
-    // nowhere to go and the user is bounced back out to pick manually.
-    final queue = await downloadedSiblingQueue(
-      showRecords: manager.byShow[record.showId] ?? const [],
-      record: record,
-      filePresent: manager.filePresent,
-    );
-    if (!context.mounted) return;
-    await launchDownloadedEpisode(
-      context,
-      record,
-      episodes: queue.episodes,
-      startIndex: queue.startIndex,
-    );
-  }
+  Future<void> _play(BuildContext context) =>
+      playDownloadedRecord(context, record, manager);
 
   @override
   Widget build(BuildContext context) {
     final l10n = context.l10n;
     final isDone = record.status == DownloadStatus.done;
+    // Windows keeps its compact desktop row (artwork + status glyph) inside
+    // DesktopDownloadSelection; phone uses upstream's card tile below.
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      return _desktopRow(context, l10n, isDone);
+    }
     final active =
         record.status == DownloadStatus.downloading ||
         record.status == DownloadStatus.paused;
@@ -1228,6 +1981,120 @@ class DownloadTile extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  /// Right-click / Menu key rows for one episode (dl-4): Play, Show in
+  /// Explorer, the same transfer actions as the three-dot menu, Delete.
+  List<DesktopMenuItem<Object?>> _rowMenu(BuildContext context,
+      AppLocalizations l10n, bool isDone) {
+    final path = record.filePath;
+    final onDisk = path != null && path.isNotEmpty && !isUriPath(path);
+    final actions = _tileActions(record, l10n, manager);
+    final transfer = actions.where((a) => a.value != 'delete' && a.value != 'cancel');
+    return [
+      if (isDone)
+        DesktopMenuItem(label: l10n.play, icon: Icons.play_arrow_rounded,
+          shortcut: 'Enter', onTap: () => unawaited(_play(context))),
+      DesktopMenuItem(label: l10n.showInExplorer,
+        icon: Icons.folder_open_rounded, enabled: onDisk,
+        onTap: () async {
+          if (!await revealInExplorer(path!) && context.mounted) {
+            showAppToast(context, l10n.downloadFileGone);
+          }
+        }),
+      if (transfer.isNotEmpty) const DesktopMenuItem.divider(),
+      for (final a in transfer)
+        DesktopMenuItem(label: a.label, icon: a.icon,
+          onTap: () => _runTileAction(a.value, record, manager)),
+      const DesktopMenuItem.divider(),
+      DesktopMenuItem(label: l10n.delete, icon: Icons.delete_outline_rounded,
+        destructive: true,
+        onTap: () => _runTileAction('delete', record, manager)),
+    ];
+  }
+
+  /// Live progress for a moving row (dl-7): only this row repaints on each
+  /// tick, the page itself rebuilds about once a second at most.
+  Widget _liveProgress({required Widget Function(double progress) builder}) {
+    final moving = record.status == DownloadStatus.downloading ||
+        record.status == DownloadStatus.paused;
+    if (!moving) return builder(record.progress);
+    return ValueListenableBuilder<double>(
+      valueListenable: manager.progressListenable(record.id),
+      builder: (context, progress, _) => builder(progress),
+    );
+  }
+
+  /// Windows row: the desktop ListTile, now selection-aware (dl-1, dl-3)
+  /// with a right-click menu (dl-4) and live progress (dl-7).
+  Widget _desktopRow(BuildContext context, AppLocalizations l10n, bool isDone) {
+    final scope = DesktopDownloadRowScope.maybeOf(context);
+    final selected = scope?.selected ?? false;
+    return DesktopContextMenuRegion(
+      // While selecting, the right-click menu would compete with ticking.
+      enabled: !(scope?.selecting ?? false),
+      items: () => _rowMenu(context, l10n, isDone),
+      child: ListTile(
+      contentPadding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
+      tileColor: selected ? DesktopChrome.selectedFill(AppColors.accent) : null,
+      // Inside a selectable list the click goes through the selection first:
+      // while selecting (or with Ctrl/Shift) it ticks the row instead of
+      // starting playback (dl-1). Elsewhere only finished rows react.
+      onTap: scope != null
+          ? () {
+              if (scope.onClick()) return;
+              if (isDone) unawaited(_play(context));
+            }
+          : isDone ? () => _play(context) : null,
+      leading: SizedBox(width: 80, height: 48, child: Stack(fit: StackFit.expand, children: [
+        DownloadThumbnail(thumbnail: record.episodeThumbnail, cover: record.cover,
+          headers: record.coverHeaders,
+          // Pictures saved next to the file, for when the web ones cannot load.
+          saved: downloadSavedArtPaths(record),
+          fallback: ColoredBox(color: AppColors.surface2)),
+        Positioned(right: 2, bottom: 2, child: _StatusGlyph(record: record)),
+      ])),
+      title: Text(
+        _epLabel(l10n),
+        style: AppText.body.copyWith(color: AppColors.textPrimary),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (record.recoveredFromDisk)
+            Text('Recovered from disk', style: AppText.caption),
+          _liveProgress(builder: (progress) => Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Speed and time left ride along with the live progress, so
+              // they refresh on the same per-row tick (dl-7).
+              Text(_subtitle(l10n, progress) + _liveStatsSuffix(),
+                  style: AppText.caption),
+              if (record.status == DownloadStatus.downloading ||
+                  record.status == DownloadStatus.paused) ...[
+                const SizedBox(height: 6),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(2),
+                  child: LinearProgressIndicator(
+                    value: progress > 0 ? progress : null,
+                    minHeight: 3,
+                    color: AppColors.accent,
+                    backgroundColor: AppColors.surface2,
+                  ),
+                ),
+              ],
+            ],
+          )),
+          if (isDone) ...[
+            const SizedBox(height: 3),
+            _WatchMeta(record: record, resume: resume),
+          ],
+        ],
+      ),
+      trailing: _TileMenu(record: record, manager: manager),
+    ));
   }
 }
 
@@ -1551,6 +2418,11 @@ class _StatusGlyph extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (defaultTargetPlatform == TargetPlatform.windows &&
+        record.status == DownloadStatus.queued && record.retryAt != null) {
+      return const Icon(Icons.schedule_rounded, size: 26,
+          color: AppColors.textSecondary);
+    }
     return switch (record.status) {
       DownloadStatus.done => Icon(
         Icons.play_circle_fill_rounded,
@@ -1616,6 +2488,70 @@ class _StatusGlyph extends StatelessWidget {
   }
 }
 
+/// The actions offered for one download, shared by the three-dot menu and
+/// the Windows right-click menu (dl-4) so they never drift apart.
+List<({String value, IconData icon, String label})> _tileActions(
+    DownloadRecord r, AppLocalizations l10n, DownloadManager manager) {
+  final windows = defaultTargetPlatform == TargetPlatform.windows;
+  // Local media workers are Windows-only; phone and TV retain their menus.
+  final localAudio = windows && r.pendingAudioFinalization;
+  final waitingRetry = windows &&
+      r.autoResumePending && r.retryAt != null && r.status == DownloadStatus.queued;
+  // Windows: an item still waiting for a slot (or resolving its source) can
+  // be held back with Pause instead of only removed (dl-6).
+  final waiting = windows && !r.isTorrent &&
+      const {DownloadStatus.queued, DownloadStatus.resolving}.contains(r.status);
+  // Windows: "Download next" moves an item to the front of the queue (dl-6).
+  // Only items that wait (queued / resolving / paused) can jump; failed ones
+  // keep Retry as their way back. The manager then decides (hidden when the
+  // item is already first in line).
+  final canJump = windows && !r.isTorrent &&
+      const {
+        DownloadStatus.queued,
+        DownloadStatus.resolving,
+        DownloadStatus.paused,
+      }.contains(r.status) &&
+      manager.canMoveToFront(r);
+  return [
+    if (r.status == DownloadStatus.downloading || waitingRetry || waiting ||
+        (localAudio &&
+            const {
+              DownloadStatus.queued,
+              DownloadStatus.finalizing,
+            }.contains(r.status)))
+      (value: 'pause', icon: Icons.pause_rounded, label: l10n.pause),
+    if (r.status == DownloadStatus.paused ||
+        (localAudio && r.status == DownloadStatus.failed))
+      (value: 'resume', icon: Icons.play_arrow_rounded, label: l10n.resume),
+    if (r.status == DownloadStatus.failed && !r.isTorrent)
+      (value: 'retry', icon: Icons.refresh_rounded, label: l10n.retry),
+    if (canJump)
+      (value: 'next', icon: Icons.vertical_align_top_rounded,
+        label: l10n.downloadNext),
+    if (r.isActive) (value: 'cancel', icon: Icons.close_rounded, label: l10n.cancel),
+    (value: 'delete', icon: Icons.delete_outline_rounded, label: l10n.delete),
+  ];
+}
+
+/// Runs one of [_tileActions] on [r].
+void _runTileAction(String action, DownloadRecord r, DownloadManager manager) {
+  switch (action) {
+    case 'pause':
+      unawaited(manager.pause(r));
+    case 'resume':
+      unawaited(manager.resume(r));
+    case 'retry':
+      unawaited(manager.retry(r));
+    case 'next':
+      unawaited(manager.moveToFront(r));
+    // Cancel an in-flight download = stop it AND remove it from the list
+    // (delete cancels the task, drops the record, and clears fallbacks).
+    case 'cancel':
+    case 'delete':
+      unawaited(manager.delete(r));
+  }
+}
+
 class _TileMenu extends StatelessWidget {
   const _TileMenu({required this.record, required this.manager});
   final DownloadRecord record;
@@ -1624,34 +2560,12 @@ class _TileMenu extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final l10n = context.l10n;
-    final r = record;
     return PopupMenuButton<String>(
       icon: const Icon(Icons.more_vert_rounded, color: AppColors.textSecondary),
       color: AppColors.surface2,
-      onSelected: (v) {
-        switch (v) {
-          case 'pause':
-            unawaited(manager.pause(r));
-          case 'resume':
-            unawaited(manager.resume(r));
-          case 'retry':
-            unawaited(manager.retry(r));
-          // Cancel an in-flight download = stop it AND remove it from the list
-          // (delete cancels the task, drops the record, and clears fallbacks).
-          case 'cancel':
-          case 'delete':
-            unawaited(manager.delete(r));
-        }
-      },
+      onSelected: (v) => _runTileAction(v, record, manager),
       itemBuilder: (context) => [
-        if (r.status == DownloadStatus.downloading)
-          _item('pause', Icons.pause_rounded, l10n.pause),
-        if (r.status == DownloadStatus.paused)
-          _item('resume', Icons.play_arrow_rounded, l10n.resume),
-        if (r.status == DownloadStatus.failed && !r.isTorrent)
-          _item('retry', Icons.refresh_rounded, l10n.retry),
-        if (r.isActive) _item('cancel', Icons.close_rounded, l10n.cancel),
-        _item('delete', Icons.delete_outline_rounded, l10n.delete),
+        for (final a in _tileActions(record, l10n, manager)) _item(a.value, a.icon, a.label),
       ],
     );
   }

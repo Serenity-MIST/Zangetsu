@@ -61,11 +61,11 @@ void main() {
     const channel = MethodChannel('zangetsu/cloudstream');
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
-      if (call.method == 'solveCloudflare') {
-        return {'cookie': 'cf_clearance=abc123', 'userAgent': 'TestUA/1.0'};
-      }
-      return null;
-    });
+          if (call.method == 'solveCloudflare') {
+            return {'cookie': 'cf_clearance=abc123', 'userAgent': 'TestUA/1.0'};
+          }
+          return null;
+        });
     addTearDown(() {
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(channel, null);
@@ -75,6 +75,10 @@ void main() {
     // the shared latch + solve plumbing clears a CS-originated flag too.
     final solved = await ProviderManager(
       dio: Dio(),
+      clearanceSolver: (_) async => {
+        'cookie': 'cf_clearance=abc123',
+        'userAgent': 'TestUA/1.0',
+      },
     ).solveCloudflareForHost('cf-cs.test', 'https://cf-cs.test/search?q=foo');
 
     expect(solved, isTrue);

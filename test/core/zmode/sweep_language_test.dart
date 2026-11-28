@@ -11,6 +11,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/models/media_item.dart';
+import 'package:watch_app/core/models/episode.dart';
 import 'package:watch_app/core/models/provider_info.dart';
 import 'package:watch_app/core/repository/source_repository.dart';
 import 'package:watch_app/core/zmode/match_store.dart';
@@ -23,6 +24,16 @@ class _Src implements SourceRepository {
   _Src(this.bySource);
   final Map<String, List<MediaItem>> bySource;
   final searched = <String>[];
+
+  /// A successful manga match must expose chapters before the sweep accepts it.
+  @override
+  Future<List<Episode>> episodes(
+    String url, {
+    String category = 'sub',
+    String? sourceId,
+  }) async => const [
+    Episode(id: '1', title: 'Chapter 1', url: 'https://chapter.test/1'),
+  ];
 
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
@@ -77,7 +88,9 @@ void main() {
     Hive.init(dir.path);
     store = await MatchStore.open();
     prefs = await ZSourcePrefs.open();
-    src = _Src({for (final s in every) s.id: [_hit(s.id)]});
+    src = _Src({
+      for (final s in every) s.id: [_hit(s.id)],
+    });
   });
 
   tearDown(() async {
@@ -108,16 +121,18 @@ void main() {
     expect((await m.resolve(manga, title: title))?.sourceId, 'mihon:ko');
   });
 
-  test('a kind default outside the enabled languages is still honoured',
-      () async {
-    await prefs.set(ZKind.manga, 'mihon:ja');
+  test(
+    'a kind default outside the enabled languages is still honoured',
+    () async {
+      await prefs.set(ZKind.manga, 'mihon:ja');
 
-    expect(
-      (await build().resolve(manga, title: title))?.sourceId,
-      'mihon:ja',
-      reason: 'an explicit default is a choice, not a sweep',
-    );
-  });
+      expect(
+        (await build().resolve(manga, title: title))?.sourceId,
+        'mihon:ja',
+        reason: 'an explicit default is a choice, not a sweep',
+      );
+    },
+  );
 
   test('with no sweep list given, it sweeps the full one', () async {
     // Back-compat: every existing caller passes only `candidates`.
@@ -139,10 +154,10 @@ void main() {
     ) => languageNarrowedCandidates(ordered, allowedIds.toSet());
 
     test('keeps the enabled ones, in the order given', () {
-      expect(
-        narrow(every, ['mihon:ja', 'mihon:en']).map((s) => s.id),
-        ['mihon:ja', 'mihon:en'],
-      );
+      expect(narrow(every, ['mihon:ja', 'mihon:en']).map((s) => s.id), [
+        'mihon:ja',
+        'mihon:en',
+      ]);
     });
 
     test('falls back to everything when the filter empties it', () {

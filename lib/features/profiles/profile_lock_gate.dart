@@ -1,5 +1,6 @@
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -9,6 +10,7 @@ import '../../core/profiles/profile_lock_remote.dart';
 import '../../core/profiles/viewer_profile.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
+import '../../core/ui/desktop_settings_surface.dart' show GraphiteSettingsColors;
 import '../../l10n/l10n.dart';
 import '../auth/auth_screens.dart' show LoginScreen;
 
@@ -53,10 +55,40 @@ Future<bool> ensureProfileUnlocked(
       false;
 }
 
-String _lockErrorText(BuildContext context, Object error) =>
-    error is ProfileLockException
-    ? error.message
-    : context.l10n.somethingWentWrong;
+/// Windows shows the lock dialogs in the graphite desktop style, takes the
+/// PIN from the keyboard and offers no fingerprint option; phone and TV keep
+/// the dialogs unchanged.
+bool get _desktopLock => defaultTargetPlatform == TargetPlatform.windows;
+
+/// Graphite dialog colours, matching the desktop settings dialogs. Getters so
+/// they follow Pure black and custom backgrounds.
+Color get _kDesktopLockSurface => GraphiteSettingsColors.dialog;
+Color get _kDesktopLockBorder => GraphiteSettingsColors.dialogEdge;
+
+/// Shown on Windows when this PC cannot check the lock offline because it
+/// never accepted the current PIN while online.
+const kConnectOnceToUnlockOnThisPc =
+    'Connect to the internet once to unlock this profile on this PC.';
+
+String _lockErrorText(BuildContext context, Object error) {
+  // Windows: name the one fix for a PC with no offline copy of the PIN.
+  if (_desktopLock &&
+      error is ProfileLockException &&
+      error.code == 'offline_pin_unavailable') {
+    return kConnectOnceToUnlockOnThisPc;
+  }
+  return error is ProfileLockException
+      ? error.message
+      : context.l10n.somethingWentWrong;
+}
+
+/// Shows the one-time recovery code a PIN change produced, if any. Public so
+/// the Windows move of an old PC-only PIN can show it too.
+Future<void> showProfileLockRecoveryCode(
+  BuildContext context,
+  ProfileLockStore locks,
+  String profileId,
+) => _showRecoveryCode(context, locks, profileId);
 
 Future<void> _showRecoveryCode(
   BuildContext context,
@@ -72,6 +104,14 @@ Future<void> _showRecoveryCode(
     builder: (context) => PopScope(
       canPop: false,
       child: AlertDialog(
+        // Windows: graphite surface like the other desktop dialogs.
+        backgroundColor: _desktopLock ? _kDesktopLockSurface : null,
+        shape: _desktopLock
+            ? RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(20),
+                side: BorderSide(color: _kDesktopLockBorder),
+              )
+            : null,
         title: const Text('Save your recovery code'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
@@ -175,16 +215,23 @@ class _PinDialog extends StatelessWidget {
     elevation: 0,
     insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
     child: ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 304),
+      // Windows: a wider graphite card, as the desktop unlock uses a field.
+      constraints: BoxConstraints(maxWidth: _desktopLock ? 420 : 304),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(24),
         child: BackdropFilter(
           filter: ui.ImageFilter.blur(sigmaX: 16, sigmaY: 16),
           child: Material(
-            color: const Color(0x65101115),
+            color: _desktopLock
+                ? _kDesktopLockSurface
+                : const Color(0x65101115),
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(24),
-              side: const BorderSide(color: Color(0x26FFFFFF)),
+              side: BorderSide(
+                color: _desktopLock
+                    ? _kDesktopLockBorder
+                    : const Color(0x26FFFFFF),
+              ),
             ),
             child: AnimatedSize(
               duration: MediaQuery.disableAnimationsOf(context)
@@ -297,6 +344,7 @@ class _ProfilePinKeypad extends StatelessWidget {
     required this.length,
     required this.enabled,
     this.onComplete,
+    this.onSubmit,
     this.unknownLength = false,
   });
 
@@ -304,6 +352,9 @@ class _ProfilePinKeypad extends StatelessWidget {
   final int length;
   final bool enabled;
   final VoidCallback? onComplete;
+
+  /// Windows: run when Enter is pressed on the keyboard.
+  final VoidCallback? onSubmit;
   final bool unknownLength;
 
   void _press(String key) {
@@ -317,8 +368,39 @@ class _ProfilePinKeypad extends StatelessWidget {
     HapticFeedback.selectionClick();
   }
 
+  /// Windows: digits, Backspace and Enter from the keyboard work the keypad,
+  /// so the PIN can be typed as in a text field.
+  KeyEventResult _onKey(FocusNode node, KeyEvent event) {
+    if (!enabled || event is KeyUpEvent) return KeyEventResult.ignored;
+    final key = event.logicalKey;
+    if (key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.numpadEnter) {
+      final submit = onSubmit;
+      if (submit == null) return KeyEventResult.ignored;
+      submit();
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.backspace) {
+      if (controller.text.isNotEmpty) _press('⌫');
+      return KeyEventResult.handled;
+    }
+    final digit = event.character;
+    if (digit != null && RegExp(r'^[0-9]$').hasMatch(digit)) {
+      if (controller.text.length < length) _press(digit);
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
   @override
-  Widget build(BuildContext context) => ValueListenableBuilder(
+  Widget build(BuildContext context) {
+    final keypad = _keypad();
+    if (!_desktopLock) return keypad;
+    return Focus(autofocus: true, onKeyEvent: _onKey, child: keypad);
+  }
+
+  /// The dots row and the on-screen number pad.
+  Widget _keypad() => ValueListenableBuilder(
     valueListenable: controller,
     builder: (context, value, _) => Column(
       children: [
@@ -458,6 +540,9 @@ class _PinUnlockSheetState extends State<_PinUnlockSheet> {
   }
 
   Future<void> _loadBiometrics() async {
+    // Windows Hello cannot run the fingerprint-only check this lock uses
+    // (local_auth_windows rejects biometricOnly), so the PIN is the only way.
+    if (_desktopLock) return;
     try {
       final available = await widget.locks.canUnlockWithBiometrics(
         widget.profile.id,
@@ -573,15 +658,25 @@ class _PinUnlockSheetState extends State<_PinUnlockSheet> {
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 22),
-          _ProfilePinKeypad(
-            controller: _pin,
-            length: _knownLength ?? 6,
-            unknownLength: _knownLength == null,
-            enabled: !_busy,
-            onComplete: _knownLength == null || _needsLegacyPin
-                ? null
-                : _tryUnlock,
-          ),
+          // Windows: one PIN field, typed and sent with Enter.
+          if (_desktopLock)
+            _pinField(
+              controller: _pin,
+              hint: 'PIN',
+              autofocus: true,
+              newPin: true,
+              onSubmitted: (_) => _tryUnlock(),
+            )
+          else
+            _ProfilePinKeypad(
+              controller: _pin,
+              length: _knownLength ?? 6,
+              unknownLength: _knownLength == null,
+              enabled: !_busy,
+              onComplete: _knownLength == null || _needsLegacyPin
+                  ? null
+                  : _tryUnlock,
+            ),
           if (_needsLegacyPin) ...[
             const SizedBox(height: 10),
             const Text(
@@ -635,7 +730,7 @@ class _PinUnlockSheetState extends State<_PinUnlockSheet> {
                   ),
                 ),
               if (_canBio) const SizedBox(width: 10),
-              if (_knownLength == null || _needsLegacyPin)
+              if (_desktopLock || _knownLength == null || _needsLegacyPin)
                 Expanded(
                   child: FilledButton(
                     onPressed: _busy ? null : () => _tryUnlock(),
@@ -648,15 +743,19 @@ class _PinUnlockSheetState extends State<_PinUnlockSheet> {
             onPressed: _busy
                 ? null
                 : () async {
-                    final recovered = await showModalBottomSheet<bool>(
-                      context: context,
-                      isScrollControlled: true,
-                      backgroundColor: AppColors.surface,
-                      builder: (_) => _PinRecoverySheet(
-                        profile: widget.profile,
-                        locks: widget.locks,
-                      ),
+                    Widget recovery(BuildContext _) => _PinRecoverySheet(
+                      profile: widget.profile,
+                      locks: widget.locks,
                     );
+                    // Windows: a centred dialog instead of a bottom sheet.
+                    final recovered = _desktopLock
+                        ? await _showPinDialog(context, builder: recovery)
+                        : await showModalBottomSheet<bool>(
+                            context: context,
+                            isScrollControlled: true,
+                            backgroundColor: AppColors.surface,
+                            builder: recovery,
+                          );
                     if (recovered == true && context.mounted) {
                       Navigator.of(context).pop(true);
                     }
@@ -721,7 +820,8 @@ class _PinSetupSheetState extends State<_PinSetupSheet> {
                 .pinLength(widget.profileId)
                 .catchError((Object _) => null)
           : null;
-      final available = await widget.locks.canUseBiometrics;
+      // No fingerprint option on Windows (see _PinUnlockSheet).
+      final available = !_desktopLock && await widget.locks.canUseBiometrics;
       final enabled =
           locked && await widget.locks.biometricEnabled(widget.profileId);
       if (mounted) {
@@ -1006,6 +1106,7 @@ class _PinSetupSheetState extends State<_PinSetupSheet> {
                       unknownLength:
                           _enteringCurrent && _currentPinLength == null,
                       enabled: !_busy,
+                      onSubmit: _continueSetup,
                     ),
                   Wrap(
                     alignment: WrapAlignment.center,
@@ -1141,6 +1242,7 @@ class _PinConfirmationSheetState extends State<_PinConfirmationSheet> {
             controller: _pin,
             length: widget.length ?? 6,
             enabled: !_busy,
+            onSubmit: _confirm,
           ),
           if (_error != null)
             Text(
@@ -1239,6 +1341,7 @@ class _PinRecoverySheetState extends State<_PinRecoverySheet> {
   @override
   Widget build(BuildContext context) => _SheetShell(
     title: 'Recover profile PIN',
+    dialog: _desktopLock,
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -1251,14 +1354,14 @@ class _PinRecoverySheetState extends State<_PinRecoverySheet> {
           hint: 'Recovery code',
           numeric: false,
           autofocus: true,
-          onSubmitted: (_) {},
+          onSubmitted: (_) => _nextField(context),
         ),
         if (_needsLegacyPin) ...[
           const SizedBox(height: 10),
           _pinField(
             controller: _localPin,
             hint: 'Previous PIN on this device',
-            onSubmitted: (_) {},
+            onSubmitted: (_) => _nextField(context),
           ),
         ],
         const SizedBox(height: 10),
@@ -1266,7 +1369,7 @@ class _PinRecoverySheetState extends State<_PinRecoverySheet> {
           controller: _pin,
           hint: 'New PIN (4 or 6 digits)',
           newPin: true,
-          onSubmitted: (_) {},
+          onSubmitted: (_) => _nextField(context),
         ),
         const SizedBox(height: 10),
         _pinField(
@@ -1289,4 +1392,10 @@ class _PinRecoverySheetState extends State<_PinRecoverySheet> {
       ],
     ),
   );
+}
+
+/// Windows: Enter in an earlier PIN field moves on to the next one, so the
+/// whole form works from the keyboard. Phone keeps its keyboard behaviour.
+void _nextField(BuildContext context) {
+  if (_desktopLock) FocusScope.of(context).nextFocus();
 }

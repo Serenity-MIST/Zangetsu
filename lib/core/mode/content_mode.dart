@@ -8,6 +8,7 @@ import '../models/provider_info.dart';
 /// existing video app (anime + movie sources); manga/novel are reading modes.
 enum ContentMode { anime, manga, novel }
 
+/// Matches stable extension identities to the selected reading/streaming mode.
 bool sourceIdMatchesContentMode(String sourceId, ContentMode mode) {
   final mangayomiType = mangayomiContentTypeOf(sourceId);
   if (mangayomiType != null) {

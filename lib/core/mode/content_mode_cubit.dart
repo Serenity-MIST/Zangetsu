@@ -6,6 +6,7 @@ import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:hive/hive.dart';
 
 import '../di/injector.dart';
+import '../provider/provider_registry.dart';
 import '../repository/source_repository.dart';
 import '../state/active_source_cubit.dart';
 import 'content_mode.dart';
@@ -47,9 +48,34 @@ class ContentModeCubit extends Cubit<ContentMode> {
     return sl<SourceRepository>().loadedSources.any((s) => s.id == id);
   }
 
+  /// True on the Windows desktop build, which keeps its own mode-switch rules.
+  static bool get _isWindows => defaultTargetPlatform == TargetPlatform.windows;
+
   /// Cheap ID-only mode check; Mangayomi's key encodes its declared type.
-  static bool _sourceInMode(String id, ContentMode m) =>
-      sourceIdMatchesContentMode(id, m);
+  /// On Windows, JS sources also consult the provider registry's declared
+  /// type so a JS manga/novel source lands in its reading mode.
+  static bool _sourceInMode(String id, ContentMode m) {
+    if (_isWindows &&
+        sl.isRegistered<ProviderRegistry>() &&
+        id.startsWith('js:')) {
+      final type = sl<ProviderRegistry>().typeOf(id);
+      if (type != null) {
+        return switch (m) {
+          ContentMode.manga => type == 'manga',
+          ContentMode.novel => type == 'novel',
+          ContentMode.anime => type != 'manga' && type != 'novel',
+        };
+      }
+    }
+    return sourceIdMatchesContentMode(id, m);
+  }
+
+  /// Windows only: whether a remembered source may be restored for [m].
+  /// It must belong to [m]; a JS source is trusted while the registry that
+  /// knows its type is not up yet.
+  bool _windowsRememberedFits(String id, ContentMode m) =>
+      _sourceInMode(id, m) ||
+      (!sl.isRegistered<ProviderRegistry>() && id.startsWith('js:'));
 
   /// No valid remembered source for [m] — don't leave a source from another
   /// mode active (the "enter Novel and the header still shows an anime source"
@@ -81,7 +107,10 @@ class ContentModeCubit extends Cubit<ContentMode> {
     // under the OUTGOING mode's key instead of what was really active there.
     final outgoingMode = state;
     final outgoingSource = _active.state;
-    emit(m); // update the UI first; persistence below is fire-and-forget.
+    // Windows restores the source before notifying mode listeners; other
+    // platforms update the UI first. Persistence below is fire-and-forget.
+    final windows = _isWindows;
+    if (!windows) emit(m);
 
     // Restore the incoming mode's remembered source — but only if it's still
     // loaded. A stale/uninstalled id would otherwise leave Home silently
@@ -90,13 +119,16 @@ class ContentModeCubit extends Cubit<ContentMode> {
     final remembered = _box.get('src.${m.name}') as String?;
     if (remembered != null &&
         remembered.isNotEmpty &&
-        _sourceStillLoaded(remembered)) {
+        _sourceStillLoaded(remembered) &&
+        (!windows || _windowsRememberedFits(remembered, m))) {
       _active.setSource(remembered);
     } else {
       // No valid remembered source for this mode — don't strand a reading mode
       // on the anime source that was active; land on a source of this mode.
       _fallBackToModeSource(m);
     }
+
+    if (windows) emit(m);
 
     // Fire-and-forget; Hive serializes writes so ordering is preserved (same
     // rationale as ActiveSourceCubit.setSource). Each write catches its own
@@ -110,7 +142,7 @@ class ContentModeCubit extends Cubit<ContentMode> {
             (e) => debugPrint(
               '[ContentModeCubit] failed to park $outgoingSource: $e',
             ),
-      ),
+          ),
     );
     unawaited(
       _box
@@ -119,7 +151,7 @@ class ContentModeCubit extends Cubit<ContentMode> {
             (e) => debugPrint(
               '[ContentModeCubit] failed to persist mode ${m.name}: $e',
             ),
-      ),
+          ),
     );
   }
 }

@@ -3,18 +3,31 @@ import 'dart:async';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 
+import '../../core/desktop/desktop_sheet.dart';
 import '../../core/profiles/klipy_gif_service.dart';
 import '../../core/theme/app_colors.dart';
+import '../../core/ui/desktop_docked_panel.dart' show desktopPanelsEnabled;
 
 Future<KlipyGif?> showProfileKlipyGifPicker(
   BuildContext context,
   KlipyGifService service,
-) => showModalBottomSheet<KlipyGif>(
-  context: context,
-  isScrollControlled: true,
-  backgroundColor: Colors.transparent,
-  builder: (_) => _KlipyGifPicker(service: service),
-);
+) {
+  // Windows (acct-6): a centred graphite dialog instead of a bottom sheet;
+  // showAdaptiveSheet forwards everything to showModalBottomSheet on phone.
+  if (desktopPanelsEnabled) {
+    return showAdaptiveSheet<KlipyGif>(
+      context,
+      desktopWidth: 640,
+      builder: (_) => _KlipyGifPicker(service: service),
+    );
+  }
+  return showModalBottomSheet<KlipyGif>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: Colors.transparent,
+    builder: (_) => _KlipyGifPicker(service: service),
+  );
+}
 
 class _KlipyGifPicker extends StatefulWidget {
   const _KlipyGifPicker({required this.service});
@@ -85,13 +98,18 @@ class _KlipyGifPickerState extends State<_KlipyGifPicker> {
   @override
   Widget build(BuildContext context) {
     final media = MediaQuery.sizeOf(context);
+    // Inside the Windows dialog the graphite frame supplies the background
+    // and corners, and the picker is a little shorter than the phone sheet.
+    final desktop = DesktopSheetScope.of(context);
     return SizedBox(
-      height: media.height * 0.84,
+      height: media.height * (desktop ? 0.7 : 0.84),
       child: SafeArea(
         top: false,
         child: Material(
-          color: AppColors.bg,
-          borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+          color: desktop ? Colors.transparent : AppColors.bg,
+          borderRadius: desktop
+              ? null
+              : const BorderRadius.vertical(top: Radius.circular(28)),
           clipBehavior: Clip.antiAlias,
           child: Padding(
             padding: EdgeInsets.fromLTRB(

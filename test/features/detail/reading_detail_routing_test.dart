@@ -8,9 +8,12 @@
 // we just pump DetailScreen(item:) directly and let it load.
 
 import 'dart:io';
+import 'dart:async';
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -28,6 +31,7 @@ import 'package:watch_app/core/models/media_item.dart';
 import 'package:watch_app/core/models/provider_info.dart';
 import 'package:watch_app/core/models/video_source.dart';
 import 'package:watch_app/core/models/watch_status.dart';
+import 'package:watch_app/core/notify/subscription_store.dart';
 import 'package:watch_app/core/playback/list_status_store.dart';
 import 'package:watch_app/core/playback/my_list.dart';
 import 'package:watch_app/core/playback/playback_prefs.dart';
@@ -134,10 +138,6 @@ class _FakeTitlePrefs extends TitlePrefsStore {
 class _FakeMyListStore implements MyListStore {
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
-  // Added with the on-demand resolver: SourceMatcher now asks whether a JS
-  // provider is loaded before searching it. These fakes are already "loaded".
-  @override
-  Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
   bool contains(MediaItem m) => false;
@@ -149,10 +149,6 @@ class _FakeMyListStore implements MyListStore {
 class _FakeListStatusStore implements ListStatusStore {
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
-  // Added with the on-demand resolver: SourceMatcher now asks whether a JS
-  // provider is loaded before searching it. These fakes are already "loaded".
-  @override
-  Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
   WatchStatus? statusOf(MediaItem m) => null;
@@ -164,10 +160,6 @@ class _FakeListStatusStore implements ListStatusStore {
 class _FakeResumeStore implements ResumeStore {
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
-  // Added with the on-demand resolver: SourceMatcher now asks whether a JS
-  // provider is loaded before searching it. These fakes are already "loaded".
-  @override
-  Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
   ResumeMark? get(String sourceId, String showId, String episodeId) => null;
@@ -186,6 +178,17 @@ class _FakeReadStore extends ReadStore {
     String showId,
     String chapterId,
   ) => marks[chapterId];
+
+  @override
+  Future<void> save(
+    String sourceId,
+    String showId,
+    String chapterId, {
+    required int pos,
+    required int total,
+  }) async {
+    marks[chapterId] = (pos: pos, total: total);
+  }
 
   @override
   bool finished(String sourceId, String showId, String chapterId) {
@@ -273,13 +276,33 @@ class _FakeReadHistory extends ReadHistory {
   ReadEntry? get(String sourceId, String showId) => entry;
 }
 
+/// Holds the initial history fetch until after the viewer clicks Read.
+class _DelayedReadHistory extends ReadHistory {
+  _DelayedReadHistory() : super(SupabaseService(), () => null);
+  final pending = Completer<ReadEntry?>();
+  ReadEntry? entry;
+  @override
+  ReadEntry? get(String sourceId, String showId) => entry;
+  @override
+  Future<ReadEntry?> refreshFromCloud(String sourceId, String showId) async {
+    entry = await pending.future;
+    return entry;
+  }
+}
+
+/// Alerts store for the Windows detail page, which shows a subscribe toggle.
+/// Nothing is subscribed.
+class _FakeSubscriptionStore implements SubscriptionStore {
+  @override
+  noSuchMethod(Invocation i) => super.noSuchMethod(i);
+
+  @override
+  bool contains(String sourceId, String url) => false;
+}
+
 class _FakeProviderRegistry implements ProviderRegistry {
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
-  // Added with the on-demand resolver: SourceMatcher now asks whether a JS
-  // provider is loaded before searching it. These fakes are already "loaded".
-  @override
-  Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
   ProviderRegistryEntry? entryFor(String sourceId) => null;
@@ -292,10 +315,6 @@ class _FakeCloudStreamManager extends ChangeNotifier
     implements CloudStreamManager {
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
-  // Added with the on-demand resolver: SourceMatcher now asks whether a JS
-  // provider is loaded before searching it. These fakes are already "loaded".
-  @override
-  Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
   @override
   BaseProvider? get(String sourceId) => null;
@@ -310,13 +329,13 @@ class _FakeCloudStreamManager extends ChangeNotifier
 class _FakeDownloadManager extends ChangeNotifier implements DownloadManager {
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
-  // Added with the on-demand resolver: SourceMatcher now asks whether a JS
-  // provider is loaded before searching it. These fakes are already "loaded".
+
+  /// Nothing is downloaded (the Windows page lists saved episodes).
   @override
-  Future<bool> ensureSourceLoaded(String sourceId) async => true;
+  List<DownloadRecord> get all => const [];
 
   @override
-  DownloadRecord? recordFor(String sourceId, String showId, String episodeId) =>
+  DownloadRecord? recordFor(String sourceId, String showId, String episodeId, {String? category}) =>
       null;
 
   @override
@@ -326,7 +345,12 @@ class _FakeDownloadManager extends ChangeNotifier implements DownloadManager {
     required String episodeId,
     String? episodeUrl,
     int? malId,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    int? anilistId,
     double? episodeNumber,
+    String? category,
+    int? season,
   }) async => null;
 }
 
@@ -1219,6 +1243,68 @@ void main() {
     },
   );
 
+  // Windows desktop page only: its Read button waits for the cloud read
+  // history before choosing the chapter. The phone page keeps upstream's
+  // behaviour (it opens the chapter shown when Read was pressed).
+  testWidgets(
+    'Windows: Read clicked before sync finishes uses the newly synced chapter and position',
+    (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      tester.view.physicalSize = const Size(800, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      sl.registerSingleton<SourceRepository>(
+        _StubSourceRepository(_novelDetail),
+      );
+      sl.registerSingleton<CatalogueRepository>(sl<SourceRepository>());
+      final history = _DelayedReadHistory();
+      sl.unregister<ReadHistory>();
+      sl.registerSingleton<ReadHistory>(history);
+      final positions = _FakeReadStore({});
+      sl.unregister<ReadStore>();
+      sl.registerSingleton<ReadStore>(positions);
+      if (!sl.isRegistered<SubscriptionStore>()) {
+        sl.registerSingleton<SubscriptionStore>(_FakeSubscriptionStore());
+        addTearDown(() => sl.unregister<SubscriptionStore>());
+      }
+      await tester.pumpWidget(
+        const MaterialApp(home: DetailScreen(item: _novelItem, initialTab: 1)),
+      );
+      await tester.pump();
+      await tester.pump();
+      await tester.tap(find.text('Read').first);
+      await tester.pump();
+      expect(find.byType(NovelReaderScreen), findsNothing);
+      history.pending.complete(
+        ReadEntry(
+          sourceId: 'test',
+          showId: 'test-novel',
+          title: 'Test Novel',
+          chapterId: 'mobile-c2',
+          chapterUrl: '/mobile/c2',
+          chapterNumber: 2,
+          pos: 450,
+          total: 1000,
+          updatedMs: 200,
+          type: ProviderType.novel,
+        ),
+      );
+      await tester.pumpAndSettle();
+      final reader = tester.widget<NovelReaderScreen>(
+        find.byType(NovelReaderScreen),
+      );
+      expect(reader.startIndex, 1);
+      expect(positions.get('test', 'test-novel', 'c2'), (
+        pos: 450,
+        total: 1000,
+      ));
+      // Reset inside the body: the binding checks foundation overrides
+      // before tear-downs run.
+      debugDefaultTargetPlatformOverride = null;
+    },
+  );
+
   for (final playerPackage in ['', PlaybackPrefs.androidPlayerId]) {
     testWidgets('built-in player $playerPackage opens without a mirror sheet', (
       tester,
@@ -1353,7 +1439,7 @@ void main() {
       expect(find.byKey(chapterCover), findsNWidgets(2));
       expect(
         tester.getSize(find.byKey(chapterCover).first),
-        const Size(44, 62),
+        defaultTargetPlatform == TargetPlatform.windows ? const Size(32, 44) : const Size(44, 62),
       );
 
       // No ▶ anywhere on a reading page — not in the row, and the hero button
@@ -1402,7 +1488,16 @@ void main() {
     expect(store.readShowIds, isNotEmpty, reason: 'row read some key');
     final rowKey = store.readShowIds.first;
 
-    await tester.longPress(find.byKey(chapterCover).first);
+    // Desktop chapter menus use the requested secondary mouse action.
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      await tester.tap(
+        find.byKey(chapterCover).first,
+        buttons: kSecondaryMouseButton,
+        kind: PointerDeviceKind.mouse,
+      );
+    } else {
+      await tester.longPress(find.byKey(chapterCover).first);
+    }
     await tester.pumpAndSettle();
     await tester.tap(find.text('Mark as read'));
     await tester.pumpAndSettle();
@@ -1436,7 +1531,15 @@ void main() {
     await tester.pump();
     await tester.pump();
 
-    await tester.longPress(find.byKey(chapterCover).first);
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      await tester.tap(
+        find.byKey(chapterCover).first,
+        buttons: kSecondaryMouseButton,
+        kind: PointerDeviceKind.mouse,
+      );
+    } else {
+      await tester.longPress(find.byKey(chapterCover).first);
+    }
     await tester.pumpAndSettle();
 
     expect(find.text('Mark as read'), findsOneWidget);

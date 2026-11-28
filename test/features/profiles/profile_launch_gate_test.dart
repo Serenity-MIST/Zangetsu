@@ -1,5 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:crypto/crypto.dart';
+import 'package:watch_app/core/profiles/profile_pin_store.dart';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
@@ -711,6 +716,59 @@ void main() {
     expect(find.text('Retry'), findsNothing);
   });
 
+  // Windows: a PIN from an older PC-only build, not yet moved into the
+  // synced lock, must never let its profile open without being asked.
+  testWidgets('old PC PIN on the active profile stops launch at the picker', (
+    tester,
+  ) async {
+    await tester.runAsync(() => profiles.setAskOnLaunch(false));
+    final pins = ProfilePinStore(
+      storage: _MemoryPinStorage(),
+      owner: () => 'local',
+      iterations: 1000,
+      derive: _fastDerive,
+    );
+    await tester.runAsync(() => pins.setPin(profiles.activeId, '4821'));
+    GetIt.instance.registerSingleton<ProfilePinStore>(pins);
+
+    await tester.pumpWidget(app());
+    await tester.pumpAndSettle();
+
+    expect(find.text("Who's watching?"), findsOneWidget);
+    expect(find.text('Main screen'), findsNothing);
+  });
+
+  testWidgets('unapproved switch to an old-PC-PIN profile shows the picker', (
+    tester,
+  ) async {
+    await tester.runAsync(() => profiles.setAskOnLaunch(false));
+    late ViewerProfile kid;
+    await tester.runAsync(() async {
+      kid = (await profiles.create('Kid'))!;
+    });
+    // Built and written in the test's own zone, like the launch test above.
+    final pins = ProfilePinStore(
+      storage: _MemoryPinStorage(),
+      owner: () => 'local',
+      iterations: 1000,
+      derive: _fastDerive,
+    );
+    GetIt.instance.registerSingleton<ProfilePinStore>(pins);
+    await tester.runAsync(() => pins.setPin(kid.id, '4821'));
+    await tester.pumpWidget(app());
+    await tester.pumpAndSettle();
+    expect(find.text('Main screen'), findsOneWidget);
+
+    // The active profile changes with no PIN asked and no switch approval
+    // (e.g. after an account change). Set directly: the store's switchTo
+    // also applies the theme, which this widget test does not set up.
+    profiles.active.value = kid;
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+
+    expect(find.text("Who's watching?"), findsOneWidget);
+  });
+
   testWidgets('picker entrance staggers title, avatars, footer', (
     tester,
   ) async {
@@ -1252,6 +1310,26 @@ void main() {
     expect(find.text("Turn off Who's watching?"), findsNothing);
   });
 
+  testWidgets('Windows warns before turning asking off, like the phone', (
+    tester,
+  ) async {
+    // The PC uses the same synced lock, which is not asked at launch with
+    // the picker off, so the confirmation applies there too.
+    await tester.pumpWidget(
+      const MaterialApp(home: ViewerProfilesScreen(selectionOnly: true)),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Manage profiles'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Ask who is watching on launch'));
+    await tester.pumpAndSettle();
+    expect(find.text("Turn off Who's watching?"), findsOneWidget);
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(profiles.askOnLaunch, isTrue);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
+
   testWidgets('picker greeting follows a rename', (tester) async {
     await tester.pumpWidget(
       const MaterialApp(home: ViewerProfilesScreen(selectionOnly: true)),
@@ -1297,6 +1375,21 @@ class _ThrowingLockStore extends ProfileLockStore {
   Future<bool> isLocked(String profileId) async =>
       throw const ProfileLockException('online_required');
 }
+
+/// In-memory stand-in for the OS credential store used by old PC PINs.
+class _MemoryPinStorage implements PinSecretStorage {
+  final Map<String, String> data = {};
+  @override
+  Future<String?> read(String key) async => data[key];
+  @override
+  Future<void> write(String key, String value) async => data[key] = value;
+  @override
+  Future<void> delete(String key) async => data.remove(key);
+}
+
+/// Fast stand-in for PBKDF2 so the tests need no background isolate.
+Future<Uint8List> _fastDerive(String pin, Uint8List salt, int rounds) async =>
+    Uint8List.fromList(sha256.convert([...salt, ...utf8.encode(pin)]).bytes);
 
 class _CountingNavigatorObserver extends NavigatorObserver {
   int pushes = 0;

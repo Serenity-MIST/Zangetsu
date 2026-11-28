@@ -20,6 +20,8 @@ import 'package:watch_app/features/search/browse_source_screen.dart';
 
 class _FakeRepo implements SourceRepository {
   @override
+  bool hasSource(String id) => true;
+  @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
@@ -47,12 +49,13 @@ class _FakeCloudStreamManager extends ChangeNotifier
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
   // Added with the on-demand resolver: SourceMatcher now asks whether a JS
   // provider is loaded before searching it. These fakes are already "loaded".
-  @override
   Future<bool> ensureSourceLoaded(String sourceId) async => true;
 
 
   @override
   BaseProvider? get(String sourceId) => null;
+  @override
+  BaseProvider? resolveCompatible(String sourceId) => get(sourceId);
 
   @override
   String? repoNameForSourceId(String sourceId) => null;
@@ -62,12 +65,15 @@ void main() {
   Widget harness(Widget child) => MaterialApp(home: child);
 
   setUp(() {
+    // Settings availability is a host query, not a real JVM integration test.
+    cloudStreamHostOverride = (method, args) async => false;
     sl.registerSingleton<ActiveSourceCubit>(ActiveSourceCubit(fallback: 'cs:1'));
     sl.registerSingleton<CloudStreamManager>(_FakeCloudStreamManager());
     sl.registerSingleton<SourceRepository>(_FakeRepo());
   });
 
   tearDown(() async {
+    cloudStreamHostOverride = null;
     await sl<ActiveSourceCubit>().close();
     await sl.reset();
   });

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../core/aniyomi/aniyomi_filters.dart';
+import '../../core/desktop/desktop_sheet.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 
@@ -17,8 +18,11 @@ Future<List<AniyomiFilter>?> showAniyomiFilterSheet(
   BuildContext context,
   List<AniyomiFilter> filters,
 ) {
-  return showModalBottomSheet<List<AniyomiFilter>>(
-    context: context,
+  // Phone: the same bottom sheet as before. Windows: a centred, width-capped
+  // graphite dialog instead of a full-width strip (search-4).
+  return showAdaptiveSheet<List<AniyomiFilter>>(
+    context,
+    desktopWidth: 560,
     backgroundColor: AppColors.surface,
     isScrollControlled: true,
     shape: const RoundedRectangleBorder(
@@ -120,7 +124,8 @@ class _AniyomiFilterSheetState extends State<_AniyomiFilterSheet> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              _buildDragHandle(),
+              // The Windows dialog cannot be dragged, so no handle there.
+              if (!DesktopSheetScope.of(context)) _buildDragHandle(),
               _buildHeader(),
               const Divider(color: AppColors.hairline, height: 1),
               Flexible(

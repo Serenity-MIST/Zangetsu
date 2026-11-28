@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart' show ValueListenable, ValueNotifier;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'profile_lock_remote.dart';
@@ -34,6 +35,25 @@ class SyncedProfileLockStore extends ProfileLockStore {
   late final _offlinePins = OfflineProfilePin(_secure);
   String? _owner;
   int _lockRevision = 0;
+  final _statusChanges = ValueNotifier<int>(0);
+
+  /// Bumps whenever a profile's saved lock status changes (set, removed,
+  /// refreshed), so lock badges can re-read [cachedLocked].
+  ValueListenable<int> get statusChanges => _statusChanges;
+
+  /// The last lock status this device saw for [profileId], without asking the
+  /// server: true/false, or null when signed out or never checked here. For
+  /// display only (badges); access always goes through [isLocked]/[verify].
+  Future<bool?> cachedLocked(String profileId) async {
+    try {
+      if (_checkOwner() == null) return null;
+      final saved = await _read(_key('status', profileId));
+      final locked = saved?['locked'];
+      return locked is bool ? locked : null;
+    } catch (_) {
+      return null;
+    }
+  }
 
   Future<Map<String, dynamic>> _request(
     String action, {
@@ -147,6 +167,8 @@ class SyncedProfileLockStore extends ProfileLockStore {
       // A failed refresh must not leave an older unlocked status trusted.
       await _secure.delete(key: statusKey);
       rethrow;
+    } finally {
+      _statusChanges.value++;
     }
     if (_checkOwner() != owner) {
       throw const ProfileLockException('session_changed');

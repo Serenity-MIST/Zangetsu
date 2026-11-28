@@ -1,3 +1,8 @@
+import 'dart:io';
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:watch_app/features/home/cubit/home_cubit.dart';
+import 'package:hive/hive.dart';
+import 'package:watch_app/core/zmode/zmode_prefs.dart';
 // The Genres card on Home is only offered when the catalogue can actually
 // narrow itself, so what is worth pinning here is the OTHER half of that
 // promise: the screen behind the card lists the genres for the mode you are
@@ -23,8 +28,17 @@ import 'package:watch_app/l10n/app_localizations.dart';
 class _FakeContentModeCubit extends Cubit<ContentMode>
     implements ContentModeCubit {
   _FakeContentModeCubit(super.initial);
+  void change(ContentMode mode) => emit(mode);
   @override
   noSuchMethod(Invocation i) => super.noSuchMethod(i);
+}
+
+/// Emits catalogue rows without fetching a real provider or altering user data.
+class _ArtworkHomeCubit extends Cubit<HomeState> implements HomeCubit {
+  _ArtworkHomeCubit() : super(const HomeState());
+  void rows(List<HomeSection> sections) => emit(HomeState(sections: sections));
+  @override
+  noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
 /// Only [supportsFilters] is reached by this screen; everything else on the
@@ -58,7 +72,11 @@ Widget harness(NavigatorObserver observer) => MaterialApp(
     );
 
 void main() {
-  setUp(() {
+  late Directory directory;
+  setUp(() async {
+    directory = await Directory.systemTemp.createTemp('genres-kind-');
+    Hive.init(directory.path);
+    await ZModePrefs.init();
     // The grid runs well past a default 800x600 surface, and a tile that was
     // never laid out cannot be found or tapped.
     final v = TestWidgetsFlutterBinding.ensureInitialized().platformDispatcher
@@ -72,6 +90,87 @@ void main() {
     TestWidgetsFlutterBinding.ensureInitialized().platformDispatcher.views.first
         .resetPhysicalSize();
     await sl.reset();
+    await Hive.close();
+    await directory.delete(recursive:true);
+  });
+
+  test('genre artwork isolates canonical and provider media kinds', () {
+    MediaItem media(String id, ProviderType type, String url) => MediaItem(
+      id:id, title:id, url:url, sourceId:'fixture', type:type,
+      cover:'https://example.invalid/$id.jpg', genres:const ['Action'],
+      coverHeaders:const {'Referer':'fixture'},
+    );
+    final rows=[HomeSection(title:'mixed',items:[
+      media('old-anime',ProviderType.anime,'/anime'),
+      media('movie',ProviderType.anime,'zm://tv/123'),
+      media('manga',ProviderType.manga,'/manga'),
+      media('novel',ProviderType.novel,'/novel'),
+    ])];
+    for(final kind in ZKind.values) {
+      final expected=switch(kind) {
+        ZKind.anime=>'old-anime', ZKind.movie || ZKind.tv=>'movie',
+        ZKind.manga=>'manga', ZKind.novel=>'novel',
+      };
+      final art=genreArtFrom(rows,kind:kind);
+      expect(art['Action']?.url,'https://example.invalid/$expected.jpg');
+      expect(art['Action']?.headers,{'Referer':'fixture'});
+    }
+    expect(genreArtFrom(const [],kind:ZKind.manga),isEmpty);
+  });
+
+  testWidgets('retained Genres refreshes late Home artwork and disposes listener', (t) async {
+    final mode = _FakeContentModeCubit(ContentMode.anime);
+    final home = _ArtworkHomeCubit();
+    sl.registerSingleton<ContentModeCubit>(mode);
+    sl.registerSingleton<HomeCubit>(home);
+    sl.registerSingleton<MetadataRepository>(_FakeMetaRepo(true));
+    await t.pumpWidget(harness(_Pushes()));
+    await t.pumpAndSettle();
+    final state = t.state(find.byType(GenresScreen));
+    expect(find.byType(CachedNetworkImage), findsNothing);
+    List<HomeSection> rows(String id, ProviderType type) => [
+      HomeSection(title:'loaded', items:[MediaItem(
+        id:id, title:id, url:'/$id', sourceId:'fixture', type:type,
+        cover:'https://example.invalid/$id.jpg', genres:const ['Action'],
+      )]),
+    ];
+    home.rows(rows('late-anime',ProviderType.anime));
+    await t.pump(); await t.pump();
+    expect(t.widget<CachedNetworkImage>(find.byType(CachedNetworkImage)).imageUrl,
+      'https://example.invalid/late-anime.jpg');
+    mode.change(ContentMode.manga);
+    await t.pump(); await t.pump();
+    expect(find.byType(CachedNetworkImage), findsNothing);
+    home.rows(rows('late-manga',ProviderType.manga));
+    await t.pump(); await t.pump();
+    expect(t.widget<CachedNetworkImage>(find.byType(CachedNetworkImage)).imageUrl,
+      'https://example.invalid/late-manga.jpg');
+    expect(t.state(find.byType(GenresScreen)),same(state));
+    await t.pumpWidget(const SizedBox());
+    home.rows(rows('after-dispose',ProviderType.manga));
+    await t.pump();
+    expect(t.takeException(),isNull);
+    await mode.close(); await home.close();
+  });
+
+  testWidgets('retained Genres follows media mode and streaming kind', (t) async {
+    final mode=_FakeContentModeCubit(ContentMode.anime);
+    sl.registerSingleton<ContentModeCubit>(mode);
+    sl.registerSingleton<MetadataRepository>(_FakeMetaRepo(true));
+    await t.pumpWidget(harness(_Pushes())); await t.pumpAndSettle();
+    final state=t.state(find.byType(GenresScreen));
+    expect(find.byKey(const ValueKey('genre_Documentary')),findsNothing);
+    await t.runAsync(()=>ZModePrefs.setStreamKind(StreamKind.movie)); await t.pumpAndSettle();
+    expect(find.byKey(const ValueKey('genre_Documentary')),findsOneWidget);
+    mode.change(ContentMode.manga); await t.pumpAndSettle();
+    expect(find.byKey(const ValueKey('genre_Documentary')),findsNothing);
+    mode.change(ContentMode.anime); await t.pumpAndSettle();
+    expect(find.byKey(const ValueKey('genre_Documentary')),findsOneWidget);
+    expect(t.state(find.byType(GenresScreen)),same(state));
+    await t.pumpWidget(const SizedBox());
+    mode.change(ContentMode.novel); await t.pump();
+    expect(t.takeException(),isNull);
+    await mode.close();
   });
 
   testWidgets('lists the genres for the current mode', (t) async {

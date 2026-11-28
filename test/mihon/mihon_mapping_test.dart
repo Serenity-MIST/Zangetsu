@@ -8,14 +8,11 @@ void main() {
   // ── mediaItemFromSManga ─────────────────────────────────────────────────────
   group('mediaItemFromSManga', () {
     test('basic mapping, fully populated', () {
-      final item = mediaItemFromSManga(
-        {
-          'url': 'https://source.test/manga/1',
-          'title': 'One Piece',
-          'thumbnail_url': 'https://img.test/op.jpg',
-        },
-        sourceId: 'mihon:123456',
-      );
+      final item = mediaItemFromSManga({
+        'url': 'https://source.test/manga/1',
+        'title': 'One Piece',
+        'thumbnail_url': 'https://img.test/op.jpg',
+      }, sourceId: 'mihon:123456');
 
       expect(item.id, 'https://source.test/manga/1');
       expect(item.url, 'https://source.test/manga/1');
@@ -26,10 +23,10 @@ void main() {
     });
 
     test('null/absent thumbnail_url produces null cover', () {
-      final item = mediaItemFromSManga(
-        {'url': 'https://source.test/manga/2', 'title': 'Title'},
-        sourceId: 'mihon:789',
-      );
+      final item = mediaItemFromSManga({
+        'url': 'https://source.test/manga/2',
+        'title': 'Title',
+      }, sourceId: 'mihon:789');
       expect(item.cover, isNull);
     });
 
@@ -99,7 +96,12 @@ void main() {
 
     test('distinct author and artist both land in studios, in order', () {
       final detail = mediaDetailFromSManga(
-        {'url': 'u', 'title': 'T', 'author': 'Writer Name', 'artist': 'Artist Name'},
+        {
+          'url': 'u',
+          'title': 'T',
+          'author': 'Writer Name',
+          'artist': 'Artist Name',
+        },
         const [],
         sourceId: 'mihon:2',
       );
@@ -137,17 +139,20 @@ void main() {
       });
     });
 
-    test('status 2 -> completed, 5 -> cancelled, 6 -> hiatus, unknown -> unknown', () {
-      MediaStatus statusFor(int code) => mediaDetailFromSManga(
-            {'url': 'u', 'title': 'T', 'status': code},
-            const [],
-            sourceId: 'mihon:s',
-          ).status;
-      expect(statusFor(2), MediaStatus.completed);
-      expect(statusFor(5), MediaStatus.cancelled);
-      expect(statusFor(6), MediaStatus.hiatus);
-      expect(statusFor(99), MediaStatus.unknown);
-    });
+    test(
+      'status 2 -> completed, 5 -> cancelled, 6 -> hiatus, unknown -> unknown',
+      () {
+        MediaStatus statusFor(int code) => mediaDetailFromSManga(
+          {'url': 'u', 'title': 'T', 'status': code},
+          const [],
+          sourceId: 'mihon:s',
+        ).status;
+        expect(statusFor(2), MediaStatus.completed);
+        expect(statusFor(5), MediaStatus.cancelled);
+        expect(statusFor(6), MediaStatus.hiatus);
+        expect(statusFor(99), MediaStatus.unknown);
+      },
+    );
 
     test('null genre produces empty genres list', () {
       final detail = mediaDetailFromSManga(
@@ -193,17 +198,20 @@ void main() {
       expect(ep.title, 'Chapter 1');
     });
 
-    test('negative chapter_number treated as null number, id falls back to url', () {
-      final ep = episodeFromSChapter({
-        'url': 'https://source.test/ch/special',
-        'name': 'Special',
-        'chapter_number': -1.0,
-        'date_upload': 0,
-      });
+    test(
+      'negative chapter_number treated as null number, id falls back to url',
+      () {
+        final ep = episodeFromSChapter({
+          'url': 'https://source.test/ch/special',
+          'name': 'Special',
+          'chapter_number': -1.0,
+          'date_upload': 0,
+        });
 
-      expect(ep.number, isNull);
-      expect(ep.id, 'https://source.test/ch/special');
-    });
+        expect(ep.number, isNull);
+        expect(ep.id, 'https://source.test/ch/special');
+      },
+    );
 
     test('date_upload millis are converted to ISO string', () {
       final ep = episodeFromSChapter({
@@ -236,42 +244,48 @@ void main() {
       expect(ep.date, isNull);
     });
 
-    test('chapter id uses a fixed-precision number key, distinguishing 1.0 from 1.5', () {
-      final whole = episodeFromSChapter({
-        'url': 'u1',
-        'name': 'C1',
-        'chapter_number': 1.0,
-        'date_upload': 0,
-      });
-      final half = episodeFromSChapter({
-        'url': 'u2',
-        'name': 'C1.5',
-        'chapter_number': 1.5,
-        'date_upload': 0,
-      });
-      expect(whole.id, isNot(equals(half.id)));
-    });
+    test(
+      'chapter id uses a fixed-precision number key, distinguishing 1.0 from 1.5',
+      () {
+        final whole = episodeFromSChapter({
+          'url': 'u1',
+          'name': 'C1',
+          'chapter_number': 1.0,
+          'date_upload': 0,
+        });
+        final half = episodeFromSChapter({
+          'url': 'u2',
+          'name': 'C1.5',
+          'chapter_number': 1.5,
+          'date_upload': 0,
+        });
+        expect(whole.id, isNot(equals(half.id)));
+      },
+    );
 
-    test('same chapter_number, different scanlator -> distinct ids (no collision)', () {
-      // MangaDex-style: two groups both release "Chapter 12" on the same
-      // source. Without folding scanlator into the id, these would collide
-      // and silently share read progress.
-      final groupA = episodeFromSChapter({
-        'url': 'https://source.test/ch/12-groupA',
-        'name': 'Chapter 12',
-        'chapter_number': 12.0,
-        'date_upload': 0,
-        'scanlator': 'Group A',
-      });
-      final groupB = episodeFromSChapter({
-        'url': 'https://source.test/ch/12-groupB',
-        'name': 'Chapter 12',
-        'chapter_number': 12.0,
-        'date_upload': 0,
-        'scanlator': 'Group B',
-      });
-      expect(groupA.id, isNot(equals(groupB.id)));
-    });
+    test(
+      'same chapter_number, different scanlator -> distinct ids (no collision)',
+      () {
+        // MangaDex-style: two groups both release "Chapter 12" on the same
+        // source. Without folding scanlator into the id, these would collide
+        // and silently share read progress.
+        final groupA = episodeFromSChapter({
+          'url': 'https://source.test/ch/12-groupA',
+          'name': 'Chapter 12',
+          'chapter_number': 12.0,
+          'date_upload': 0,
+          'scanlator': 'Group A',
+        });
+        final groupB = episodeFromSChapter({
+          'url': 'https://source.test/ch/12-groupB',
+          'name': 'Chapter 12',
+          'chapter_number': 12.0,
+          'date_upload': 0,
+          'scanlator': 'Group B',
+        });
+        expect(groupA.id, isNot(equals(groupB.id)));
+      },
+    );
 
     test('no scanlator -> id is byte-identical to the plain ch-<n> form', () {
       final ep = episodeFromSChapter({
@@ -309,11 +323,7 @@ void main() {
     });
 
     test('empty imageUrl string also produces null', () {
-      final page = pageImageFromJson({
-        'index': 0,
-        'url': 'u',
-        'imageUrl': '',
-      });
+      final page = pageImageFromJson({'index': 0, 'url': 'u', 'imageUrl': ''});
       expect(page, isNull);
     });
 
@@ -330,17 +340,20 @@ void main() {
   });
 
   group('pagesFromJson', () {
-    test('one unresolvable page (imageUrl: null) is dropped without failing the chapter', () {
-      final pages = pagesFromJson([
-        {'index': 0, 'url': 'u0', 'imageUrl': 'https://cdn.test/0.jpg'},
-        {'index': 1, 'url': 'u1', 'imageUrl': null},
-        {'index': 2, 'url': 'u2', 'imageUrl': 'https://cdn.test/2.jpg'},
-      ]);
+    test(
+      'one unresolvable page (imageUrl: null) is dropped without failing the chapter',
+      () {
+        final pages = pagesFromJson([
+          {'index': 0, 'url': 'u0', 'imageUrl': 'https://cdn.test/0.jpg'},
+          {'index': 1, 'url': 'u1', 'imageUrl': null},
+          {'index': 2, 'url': 'u2', 'imageUrl': 'https://cdn.test/2.jpg'},
+        ]);
 
-      expect(pages, hasLength(2));
-      expect(pages[0].url, 'https://cdn.test/0.jpg');
-      expect(pages[1].url, 'https://cdn.test/2.jpg');
-    });
+        expect(pages, hasLength(2));
+        expect(pages[0].url, 'https://cdn.test/0.jpg');
+        expect(pages[1].url, 'https://cdn.test/2.jpg');
+      },
+    );
 
     test('all pages unresolved yields an empty (not throwing) list', () {
       final pages = pagesFromJson([
@@ -386,12 +399,15 @@ void _chapterNumberFallbackTests() {
       expect(parseChapterNumber('#22'), 22.0);
     });
 
-    test('falls back to a lone number, and gives up on title-only specials', () {
-      expect(parseChapterNumber('12 - Dream'), 12.0);
-      expect(parseChapterNumber('Oneshot'), isNull);
-      expect(parseChapterNumber('Extra'), isNull);
-      expect(parseChapterNumber(''), isNull);
-    });
+    test(
+      'falls back to a lone number, and gives up on title-only specials',
+      () {
+        expect(parseChapterNumber('12 - Dream'), 12.0);
+        expect(parseChapterNumber('Oneshot'), isNull);
+        expect(parseChapterNumber('Extra'), isNull);
+        expect(parseChapterNumber(''), isNull);
+      },
+    );
 
     test(
       'episodeFromSChapter uses the parsed number when the sentinel is set — '

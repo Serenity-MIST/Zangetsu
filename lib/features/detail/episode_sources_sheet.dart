@@ -6,13 +6,17 @@ import 'dart:ui' show FramePhase;
 import 'package:flutter/scheduler.dart';
 
 import '../../core/app_mode.dart';
+import '../../core/desktop/desktop_chrome_colors.dart';
 import '../../core/di/injector.dart';
 import '../../core/models/episode.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/tv/tv_focusable.dart';
+import '../../core/ui/desktop_docked_panel.dart';
 import '../../core/ui/source_switcher.dart';
 import '../../core/zmode/playback_resolver.dart';
+import '../../core/zmode/zmode_ids.dart';
+import '../../core/zmode/zmode_module.dart' show switchedOffForSweep;
 
 /// "Where can I watch this one?" — the sources that HAVE the episode, listed
 /// as they answer.
@@ -36,19 +40,51 @@ import '../../core/zmode/playback_resolver.dart';
 Future<SourceProbe?> showEpisodeSourcesSheet(
   BuildContext context, {
   required Episode episode,
-}) => showDialog<SourceProbe>(
-  context: context,
-  builder: (_) => Dialog(
-    backgroundColor: AppColors.surface,
-    insetPadding: const EdgeInsets.symmetric(horizontal: 28, vertical: 40),
-    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
-    child: _EpisodeSourcesBody(episode: episode),
-  ),
-);
+}) {
+  // Windows: graphite dialog (panel surface + edge, radius 14) that Esc
+  // closes, with a real close button and right-aligned footer buttons.
+  if (desktopPanelsEnabled) {
+    return showDialog<SourceProbe>(
+      context: context,
+      // Same as the desktop dialog kit: stay under the window's title bar.
+      useRootNavigator: false,
+      builder: (_) => DesktopEscCloses(
+        child: Dialog(
+          backgroundColor: DesktopPanelColors.surface,
+          surfaceTintColor: Colors.transparent,
+          insetPadding: const EdgeInsets.all(24),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+            side: BorderSide(color: DesktopPanelColors.edge),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: ConstrainedBox(
+            // A list of source names; wider than this just adds empty space.
+            constraints: const BoxConstraints(maxWidth: 480),
+            child: _EpisodeSourcesBody(episode: episode, desktop: true),
+          ),
+        ),
+      ),
+    );
+  }
+  return showDialog<SourceProbe>(
+    context: context,
+    builder: (_) => Dialog(
+      backgroundColor: AppColors.surface,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 28, vertical: 40),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      child: _EpisodeSourcesBody(episode: episode),
+    ),
+  );
+}
 
 class _EpisodeSourcesBody extends StatefulWidget {
-  const _EpisodeSourcesBody({required this.episode});
+  const _EpisodeSourcesBody({required this.episode, this.desktop = false});
   final Episode episode;
+
+  /// True on Windows: graphite close button, progress track and a
+  /// right-aligned footer instead of the phone's full-width pill buttons.
+  final bool desktop;
 
   @override
   State<_EpisodeSourcesBody> createState() => _EpisodeSourcesBodyState();
@@ -76,6 +112,13 @@ class _EpisodeSourcesBodyState extends State<_EpisodeSourcesBody> {
   /// Built once: [categorizedSources] walks every installed manager, which is
   /// not something to do per row.
   final _tags = <String, ({String label, String? repo})>{};
+
+  /// Windows: sources switched off for Auto Resolve. Auto Resolve and normal
+  /// playback never ask them, so without this the sheet could not offer them
+  /// either and a switched-off source had no on-demand way to be used. They
+  /// are asked after the normal list and their rows say "switched off".
+  /// Always empty on phone and TV (the switch is not honoured there).
+  List<String> _switchedOff = const [];
 
   // ── Frame-stall measurement ─────────────────────────────────────────────
   //
@@ -118,9 +161,20 @@ class _EpisodeSourcesBodyState extends State<_EpisodeSourcesBody> {
   void initState() {
     super.initState();
     _watchFrames();
-    _total = sl<PlaybackResolver>()
-        .candidatesForEpisode(widget.episode.url)
-        .length;
+    final normal = sl<PlaybackResolver>().candidatesForEpisode(
+      widget.episode.url,
+    );
+    final show = ZmodeIds.parseEpisode(widget.episode.url)?.show;
+    if (show != null) {
+      // Only ones not already in the normal list (a pinned or preferred
+      // source is asked there even when switched off).
+      final listed = {for (final c in normal) c.id};
+      _switchedOff = [
+        for (final id in switchedOffForSweep(show.kind))
+          if (!listed.contains(id)) id,
+      ];
+    }
+    _total = normal.length + _switchedOff.length;
     // Best-effort: a missing repo tag must never stop the list from working.
     try {
       final b = categorizedSources();
@@ -137,9 +191,17 @@ class _EpisodeSourcesBodyState extends State<_EpisodeSourcesBody> {
   void _start() {
     setState(() => _done = false);
     _sub?.cancel();
-    _sub = sl<PlaybackResolver>()
-        .probeEach(widget.episode.url, skip: _asked)
-        .listen(
+    final resolver = sl<PlaybackResolver>();
+    // Windows with switched-off sources: ask them too, after the rest.
+    // Otherwise exactly the old call (phone and TV always take this one).
+    final probes = _switchedOff.isEmpty
+        ? resolver.probeEach(widget.episode.url, skip: _asked)
+        : resolver.probeEachWithExtra(
+            widget.episode.url,
+            skip: _asked,
+            extra: _switchedOff,
+          );
+    _sub = probes.listen(
           (p) {
             if (!mounted) return;
             setState(() {
@@ -232,6 +294,15 @@ class _EpisodeSourcesBodyState extends State<_EpisodeSourcesBody> {
                   ),
                   // A dialog with a running job in it needs a way out that
                   // isn't guessing whether tapping outside will work.
+                  // Windows: a focusable IconButton with a tooltip.
+                  if (widget.desktop)
+                    IconButton(
+                      tooltip: 'Close (Esc)',
+                      onPressed: () => Navigator.pop(context),
+                      icon: const Icon(Icons.close_rounded, size: 20),
+                      color: AppColors.textSecondary,
+                    )
+                  else
                   _tvAware(
                     onTap: () => Navigator.pop(context),
                     semanticLabel: 'Close',
@@ -259,7 +330,10 @@ class _EpisodeSourcesBodyState extends State<_EpisodeSourcesBody> {
                   borderRadius: BorderRadius.circular(2),
                   child: LinearProgressIndicator(
                     minHeight: 3,
-                    backgroundColor: AppColors.hairline,
+                    // Windows: the graphite panel's edge colour as the track.
+                    backgroundColor: widget.desktop
+                        ? DesktopPanelColors.edge
+                        : AppColors.hairline,
                     color: AppColors.accent,
                   ),
                 ),
@@ -284,12 +358,45 @@ class _EpisodeSourcesBodyState extends State<_EpisodeSourcesBody> {
                     itemBuilder: (context, i) => _FoundRow(
                       probe: _found[i],
                       tag: _tags[_found[i].sourceId],
+                      switchedOff: _switchedOff.contains(_found[i].sourceId),
                       onTap: () => Navigator.pop(context, _found[i]),
                     ),
                   ),
                 ),
               ],
-              if (!_done) ...[
+              // Windows: one right-aligned button row (Stop while checking,
+              // or check the rest once a pass ends early).
+              if (widget.desktop) ...[
+                if (!_done || more) ...[
+                  const SizedBox(height: 16),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      if (!_done)
+                        TextButton(
+                          onPressed: _stop,
+                          style: TextButton.styleFrom(
+                            foregroundColor: AppColors.textSecondary,
+                          ),
+                          child: const Text('Stop'),
+                        )
+                      else
+                        FilledButton(
+                          onPressed: _start,
+                          style: FilledButton.styleFrom(
+                            backgroundColor: AppColors.accent,
+                            foregroundColor: DesktopChrome.onAccent(
+                              AppColors.accent,
+                            ),
+                          ),
+                          child: Text(
+                            'Check the remaining ${_total - _asked.length}',
+                          ),
+                        ),
+                    ],
+                  ),
+                ],
+              ] else if (!_done) ...[
                 const SizedBox(height: 12),
                 _WideButton(
                   label: 'Stop',
@@ -314,8 +421,13 @@ class _FoundRow extends StatelessWidget {
     required this.probe,
     required this.onTap,
     this.tag,
+    this.switchedOff = false,
   });
   final SourceProbe probe;
+
+  /// Windows: this source is switched off for Auto Resolve; the row says so,
+  /// so the viewer knows it is only used because they picked it here.
+  final bool switchedOff;
 
   /// The picker's own label (ecosystem-prefixed) and repo, when the registries
   /// could be read. Falls back to the plain source name.
@@ -343,10 +455,14 @@ class _FoundRow extends StatelessWidget {
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
-                if (tag?.repo != null) ...[
+                if (tag?.repo != null || switchedOff) ...[
                   const SizedBox(height: 2),
                   Text(
-                    tag!.repo!,
+                    // Windows: "switched off" first, then the repo if known.
+                    [
+                      if (switchedOff) 'Switched off for Auto Resolve',
+                      if (tag?.repo != null) tag!.repo!,
+                    ].join(' · '),
                     style: AppText.caption.copyWith(
                       color: AppColors.textTertiary,
                       fontSize: 11,

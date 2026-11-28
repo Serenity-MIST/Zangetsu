@@ -43,8 +43,18 @@ abstract class JsEngine {
   /// Read by [PlaybackResolver] to decide how long a source the viewer
   /// explicitly picked may take. Where this is false the old, tight budget has
   /// to stand — the wait would be a frozen screen.
+  ///
+  /// Windows takes the isolate too: its QuickJS loads through FFI from any
+  /// isolate, and the Apple-only JavaScriptCore re-entry problem described in
+  /// [JsEngine.new] does not apply there. `flutter test` runs on a Windows
+  /// host but must keep the host-neutral default, so it is excluded.
   static bool get runsOffUiIsolate =>
-      debugRunsOffUiIsolateOverride ?? Platform.isAndroid;
+      debugRunsOffUiIsolateOverride ??
+      (Platform.isAndroid || (Platform.isWindows && !_underFlutterTest));
+
+  /// True inside `flutter test`, which sets FLUTTER_TEST in the environment.
+  static bool get _underFlutterTest =>
+      Platform.environment['FLUTTER_TEST'] == 'true';
 
   /// Lets a test pretend either way — the host `flutter test` runs on is not
   /// Android, so without this the isolate-only behaviour is unreachable.
@@ -52,7 +62,7 @@ abstract class JsEngine {
   static bool? debugRunsOffUiIsolateOverride;
 
   factory JsEngine({required JsChannelSink onChannel, bool polling = false}) {
-    // Android only for now. Apple runs JavaScriptCore, whose FFI callback
+    // Android and Windows (QuickJS) only. Apple runs JavaScriptCore, whose FFI callback
     // already cannot re-enter Dart while evaluate() holds the engine on
     // physical tvOS (hence __usePollingBridge in js_bootstrap.dart). Until
     // that can be tested on real hardware it keeps the runtime it has always

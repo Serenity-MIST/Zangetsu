@@ -27,8 +27,7 @@ class ReaderOverrideStore {
 
   Box get _box => Hive.box(boxName);
 
-  String _key(String sourceId, String showId) =>
-      hiveKey('$sourceId:$showId');
+  String _key(String sourceId, String showId) => hiveKey('$sourceId:$showId');
 
   Map<String, dynamic> _entry(String sourceId, String showId) {
     final raw = _box.get(_key(sourceId, showId));
@@ -43,7 +42,9 @@ class ReaderOverrideStore {
     String sourceId,
     String showId,
     String field,
-    String? value,
+    // Object rather than String so the Windows page width (a number) and the
+    // spread shift (a bool) can share the same per-series entry.
+    Object? value,
   ) {
     final entry = _entry(sourceId, showId);
     if (value == null) {
@@ -81,4 +82,47 @@ class ReaderOverrideStore {
   /// else the global default.
   String effectiveFit(String sourceId, String showId, ReaderPrefs prefs) =>
       fitOverride(sourceId, showId) ?? prefs.fitMode;
+
+  /// Default width cap (logical px) of the Windows long strip, used when a
+  /// series has no 'Page width' of its own.
+  static const double defaultPageWidth = 1040;
+
+  /// Range the Windows 'Page width' slider offers.
+  static const double minPageWidth = 400;
+  static const double maxPageWidth = 2400;
+
+  /// Windows long-strip page width for this series (reader-5), or null when
+  /// it uses [defaultPageWidth]. Stored as a number in the series' entry.
+  double? pageWidthOverride(String sourceId, String showId) {
+    final raw = _entry(sourceId, showId)['pageWidth'];
+    return raw is num ? raw.toDouble() : null;
+  }
+
+  /// Saves (or, with null, clears) the series' long-strip page width,
+  /// clamped to the slider's range.
+  Future<void> setPageWidthOverride(
+    String sourceId,
+    String showId,
+    double? value,
+  ) => _putField(
+    sourceId,
+    showId,
+    'pageWidth',
+    value?.clamp(minPageWidth, maxPageWidth).roundToDouble(),
+  );
+
+  /// The width the long strip is capped at for this series on Windows.
+  double effectivePageWidth(String sourceId, String showId) =>
+      pageWidthOverride(sourceId, showId) ?? defaultPageWidth;
+
+  /// Whether double-page spreads for this series start one page later
+  /// (reader-8), so a cover or credits page that shifted the pairing is
+  /// fixed. False when never set.
+  bool shiftSpread(String sourceId, String showId) =>
+      _entry(sourceId, showId)['shiftSpread'] == true;
+
+  /// Turns the spread shift on or off for this series; off removes the field
+  /// so an untouched title leaves nothing in the box.
+  Future<void> setShiftSpread(String sourceId, String showId, bool value) =>
+      _putField(sourceId, showId, 'shiftSpread', value ? true : null);
 }

@@ -15,6 +15,8 @@ import '../mode/content_mode.dart';
 import 'cbz_image.dart';
 import 'chapter_download.dart';
 import 'download_prefs.dart';
+// Recycle Bin deletes for saved chapters on Windows (dl-2).
+import 'download_recycle.dart';
 
 /// Hive-backed index of saved manga/novel chapters, plus the on-disk layout
 /// they live in.
@@ -119,9 +121,21 @@ class ChapterDownloadStore {
     if (d != null) {
       // The reader may still hold the archive open.
       if (d.archivePath != null) releaseCbz();
+      // A saved chapter deleted on Windows goes to the Recycle Bin so it can
+      // be restored (dl-2). Staging folders below stay permanent deletes:
+      // they are app-private leftovers, not the user's files.
+      final recycle =
+          d.status == ChapterDownloadStatus.done && recycleDownloadDeletes;
+      final ownedPath = ownedFolder(d)?.path;
       for (final p in [...d.pagePaths, ?d.textPath, ?d.archivePath]) {
+        // A novel's own folder is recycled whole below, as one bin entry.
+        if (recycle && ownedPath != null && p.startsWith(ownedPath)) continue;
         try {
-          await File(p).delete();
+          if (recycle) {
+            await deleteDownloadedFile(File(p));
+          } else {
+            await File(p).delete();
+          }
         } catch (_) {
           // Already gone, or the user deleted it themselves. Either way the
           // record still goes.
@@ -130,7 +144,11 @@ class ChapterDownloadStore {
       final owned = ownedFolder(d);
       if (owned != null) {
         try {
-          await deleteDir(owned);
+          if (recycle) {
+            await deleteDownloadedFolder(owned);
+          } else {
+            await deleteDir(owned);
+          }
         } catch (_) {
           // Best-effort, like the file deletes above.
         }
@@ -216,7 +234,9 @@ class ChapterDownloadStore {
       ..sort((a, b) => a.path.compareTo(b.path));
     if (files.isEmpty) return d;
 
-    final show = 'Zangetsu/${safeName(d.showTitle)}';
+    final show = Platform.isWindows
+        ? '${d.mode == ContentMode.novel ? 'Novels' : 'Manga'}/${safeName(d.showTitle)}'
+        : 'Zangetsu/${safeName(d.showTitle)}';
     final chapter = safeName(d.chapterTitle);
     // Manga leaves as one archive; a novel is a single html file already.
     final packed = d.mode == ContentMode.novel
@@ -329,10 +349,9 @@ class ChapterDownloadStore {
   Directory? _cachedRoot;
 
   /// Staging root, and where chapters from older builds still live.
-  Future<Directory> _root() async =>
-      _cachedRoot ??= Directory(
-        '${(await getApplicationSupportDirectory()).path}/chapters',
-      );
+  Future<Directory> _root() async => _cachedRoot ??= Directory(
+    '${(await getApplicationSupportDirectory()).path}/chapters',
+  );
 
   static String _hash(String url) =>
       crypto.sha1.convert(utf8.encode(url)).toString();

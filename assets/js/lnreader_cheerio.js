@@ -1,3 +1,10 @@
+globalThis.__lnSetUint64 = function (view, offset, value, littleEndian) {
+  if (!Number.isSafeInteger(value) || value < 0) throw new RangeError('Invalid uint64 length');
+  const low = value >>> 0;
+  const high = Math.floor(value / 4294967296);
+  view.setUint32(offset + (littleEndian ? 0 : 4), low, littleEndian);
+  view.setUint32(offset + (littleEndian ? 4 : 0), high, littleEndian);
+};
 (() => {
   var __create = Object.create;
   var __defProp = Object.defineProperty;
@@ -10399,8 +10406,8 @@
     abool(isLE2);
     const num = new Uint8Array(16);
     const view = createView(num);
-    view.setBigUint64(0, BigInt(aadLength), isLE2);
-    view.setBigUint64(8, BigInt(dataLength), isLE2);
+    globalThis.__lnSetUint64(view, 0, aadLength, isLE2);
+    globalThis.__lnSetUint64(view, 8, dataLength, isLE2);
     return num;
   }
   function isAligned32(bytes) {
@@ -10728,7 +10735,7 @@
       } else {
         const nonceLen = EMPTY_BLOCK.slice();
         const view = createView(nonceLen);
-        view.setBigUint64(8, BigInt(nonce.length * 8), false);
+        globalThis.__lnSetUint64(view, 8, nonce.length * 8, false);
         const g = ghash.create(authKey).update(nonce).update(nonceLen);
         g.digestInto(counter);
         g.destroy();

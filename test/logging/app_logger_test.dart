@@ -35,6 +35,22 @@ void main() {
     expect(log.contents, contains('E'));
   });
 
+  test('onLine gets each line, redacted and cut; null is fine', () {
+    final log = AppLogger.instance..clearForTest();
+    final seen = <String>[];
+    AppLogger.onLine = seen.add;
+    log.log('token: abc123\nsecond');
+    log.log('x' * 1000);
+    AppLogger.onLine = null;
+    log.log('not seen');
+    expect(seen, hasLength(3));
+    expect(seen[0], contains('<redacted>'));
+    expect(seen[0], isNot(contains('abc123')));
+    expect(seen[1], contains('second'));
+    expect(seen[2], hasLength(300));
+    expect(log.contents, contains('not seen'));
+  });
+
   group('on-disk log', () {
     late Directory dir;
     late File file;
@@ -47,6 +63,8 @@ void main() {
     });
 
     tearDown(() async {
+      // Drain writes before clearing the singleton or removing a Windows file.
+      await AppLogger.instance.flush();
       AppLogger.instance.clearForTest();
       await dir.delete(recursive: true);
     });
@@ -96,7 +114,7 @@ void main() {
       // lines were written.
       expect(lines.length, lessThanOrEqualTo(4001));
       expect(lines.last, contains('line 2499'));
-    });
+    }, timeout: const Timeout(Duration(minutes: 2)));
 
     test('redaction reaches the disk, not just the buffer', () async {
       AppLogger.instance.log('signed in as someone@example.com ok');

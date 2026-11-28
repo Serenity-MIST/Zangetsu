@@ -1,7 +1,10 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
 
+import '../../core/desktop/desktop_context_menu.dart';
+import '../../core/desktop/desktop_sheet.dart';
 import '../../core/di/injector.dart';
 import '../../core/ui/source_icon_tile.dart';
 import '../../core/lnreader/lnreader_extension_service.dart';
@@ -12,8 +15,17 @@ import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../core/ui/app_dialog.dart';
 import '../../core/ui/states.dart';
+import 'sources_desktop_keys.dart';
 import 'sources_search_field.dart';
 import '../../l10n/l10n.dart';
+
+/// Windows-only behaviour on this screen (update banner, keys, right-click
+/// menus, desktop language dialog) is gated on this; phone stays unchanged.
+bool get _windowsLnr => defaultTargetPlatform == TargetPlatform.windows;
+
+/// The shared manager when DI has it (tests may register only the service).
+LnReaderManager? get _lnrManager =>
+    sl.isRegistered<LnReaderManager>() ? sl<LnReaderManager>() : null;
 
 /// Hive box name for persisted LNReader repo index URLs — the novel twin of
 /// `kMihonReposBoxName` (`lib/features/sources/mihon_repo_tab.dart`).
@@ -61,16 +73,34 @@ class _LnReaderSourcesScreenState extends State<LnReaderSourcesScreen> {
 
   final _langPrefs = sl<NovelLangPrefs>();
 
+  /// Wraps the search box so Ctrl+F can focus it (the shared field does not
+  /// take a FocusNode).
+  final _searchScope = FocusScopeNode(debugLabel: 'lnreader-search');
+
+  /// True while the Windows "Update all" runs.
+  bool _updatingAll = false;
+
+  /// The manager this screen listens to (Windows only), kept so dispose
+  /// removes the listener from the same object even if the platform check
+  /// or DI registration changed in between (e.g. a test resetting it).
+  LnReaderManager? _listenedManager;
+
   @override
   void initState() {
     super.initState();
     _langPrefs.addListener(_onLangsChanged);
+    // Windows: redraw update badges when the manager's catalog changes.
+    if (_windowsLnr) {
+      _listenedManager = _lnrManager?..addListener(_onLangsChanged);
+    }
     _load();
   }
 
   @override
   void dispose() {
     _langPrefs.removeListener(_onLangsChanged);
+    _listenedManager?.removeListener(_onLangsChanged);
+    _searchScope.dispose();
     _searchCtrl.dispose();
     super.dispose();
   }
@@ -78,6 +108,40 @@ class _LnReaderSourcesScreenState extends State<LnReaderSourcesScreen> {
   void _onLangsChanged() {
     if (mounted) setState(() {});
   }
+
+  /// Esc on Windows: clear a typed search first; otherwise let the app's Esc
+  /// unfocus the field or go back.
+  bool _escape() {
+    if (_searchCtrl.text.isEmpty) return false;
+    _searchCtrl.clear();
+    setState(() => _query = '');
+    return true;
+  }
+
+  /// src-16 (Windows): installs every pending novel plugin update.
+  Future<void> _updateAll() async {
+    final manager = _lnrManager;
+    if (manager == null || _updatingAll) return;
+    final messenger = ScaffoldMessenger.of(context);
+    final l10n = context.l10n;
+    setState(() => _updatingAll = true);
+    final done = await manager.updateAll();
+    if (!mounted) return;
+    setState(() => _updatingAll = false);
+    messenger
+      ..clearSnackBars()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(l10n.updatedSourcesCount(done, done == 1 ? '' : 's')),
+        ),
+      );
+  }
+
+  /// Ids of installed plugins with a newer repo version (Windows only; the
+  /// phone screen keeps its no-update layout).
+  Set<String> get _updateIds => _windowsLnr
+      ? {for (final m in _lnrManager?.updates ?? const []) m.id}
+      : const {};
 
   /// Every plugin meta the tracked repos returned (successful repos only),
   /// flattened — feeds the language sheet and the default-language guess.
@@ -177,6 +241,9 @@ class _LnReaderSourcesScreenState extends State<LnReaderSourcesScreen> {
         ..addEntries(fetched);
       _state = _LoadState.loaded;
     });
+    // src-16: the freshly downloaded lists are what update detection
+    // compares installed versions against.
+    if (_windowsLnr) _lnrManager?.recordCatalog(_allCatalogEntries);
   }
 
   Future<void> _addRepo(String url) async {
@@ -231,6 +298,83 @@ class _LnReaderSourcesScreenState extends State<LnReaderSourcesScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // src-3 (Windows): desktop settings look whatever opened it, with the
+    // shared provider toolbar and keys (same port as the Mihon screen).
+    if (desktopPanelsEnabled) {
+      return DesktopProviderScope(child: Builder(builder: _desktop));
+    }
+    // src-13 (Windows): Ctrl+F focuses search, F5 / Ctrl+R refreshes the
+    // repositories, Esc clears the search before going back.
+    return SourcesDesktopKeys(
+      onFind: () => focusFirstIn(_searchScope),
+      onRefresh: () => _load(refresh: true),
+      onEscape: _escape,
+      child: _scaffold(context),
+    );
+  }
+
+  /// Windows layout (src-3 / src-13): settings app bar, the shared toolbar
+  /// (tabs, languages, refresh, Add repository, search) and no floating
+  /// button. [DesktopSourcesKeys] gives Ctrl+F (focus search), Esc (clear
+  /// search, then back) and F5 / Ctrl+R (re-fetch the repositories).
+  Widget _desktop(BuildContext context) => DesktopSourcesKeys(
+    onRefresh: () => _load(refresh: true),
+    child: DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        backgroundColor: AppColors.bg,
+        appBar: desktopSourcesAppBar(context.l10n.lnreader),
+        body: Column(
+          children: [
+            DesktopSourcesToolbar(
+              tabs: [context.l10n.installed, context.l10n.repositories],
+              actions: [
+                // Same rule as the phone app bar: only when there is more
+                // than one language to filter.
+                if (_state == _LoadState.loaded && _availableLangs.length > 1)
+                  IconButton(
+                    tooltip: context.l10n.languages,
+                    icon: const Icon(Icons.language_rounded),
+                    onPressed: _openLanguageSheet,
+                  ),
+                // Builder: the keys scope sits below `context` here.
+                Builder(
+                  builder: (inner) => IconButton(
+                    tooltip: inner.l10n.refreshRepositoriesF5,
+                    icon: const Icon(Icons.refresh_rounded),
+                    onPressed: () =>
+                        DesktopSourcesKeys.maybeOf(inner)?.refresh(),
+                  ),
+                ),
+              ],
+              addLabel: context.l10n.addRepository,
+              addKey: const ValueKey('desktop-add-lnreader-repo'),
+              onAdd: _showAddRepoDialog,
+              // Joins the keys scope by itself (no FocusScope workaround).
+              search: SourcesSearchField(
+                controller: _searchCtrl,
+                onChanged: (q) => setState(() => _query = q),
+                hint: context.l10n.searchNovelSources,
+              ),
+            ),
+            Expanded(
+              child: TabBarView(
+                children: [_installedTab(), _repositoriesTab()],
+              ),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+
+  /// List padding: no room is kept for a floating button on Windows.
+  EdgeInsets get _listPadding => desktopPanelsEnabled
+      ? kDesktopSourcesListPadding
+      : const EdgeInsets.fromLTRB(16, 12, 16, 96);
+
+  /// Phone (and TV) layout, unchanged.
+  Widget _scaffold(BuildContext context) {
     return DefaultTabController(
       length: 2,
       child: Scaffold(
@@ -275,11 +419,9 @@ class _LnReaderSourcesScreenState extends State<LnReaderSourcesScreen> {
           children: [
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-              child: SourcesSearchField(
-                controller: _searchCtrl,
-                onChanged: (q) => setState(() => _query = q),
-                hint: context.l10n.searchNovelSources,
-              ),
+              child: _windowsLnr
+                  ? FocusScope(node: _searchScope, child: _searchField(context))
+                  : _searchField(context),
             ),
             Expanded(
               child: TabBarView(
@@ -288,6 +430,61 @@ class _LnReaderSourcesScreenState extends State<LnReaderSourcesScreen> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  /// The shared search box (wrapped in [_searchScope] on Windows).
+  Widget _searchField(BuildContext context) => SourcesSearchField(
+    controller: _searchCtrl,
+    onChanged: (q) => setState(() => _query = q),
+    hint: context.l10n.searchNovelSources,
+  );
+
+  /// src-16 (Windows): "N updates available" card with Update all, shown
+  /// above the installed list like Mihon's update pill.
+  Widget _updatesBanner(int count) {
+    return Container(
+      key: const ValueKey('lnreader-updates-banner'),
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.fromLTRB(16, 10, 10, 10),
+      decoration: BoxDecoration(
+        color: AppColors.accent.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.system_update_alt_rounded, color: AppColors.accent),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              count == 1
+                  ? context.l10n.oneUpdate
+                  : context.l10n.nUpdates(count),
+              style: AppText.body.copyWith(
+                color: AppColors.accent,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          FilledButton(
+            key: const ValueKey('lnreader-update-all'),
+            onPressed: _updatingAll ? null : _updateAll,
+            style: FilledButton.styleFrom(
+              backgroundColor: AppColors.accent,
+              foregroundColor: Colors.white,
+            ),
+            child: _updatingAll
+                ? const SizedBox.square(
+                    dimension: 16,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: Colors.white,
+                    ),
+                  )
+                : Text(context.l10n.updateAllCount(count)),
+          ),
+        ],
       ),
     );
   }
@@ -309,12 +506,15 @@ class _LnReaderSourcesScreenState extends State<LnReaderSourcesScreen> {
             : 'No installed sources match "${_query.trim()}".',
       );
     }
+    final updateIds = _updateIds;
     return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
+      padding: _listPadding,
       children: [
+        if (updateIds.isNotEmpty) _updatesBanner(updateIds.length),
         _LnReaderCatalogCard(
           entries: installed,
           installedIds: installed.map((m) => m.id).toSet(),
+          updateIds: updateIds,
           onChanged: () => setState(() {}),
           iconOnly: true, // Installed tab → compact trash icon
         ),
@@ -349,14 +549,19 @@ class _LnReaderSourcesScreenState extends State<LnReaderSourcesScreen> {
         return byCount != 0 ? byCount : _langName(a).compareTo(_langName(b));
       });
 
-    showModalBottomSheet<void>(
-      context: context,
+    // src-7 (Windows): a centred graphite dialog titled "Languages" instead
+    // of a phone bottom sheet; phone gets the identical bottom sheet.
+    showAdaptiveSheet<void>(
+      context,
+      title: _windowsLnr ? context.l10n.languages : null,
       backgroundColor: AppColors.surface,
       showDragHandle: true,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
       builder: (ctx) {
+        // Inside the desktop dialog the title bar already names it.
+        final desktop = DesktopSheetScope.of(ctx);
         return SafeArea(
           child: StatefulBuilder(
             builder: (ctx, setSheet) {
@@ -366,21 +571,22 @@ class _LnReaderSourcesScreenState extends State<LnReaderSourcesScreen> {
               return Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 4, 20, 6),
-                    child: Row(
-                      children: [
-                        Text(context.l10n.languages, style: AppText.headline),
-                        const Spacer(),
-                        Text(
-                          '${enabled.where(counts.containsKey).length} of ${langs.length}',
-                          style: AppText.caption.copyWith(
-                            color: AppColors.textSecondary,
+                  if (!desktop)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 4, 20, 6),
+                      child: Row(
+                        children: [
+                          Text(context.l10n.languages, style: AppText.headline),
+                          const Spacer(),
+                          Text(
+                            '${enabled.where(counts.containsKey).length} of ${langs.length}',
+                            style: AppText.caption.copyWith(
+                              color: AppColors.textSecondary,
+                            ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
-                  ),
                   Flexible(
                     child: ListView(
                       shrinkWrap: true,
@@ -432,13 +638,14 @@ class _LnReaderSourcesScreenState extends State<LnReaderSourcesScreen> {
         .map((m) => m.id)
         .toSet();
     final enabled = _enabledLangs;
+    final updateIds = _updateIds;
 
     return RefreshIndicator(
       color: AppColors.accent,
       backgroundColor: AppColors.surface,
       onRefresh: () => _load(refresh: true),
       child: ListView(
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
+        padding: _listPadding,
         children: [
           if (_repoUrls.isEmpty)
             EmptyState(
@@ -455,6 +662,7 @@ class _LnReaderSourcesScreenState extends State<LnReaderSourcesScreen> {
                 query: _query,
                 enabledLangs: enabled,
                 installedIds: installedIds,
+                updateIds: updateIds,
                 onRemove: () => _confirmRemoveRepo(url),
                 onRefresh: () => _load(refresh: true),
                 onChanged: () => setState(() {}),
@@ -570,6 +778,7 @@ class _LnReaderRepoSection extends StatefulWidget {
     required this.onRemove,
     required this.onRefresh,
     required this.onChanged,
+    this.updateIds = const {},
   });
 
   final String url;
@@ -577,6 +786,9 @@ class _LnReaderRepoSection extends StatefulWidget {
   final String query;
   final Set<String> enabledLangs;
   final Set<String> installedIds;
+
+  /// Installed plugin ids with a newer version (Windows update badges).
+  final Set<String> updateIds;
   final VoidCallback onRemove;
   final VoidCallback onRefresh;
   final VoidCallback onChanged;
@@ -623,88 +835,30 @@ class _LnReaderRepoSectionState extends State<_LnReaderRepoSection> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 4, 12),
-            child: Row(
-              children: [
-                Expanded(
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTap: () => setState(() => _expanded = !_expanded),
-                    child: Row(
-                      children: [
-                        AnimatedRotation(
-                          turns: _expanded ? 0 : -0.25,
-                          duration: const Duration(milliseconds: 200),
-                          child: const Icon(
-                            Icons.expand_more,
-                            color: AppColors.textSecondary,
-                            size: 22,
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                _displayName,
-                                style: AppText.headline,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                error != null
-                                    ? context.l10n.failedToLoad
-                                    : '${widget.catalog?.entries?.length ?? 0} source'
-                                          '${(widget.catalog?.entries?.length ?? 0) == 1 ? '' : 's'}',
-                                style: AppText.caption.copyWith(
-                                  color: error != null
-                                      ? AppColors.accent
-                                      : AppColors.textTertiary,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-                PopupMenuButton<String>(
-                  icon: const Icon(
-                    Icons.more_vert,
-                    color: AppColors.textSecondary,
-                  ),
-                  color: AppColors.surface2,
-                  onSelected: (v) {
-                    if (v == 'refresh') widget.onRefresh();
-                    if (v == 'remove') widget.onRemove();
-                  },
-                  itemBuilder: (_) => [
-                    PopupMenuItem(
-                      value: 'refresh',
-                      child: Text(
-                        context.l10n.refresh,
-                        style: AppText.body.copyWith(
-                          color: AppColors.textPrimary,
-                        ),
-                      ),
-                    ),
-                    PopupMenuItem(
-                      value: 'remove',
-                      child: Text(
-                        context.l10n.removeRepository,
-                        style: AppText.body.copyWith(
-                          color: AppColors.textPrimary,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
+          // src-13 (Windows): right-click the repo header for the same
+          // actions as its three-dot menu.
+          DesktopContextMenuRegion(
+            items: () => [
+              DesktopMenuItem<Object?>(
+                label: context.l10n.refresh,
+                icon: Icons.refresh_rounded,
+                shortcut: 'F5',
+                onTap: widget.onRefresh,
+              ),
+              DesktopMenuItem<Object?>(
+                label: _expanded ? context.l10n.collapse : context.l10n.expand,
+                icon: _expanded ? Icons.unfold_less : Icons.unfold_more,
+                onTap: () => setState(() => _expanded = !_expanded),
+              ),
+              const DesktopMenuItem<Object?>.divider(),
+              DesktopMenuItem<Object?>(
+                label: context.l10n.removeRepository,
+                icon: Icons.delete_outline_rounded,
+                destructive: true,
+                onTap: widget.onRemove,
+              ),
+            ],
+            child: _header(context, error),
           ),
           AnimatedSize(
             duration: const Duration(milliseconds: 200),
@@ -713,6 +867,86 @@ class _LnReaderRepoSectionState extends State<_LnReaderRepoSection> {
             child: !(_expanded || searching)
                 ? const SizedBox(width: double.infinity)
                 : _buildBody(error, filtered),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Repo header row: collapse chevron, name, source count and menu.
+  Widget _header(BuildContext context, Object? error) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 4, 12),
+      child: Row(
+        children: [
+          Expanded(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => setState(() => _expanded = !_expanded),
+              child: Row(
+                children: [
+                  AnimatedRotation(
+                    turns: _expanded ? 0 : -0.25,
+                    duration: const Duration(milliseconds: 200),
+                    child: const Icon(
+                      Icons.expand_more,
+                      color: AppColors.textSecondary,
+                      size: 22,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          _displayName,
+                          style: AppText.headline,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          error != null
+                              ? context.l10n.failedToLoad
+                              : '${widget.catalog?.entries?.length ?? 0} source'
+                                    '${(widget.catalog?.entries?.length ?? 0) == 1 ? '' : 's'}',
+                          style: AppText.caption.copyWith(
+                            color: error != null
+                                ? AppColors.accent
+                                : AppColors.textTertiary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.more_vert, color: AppColors.textSecondary),
+            color: AppColors.surface2,
+            onSelected: (v) {
+              if (v == 'refresh') widget.onRefresh();
+              if (v == 'remove') widget.onRemove();
+            },
+            itemBuilder: (_) => [
+              PopupMenuItem(
+                value: 'refresh',
+                child: Text(
+                  context.l10n.refresh,
+                  style: AppText.body.copyWith(color: AppColors.textPrimary),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'remove',
+                child: Text(
+                  context.l10n.removeRepository,
+                  style: AppText.body.copyWith(color: AppColors.textPrimary),
+                ),
+              ),
+            ],
           ),
         ],
       ),
@@ -738,6 +972,7 @@ class _LnReaderRepoSectionState extends State<_LnReaderRepoSection> {
     return _LnReaderCatalogCard(
       entries: filtered,
       installedIds: widget.installedIds,
+      updateIds: widget.updateIds,
       onChanged: widget.onChanged,
       bare: true, // already inside this section's own card
     );
@@ -753,12 +988,16 @@ class _LnReaderCatalogCard extends StatelessWidget {
     required this.onChanged,
     this.bare = false,
     this.iconOnly = false,
+    this.updateIds = const {},
   });
 
   final List<LnReaderPluginMeta> entries;
   final Set<String> installedIds;
   final VoidCallback onChanged;
   final bool bare;
+
+  /// Installed ids with a newer version (Windows update badges only).
+  final Set<String> updateIds;
 
   /// True for the Installed tab (compact trash icon); false for a repo's
   /// catalog (text Install/Uninstall buttons).
@@ -779,6 +1018,7 @@ class _LnReaderCatalogCard extends StatelessWidget {
             key: ValueKey(entries[i].id),
             meta: entries[i],
             installed: installedIds.contains(entries[i].id),
+            hasUpdate: updateIds.contains(entries[i].id),
             onChanged: onChanged,
             iconOnly: iconOnly,
           ),
@@ -808,10 +1048,14 @@ class _LnReaderSourceRow extends StatefulWidget {
     required this.installed,
     required this.onChanged,
     this.iconOnly = false,
+    this.hasUpdate = false,
   });
 
   final LnReaderPluginMeta meta;
   final bool installed;
+
+  /// Windows: a newer version is listed (accent note + Update action).
+  final bool hasUpdate;
 
   /// Installed tab uses the compact trash icon ([iconOnly] true); a repo's
   /// catalog uses text Install/Uninstall buttons like Mihon's repo tab.
@@ -837,6 +1081,8 @@ class _LnReaderSourceRowState extends State<_LnReaderSourceRow> {
       // given id wins, whichever repo it came from. Acceptable: it just
       // overwrites the stored JS, never crashes.
       await sl<LnReaderExtensionService>().install(widget.meta);
+      // The install remains valid after navigation; its old row and parent do not.
+      if (!mounted) return;
       widget.onChanged();
       messenger
         ..clearSnackBars()
@@ -844,6 +1090,7 @@ class _LnReaderSourceRowState extends State<_LnReaderSourceRow> {
           SnackBar(content: Text(context.l10n.installedName(widget.meta.name))),
         );
     } catch (e) {
+      if (!mounted) return;
       messenger
         ..clearSnackBars()
         ..showSnackBar(
@@ -867,6 +1114,8 @@ class _LnReaderSourceRowState extends State<_LnReaderSourceRow> {
     setState(() => _busy = true);
     try {
       await sl<LnReaderManager>().uninstall(widget.meta.id);
+      // Removing an extension must not rebuild a route that has already closed.
+      if (!mounted) return;
       widget.onChanged();
       messenger
         ..clearSnackBars()
@@ -874,6 +1123,7 @@ class _LnReaderSourceRowState extends State<_LnReaderSourceRow> {
           SnackBar(content: Text(context.l10n.removedName(widget.meta.name))),
         );
     } catch (e) {
+      if (!mounted) return;
       messenger
         ..clearSnackBars()
         ..showSnackBar(
@@ -884,8 +1134,66 @@ class _LnReaderSourceRowState extends State<_LnReaderSourceRow> {
     }
   }
 
+  /// src-16 (Windows): installs the newer repo version of this plugin.
+  Future<void> _update() async {
+    final manager = _lnrManager;
+    if (manager == null) return;
+    final newer = manager.updates
+        .where((m) => m.id == widget.meta.id)
+        .firstOrNull;
+    if (newer == null) return;
+    final messenger = ScaffoldMessenger.of(context);
+    final l10n = context.l10n;
+    setState(() => _busy = true);
+    try {
+      await manager.update(newer);
+      if (!mounted) return;
+      widget.onChanged();
+      messenger
+        ..clearSnackBars()
+        ..showSnackBar(
+          SnackBar(content: Text(l10n.updatedSourcesCount(1, ''))),
+        );
+    } catch (e) {
+      if (!mounted) return;
+      messenger
+        ..clearSnackBars()
+        ..showSnackBar(SnackBar(content: Text(l10n.installFailed('$e'))));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// src-13 (Windows): right-click actions for this plugin, built with the
+  /// shared provider menu so labels, icons and order match the other
+  /// provider screens. LNReader plugins have no per-source settings, so
+  /// there is no Settings entry. While busy only the site link is offered.
+  List<DesktopMenuItem<Object?>> _menu(BuildContext context) =>
+      desktopSourceMenuItems(
+        context,
+        onInstall: !widget.installed && !_busy ? _install : null,
+        onUpdate: widget.installed && widget.hasUpdate && !_busy
+            ? _update
+            : null,
+        onOpenSite:
+            widget.installed && source_actions.webViewUrlFor(_sourceId) != null
+            ? () => source_actions.openSourceWebView(_sourceId)
+            : null,
+        onUninstall: widget.installed && !_busy ? _remove : null,
+      );
+
   @override
   Widget build(BuildContext context) {
+    // Windows: hover highlight, name + version tooltip and right-click menu
+    // (src-13 B). Pass-through on phone.
+    return DesktopSourceRow(
+      items: () => _menu(context),
+      tooltip: '${widget.meta.name} ${widget.meta.version}',
+      child: _row(context),
+    );
+  }
+
+  Widget _row(BuildContext context) {
     final meta = widget.meta;
     final host = Uri.parse(meta.site).host;
     return Padding(
@@ -910,6 +1218,16 @@ class _LnReaderSourceRowState extends State<_LnReaderSourceRow> {
                 ),
                 const SizedBox(height: 2),
                 Text('${meta.lang} · $host', style: AppText.caption),
+                // Windows update badge (src-16), same accent as Mihon's.
+                if (widget.installed && widget.hasUpdate)
+                  Text(
+                    context.l10n.updateAvailable,
+                    key: ValueKey('lnreader-update-${meta.id}'),
+                    style: AppText.caption.copyWith(
+                      color: AppColors.accent,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
               ],
             ),
           ),

@@ -1,4 +1,5 @@
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 
 import '../metadata/tmdb.dart';
 import '../models/episode.dart';
@@ -581,6 +582,9 @@ class TmdbCatalogue implements VideoCatalogue {
   }) {
     final results = data?['results'];
     if (results is! List) return const [];
+    // Only the Windows Home banner shows the synopsis; phone and TV items
+    // stay exactly as they were (no description, same equality).
+    final keepOverview = defaultTargetPlatform == TargetPlatform.windows;
     final out = <MediaItem>[];
     for (final r in results) {
       if (r is! Map) continue;
@@ -599,6 +603,9 @@ class TmdbCatalogue implements VideoCatalogue {
           title: ((isTv ? m['name'] : m['title']) as String?) ?? '',
           cover: _poster(m['poster_path'] as String?),
           banner: _backdrop(m['backdrop_path'] as String?),
+          // List results already include the synopsis; carried for the
+          // Windows Home banner so it needs no detail request.
+          description: keepOverview ? m['overview'] as String? : null,
           url: ZmodeIds.showUrl(c),
           type: ProviderType.movie,
           sourceId: ZmodeIds.sourceId,

@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import '../mihon/mihon_extension_service.dart';
 import '../provider/cf_solve_needed.dart';
 
+/// Opens the platform verification flow for a protected extension request.
 class MangayomiCloudflare {
   static const MethodChannel _channel = MethodChannel('zangetsu/mihon');
 

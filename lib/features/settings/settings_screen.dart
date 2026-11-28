@@ -1,7 +1,17 @@
+import '../../core/desktop/desktop_focus_repair.dart';
+import '../../core/ui/nav_prefs.dart';
+import '../../core/desktop/desktop_prefs.dart';
+import '../../core/ui/desktop_settings_row_target.dart';
+import 'desktop_settings_navigation.dart';
+import 'desktop_settings_search.dart';
+import 'desktop_settings_profile.dart';
+import 'desktop_settings_workspace.dart';
 import 'dart:async';
 import '../../core/theme/theme_controller.dart';
 import 'dart:io';
 
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
@@ -20,11 +30,15 @@ import '../../core/logging/app_logger.dart';
 import '../../core/logging/log_report_service.dart';
 import '../player/in_app_mini_player.dart';
 import '../player/player_screen.dart' show openSubtitleStyleSheet;
+import '../player/desktop_floating_player.dart'
+    show closeFloatingPlayerBeforeProfileSwitch;
 import '../player/shader_presets.dart';
 import '../player/tv_exo_spike_screen.dart';
 import '../../core/di/injector.dart';
 import '../../core/platform/apple_tv.dart';
 import '../../core/playback/external_player.dart';
+import '../../core/playback/list_idle_runner.dart'; // R5 rows in Playback
+import '../../core/playback/list_idle_status.dart' show ListIdleRule;
 import '../../core/playback/playback_prefs.dart';
 import '../home/home_catalogue_prefs.dart';
 import '../../core/privacy/incognito_mode.dart';
@@ -44,12 +58,15 @@ import 'poster_card_settings_screen.dart';
 import 'home_rows_screen.dart';
 import 'nav_tabs_screen.dart';
 import 'reader_settings_screen.dart';
+import 'keyboard_shortcuts_screen.dart';
+import 'window_system_settings_screen.dart';
 import 'torrent_settings_screen.dart';
 import '../../core/provider/provider_downloader.dart';
 import '../../core/provider/provider_registry.dart';
 import '../../core/state/active_source_cubit.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/locale/app_language_picker.dart';
+import '../../core/locale/locale_controller.dart';
 import '../../l10n/l10n.dart';
 import '../../core/mode/content_mode_cubit.dart';
 import '../home/metadata_switch_sheet.dart';
@@ -63,6 +80,10 @@ import '../../core/ui/app_dialog.dart';
 import '../../core/ui/settings_widgets.dart';
 import '../../core/ui/settings_search_target.dart';
 import 'download_location_screen.dart';
+import '../../core/ui/desktop_settings_surface.dart';
+import '../../core/desktop/desktop_chrome_colors.dart';
+import '../../core/desktop/desktop_reveal.dart';
+import 'package:path_provider/path_provider.dart';
 import '../../core/tv/tv_list_focusable.dart';
 
 import '../../core/ui/dock_visibility.dart';
@@ -74,11 +95,17 @@ import '../auth/auth_cubit.dart';
 import '../watch_together/ui/watch_party_lobby_screen.dart';
 import '../watch_together/watch_together_controller.dart';
 import '../profiles/viewer_profiles_screen.dart';
+import '../profiles/profile_unlock.dart';
+import '../../core/profiles/profile_lock_store.dart';
+import '../../core/update/extension_auto_updater.dart';
 import '../onboarding/how_it_works.dart';
 import '../notify/subscriptions_screen.dart';
+// set-6: Windows storage dashboard, used by the settings_storage.dart part.
+import 'desktop_storage_dashboard.dart';
 import '../sources/source_health_screen.dart';
 import '../sources/sources_screen.dart';
 import 'source_priority_screen.dart';
+import 'desktop_settings_slider.dart'; // shared Windows slider row (Playback)
 import 'player_controls_screen.dart';
 import 'native_player_cache_screen.dart';
 import 'connected_services_screen.dart';
@@ -92,12 +119,37 @@ part 'settings_about.dart';
 part 'settings_privacy.dart';
 part 'settings_tv_pickers.dart';
 
-/// Top-level Settings screen — a grouped list of cards mirroring the
-/// iOS Settings look in our dark/coral language.
-class SettingsScreen extends StatefulWidget {
-  const SettingsScreen({super.key, this.showBackButton = false});
+/// Default name for a log saved on Windows, stamped to the minute so repeated
+/// saves never overwrite each other (zangetsu-logs-20261117-0930.txt).
+@visibleForTesting
+String windowsLogFileName(DateTime now) {
+  String two(int v) => v.toString().padLeft(2, '0');
+  return 'zangetsu-logs-${now.year}${two(now.month)}${two(now.day)}-'
+      '${two(now.hour)}${two(now.minute)}.txt';
+}
 
+/// Windows desktop UI gate for this library and its parts. Read through
+/// [defaultTargetPlatform] (not Platform.isWindows) so phone tests, which run
+/// on a Windows host as the Android target, keep the phone layout.
+bool get _windowsUi => defaultTargetPlatform == TargetPlatform.windows;
+
+/// Settings navigation shares one entry catalogue across platforms. Windows
+/// presents category cards; phone and TV retain their own navigation surfaces.
+class SettingsScreen extends StatefulWidget {
+  const SettingsScreen({
+    super.key,
+    this.returnToPlayer = false,
+    this.showBackButton = false,
+  });
+
+  final bool returnToPlayer;
   final bool showBackButton;
+
+  /// Test hook: forces the Windows settings workspace on (true) or off
+  /// (false). Null in the app, where the Windows host decides. Phone-layout
+  /// tests set false because the test host itself runs on Windows.
+  @visibleForTesting
+  static bool? debugDesktopWorkspaceOverride;
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -117,8 +169,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// Nested navigator for TV leaf screens (Playback, Downloads, …) so they
   /// stay in the content pane beside the left rail instead of covering it.
   final List<_TvSettingsLeaf> _tvLeaves = [];
+  final _desktopNavigator = GlobalKey<NavigatorState>();
+  int _desktopDepth = 0;
+
+  /// set-3: the always-visible Windows search box, focused by Ctrl+F / Ctrl+K.
+  final FocusNode _desktopSearchFocus = FocusNode(
+    debugLabel: 'desktop-settings-search',
+  );
 
   bool get _isTv => sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
+
+  /// Windows desktop build. Used for Windows-only rows and pickers; read via
+  /// [defaultTargetPlatform] so widget tests can switch it on.
+  bool get _windowsDesktop =>
+      defaultTargetPlatform == TargetPlatform.windows && !_isTv;
+
+  /// The Windows settings workspace (sidebar, graphite panels and dialogs)
+  /// instead of the phone hub. One gate for every layout and picker choice so
+  /// they can never disagree; tests flip it with
+  /// [SettingsScreen.debugDesktopWorkspaceOverride].
+  bool get _desktopWorkspace =>
+      !_isTv && (SettingsScreen.debugDesktopWorkspaceOverride ?? _windowsUi);
+
+  /// Guards the avatar strip against a second switch while one is running.
+  bool _switchingProfile = false;
+
+  /// True while "Auto-update extensions" is running its immediate check.
+  bool _updatingExtensions = false;
 
   /// The metadata rows show the CURRENT provider, and it can now be changed
   /// from outside this screen (the Home wordmark shortcut). Without this the
@@ -143,7 +220,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void dispose() {
     MetadataProviderPrefs.revision.removeListener(_onProviderChanged);
     _searchCtrl.dispose();
+    _desktopSearchFocus.dispose();
     _settingsCubit.close();
+    // Settings is gone, so nothing of it is open any more (shell-1).
+    if (_desktopWorkspace) DesktopSettingsNavigation.atRoot.value = true;
     for (final leaf in _tvLeaves) {
       if (!leaf.done.isCompleted) leaf.done.complete();
     }
@@ -160,6 +240,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// Pushes onto the TV nested navigator (or the root navigator on phone).
   /// [builder] is re-invoked when Settings rebuilds so section pages stay fresh.
   Future<void> _pushBuilder(Widget Function(BuildContext context) builder) {
+    if (_desktopWorkspace) return _pushDesktopBuilder(builder);
     if (_isTv) {
       final done = Completer<void>();
       final key = UniqueKey();
@@ -169,9 +250,71 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _syncShellBackIntercept();
       return done.future;
     }
-    return Navigator.of(
-      context,
-    ).push(MaterialPageRoute<void>(builder: builder));
+    // Desktop leaf pages must match the in-hub section slide/fade below;
+    // MaterialPageRoute otherwise chooses a different platform animation.
+    final desktop = _windowsUi;
+    return Navigator.of(context).push<void>(
+      desktop
+          ? PageRouteBuilder<void>(
+              pageBuilder: (context, animation, secondaryAnimation) =>
+                  builder(context),
+              transitionDuration: const Duration(milliseconds: 280),
+              reverseTransitionDuration: const Duration(milliseconds: 280),
+              transitionsBuilder:
+                  (context, animation, secondaryAnimation, child) {
+                    final curved = animation.drive(
+                      CurveTween(curve: Curves.easeOutCubic),
+                    );
+                    return FadeTransition(
+                      opacity: curved,
+                      child: SlideTransition(
+                        position: curved.drive(
+                          Tween<Offset>(
+                            begin: const Offset(1, 0),
+                            end: Offset.zero,
+                          ),
+                        ),
+                        child: child,
+                      ),
+                    );
+                  },
+            )
+          : MaterialPageRoute<void>(builder: builder),
+    );
+  }
+
+  /// Keeps Windows leaf pages inside the reference workspace rather than
+  /// replacing its sidebar. Original route completion/await behavior survives.
+  Future<void> _pushDesktopBuilder(
+    Widget Function(BuildContext context) builder,
+  ) async {
+    final navigator = _desktopNavigator.currentState;
+    if (navigator == null) return;
+    setState(() => _desktopDepth++);
+    shellBackIntercepted.value = true;
+    try {
+      await navigator.push<void>(
+        PageRouteBuilder<void>(
+          // set-2: a page opened from a search result scrolls down to the
+          // named row when it is not built yet (see DesktopSettingsRowSeeker).
+          pageBuilder: (context, animation, secondaryAnimation) =>
+              DesktopSettingsRowSeeker(child: builder(context)),
+          transitionDuration: MediaQuery.disableAnimationsOf(context)
+              ? Duration.zero
+              : const Duration(milliseconds: 220),
+          reverseTransitionDuration: MediaQuery.disableAnimationsOf(context)
+              ? Duration.zero
+              : const Duration(milliseconds: 180),
+          transitionsBuilder: (context, animation, secondaryAnimation, child) =>
+              FadeTransition(opacity: animation, child: child),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _desktopDepth--);
+        _syncShellBackIntercept();
+      }
+    }
   }
 
   void _removeTvLeaf(Page<dynamic> page) {
@@ -185,6 +328,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// nested leaf route on TV).
   void _syncShellBackIntercept({SettingsState? state}) {
     final s = state ?? _settingsCubit.state;
+    if (_desktopWorkspace) {
+      // Windows: sidebar sections are peers, so an open section is not
+      // something Back closes; only a page above it or search text are.
+      final owned = _desktopDepth > 0 || s.query.isNotEmpty;
+      shellBackIntercepted.value = owned;
+      DesktopSettingsNavigation.atRoot.value = !owned;
+      dockHiddenBySection.value = s.openSection != null;
+      return;
+    }
     final nestedCanPop = _isTv && _tvLeaves.isNotEmpty;
     shellBackIntercepted.value =
         s.openSection != null || s.query.isNotEmpty || nestedCanPop;
@@ -286,6 +438,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
           current: prefs.titleLanguage,
         ),
       );
+    } else if (_desktopWorkspace) {
+      picked = await showGraphiteSettingsChoice<TitleLanguage>(
+        context,
+        title: l10n.titleLanguage,
+        options: options,
+        current: prefs.titleLanguage,
+      );
     } else {
       picked = await showModalBottomSheet<TitleLanguage>(
         context: context,
@@ -322,6 +481,114 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await prefs.setTitleLanguage(picked);
   }
 
+  /// Windows App language: the bounded desktop choice dialog instead of the
+  /// phone bottom sheet. Same options and the same [LocaleController] write,
+  /// so the whole app re-renders in the new language as soon as it is picked.
+  Future<void> _pickAppLanguageDesktop() async {
+    final l10n = context.l10n;
+    final device = View.of(context).platformDispatcher.locale;
+    final current = LocaleController.tag;
+    final picked = await showGraphiteSettingsChoice<String>(
+      context,
+      title: l10n.appLanguage,
+      current: current,
+      options: [
+        (LocaleController.systemTag, l10n.appLanguageSystem),
+        ...LocaleController.options,
+      ],
+      optionDescriptions: {
+        LocaleController.systemTag: l10n.appLanguageSystemSubtitle(
+          LocaleController.nativeNameForDevice(device),
+        ),
+      },
+    );
+    if (picked == null || picked == current) return;
+    await LocaleController.setTag(picked);
+  }
+
+  /// Start page choices on Windows: the sidebar destinations the app can open
+  /// on. Labels match the sidebar.
+  static final _desktopStartPages = <(DockTab, String)>[
+    for (final tab in NavPrefs.desktopStartTabs) (tab, tab.label),
+  ];
+
+  String _desktopStartLabel() {
+    final tab = sl<NavPrefs>().startTab;
+    return _desktopStartPages
+        .firstWhere((p) => p.$1 == tab, orElse: () => _desktopStartPages.first)
+        .$2;
+  }
+
+  /// Windows replacement for "Customize dock": only the start page applies
+  /// on PC, since the sidebar is fixed. Read once when the app opens.
+  Future<void> _pickDesktopStartPage() async {
+    final prefs = sl<NavPrefs>();
+    final picked = await showGraphiteSettingsChoice<DockTab>(
+      context,
+      title: 'Start page',
+      description:
+          'The page Zangetsu shows when it opens. Applies the next '
+          'time you start the app.',
+      current: prefs.startTab,
+      options: _desktopStartPages,
+    );
+    if (picked == null || picked == prefs.startTab) return;
+    await prefs.setStartTab(picked);
+    if (!mounted) return;
+    setState(() {});
+    ScaffoldMessenger.of(context)
+      ..clearSnackBars()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(
+            'Zangetsu will open on '
+            '${_desktopStartLabel()} next time',
+          ),
+        ),
+      );
+  }
+
+  /// Turning auto-update on at Windows runs one check right away, so the
+  /// switch visibly does something; after that it runs once a day at launch
+  /// (AppLaunchChecks in home_screen.dart, started by RootShell on Windows).
+  /// Phone keeps its launch-only behaviour.
+  Future<void> _setAutoUpdateExtensions(bool value) async {
+    final prefs = sl<PlaybackPrefs>();
+    await prefs.setAutoUpdateExtensions(value);
+    if (!mounted) return;
+    setState(() {});
+    if (!value || !_windowsDesktop || _updatingExtensions) return;
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _updatingExtensions = true);
+    messenger
+      ..clearSnackBars()
+      ..showSnackBar(
+        SnackBar(content: Text(context.l10n.checkingExtensionsForUpdates)),
+      );
+    var updated = 0;
+    try {
+      // Stamp first so the launch check does not repeat this run today.
+      await prefs.setLastExtensionUpdateMs(
+        DateTime.now().millisecondsSinceEpoch,
+      );
+      updated = await ExtensionAutoUpdater.run();
+    } finally {
+      if (mounted) setState(() => _updatingExtensions = false);
+    }
+    if (!mounted) return;
+    messenger
+      ..clearSnackBars()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(
+            updated == 0
+                ? 'Extensions are up to date'
+                : '$updated extension${updated == 1 ? '' : 's'} updated',
+          ),
+        ),
+      );
+  }
+
   /// Send the diagnostic log straight to us, falling back to the share sheet.
   ///
   /// Sharing put the work on the reporter — find the file, pick an app, send it
@@ -343,13 +610,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final ref = await reporter.send();
     if (!mounted) return;
     messenger.clearSnackBars();
-    if (ref == null) return _shareLogs();
+    // Windows says why the Save dialog opened instead of a "Report sent".
+    if (ref == null) return _shareLogs(reportFailed: true);
 
     await AppDialog.show<void>(
       context,
       title: context.l10n.reportSent,
       body: Text(context.l10n.reportSentBody(ref)),
       actions: [
+        // Windows: also offer the log as a file, since there is no share
+        // sheet worth using there.
+        if (_windowsDesktop)
+          TvAlertAction(
+            label: 'Save a copy',
+            onTap: () {
+              Navigator.of(context, rootNavigator: true).pop();
+              _shareLogs();
+            },
+          ),
         TvAlertAction(
           label: context.l10n.copy,
           onTap: () {
@@ -367,7 +645,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  Future<void> _shareLogs() async {
+  /// [reportFailed]: the upload just failed, so this is the fallback.
+  Future<void> _shareLogs({bool reportFailed = false}) async {
     final file = await AppLogger.instance.exportFile();
     if (!mounted) return;
     if (file == null) {
@@ -378,9 +657,109 @@ class _SettingsScreenState extends State<SettingsScreen> {
         );
       return;
     }
+    if (_windowsDesktop) {
+      return _saveLogsOnWindows(file, reportFailed: reportFailed);
+    }
     await SharePlus.instance.share(
       ShareParams(files: [XFile(file.path)], subject: 'Zangetsu logs'),
     );
+  }
+
+  /// Windows replacement for the share sheet. The native Save dialog picks
+  /// where the log goes; if that dialog cannot open, a copy is kept in the
+  /// app's own logs folder instead. Either way the saved file is selected in
+  /// File Explorer and a snack bar names the full path.
+  Future<void> _saveLogsOnWindows(
+    File file, {
+    bool reportFailed = false,
+  }) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final name = windowsLogFileName(DateTime.now());
+    String? savedPath;
+    try {
+      final bytes = await file.readAsBytes();
+      final saved = await FilePicker.saveFile(
+        // After a failed upload the dialog title is the only explanation the
+        // user sees, so it says why the dialog opened.
+        dialogTitle: reportFailed
+            ? "Couldn't send the report: save the log to a file"
+            : 'Save logs',
+        fileName: name,
+        bytes: bytes,
+        mimeType: 'text/plain',
+        // A bare typed name still gets .txt: the Windows picker takes the
+        // default extension from [name]. Owned by the app window: modal and never hidden behind it.
+        windowsOptions: const WindowsOptions(lockParentWindow: true),
+      );
+      // Null means the user cancelled the dialog: nothing to report.
+      if (saved == null) return;
+      savedPath = saved.toFilePath(windows: Platform.isWindows);
+      // The picker writes the bytes itself; make sure they really landed so
+      // the snack bar never points at a file that is not there.
+      final target = File(savedPath);
+      if (!await target.exists()) await target.writeAsBytes(bytes);
+    } catch (e) {
+      AppLogger.instance.log('Save logs dialog failed: $e');
+      savedPath = await _keepLogsInAppFolder(file, name);
+    }
+    if (!mounted) return;
+    if (savedPath == null) {
+      messenger
+        ..clearSnackBars()
+        ..showSnackBar(
+          SnackBar(content: Text(context.l10n.couldNotExportLogs)),
+        );
+      return;
+    }
+    final path = savedPath;
+    final shown = await _revealLogs(path);
+    if (!mounted) return;
+    messenger
+      ..clearSnackBars()
+      ..showSnackBar(
+        SnackBar(
+          key: const ValueKey('logs-saved-snackbar'),
+          duration: const Duration(seconds: 8),
+          // A bounded floating toast instead of a window-wide bar.
+          behavior: SnackBarBehavior.floating,
+          width: 640,
+          content: Text(
+            '${reportFailed ? "Couldn't send the report. " : ''}'
+            'Logs saved to $path'
+            "${shown ? '' : ". File Explorer couldn't be opened."}",
+          ),
+          action: SnackBarAction(
+            label: 'Show in folder',
+            onPressed: () => unawaited(_revealLogs(path)),
+          ),
+        ),
+      );
+  }
+
+  /// Fallback when the Save dialog fails: copies the log into
+  /// `%APPDATA%\...\logs` (the app support folder). Null when even that fails.
+  Future<String?> _keepLogsInAppFolder(File file, String name) async {
+    try {
+      final support = await getApplicationSupportDirectory();
+      final dir = Directory('${support.path}${Platform.pathSeparator}logs');
+      await dir.create(recursive: true);
+      final copy = await file.copy('${dir.path}${Platform.pathSeparator}$name');
+      return copy.path;
+    } catch (e) {
+      AppLogger.instance.log('Keeping logs in the app folder failed: $e');
+      return null;
+    }
+  }
+
+  /// Selects the saved log in File Explorer. False when Explorer could not be
+  /// opened (or the file is gone); failures are only logged.
+  Future<bool> _revealLogs(String path) async {
+    try {
+      return await revealInExplorer(path);
+    } catch (e) {
+      AppLogger.instance.log('Could not open Explorer: $e');
+      return false;
+    }
   }
 
   Future<void> _pickDns() async {
@@ -484,6 +863,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
           current: prefs.layout,
         ),
       );
+    } else if (_desktopWorkspace) {
+      picked = await showGraphiteSettingsChoice<SearchLayout>(
+        context,
+        title: context.l10n.searchLayout,
+        options: SearchLayout.values
+            .map((layout) => (layout, layout.localizedLabel(context)))
+            .toList(),
+        current: prefs.layout,
+      );
     } else {
       picked = await showModalBottomSheet<SearchLayout>(
         context: context,
@@ -565,6 +953,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
           current: prefs.batchDownloadStyle,
         ),
       );
+    } else if (_desktopWorkspace) {
+      picked = await showGraphiteSettingsChoice<String>(
+        context,
+        title: l10n.batchDownloadStyle,
+        description: l10n.batchDownloadStyleBlurb,
+        options: options,
+        current: prefs.batchDownloadStyle,
+        optionDescriptions: {
+          'classic': l10n.batchDownloadClassicBlurb,
+          'minimal': l10n.batchDownloadMinimalBlurb,
+        },
+      );
     } else {
       picked = await showModalBottomSheet<String>(
         context: context,
@@ -641,6 +1041,82 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (mounted) setState(() {});
   }
 
+  /// Chooses Classic or dock-following My List and persists it without changing
+  /// library records. The selected descriptive row displays an accent check.
+  Future<void> _pickMyListStyle() async {
+    final prefs = sl<NavPrefs>();
+    final selected = _desktopWorkspace
+        ? await showGraphiteSettingsChoice<String>(
+            context,
+            title: 'My List style',
+            description:
+                'Choose how your library is organized. Your saved titles and progress stay the same.',
+            options: const [('classic', 'Classic'), ('new', 'New')],
+            current: prefs.myListStyle,
+            optionDescriptions: const {
+              'classic':
+                  'Switch between Streaming, Manga and Novel inside My List.',
+              'new':
+                  'My List follows Anime, Movie/TV, Manga or Novel selected in the dock.',
+            },
+          )
+        : await showModalBottomSheet<String>(
+            context: context,
+            backgroundColor: AppColors.surface,
+            constraints: const BoxConstraints(maxWidth: 640),
+            shape: const RoundedRectangleBorder(
+              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+            ),
+            builder: (ctx) => SafeArea(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    margin: const EdgeInsets.only(top: 12, bottom: 12),
+                    width: 36,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: AppColors.textTertiary,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                  const ListTile(
+                    title: Text('My List style'),
+                    subtitle: Text(
+                      'Choose how your library is organized. Your saved titles and progress stay the same.',
+                    ),
+                  ),
+                  const Divider(height: 1),
+                  for (final option in const [
+                    (
+                      'classic',
+                      'Classic',
+                      'Switch between Streaming, Manga and Novel inside My List.',
+                    ),
+                    (
+                      'new',
+                      'New',
+                      'My List follows Anime, Movie/TV, Manga or Novel selected in the dock.',
+                    ),
+                  ])
+                    ListTile(
+                      title: Text(option.$2),
+                      subtitle: Text(option.$3),
+                      trailing: prefs.myListStyle == option.$1
+                          ? Icon(Icons.check_rounded, color: AppColors.accent)
+                          : null,
+                      onTap: () => Navigator.pop(ctx, option.$1),
+                    ),
+                  const SizedBox(height: 8),
+                ],
+              ),
+            ),
+          );
+    if (selected == null) return;
+    await prefs.setMyListStyle(selected);
+    if (mounted) setState(() {});
+  }
+
   /// Which country's streaming catalogue to browse.
   ///
   /// A service's shelf differs per country, so the wrong region silently shows
@@ -648,26 +1124,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// not only a locale guess.
   Future<void> _pickStreamingRegion() async {
     final current = StreamingPrefs.region;
-    final picked = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: AppColors.surface,
-      isScrollControlled: true,
-      builder: (ctx) => SafeArea(
-        child: ListView(
-          shrinkWrap: true,
-          children: [
-            for (final code in kStreamingRegions)
-              ListTile(
-                title: Text(code, style: AppText.body),
-                trailing: code == current
-                    ? Icon(Icons.check_rounded, color: AppColors.accent)
-                    : null,
-                onTap: () => Navigator.pop(ctx, code),
+    final picked = _desktopWorkspace
+        ? await showGraphiteSettingsChoice<String>(
+            context,
+            title: context.l10n.streamingRegion,
+            description: context.l10n.streamingRegionSubtitle,
+            options: [for (final code in kStreamingRegions) (code, code)],
+            current: current,
+          )
+        : await showModalBottomSheet<String>(
+            context: context,
+            backgroundColor: AppColors.surface,
+            isScrollControlled: true,
+            builder: (ctx) => SafeArea(
+              child: ListView(
+                shrinkWrap: true,
+                children: [
+                  for (final code in kStreamingRegions)
+                    ListTile(
+                      title: Text(code, style: AppText.body),
+                      trailing: code == current
+                          ? Icon(Icons.check_rounded, color: AppColors.accent)
+                          : null,
+                      onTap: () => Navigator.pop(ctx, code),
+                    ),
+                ],
               ),
-          ],
-        ),
-      ),
-    );
+            ),
+          );
     if (picked == null || picked == current) return;
     await StreamingPrefs.setRegion(picked);
     // The cached provider list is per region; leaving it would show the old
@@ -689,6 +1173,32 @@ class _SettingsScreenState extends State<SettingsScreen> {
         valueListenable: profiles.active,
         builder: (context, active, _) {
           final profile = active ?? profiles.activeProfile;
+          final accountStatus = auth.isLoggedIn
+              ? (auth.user?.email ?? auth.displayName)
+              : context.l10n.notSignedIn;
+          if (_desktopWorkspace) {
+            return DesktopSettingsProfile(
+              title: context.l10n.profilesAndAccount,
+              subtitle: context.l10n.watchingAsNameStatus(
+                profile.name,
+                accountStatus,
+              ),
+              onOpen: () => _push(const ViewerProfilesScreen()),
+              avatar: CircleAvatar(
+                radius: 22,
+                backgroundColor: viewerProfileAvatarColor(profile.avatar),
+                child: ProfileAvatarFace(
+                  profile: profile,
+                  photoUrl: profilePhotoForFace(
+                    profile: profile,
+                    accountPhotoUrl: auth.avatarUrl,
+                  ),
+                  iconSize: 22,
+                  photoDiameter: 44,
+                ),
+              ),
+            );
+          }
           return Padding(
             padding: const EdgeInsets.only(bottom: 10),
             child: SettingsCard(
@@ -751,7 +1261,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   /// A plain grey value shown at the row's trailing edge (before the chevron).
   /// Used for e.g. "Rows", "Off", "2 linked".
-  Widget _value(String text) => Row(
+  Widget _value(String text) =>
+      _desktopWorkspace ? DesktopSettingsValue(text) : _rowValue(text);
+
+  /// The phone and TV form of [_value].
+  Widget _rowValue(String text) => Row(
     mainAxisSize: MainAxisSize.min,
     children: [
       Text(
@@ -765,6 +1279,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
         size: 20,
       ),
     ],
+  );
+
+  /// The current accent colour, on the Theme & colour row.
+  Widget _accentDot() => Container(
+    width: 20,
+    height: 20,
+    decoration: BoxDecoration(
+      color: AppColors.accent,
+      shape: BoxShape.circle,
+      border: Border.all(color: AppColors.hairline),
+    ),
   );
 
   /// Live "Search settings" field — filters every setting as you type
@@ -808,7 +1333,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               onTap: () {
                 _searchCtrl.clear();
                 _settingsCubit.setQuery('');
-                FocusScope.of(context).unfocus();
+                DesktopFocusRepair.dropFocus(context);
               },
               child: const Padding(
                 padding: EdgeInsets.all(8),
@@ -880,8 +1405,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _SettingsEntry(
       section: SettingsSection.sources,
       icon: Icons.low_priority_rounded,
-      title: 'Source Priority',
-      subtitle: 'Order Auto Resolve tries sources in',
+      title: _windowsDesktop ? context.l10n.sourcePriority : 'Source Priority',
+      subtitle: _windowsDesktop
+          ? context.l10n.sourcePrioritySubtitle
+          : 'Order Auto Resolve tries sources in',
       keywords: 'source priority order auto resolve sweep anime movies tv',
       onTap: () => _push(const SourcePriorityScreen()),
     ),
@@ -901,7 +1428,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
       keywords: 'source health test working dead status check',
       onTap: () => _push(const SourceHealthScreen()),
     ),
-    if (Platform.isAndroid) ...[
+    // Update notifications are an Android notification feature; auto-update
+    // itself also runs on Windows (CloudStream, JS and the bundled Aniyomi
+    // engine), so that row is shown there too.
+    if (Platform.isAndroid)
       _SettingsEntry(
         section: SettingsSection.sources,
         icon: Icons.update_rounded,
@@ -917,23 +1447,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
           },
         ),
       ),
+    if (Platform.isAndroid || _windowsDesktop)
       _SettingsEntry(
         section: SettingsSection.sources,
         icon: Icons.autorenew_rounded,
         title: l10n.autoUpdateExtensions,
-        subtitle: l10n.autoUpdateExtensionsSubtitle,
+        subtitle: _windowsDesktop
+            ? (_updatingExtensions
+                  ? 'Checking for updates now…'
+                  // The daily check is started at launch by RootShell
+                  // (AppLaunchChecks), whatever the Start page is.
+                  : 'Updates installed extensions once a day, when Zangetsu '
+                        'opens. Turning it on checks now.')
+            : l10n.autoUpdateExtensionsSubtitle,
         keywords:
             'auto update extensions sources plugins automatic upgrade cloudstream aniyomi',
         trailing: Switch.adaptive(
           value: sl<PlaybackPrefs>().autoUpdateExtensions,
           activeThumbColor: AppColors.accent,
-          onChanged: (v) async {
-            await sl<PlaybackPrefs>().setAutoUpdateExtensions(v);
-            if (mounted) setState(() {});
-          },
+          // Windows: the same row height as the other pages' switches.
+          materialTapTargetSize: _desktopWorkspace
+              ? MaterialTapTargetSize.shrinkWrap
+              : null,
+          onChanged: _updatingExtensions ? null : _setAutoUpdateExtensions,
         ),
+        // The desktop row toggles on click, like every other switch row.
+        onTap: _windowsDesktop && !_updatingExtensions
+            ? () => _setAutoUpdateExtensions(
+                !sl<PlaybackPrefs>().autoUpdateExtensions,
+              )
+            : null,
       ),
-    ],
     // Playback & downloads
     _SettingsEntry(
       section: SettingsSection.playback,
@@ -941,8 +1485,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
       icon: Icons.play_circle_outline,
       title: l10n.playback,
       subtitle: l10n.playbackSubtitle,
-      keywords:
-          'playback quality autoplay speed player decoder audio subtitle resume gesture',
+      // Windows has no touch gestures or decoder picker, so search must not
+      // send those words to a page that does not show them.
+      keywords: _windowsDesktop
+          ? 'playback quality autoplay speed player audio subtitle resume seek'
+          : 'playback quality autoplay speed player decoder audio subtitle '
+                'resume gesture',
+      // set-1: Playback is its section's only page, so Windows shows it
+      // as the section itself.
+      page: (_) => const PlaybackSettingsScreen(),
       onTap: () => _push(const PlaybackSettingsScreen()),
     ),
     // Manga/novel reader — phone only. TV has no reading surface.
@@ -955,6 +1506,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         subtitle: l10n.readerSubtitle,
         keywords:
             'reader manga novel reading defaults fit direction fontsize theme orientation preload',
+        page: (_) => const ReaderSettingsScreen(),
         onTap: () => _push(const ReaderSettingsScreen()),
       ),
     _SettingsEntry(
@@ -963,6 +1515,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       title: l10n.history,
       subtitle: l10n.historySubtitle,
       keywords: 'history watch watched continue recent resume',
+      page: (_) => const HistoryScreen(),
       onTap: () async {
         await _push(const HistoryScreen());
         if (mounted) setState(() {});
@@ -986,14 +1539,30 @@ class _SettingsScreenState extends State<SettingsScreen> {
       keywords: 'storage space cache clear disk usage',
       onTap: () => _push(const StorageSettingsScreen()),
     ),
-    _SettingsEntry(
-      section: SettingsSection.downloads,
-      icon: Icons.downloading_outlined,
-      title: l10n.torrents,
-      subtitle: l10n.torrentsSubtitle,
-      keywords: 'torrent magnet streaming seed data wifi',
-      onTap: () => _push(const TorrentSettingsScreen()),
-    ),
+    // Windows: the download folder gets its own row (phone reaches it from
+    // the Downloads page). Search leaves for "Choose folder…", "Reset to
+    // default" and "Open in File Explorer" open this row via its id.
+    if (_windowsDesktop)
+      _SettingsEntry(
+        section: SettingsSection.downloads,
+        id: LeafParent.downloadLocation,
+        icon: Icons.folder_outlined,
+        title: l10n.downloadLocation,
+        subtitle: 'The folder new downloads are saved in',
+        keywords: 'download location folder path directory drive save',
+        onTap: () => _push(const DownloadLocationScreen()),
+      ),
+    // This setting controls Android's torrent host and mobile-data permission.
+    // Desktop uses direct video streams and has neither native capability.
+    if (Platform.isAndroid)
+      _SettingsEntry(
+        section: SettingsSection.downloads,
+        icon: Icons.downloading_outlined,
+        title: l10n.torrents,
+        subtitle: l10n.torrentsSubtitle,
+        keywords: 'torrent magnet streaming seed data wifi',
+        onTap: () => _push(const TorrentSettingsScreen()),
+      ),
     // Interface & notifications
     _SettingsEntry(
       section: SettingsSection.interface,
@@ -1002,37 +1571,46 @@ class _SettingsScreenState extends State<SettingsScreen> {
       icon: Icons.palette_outlined,
       title: 'Theme & colour',
       subtitle: 'Accent colour, dark mode and font',
-      keywords:
-          'appearance accent colour color theme highlight personalise '
-          'dark amoled black font type animation motion',
+      // Windows: no AMOLED/wallpaper wording; it names its own rows instead.
+      keywords: _windowsDesktop
+          ? 'appearance accent colour color theme highlight personalise '
+                'dark pure black background font typeface animation motion '
+                'adaptive title logo'
+          : 'appearance accent colour color theme highlight personalise '
+                'dark amoled black font type animation motion',
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
-        children: [
-          _value(themeAccentLabel(l10n)),
-          const SizedBox(width: 10),
-          Container(
-            width: 20,
-            height: 20,
-            decoration: BoxDecoration(
-              color: AppColors.accent,
-              shape: BoxShape.circle,
-              border: Border.all(color: AppColors.hairline),
-            ),
-          ),
-        ],
+        // Windows: the dot comes first, so this row's value and chevron end
+        // at the same right edge as every other row's.
+        children: _desktopWorkspace
+            ? [
+                _accentDot(),
+                const SizedBox(width: 10),
+                Flexible(child: _value(themeAccentLabel(l10n))),
+              ]
+            : [
+                _value(themeAccentLabel(l10n)),
+                const SizedBox(width: 10),
+                _accentDot(),
+              ],
       ),
       onTap: () => _push(const AppearanceScreen()),
     ),
+    // Windows has no launcher-icon switch and its Home has one fixed hero, so
+    // only the splash picker remains there: the row is named for it.
     if (!_isTv)
       _SettingsEntry(
         section: SettingsSection.interface,
         group: 'Look',
         icon: Icons.auto_awesome_outlined,
-        title: 'Icon, splash & banner',
-        subtitle: 'How the app looks before you open it',
-        keywords:
-            'app icon launcher splash startup animation bankai wordmark '
-            'home banner card panels face',
+        title: _windowsDesktop ? 'Splash screen' : 'Icon, splash & banner',
+        subtitle: _windowsDesktop
+            ? 'The animation that plays while Zangetsu starts'
+            : 'How the app looks before you open it',
+        keywords: _windowsDesktop
+            ? 'splash startup launch animation bankai wordmark intro'
+            : 'app icon launcher splash startup animation bankai wordmark '
+                  'home banner card panels face',
         onTap: () => _push(const AppFaceScreen()),
       ),
     _SettingsEntry(
@@ -1050,13 +1628,30 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _SettingsEntry(
         section: SettingsSection.interface,
         group: 'Layout',
+        // Lets the "Home rows" search leaf open this page.
+        id: LeafParent.homeRows,
         icon: Icons.view_agenda_outlined,
         title: l10n.homeRows,
         subtitle: 'Which rows show on Home, and their order',
         keywords: 'home rows order hide show continue watching trending',
         onTap: () => _push(const HomeRowsScreen()),
       ),
-    if (!_isTv)
+    // Windows has a fixed sidebar instead of a dock, so the dock editor is
+    // replaced by the one part of it that applies on PC: the start page.
+    if (_windowsDesktop)
+      _SettingsEntry(
+        section: SettingsSection.interface,
+        group: 'Layout',
+        icon: Icons.home_outlined,
+        title: 'Start page',
+        subtitle: 'The page Zangetsu opens on',
+        keywords:
+            'start page startup launch open opens on landing default home '
+            'my list sources downloads',
+        trailing: _value(_desktopStartLabel()),
+        onTap: _pickDesktopStartPage,
+      ),
+    if (!_isTv && !_windowsDesktop)
       _SettingsEntry(
         section: SettingsSection.interface,
         group: 'Layout',
@@ -1067,6 +1662,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
             'navigation bar tabs dock bottom reorder hide downloads '
             'history customise customize interface',
         onTap: () => _push(const NavTabsScreen()),
+      ),
+    // Windows only: Classic tabs or a My List that follows the dock.
+    if (_windowsDesktop)
+      _SettingsEntry(
+        section: SettingsSection.interface,
+        group: 'Layout',
+        icon: Icons.view_list_rounded,
+        title: 'My List style',
+        subtitle: 'Classic tabs or follow the dock media selection',
+        keywords:
+            'library my list classic new style dock content anime manga movie novel',
+        trailing: _value(
+          sl<NavPrefs>().myListStyle == 'new' ? 'New' : 'Classic',
+        ),
+        onTap: _pickMyListStyle,
       ),
     if (_isTv)
       _SettingsEntry(
@@ -1170,6 +1780,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       onTap: () async {
         if (_isTv) {
           await pickAppLanguageTv(context);
+        } else if (_windowsDesktop) {
+          await _pickAppLanguageDesktop();
         } else {
           await pickAppLanguagePhone(context);
         }
@@ -1183,6 +1795,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         title: l10n.notifications,
         subtitle: l10n.notificationsSubtitle,
         keywords: 'notifications alerts new episode subscribe airing',
+        page: (_) => const SubscriptionsScreen(),
         onTap: () => _push(const SubscriptionsScreen()),
       ),
     // Advanced
@@ -1202,6 +1815,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _dnsChoice == CsDns.off ? l10n.off : CsDns.labelFor(_dnsChoice),
         ),
         onTap: _pickDns,
+      ),
+    // set-7: Windows takes DNS's place here with the desktop-only window,
+    // tray, start page, alerts and profile-lock settings.
+    if (_windowsDesktop)
+      _SettingsEntry(
+        section: SettingsSection.advanced,
+        id: LeafParent.windowSystem,
+        icon: Icons.desktop_windows_outlined,
+        title: context.l10n.windowAndSystem,
+        subtitle: context.l10n.windowAndSystemSubtitle,
+        keywords:
+            'window system startup launch sign in boot autostart close tray '
+            'minimise minimize remember size position start page open '
+            'notifications alerts new episode lock idle auto-lock',
+        onTap: () => _push(const WindowSystemSettingsScreen()),
+      ),
+    // set-8: every shortcut in one place, with player key remapping.
+    if (_windowsDesktop)
+      _SettingsEntry(
+        section: SettingsSection.advanced,
+        id: LeafParent.keyboardShortcuts,
+        icon: Icons.keyboard_alt_outlined,
+        title: context.l10n.keyboardShortcuts,
+        subtitle: context.l10n.keyboardShortcutsSubtitle,
+        keywords:
+            'keyboard shortcuts keys hotkeys bindings remap customise '
+            'customize player reader help',
+        onTap: () => _push(const KeyboardShortcutsScreen()),
       ),
     _SettingsEntry(
       section: SettingsSection.advanced,
@@ -1231,10 +1872,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
       icon: Icons.info_outline_rounded,
       title: l10n.about,
       subtitle: 'v$kAppVersion',
+      // Windows hides the prerelease opt-in, so its search drops those words.
       keywords:
           'about version app info license developers credits team '
           'contributors social discord telegram how it works guide '
-          'check updates upgrade latest beta prerelease support donate coffee',
+          'check updates upgrade latest support donate coffee'
+          '${_windowsDesktop ? ' windows github' : ' beta prerelease'}',
+      page: (_) => const AboutSettingsScreen(),
       onTap: () => _push(const AboutSettingsScreen()),
     ),
   ];
@@ -1252,6 +1896,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
       connectedCount: connectedCount,
     );
 
+    // Windows keeps its desktop workspace; every other non-TV platform takes
+    // upstream's theme-revision-aware hub.
+    if (_desktopWorkspace) {
+      // Rebuild on theme changes (accent, background, pure black) so the
+      // section page and its row previews repaint as soon as one is changed,
+      // instead of keeping the old colours until Settings is reopened.
+      return ValueListenableBuilder<int>(
+        valueListenable: ThemeController.revision,
+        builder: (context, _, _) => _buildDesktopWorkspace(
+          _buildSettingsEntries(
+            l10n: context.l10n,
+            enabledCount: enabledCount,
+            connectedCount: connectedCount,
+          ),
+        ),
+      );
+    }
     if (!_isTv) {
       // Screens paint AppColors directly at build time, so rebuild the hub
       // whenever the theme's mutable colours change; otherwise the section
@@ -1267,7 +1928,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     // PopScope owns system/TV Back (NavigatorPopHandler alone was unreliable
     // once the shell stood down on [shellBackIntercepted]).
     return PopScope(
-      canPop: false,
+      canPop: widget.returnToPlayer && _tvLeaves.isEmpty,
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) return;
         if (_tvLeaves.isNotEmpty) {
@@ -1307,6 +1968,509 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  /// Reference workspace owns category navigation; the nested navigator owns
+  /// leaf Back actions. Switching category always returns to its root first.
+  Widget _buildDesktopWorkspace(List<_SettingsEntry> entries) =>
+      BlocConsumer<SettingsCubit, SettingsState>(
+        bloc: _settingsCubit,
+        listener: (context, state) => _syncShellBackIntercept(state: state),
+        builder: (context, state) {
+          final selected = _desktopSelectedSection(entries, state);
+          return PopScope(
+            canPop: _desktopDepth == 0 && state.query.isEmpty,
+            onPopInvokedWithResult: (didPop, _) {
+              // Only close what Settings owns (a page above the section, or
+              // the search). At the root another PopScope on this route (the
+              // shell's) blocked the pop; calling Back again from here would
+              // just bounce between the two, so the shell decides (shell-1).
+              if (didPop) return;
+              // A retained, hidden Settings tab must not react to Back meant
+              // for the page that is showing.
+              if (!TickerMode.valuesOf(context).enabled) return;
+              if (_desktopDepth > 0 || _settingsCubit.state.query.isNotEmpty) {
+                _desktopBack();
+              }
+            },
+            child: DesktopSettingsWorkspace(
+              title: context.l10n.settingsTitle,
+              selectedId: selected,
+              onExit: _desktopBack,
+              // set-3: one search box for every settings page.
+              search: DesktopSettingsSearch(
+                controller: _searchCtrl,
+                focusNode: _desktopSearchFocus,
+                hint: context.l10n.settingsSearchHint,
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+                onChanged: _onDesktopSearchChanged,
+                onSubmitted: (_) => _openFirstDesktopResult(entries),
+                onClear: () {
+                  _searchCtrl.clear();
+                  _settingsCubit.setQuery('');
+                  _desktopSearchFocus.unfocus();
+                },
+              ),
+              onSearchShortcut: _focusDesktopSearch,
+              destinations: [
+                for (final section in _sectionOrder)
+                  if (entries.any((entry) => entry.section == section))
+                    DesktopSettingsDestination(
+                      id: section,
+                      title: settingsSectionTitle(context.l10n, section),
+                      icon: settingsSectionIcon(section),
+                      onOpen: () => _openDesktopSection(section),
+                    ),
+              ],
+              child: Navigator(
+                key: _desktopNavigator,
+                pages: [
+                  MaterialPage<void>(
+                    key: const ValueKey('desktop-settings-root'),
+                    child: _desktopRoot(entries, state, selected),
+                  ),
+                ],
+                onDidRemovePage: (_) {},
+              ),
+            ),
+          );
+        },
+      );
+
+  /// set-8: the section the sidebar shows as selected. An explicit choice
+  /// wins; otherwise the section used last time (DesktopPrefs), and Account
+  /// only on a first visit. A section this platform does not show (or one
+  /// saved by another build) falls back too.
+  String _desktopSelectedSection(
+    List<_SettingsEntry> entries,
+    SettingsState state,
+  ) {
+    bool shown(String? id) =>
+        id != null && entries.any((entry) => entry.section == id);
+    if (shown(state.openSection)) return state.openSection!;
+    final last = DesktopPrefs.lastSettingsSection;
+    if (shown(last)) return last!;
+    return SettingsSection.account;
+  }
+
+  /// Sidebar click, arrow key or Ctrl+number: show [section] from its root,
+  /// clear any search, and remember it for next time (set-8).
+  void _openDesktopSection(String section) {
+    _desktopNavigator.currentState?.popUntil((r) => r.isFirst);
+    _searchCtrl.clear();
+    _settingsCubit.setQuery('');
+    _settingsCubit.open(section);
+    _syncShellBackIntercept();
+    unawaited(DesktopPrefs.setLastSettingsSection(section));
+  }
+
+  /// Typing in the sidebar search shows results in place of whatever page
+  /// was open, so a page left open never hides them.
+  void _onDesktopSearchChanged(String value) {
+    final query = value.trim();
+    if (query.isNotEmpty && _desktopDepth > 0) {
+      _desktopNavigator.currentState?.popUntil((r) => r.isFirst);
+    }
+    _settingsCubit.setQuery(query);
+  }
+
+  /// Ctrl+F / Ctrl+K: focus the search box and select its text, so typing
+  /// replaces the last search.
+  void _focusDesktopSearch() {
+    _desktopSearchFocus.requestFocus();
+    _searchCtrl.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: _searchCtrl.text.length,
+    );
+  }
+
+  /// Enter in the search box opens the first result.
+  void _openFirstDesktopResult(List<_SettingsEntry> entries) {
+    final query = _settingsCubit.state.query.toLowerCase();
+    if (query.isEmpty) return;
+    final results = _desktopResultItems(entries, query);
+    if (results.isEmpty) return;
+    results.first.open();
+  }
+
+  /// What the nested navigator's root shows: search results while there is
+  /// a query; a one-page section's page itself (set-1); otherwise the
+  /// section's list of rows.
+  Widget _desktopRoot(
+    List<_SettingsEntry> entries,
+    SettingsState state,
+    String section,
+  ) {
+    final query = state.query.toLowerCase();
+    if (query.isNotEmpty) {
+      return KeyedSubtree(
+        key: const ValueKey('desktop-root-search'),
+        child: _desktopResultsBody(entries, query),
+      );
+    }
+    final items = entries.where((entry) => entry.section == section).toList();
+    final page = items.length == 1 ? items.single.page : null;
+    if (page != null) {
+      return PopScope(
+        // set-1: nothing sits under this page. Its own header Back button
+        // pops this (first) route, which cannot pop, so leave Settings the
+        // same way the sidebar's Back does instead of doing nothing.
+        key: ValueKey('desktop-root-page-$section'),
+        canPop: false,
+        onPopInvokedWithResult: (didPop, _) {
+          if (!didPop) _leaveDesktopSettings();
+        },
+        child: DesktopSettingsRowSeeker(child: Builder(builder: page)),
+      );
+    }
+    return KeyedSubtree(
+      key: ValueKey('desktop-root-section-$section'),
+      child: _desktopSectionBody(entries, section),
+    );
+  }
+
+  /// Return from real nested content or search, then exit Settings directly.
+  /// Sidebar categories are peers, so they must not add a hidden Account hop.
+  void _desktopBack() {
+    if (widget.returnToPlayer) {
+      // Opened from the player: the sidebar's Back always returns to it.
+      Navigator.of(context).maybePop();
+    } else if (_desktopDepth > 0) {
+      _desktopNavigator.currentState?.maybePop();
+    } else if (_settingsCubit.state.query.isNotEmpty) {
+      _searchCtrl.clear();
+      _settingsCubit.setQuery('');
+    } else {
+      _leaveDesktopSettings();
+    }
+    _syncShellBackIntercept();
+  }
+
+  /// Leaves Settings: back to the player when opened from it; otherwise
+  /// through the shell's handler (shell-1: return to the previous page), and
+  /// a plain route pop when the shell installed none.
+  void _leaveDesktopSettings() {
+    if (widget.returnToPlayer || widget.showBackButton) {
+      Navigator.of(context).maybePop();
+      return;
+    }
+    if (!DesktopSettingsNavigation.leave()) Navigator.of(context).maybePop();
+  }
+
+  /// Heading, summary and content for a Windows settings page body. The
+  /// heading starts at the panels' left edge; the panels, section titles and
+  /// rows are the ones every other settings page uses (set-4 caps their width).
+  Widget _desktopPageBody({
+    required Key key,
+    required String title,
+    String? summary,
+    required List<Widget> children,
+  }) {
+    // A Scaffold (not a bare Material) so this page hosts snack bars: without
+    // one, "Sync library", "Share logs", Start page and auto-update messages
+    // were drawn on the app shell hidden behind the Settings route.
+    return Scaffold(
+      // The shared desktop frame colour, so Pure black and a custom
+      // Background colour reach this page exactly as they reach the title bar
+      // and sidebar around it.
+      backgroundColor: DesktopChrome.frame,
+      body: SingleChildScrollView(
+        key: key,
+        // Only top and bottom: the panels and section titles bring their own
+        // side margins, as on every other settings page.
+        padding: const EdgeInsets.only(top: 24, bottom: 32),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // No "Settings /" breadcrumb: the sidebar is the overview.
+            DesktopSettingsColumn(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: AppText.headline.copyWith(
+                      fontSize: 30,
+                      color: AppColors.textPrimary,
+                    ),
+                  ),
+                  if (summary != null) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      summary,
+                      style: AppText.body.copyWith(
+                        color: AppColors.textSecondary,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const SizedBox(height: 20),
+            ...children,
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Real entry callbacks are rendered in new graphite panels. No account,
+  /// preference or source data is copied into presentation state.
+  Widget _desktopSectionBody(List<_SettingsEntry> entries, String section) {
+    final items = entries.where((entry) => entry.section == section).toList();
+    final groups = <String, List<_SettingsEntry>>{};
+    for (final item in items) {
+      groups.putIfAbsent(item.group ?? '', () => []).add(item);
+    }
+    return _desktopPageBody(
+      key: ValueKey('desktop-section-$section'),
+      title: settingsSectionTitle(context.l10n, section),
+      summary: settingsSectionSummary(context.l10n, section),
+      children: [
+        if (section == SettingsSection.account) ...[
+          _accountCard(context, entries),
+          _desktopProfilesPanel(),
+          _desktopAccountPanel(),
+          const SizedBox(height: 16),
+        ],
+        for (final (index, group) in groups.entries.indexed) ...[
+          // The same section title, and the same gaps around it, as on the
+          // pages below.
+          if (group.key.isNotEmpty)
+            SettingsSectionLabel(group.key, first: index == 0)
+          else if (index > 0)
+            const SizedBox(height: 16),
+          _desktopPanel([
+            for (final item in group.value)
+              DesktopSettingsAction(
+                title: item.title,
+                subtitle: item.subtitle,
+                icon: item.icon,
+                trailing: item.trailing,
+                onTap: item.onTap,
+              ),
+          ]),
+        ],
+      ],
+    );
+  }
+
+  /// Search results page shown at the navigator root while there is a query.
+  Widget _desktopResultsBody(List<_SettingsEntry> entries, String query) {
+    final results = _desktopResultItems(entries, query);
+    return _desktopPageBody(
+      key: const ValueKey('desktop-settings-results'),
+      title: context.l10n.searchResults,
+      children: [
+        if (results.isEmpty)
+          DesktopSettingsColumn(
+            child: Text(
+              context.l10n.settingsNoMatch(_searchCtrl.text.trim()),
+              style: AppText.body,
+            ),
+          )
+        else
+          _desktopPanel([
+            for (final result in results)
+              DesktopSettingsAction(
+                title: result.title,
+                subtitle: result.subtitle,
+                icon: result.icon,
+                trailing: result.trailing,
+                onTap: result.open,
+              ),
+          ]),
+      ],
+    );
+  }
+
+  /// Windows Account section: the Zangetsu account row (sign-in, library sync
+  /// and backup live on [AccountScreen]), shown above the section's entries.
+  Widget _desktopAccountPanel() => BlocBuilder<AuthCubit, AuthState>(
+    builder: (context, auth) {
+      final tile = _accountTile(auth);
+      return _desktopPanel([
+        DesktopSettingsAction(
+          title: tile.title,
+          subtitle: tile.subtitle,
+          icon: tile.icon,
+          onTap: tile.onTap,
+        ),
+      ]);
+    },
+  );
+
+  /// Panel boundaries group related actions without individual mobile cards.
+  Widget _desktopPanel(List<Widget> children) =>
+      GraphiteSettingsPanel(children: children);
+
+  /// Quick profile switcher. The card above already opens the profile editor,
+  /// so this strip switches instead: clicking an avatar goes through
+  /// [ensureProfileAccess], so the profile PIN (the synced lock shared
+  /// with phone and TV) is always asked first. Disabled when Settings was
+  /// opened from the player, where swapping the viewer mid-playback would be wrong.
+  Widget _desktopProfilesPanel() {
+    final store = sl<ViewerProfileStore>();
+    return ValueListenableBuilder<int>(
+      valueListenable: store.revision,
+      builder: (context, revision, child) =>
+          ValueListenableBuilder<ViewerProfile?>(
+            valueListenable: store.active,
+            builder: (context, _, _) {
+              final canSwitch = !widget.returnToPlayer && !_switchingProfile;
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 20),
+                child: _desktopPanel([
+                  Container(
+                    // As wide as the card, so the content starts at its left
+                    // edge instead of being centred in it.
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(22),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          context.l10n.switchProfile,
+                          style: AppText.headline.copyWith(fontSize: 23),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          widget.returnToPlayer
+                              ? context.l10n.closePlayerToSwitchProfiles
+                              : context.l10n.clickProfileToWatchAs,
+                          style: AppText.caption.copyWith(
+                            color: AppColors.textSecondary,
+                          ),
+                        ),
+                        const SizedBox(height: 22),
+                        Wrap(
+                          spacing: 16,
+                          runSpacing: 16,
+                          children: [
+                            for (final profile in store.profiles)
+                              _DesktopProfileAvatar(
+                                key: ValueKey('desktop-profile-${profile.id}'),
+                                profile: profile,
+                                active: profile.id == store.activeId,
+                                onTap: canSwitch && profile.id != store.activeId
+                                    ? () => _switchDesktopProfile(profile)
+                                    : null,
+                              ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ]),
+              );
+            },
+          ),
+    );
+  }
+
+  /// Same steps as the shell's profile menu: unlock, approve the switch for
+  /// the synced lock, then switch. A cancelled or wrong PIN changes nothing.
+  Future<void> _switchDesktopProfile(ViewerProfile profile) async {
+    if (_switchingProfile) return;
+    final profiles = sl<ViewerProfileStore>();
+    final owner = profiles.ownerKey;
+    setState(() => _switchingProfile = true);
+    try {
+      if (!await ensureProfileAccess(context, profile)) return;
+      if (!mounted || profiles.ownerKey != owner) return;
+      if (!profiles.profiles.any((p) => p.id == profile.id)) return;
+      final locks = sl.isRegistered<ProfileLockStore>()
+          ? sl<ProfileLockStore>()
+          : null;
+      if (profiles.activeId != profile.id) {
+        // Windows: history is per profile, so a video in the floating mini
+        // player is saved to the profile that watched it and stopped first.
+        await closeFloatingPlayerBeforeProfileSwitch();
+        locks?.approveSwitch(profile.id);
+      }
+      try {
+        await profiles.switchTo(profile.id);
+      } finally {
+        locks?.consumeSwitchApproval(profile.id);
+      }
+    } catch (e) {
+      AppLogger.instance.log('Profile switch from Settings failed: $e');
+      if (mounted) {
+        ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+          const SnackBar(content: Text("Couldn't switch profile. Try again.")),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _switchingProfile = false);
+    }
+  }
+
+  /// Search keeps the real indexed leaf destinations while using new rows.
+  /// Words match in any order (set-3). A leaf result also names its row, so
+  /// the page it opens scrolls to that row, flashes and focuses it (set-2).
+  List<_DesktopResult> _desktopResultItems(
+    List<_SettingsEntry> entries,
+    String query,
+  ) {
+    final l10n = context.l10n;
+    final byId = {
+      for (final entry in entries)
+        if (entry.id != null) entry.id!: entry,
+    };
+    // Sign-in, library sync and backup live on AccountScreen rather than in
+    // an entry, so match its labels the way the phone hub search does.
+    final accountText = [
+      AccountScreen.title,
+      l10n.syncLibraryToCloud,
+      l10n.backupAndRestore,
+      l10n.signIn,
+      l10n.logOut,
+      'cloud sync library upload backup restore account',
+    ].join(' ');
+    return [
+      if (settingsQueryMatches(accountText, query, allWords: true))
+        _DesktopResult(
+          title: AccountScreen.title,
+          subtitle: sl<AuthCubit>().state.isLoggedIn
+              ? AccountScreen.statusLabel(context, sl<AuthCubit>().state)
+              : 'Sign in to sync',
+          icon: Icons.manage_accounts_outlined,
+          open: () => _push(const AccountScreen()),
+        ),
+      for (final entry in entries)
+        if (entry.matches(query, allWords: true))
+          _DesktopResult(
+            title: entry.title,
+            subtitle: entry.subtitle,
+            icon: entry.icon,
+            trailing: entry.trailing,
+            open: () => entry.onTap?.call(),
+          ),
+      for (final leaf in settingsLeaves)
+        if (byId.containsKey(leaf.parentId) &&
+            // Never offer a setting this platform's page does not render.
+            leaf.isVisible &&
+            leaf.matches(query, l10n, allWords: true) &&
+            // Skip a leaf that only repeats its own page's row (Home rows).
+            !(byId[leaf.parentId]!.title == leaf.title(l10n) &&
+                byId[leaf.parentId]!.matches(query, allWords: true)))
+          _DesktopResult(
+            title: leaf.title(l10n),
+            subtitle: byId[leaf.parentId]!.title,
+            icon: byId[leaf.parentId]!.icon,
+            open: () {
+              // Name the row first: the page built by onTap looks for it.
+              DesktopSettingsRowTargets.request(
+                id: leaf.id,
+                title: leaf.title(l10n),
+              );
+              byId[leaf.parentId]!.onTap?.call();
+            },
+          ),
+    ];
+  }
+
+  /// Phone and other non-Windows layouts. Windows always returns the desktop
+  /// workspace from build() before reaching this (set-10 removed the old
+  /// Windows category-grid branches that used to live here).
   Widget _buildHub(List<_SettingsEntry> entries) {
     return BlocConsumer<SettingsCubit, SettingsState>(
       bloc: _settingsCubit,
@@ -1353,7 +2517,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
         }
         return Scaffold(
           backgroundColor: AppColors.bg,
-          appBar: widget.showBackButton && section == null
+          appBar: widget.returnToPlayer
+              ? AppBar(
+                  leading: BackButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                  title: const Text('Back to player'),
+                )
+              : widget.showBackButton && section == null
               ? settingsAppBar(context.l10n.settingsTitle)
               : null,
           body: SafeArea(
@@ -1362,7 +2533,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
               // Phone: top level with no search → back leaves Settings.
               // TV: the outer PopScope around the nested Navigator owns Back
               // (leaves + sections); this one must not also fire cubit.back().
-              canPop: !_isTv && section == null && query.isEmpty,
+              canPop:
+                  !_isTv &&
+                  (widget.returnToPlayer || (section == null && query.isEmpty)),
               onPopInvokedWithResult: (didPop, _) {
                 if (didPop || _isTv) return;
                 if (section != null) {
@@ -1370,7 +2543,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 } else if (query.isNotEmpty) {
                   _searchCtrl.clear();
                   _settingsCubit.setQuery('');
-                  FocusScope.of(context).unfocus();
+                  DesktopFocusRepair.dropFocus(context);
                 }
               },
               // Slide the drill-down in like a real pushed page (matching the
@@ -1434,7 +2607,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final leaves = q.isEmpty
         ? const <SettingsLeaf>[]
         : settingsLeaves
-              .where((l) => l.matches(q, l10n) && byId.containsKey(l.parentId))
+              .where(
+                (l) =>
+                    l.isVisible &&
+                    l.matches(q, l10n) &&
+                    byId.containsKey(l.parentId),
+              )
               .toList();
     for (final section in _sectionOrder) {
       final items = entries
@@ -1724,6 +2902,110 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 }
 
+/// One avatar in the Windows "Switch profile" strip. The active profile gets
+/// an accent ring and a "Watching" caption; the others show a hand cursor and
+/// a hover ring, and are keyboard-focusable.
+class _DesktopProfileAvatar extends StatefulWidget {
+  const _DesktopProfileAvatar({
+    super.key,
+    required this.profile,
+    required this.active,
+    required this.onTap,
+  });
+
+  final ViewerProfile profile;
+  final bool active;
+
+  /// Null when the profile cannot be switched to (already active, a switch is
+  /// running, or Settings was opened from the player).
+  final VoidCallback? onTap;
+
+  @override
+  State<_DesktopProfileAvatar> createState() => _DesktopProfileAvatarState();
+}
+
+class _DesktopProfileAvatarState extends State<_DesktopProfileAvatar> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final ring = widget.active
+        ? AppColors.accent
+        : _hovered && widget.onTap != null
+        ? AppColors.textSecondary
+        : Colors.transparent;
+    return Semantics(
+      button: widget.onTap != null,
+      selected: widget.active,
+      label: widget.active
+          ? '${widget.profile.name}, watching now'
+          : 'Switch to ${widget.profile.name}',
+      child: ExcludeSemantics(
+        child: InkWell(
+          onTap: widget.onTap,
+          onHover: (v) => setState(() => _hovered = v),
+          borderRadius: BorderRadius.circular(14),
+          mouseCursor: widget.onTap == null
+              ? SystemMouseCursors.basic
+              : SystemMouseCursors.click,
+          child: Padding(
+            padding: const EdgeInsets.all(6),
+            child: SizedBox(
+              width: 92,
+              child: Column(
+                children: [
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 140),
+                    padding: const EdgeInsets.all(3),
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(color: ring, width: 2),
+                    ),
+                    child: CircleAvatar(
+                      radius: 32,
+                      backgroundColor: viewerProfileAvatarColor(
+                        widget.profile.avatar,
+                      ),
+                      child: ProfileAvatarFace(
+                        profile: widget.profile,
+                        iconSize: 32,
+                        photoDiameter: 64,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    widget.profile.name,
+                    textAlign: TextAlign.center,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: AppText.caption.copyWith(
+                      color: widget.active
+                          ? AppColors.textPrimary
+                          : AppColors.textSecondary,
+                      fontWeight: widget.active
+                          ? FontWeight.w700
+                          : FontWeight.w500,
+                    ),
+                  ),
+                  if (widget.active)
+                    Text(
+                      'Watching',
+                      style: AppText.caption.copyWith(
+                        color: AppColors.accent,
+                        fontSize: 11,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// A TV leaf route stacked on the nested Settings navigator, with a [done]
 /// future completed when the page is popped (so `await _push(...)` still works).
 class _TvSettingsLeaf {
@@ -1751,9 +3033,15 @@ class _SettingsEntry {
     this.trailing,
     this.onTap,
     this.group,
+    this.page,
   });
 
   final String section;
+
+  /// set-1: the page [onTap] opens, for rows that are their section's only
+  /// destination. The Windows workspace then shows this page as the section
+  /// itself, so Back never lands on a one-row list underneath it.
+  final WidgetBuilder? page;
 
   /// Optional heading this row sits under inside its section's page. Purely
   /// presentational: rows with no group render exactly as they always have,
@@ -1773,9 +3061,14 @@ class _SettingsEntry {
   final Widget? trailing;
   final VoidCallback? onTap;
 
-  /// [q] is already lower-cased by the caller.
-  bool matches(String q) =>
-      '$title ${subtitle ?? ''} $keywords $section'.toLowerCase().contains(q);
+  /// [q] is already lower-cased by the caller. [allWords] (Windows): every
+  /// word of [q] must appear, in any order.
+  bool matches(String q, {bool allWords = false}) {
+    final text = '$title ${subtitle ?? ''} $keywords $section';
+    return allWords
+        ? settingsQueryMatches(text, q, allWords: true)
+        : text.toLowerCase().contains(q);
+  }
 
   SettingsTile toTile({bool iconAccent = false, bool autofocus = false}) =>
       SettingsTile(
@@ -1787,4 +3080,22 @@ class _SettingsEntry {
         iconAccent: iconAccent,
         autofocus: autofocus,
       );
+}
+
+/// One Windows settings search result: what the row shows and what opening
+/// it does (Enter in the search box opens the first one).
+class _DesktopResult {
+  const _DesktopResult({
+    required this.title,
+    required this.icon,
+    required this.open,
+    this.subtitle,
+    this.trailing,
+  });
+
+  final String title;
+  final String? subtitle;
+  final IconData icon;
+  final Widget? trailing;
+  final VoidCallback open;
 }

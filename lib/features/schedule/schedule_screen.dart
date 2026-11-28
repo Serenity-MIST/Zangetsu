@@ -1,12 +1,24 @@
 import 'dart:async';
 
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:intl/intl.dart';
 
 import '../../core/app_mode.dart';
+import '../../core/desktop/desktop_chrome_colors.dart';
+import '../../core/desktop/desktop_context_menu.dart';
+import '../../core/desktop/desktop_shortcuts.dart';
 import '../../core/di/injector.dart';
+import '../../core/playback/list_status_store.dart';
 import '../../core/playback/my_list.dart';
+import '../../core/theme/theme_controller.dart';
+import '../../core/ui/list_status_sheet.dart';
+import '../home/lists_hub_screen.dart' show hubUpdatedLabel;
+import 'schedule_offline_cache.dart';
 import '../../core/schedule/airing_service.dart';
 import '../../core/schedule/coming_soon_service.dart';
 import '../../core/schedule/schedule_models.dart';
@@ -23,6 +35,10 @@ import 'schedule_cubit.dart';
 import 'schedule_screen_tv.dart';
 import '../../l10n/l10n.dart';
 
+// The Windows desktop week view lives in its own file but shares this
+// file's private helpers (countdown, time formatting, day headers).
+part 'schedule_desktop_view.dart';
+
 /// The Schedule tab: a monthly/weekly anime airing calendar + upcoming
 /// movies/TV. Self-contained (creates its own ScheduleCubit) so it can sit
 /// directly in the shell page list.
@@ -31,15 +47,28 @@ class ScheduleScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tv = sl<AppMode>().isTv;
+    // Windows (not TV) gets the desktop week view plus its data extras: a
+    // saved offline copy (track-5 B), tracker lists re-read on refresh
+    // (track-11 A) and after in-app status edits (track-11 B). Phone and TV
+    // build the cubit exactly as before.
+    final windows = !tv && defaultTargetPlatform == TargetPlatform.windows;
     return BlocProvider(
       create: (_) => ScheduleCubit(
         sl<AiringService>(),
         sl<ComingSoonService>(),
         sl<MyListStore>(),
         trackerHub: sl.isRegistered<TrackerHub>() ? sl<TrackerHub>() : null,
+        offlineCache: windows ? HiveScheduleOfflineCache() : null,
+        trackerListChanges: windows && sl.isRegistered<ListStatusStore>()
+            ? sl<ListStatusStore>().revision
+            : null,
+        reloadTrackersOnRefresh: windows,
       )..load(),
-      child: sl<AppMode>().isTv
+      child: tv
           ? const ScheduleScreenTv()
+          : windows
+          ? const ScheduleDesktopView()
           : const ScheduleBody(),
     );
   }
@@ -75,26 +104,43 @@ void openCanonical(
     openTitle(context, title);
     return;
   }
-  final c = ZCanonical(kind, id);
   Navigator.of(context).push(
     DetailScreen.route(
-      MediaItem(
-        id: c.id,
+      scheduleCanonicalItem(
+        kind: kind,
+        id: id,
         title: title,
-        url: ZmodeIds.showUrl(c),
-        // Matches what TmdbCatalogue/AniListCatalogue stamp on their own
-        // items, so a row opened from here is the same shape as one opened
-        // from Home rather than a lookalike.
-        type: switch (kind) {
-          ZKind.manga => ProviderType.manga,
-          ZKind.novel => ProviderType.novel,
-          ZKind.movie || ZKind.tv => ProviderType.movie,
-          ZKind.anime => ProviderType.anime,
-        },
-        sourceId: ZmodeIds.sourceId,
-        cover: coverUrl,
+        coverUrl: coverUrl,
       ),
     ),
+  );
+}
+
+/// The [MediaItem] a schedule row stands for (a `zm://` canonical title).
+/// Shared by [openCanonical] and the Windows row menu's My List action, so
+/// both act on the very same item.
+MediaItem scheduleCanonicalItem({
+  required ZKind kind,
+  required String id,
+  required String title,
+  String? coverUrl,
+}) {
+  final c = ZCanonical(kind, id);
+  return MediaItem(
+    id: c.id,
+    title: title,
+    url: ZmodeIds.showUrl(c),
+    // Matches what TmdbCatalogue/AniListCatalogue stamp on their own
+    // items, so a row opened from here is the same shape as one opened
+    // from Home rather than a lookalike.
+    type: switch (kind) {
+      ZKind.manga => ProviderType.manga,
+      ZKind.novel => ProviderType.novel,
+      ZKind.movie || ZKind.tv => ProviderType.movie,
+      ZKind.anime => ProviderType.anime,
+    },
+    sourceId: ZmodeIds.sourceId,
+    cover: coverUrl,
   );
 }
 
@@ -168,6 +214,7 @@ class _ScheduleBodyState extends State<ScheduleBody>
     with SingleTickerProviderStateMixin {
   late final TabController _tabs;
   Timer? _tick; // refreshes the live countdowns
+  late StreamKind _streamKind;
 
   int get _tab => _tabs.index;
 
@@ -177,16 +224,18 @@ class _ScheduleBodyState extends State<ScheduleBody>
     // Open on the tab for the kind you were browsing: Schedule is reached from
     // the Home card now, and arriving on Anime after tapping it from a
     // Movies/TV Home meant a tab switch every single time.
+    _streamKind = ZModePrefs.streamKind;
     _tabs =
         TabController(
           length: 2,
           vsync: this,
-          initialIndex: ZModePrefs.streamKind == StreamKind.movie ? 1 : 0,
+          initialIndex: _streamKind == StreamKind.movie ? 1 : 0,
         )..addListener(() {
           if (mounted) {
             setState(() {}); // header (filter / busy state) follows the tab
           }
         });
+    ZModePrefs.revision.addListener(_streamKindChanged);
     // Re-render every 30s so countdowns/“LIVE” stay current. Cancelled in
     // dispose, so no timer leaks in tests.
     _tick = Timer.periodic(const Duration(seconds: 30), (_) {
@@ -194,8 +243,18 @@ class _ScheduleBodyState extends State<ScheduleBody>
     });
   }
 
+  /// Retained desktop pages must follow the shell selector after first entry.
+  /// Other preference writes must not override a tab chosen inside Schedule.
+  void _streamKindChanged() {
+    final kind = ZModePrefs.streamKind;
+    if (!mounted || kind == _streamKind) return;
+    _streamKind = kind;
+    _tabs.animateTo(kind == StreamKind.movie ? 1 : 0);
+  }
+
   @override
   void dispose() {
+    ZModePrefs.revision.removeListener(_streamKindChanged);
     _tabs.dispose();
     _tick?.cancel();
     super.dispose();

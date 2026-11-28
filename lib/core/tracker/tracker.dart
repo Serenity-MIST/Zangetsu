@@ -38,7 +38,13 @@ class TrackerListItem {
     this.totalEpisodes,
     this.nextAiringEpisode,
     this.isUnreleased = false,
+    this.latestReleaseAt,
   });
+
+  /// Roughly when the newest released episode came out: a week before the
+  /// next episode airs while a show is airing, or its end date once finished.
+  /// Null when the tracker did not say (only AniList fills it today).
+  final DateTime? latestReleaseAt;
 
   final MediaItem item;
   final WatchStatus status; // planning | watching | completed | paused | dropped

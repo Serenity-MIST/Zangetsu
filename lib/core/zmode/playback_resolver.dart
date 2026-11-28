@@ -1,12 +1,17 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
 import '../provider/link_patience.dart';
+import '../aniyomi/aniyomi_call_gate.dart';
+import '../boot_network.dart';
+import '../desktop/desktop_source_cf_cooldown.dart';
 import '../models/episode.dart';
 import '../models/video_source.dart';
 import '../playback/source_health_store.dart';
 import '../di/injector.dart';
+import '../logging/lifecycle_label.dart';
 import '../provider/cf_solve_needed.dart';
 import '../provider/cloudstream_provider.dart';
 import '../provider/js_engine.dart';
@@ -170,10 +175,31 @@ class PlaybackResolver {
     /// Likewise for [relaxedPerSourceBudget].
     Duration? relaxedBudget,
 
+    /// Desktop companions resolve off the UI thread and may collect links for
+    /// sixty seconds. Kept injectable for bounded transport regression tests.
+    Duration? companionBudget,
+
+    /// Windows: the shorter limit for a playback ("fast") ask of a CloudStream
+    /// source, see [companionFastBudget]. Injectable for tests; when left out
+    /// it follows [companionBudget] if a test set that, else 30 s.
+    Duration? companionFastBudget,
+
     /// Counts a play against the source that served it. Optional — see
     /// [_scores].
     SourceScoreStore? scores,
+
+    /// Windows: how much longer a sweep listens for sources that ran past
+    /// their budget. Injectable so tests need not wait [slowSourceGrace].
+    Duration? slowGrace,
   }) : _budget = perSourceBudget ?? defaultPerSourceBudget,
+       _slowGrace = slowGrace ?? slowSourceGrace,
+       _companionBudget =
+           companionBudget ?? perSourceBudget ?? const Duration(seconds: 75),
+       _companionFastBudget =
+           companionFastBudget ??
+           companionBudget ??
+           perSourceBudget ??
+           PlaybackResolver.companionFastBudget,
        _chosenBudget = chosenBudget ?? chosenSourceBudget,
        _relaxedBudget =
            relaxedBudget ?? perSourceBudget ?? relaxedPerSourceBudget,
@@ -183,7 +209,11 @@ class PlaybackResolver {
        _prefs = prefs,
        _health = health,
        _candidates = candidates,
-       _scores = scores;
+       _scores = scores {
+    // Windows: note network changes from the start, so a failure during a
+    // drop is recognised even when it is the first slow try of the session.
+    if (_patient) _watchNetwork();
+  }
 
   final SourceMatcher _matcher;
   final SourceRepository _sources;
@@ -218,11 +248,25 @@ class PlaybackResolver {
   final Map<String, ({String episodeUrl, String sourceId, SourceMatch match})>
   _winners = {};
 
+  /// An uninstall may happen after an episode won. Retire only this transient
+  /// cache entry; saved matches, jobs, media files and progress remain intact.
+  ({String episodeUrl, String sourceId, SourceMatch match})? _availableWinner(
+    String key,
+  ) {
+    final winner = _winners[key];
+    if (winner != null && !_sources.hasSource(winner.sourceId)) {
+      _winners.remove(key);
+      return null;
+    }
+    return winner;
+  }
+
   static String _winKey(String zmEpisodeUrl, String category) =>
       '$zmEpisodeUrl|$category';
 
   /// In-flight resolves keyed by metadata episode url.
-  final Map<String, Future<ResolvedPlayback>> _inFlight = {};
+  final Map<String, ({String providers, Future<ResolvedPlayback> future})>
+  _inFlight = {};
 
   /// How long one candidate may hold the sweep before we move on. Measured on
   /// a real device: a JS provider with its own 15s internal timeout took 15.8s
@@ -239,6 +283,21 @@ class PlaybackResolver {
   /// Everywhere else, see [relaxedPerSourceBudget].
   static const Duration defaultPerSourceBudget = Duration(seconds: 8);
   final Duration _budget;
+  final Duration _companionBudget;
+
+  /// Windows (plan item C2): how long a playback ask of a CloudStream
+  /// (`cs:`) source may hold a sweep. The engine now hands playback its first
+  /// links as soon as they are found (first link plus 0.7 s, see
+  /// `CloudStreamLinkSessions`), so waiting the full 75 s that covers the
+  /// engine's 60 s collection only kept a stalled source holding up its wave.
+  ///
+  /// Only the fast (playback) ask is shortened. A full ask (downloads, the
+  /// download dialog, fresh links) still needs every mirror and keeps
+  /// [_companionBudget]. A source that runs past 30 s on a playback sweep is
+  /// not dropped: Windows keeps listening for it for [slowSourceGrace] once
+  /// the quicker sources came back empty, so a slow first link still plays.
+  static const Duration companionFastBudget = Duration(seconds: 30);
+  final Duration _companionFastBudget;
 
   /// What an un-chosen source gets where the wait costs no frames.
   ///
@@ -283,13 +342,81 @@ class PlaybackResolver {
   static const Duration chosenSourceBudget = Duration(seconds: 60);
   final Duration _chosenBudget;
 
+  /// Windows: what an Aniyomi source ("ani:…") gets in the download search,
+  /// instead of [relaxedPerSourceBudget] or [chosenSourceBudget].
+  ///
+  /// Only two Aniyomi calls run at once (see [AniyomiCallGate]), and the
+  /// download search's clock starts when it asks, not when the gate hands
+  /// the call a slot. Right after the show page or the player asked the same
+  /// sources, the dialog's asks wait in that queue, and 20 s ran out before
+  /// they had even started: "No source had this episode" while Anikoto was
+  /// still answering. This is the gate's own limit for one call once it has
+  /// a slot. One download ask can make two gated calls in a row (episode
+  /// list, then video list), each of which may queue, so when the gate had
+  /// calls queued during the ask the search gives it one more of these
+  /// ([downloadAniyomiExtendIf]), within [downloadAniyomiWallClock].
+  ///
+  /// The source only holds a search worker for its usual budget
+  /// ([downloadCandidates] sets freeWorkerAfter); after that the next
+  /// source (a CloudStream one, say) is asked as before, and the Aniyomi
+  /// answer is still taken if it comes. So other sources are not kept
+  /// waiting, and no work is added: the call keeps running in the engine
+  /// either way, the search just stops throwing its answer away. Phone and
+  /// TV never use it.
+  static const Duration downloadAniyomiBudget =
+      AniyomiCallGate.defaultCallTimeout;
+
+  /// Windows: how long the whole download search may run when it asks
+  /// Aniyomi sources, instead of the search's usual 90 s. An Aniyomi source
+  /// asked at the start may need two [downloadAniyomiBudget]s (140 s) when
+  /// the gate was busy, and a CloudStream source asked after the first
+  /// Aniyomi workers moved on (about 20 s in) needs its own 75 s. Cancelling
+  /// the dialog still stops the search at once.
+  static const Duration downloadAniyomiWallClock = Duration(seconds: 150);
+
+  /// True when a download search for [sourceId] gets
+  /// [downloadAniyomiBudget]: an Aniyomi source where the call gate applies
+  /// (Windows).
+  static bool usesDownloadAniyomiBudget(String sourceId) =>
+      sourceId.startsWith('ani:') && AniyomiCallGate.enabled;
+
+  /// For a download ask that ran out of [downloadAniyomiBudget]: true when
+  /// the gate made calls queue since [askedAt], so part of that time was
+  /// spent waiting for a slot, not on the source. Same test playback uses
+  /// before counting a slow Aniyomi answer against the source.
+  static bool downloadAniyomiExtendIf(DateTime askedAt) =>
+      AniyomiCallGate.instance.queuedSince(askedAt);
+
   /// The budget for [sourceId] given the sources this viewer chose.
   ///
   /// Where the wait is free (JS off the UI isolate), a chosen source still gets
   /// the most patience, and everything else gets [relaxedPerSourceBudget]
   /// rather than the old 8s. Where it is not free, the tight budget applies to
   /// everything, chosen or not — exactly as before.
-  Duration _budgetFor(String sourceId, Set<String> chosen) {
+  ///
+  /// [fast] says whether the ask is a playback one (first usable link) or a
+  /// full one (every mirror). It only matters for CloudStream on Windows.
+  Duration _budgetFor(
+    String sourceId,
+    Set<String> chosen, {
+    bool fast = false,
+  }) {
+    // The desktop CS3 engine collects mirrors for up to 60s. Applying the
+    // in-process QuickJS 8s limit discarded valid replies and poisoned the
+    // provider's health before extraction had finished.
+    if (Platform.isWindows && sourceId.startsWith('cs:')) {
+      // Windows (plan item C2): a playback ask returns on the first links,
+      // so it gets the shorter limit. Phone and TV never reach this line.
+      // This 30 s limit counts on the engine sending its first links early
+      // (plan item C1, the shipped engine-core.jar). An older engine that
+      // only answers once its full 60 s collection ends would overrun it on
+      // every play and lean on the slow-source grace instead.
+      if (fast && _patient) return _companionFastBudget;
+      return _companionBudget;
+    }
+    if (_isNativeSource(sourceId) && !sourceId.startsWith('lnr:')) {
+      return chosen.contains(sourceId) ? _chosenBudget : _relaxedBudget;
+    }
     if (!JsEngine.runsOffUiIsolate) return _budget;
     return chosen.contains(sourceId) ? _chosenBudget : _relaxedBudget;
   }
@@ -409,8 +536,39 @@ class PlaybackResolver {
   ///
   /// Short-lived and cleared by [invalidateWinner], so installing a source,
   /// solving a Cloudflare challenge or hitting Retry all get a fresh sweep.
-  final Map<String, ({DateTime at, bool hadTitleMatch})> _noSource = {};
+  final Map<String, ({DateTime at, bool hadTitleMatch, String providers})>
+  _noSource = {};
   static const Duration noSourceCooldown = Duration(minutes: 5);
+
+  /// A miss only describes the provider inventory that was actually swept.
+  /// Adding a working plugin must not inherit another inventory's five-minute miss.
+  String _providerSignature(String episodeUrl) {
+    final parsed = ZmodeIds.parseEpisode(episodeUrl);
+    if (parsed == null) return '';
+    final ids = _candidates(
+      parsed.show.kind,
+    ).map((s) => s.id).where(_sources.hasSource).toSet().toList()..sort();
+    return ids.join('\u0000');
+  }
+
+  ({DateTime at, bool hadTitleMatch, String providers})? _currentMiss(
+    String url,
+    String category,
+  ) {
+    final key = _winKey(url, category);
+    final miss = _noSource[key];
+    if (miss != null && miss.providers != _providerSignature(url)) {
+      _noSource.remove(key);
+      return null;
+    }
+    return miss;
+  }
+
+  /// Late provider replies belong to the inventory that started the request.
+  /// Retire the reply without mutating a newer lookup or its winning source.
+  void _checkProviderInventory(String url, String providers) {
+    if (_providerSignature(url) != providers) throw const PlaybackAborted();
+  }
 
   bool _recentlyOverBudget(String id) {
     final at = _overBudget[id];
@@ -418,6 +576,272 @@ class PlaybackResolver {
     if (DateTime.now().difference(at) < overBudgetCooldown) return true;
     _overBudget.remove(id);
     return false;
+  }
+
+  // ── Windows: patient sweeps ───────────────────────────────────────────────
+  //
+  // On Windows the Aniyomi and CloudStream sources run in a companion engine
+  // and are often slow rather than broken: a reply after 25-40s is normal.
+  // Cutting them off at their budget and calling the episode unavailable made
+  // "video doesn't play" while the answer was still on its way, and one slow
+  // try put the source on the 10 minute skip list. On Windows a sweep now
+  // keeps listening for sources that ran past their budget, and only repeated
+  // real failures (never ones during a network change) skip a source.
+
+  /// True on Windows desktop; phone, TV and web keep the old rules.
+  static bool get _patient =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.windows;
+
+  /// How much longer a Windows sweep waits for sources that ran past their
+  /// budget once every quicker source came back empty.
+  ///
+  /// 30s (was 45s): with a 20-25s budget in front of it this still gives a
+  /// slow source close to a minute in all, while a sweep where nothing has
+  /// the episode stops keeping the viewer waiting so long. CloudStream's
+  /// playback budget is 30s too ([companionFastBudget]); a full ask keeps
+  /// [_companionBudget] (75s), so its 60s link collection is still waited out.
+  static const Duration slowSourceGrace = Duration(seconds: 30);
+  final Duration _slowGrace;
+
+  /// The time limit a sweep gives [sourceId] for a [fast] (playback) or full
+  /// ask, for tests of plan item C2.
+  @visibleForTesting
+  Duration debugBudgetFor(String sourceId, {required bool fast}) =>
+      _budgetFor(sourceId, const <String>{}, fast: fast);
+
+  // ── Windows: Cloudflare skip for JS sources ───────────────────────────────
+
+  /// Windows: which JS sources just missed behind a fresh Cloudflare
+  /// challenge, and until when they are skipped. See
+  /// [DesktopSourceCfCooldown]. Session-only, like the flag it replaces for
+  /// the sweeps.
+  final DesktopSourceCfCooldown _cfCooldown = DesktopSourceCfCooldown();
+
+  /// The single "skip for Cloudflare?" check used by every call site:
+  /// [resolveProgressive], [_resolve], [downloadCandidates] and [probeEach].
+  /// Phone/TV and native sources read [CfSolveNeeded.sourceFlagged] exactly
+  /// as before; JS sources on Windows use the short cooldown instead.
+  bool _skipForCloudflare(String sourceId) => desktopSkipForCloudflare(
+    sourceId,
+    windows: _patient,
+    cooldown: _cfCooldown,
+  );
+
+  /// Windows, JS sources only: when [outcome] (true = the ask found what it
+  /// looked for) settles, records whether this ask missed while the source
+  /// reported a NEW challenge (its [CfSolveNeeded.sourceRevision] moved
+  /// since [revisionBefore]). That is the only thing that starts the
+  /// cooldown; a hit ends it. Listens to the request itself, not its budget,
+  /// so a slow answer that lands after the budget still counts.
+  ///
+  /// Takes the raw request and a [hit] test (not an already-derived future)
+  /// on purpose: a derived future made before the platform check would, off
+  /// Windows, carry the request's error with no listener and surface it as
+  /// an unhandled error. Only the Windows path listens at all.
+  void _trackCloudflare<T>(
+    String sourceId,
+    int revisionBefore,
+    Future<T> request,
+    bool Function(T result) hit,
+  ) {
+    if (!_patient || !DesktopSourceCfCooldown.isJsSource(sourceId)) return;
+    void rec(bool wasHit) => _cfCooldown.record(
+      sourceId,
+      hit: wasHit,
+      revisionBefore: revisionBefore,
+      revisionAfter: CfSolveNeeded.sourceRevision(sourceId),
+    );
+    unawaited(
+      request.then<void>((r) => rec(hit(r)), onError: (Object _) => rec(false)),
+    );
+  }
+
+  /// Windows, JS sources only: the reason to report for a miss of
+  /// [sourceId]'s own ask. When the source recorded a NEW Cloudflare
+  /// challenge during that ask (its revision moved since [revisionBefore]),
+  /// the miss is reported as [SweepReason.cloudflare] so the dead-end dialog
+  /// can offer Verify straight away, not only on the next sweep's skip.
+  /// Everywhere else [reason] is returned unchanged.
+  SweepReason _cfMissReason(
+    String sourceId,
+    int revisionBefore,
+    SweepReason reason,
+  ) {
+    if (!_patient || !DesktopSourceCfCooldown.isJsSource(sourceId)) {
+      return reason;
+    }
+    return CfSolveNeeded.sourceRevision(sourceId) != revisionBefore
+        ? SweepReason.cloudflare
+        : reason;
+  }
+
+  /// Failures in a row (no answer at all, or an error after the budget)
+  /// before a Windows source goes on the [overBudgetCooldown] list.
+  static const int overBudgetStrikes = 2;
+
+  /// Windows: failures in a row per source, see [overBudgetStrikes].
+  final Map<String, int> _slowStrikes = {};
+
+  /// Last time the app went offline or came back online (Windows watch).
+  static DateTime? _networkChangedAt;
+  static VoidCallback? _networkListener;
+
+  /// Starts noting network changes once, so a failure that happened while
+  /// the connection was dropping or coming back is not held against a source.
+  static void _watchNetwork() {
+    if (_networkListener != null) return;
+    final listener = _networkListener = () {
+      _networkChangedAt = DateTime.now();
+    };
+    BootConnectivity.instance.offline.addListener(listener);
+  }
+
+  /// Forgets the network watch between tests.
+  @visibleForTesting
+  static void debugResetNetworkWatch() {
+    final listener = _networkListener;
+    if (listener != null) {
+      BootConnectivity.instance.offline.removeListener(listener);
+    }
+    _networkListener = null;
+    _networkChangedAt = null;
+  }
+
+  /// True when the network is down now, or went down or came back since a
+  /// little before [since]. Failures in that window say nothing about the
+  /// source.
+  bool _networkFlapped(DateTime since) {
+    if (BootConnectivity.instance.offline.value) return true;
+    final at = _networkChangedAt;
+    return at != null &&
+        at.isAfter(since.subtract(const Duration(seconds: 30)));
+  }
+
+  /// Windows: a source ran past its budget. Keeps listening to [late] (the
+  /// request underneath, still running) to decide whether that counts
+  /// against it: an answer clears its record, an error or no answer within
+  /// [_slowGrace] is one strike, and [overBudgetStrikes] strikes in a row
+  /// put it on the skip list.
+  void _watchSlowSource(
+    String sourceId,
+    Future<Object?> pending,
+    DateTime started,
+  ) {
+    _watchNetwork();
+    unawaited(
+      pending.timeout(_slowGrace).then<void>((_) {
+        // It answered, just slowly: slow is not broken.
+        _slowStrikes.remove(sourceId);
+      }, onError: (Object e) => _strike(sourceId, started)),
+    );
+  }
+
+  /// Windows: true for an Aniyomi source ("ani:…") when some Aniyomi call
+  /// had to queue for a slot since [started]. Its budget ran while it may
+  /// have been waiting its turn, so the slowness may not be its own.
+  bool _waitedInAniyomiGate(String sourceId, DateTime started) =>
+      sourceId.startsWith('ani:') &&
+      AniyomiCallGate.enabled &&
+      AniyomiCallGate.instance.queuedSince(started);
+
+  /// One failure for [sourceId]. Skipped when the network changed meanwhile,
+  /// or (Aniyomi) when its call may have spent the time queued in the gate.
+  void _strike(String sourceId, DateTime started) {
+    if (_networkFlapped(started)) {
+      debugPrint(
+        '[playback] $sourceId failed while the network changed — '
+        'not counted against it',
+      );
+      return;
+    }
+    if (_waitedInAniyomiGate(sourceId, started)) {
+      debugPrint(
+        '[playback] $sourceId was slow while Aniyomi calls were queued — '
+        'not counted against it',
+      );
+      return;
+    }
+    final n = (_slowStrikes[sourceId] ?? 0) + 1;
+    if (n >= overBudgetStrikes) {
+      _slowStrikes.remove(sourceId);
+      _overBudget[sourceId] = DateTime.now();
+      debugPrint(
+        '[playback] $sourceId failed $n times in a row — skipping it for '
+        '${overBudgetCooldown.inMinutes}m',
+      );
+      return;
+    }
+    _slowStrikes[sourceId] = n;
+    debugPrint(
+      '[playback] $sourceId slow attempt failed ($n of $overBudgetStrikes '
+      'before it is skipped)',
+    );
+  }
+
+  /// A source ran past its budget. Windows: listen on (see
+  /// [_watchSlowSource]). Elsewhere: straight onto the skip list, as before.
+  void _overBudgetHit(
+    String sourceId,
+    Future<Object?> pending,
+    DateTime started,
+  ) {
+    if (_patient) {
+      _watchSlowSource(sourceId, pending, started);
+    } else {
+      _overBudget[sourceId] = DateTime.now();
+    }
+  }
+
+  /// Windows: once every quick source came back empty, waits up to
+  /// [_slowGrace] for the first of [slow] (sources past their budget whose
+  /// requests are still running) to answer. Null when none does, or when
+  /// [abort] fires because the viewer left. The player's loading screen keeps
+  /// showing its progress meanwhile.
+  Future<_Attempt?> _awaitSlowSources(
+    String where,
+    Map<String, Future<_Attempt?>> slow,
+    Future<_Attempt?> abort,
+  ) async {
+    if (slow.isEmpty) return null;
+    debugPrint(
+      '[playback] $where · quick sources found nothing — still waiting up to '
+      '${_slowGrace.inSeconds}s for ${slow.keys.join(", ")}',
+    );
+    final first = Completer<_Attempt?>();
+    var left = slow.length;
+    void settled() {
+      if (--left == 0 && !first.isCompleted) first.complete(null);
+    }
+
+    for (final entry in slow.entries) {
+      unawaited(
+        entry.value.then<void>((a) {
+          if (a != null && !first.isCompleted) {
+            debugPrint(
+              '[playback] $where · ${entry.key} answered after its budget',
+            );
+            first.complete(a);
+          }
+          settled();
+        }, onError: (Object _) => settled()),
+      );
+    }
+    // Give up after the grace, or as soon as the viewer leaves. Completing
+    // [first] here also stops a later straggler from being taken (or logged)
+    // after the sweep has already moved on.
+    final giveUp = Timer(_slowGrace, () {
+      if (!first.isCompleted) first.complete(null);
+    });
+    unawaited(
+      abort.then<void>((_) {
+        if (!first.isCompleted) first.complete(null);
+      }),
+    );
+    try {
+      return await first.future;
+    } finally {
+      giveUp.cancel();
+    }
   }
 
   /// Resolves [zmEpisodeUrl] to playable streams, trying sources in priority
@@ -435,9 +859,12 @@ class PlaybackResolver {
     final flightKey = _winKey(zmEpisodeUrl, category);
     if (accept == null) {
       final running = _inFlight[flightKey];
-      if (running != null) return running;
+      if (running != null &&
+          running.providers == _providerSignature(zmEpisodeUrl)) {
+        return running.future;
+      }
     }
-    final miss = _noSource[flightKey];
+    final miss = _currentMiss(zmEpisodeUrl, category);
     if (miss != null) {
       if (DateTime.now().difference(miss.at) < noSourceCooldown) {
         debugPrint(
@@ -461,11 +888,13 @@ class PlaybackResolver {
         accept: accept,
       );
     }
-    final f = _resolve(zmEpisodeUrl, fast: fast, category: category)
-        .whenComplete(() {
-          _inFlight.remove(flightKey);
-        });
-    _inFlight[flightKey] = f;
+    final providers = _providerSignature(zmEpisodeUrl);
+    late final Future<ResolvedPlayback> f;
+    f = _resolve(zmEpisodeUrl, fast: fast, category: category).whenComplete(() {
+      // A retired request must not erase the replacement's dedupe entry.
+      if (identical(_inFlight[flightKey]?.future, f)) _inFlight.remove(flightKey);
+    });
+    _inFlight[flightKey] = (providers: providers, future: f);
     return f;
   }
 
@@ -507,8 +936,9 @@ class PlaybackResolver {
     }
     // A sweep that found nothing is remembered by the full path; a replay
     // through here answers from that memory instead of paying the sweep again.
+    final providerSignature = _providerSignature(zmEpisodeUrl);
     final flightKey = _winKey(zmEpisodeUrl, category);
-    final miss = _noSource[flightKey];
+    final miss = _currentMiss(zmEpisodeUrl, category);
     if (miss != null) {
       if (DateTime.now().difference(miss.at) < noSourceCooldown) {
         if (!miss.hadTitleMatch) throw NoSourceMatch(p.show);
@@ -519,7 +949,7 @@ class PlaybackResolver {
     // Winner-cache short-circuit, same as [sources]: a replay opens on the
     // cached winner's streams immediately instead of re-sweeping. `fast: true`
     // is what Play passes on that path today (prefetch/TTL/first-link).
-    final hit = _winners[flightKey];
+    final hit = _availableWinner(flightKey);
     if (hit != null) {
       // A cached winner is resolved on the foreground Play path. Race the
       // provider call with the sweep abort so leaving the player does not
@@ -531,6 +961,7 @@ class PlaybackResolver {
         ),
       ]);
       if (gen != _sweepGen) throw const PlaybackAborted();
+      _checkProviderInventory(zmEpisodeUrl, providerSignature);
       if (streams.isNotEmpty) {
         yield ProgressiveResolve(
           match: hit.match,
@@ -565,27 +996,40 @@ class PlaybackResolver {
 
     var hadTitleMatch = false;
 
+    // Windows: sources past their budget whose requests are still running,
+    // waited on once every wave came back empty (see [_awaitSlowSources]).
+    final slow = <String, Future<_Attempt?>>{};
+
     // One candidate, start to finish — same body as [_resolve]'s `ask`, minus
     // the download branch: progressive is always the foreground wait.
     Future<_Attempt?> ask(String sourceId) async {
       _Attempt? attempt;
-      final budget = _budgetFor(sourceId, chosen);
+      // Always a playback ("fast") ask here, see the call below.
+      final budget = _budgetFor(sourceId, chosen, fast: true);
+      final started = DateTime.now();
+      // Windows: read before the ask so a challenge raised DURING it shows.
+      final cfBefore = CfSolveNeeded.sourceRevision(sourceId);
+      // The request itself, kept apart from its budget so Windows can keep
+      // listening after the budget runs out.
+      final raw = runZoned(
+        () => _tryCandidate(
+          p,
+          sourceId,
+          t,
+          // Playback needs the first usable link, not every mirror. CloudStream
+          // can return early while its native link session keeps resolving;
+          // the player picks up those later links through pollSources.
+          fast: true,
+          category: category,
+          onTitleMatch: () => hadTitleMatch = true,
+          onMiss: (reason) =>
+              note(sourceId, _cfMissReason(sourceId, cfBefore, reason)),
+        ),
+        zoneValues: {patientLinksKey: chosen.contains(sourceId)},
+      );
+      _trackCloudflare(sourceId, cfBefore, raw, (a) => a != null);
       try {
-        final call = runZoned(
-          () => _tryCandidate(
-            p,
-            sourceId,
-            t,
-            // Playback needs the first usable link, not every mirror. CloudStream
-            // can return early while its native link session keeps resolving;
-            // the player picks up those later links through pollSources.
-            fast: true,
-            category: category,
-            onTitleMatch: () => hadTitleMatch = true,
-            onMiss: (reason) => note(sourceId, reason),
-          ),
-          zoneValues: {patientLinksKey: chosen.contains(sourceId)},
-        ).timeout(budget);
+        final call = raw.timeout(budget);
         // Stop WAITING when the viewer leaves; the answer underneath is
         // dropped, exactly as for an over-budget candidate.
         attempt = await Future.any<_Attempt?>([call, abortFuture]);
@@ -594,11 +1038,16 @@ class PlaybackResolver {
         if (attempt == null) {
           unawaited(call.then<void>((_) {}, onError: (_) {}));
         }
+        if (attempt != null) _slowStrikes.remove(sourceId);
       } on TimeoutException {
-        _overBudget[sourceId] = DateTime.now();
+        _overBudgetHit(sourceId, raw, started);
+        if (_patient) slow[sourceId] = raw;
         note(sourceId, SweepReason.timedOut);
       } catch (_) {
-        note(sourceId, SweepReason.failed);
+        // Windows: an ask that threw right after a fresh Cloudflare challenge
+        // (e.g. the provider could not parse the challenge page) is reported
+        // as cloudflare, so the dead-end dialog offers Verify now.
+        note(sourceId, _cfMissReason(sourceId, cfBefore, SweepReason.failed));
       }
       return attempt;
     }
@@ -615,6 +1064,7 @@ class PlaybackResolver {
     // single-winner bookkeeping [_resolve] does. Late arrivals only extend
     // the accumulated list.
     Future<ProgressiveResolve> recordHit(_Attempt attempt) async {
+      _checkProviderInventory(zmEpisodeUrl, providerSignature);
       if (!winnerWritten) {
         winnerWritten = true;
         firstHit = attempt;
@@ -628,6 +1078,7 @@ class PlaybackResolver {
           await _scores?.bump(attempt.match.sourceId);
         }
       }
+      _checkProviderInventory(zmEpisodeUrl, providerSignature);
       for (final s in attempt.streams) {
         if (seenUrls.add(s.url)) acc.add(s);
       }
@@ -678,7 +1129,7 @@ class PlaybackResolver {
           note(sourceId, SweepReason.streamsDead);
           continue;
         }
-        if (CfSolveNeeded.sourceFlagged(sourceId)) {
+        if (_skipForCloudflare(sourceId)) {
           note(sourceId, SweepReason.cloudflare);
           continue;
         }
@@ -739,6 +1190,18 @@ class PlaybackResolver {
       }
     }
 
+    // Windows: every wave came back empty but some sources only ran out of
+    // budget. Keep waiting for them instead of calling the episode missing.
+    if (firstHit == null && slow.isNotEmpty) {
+      final late = await _awaitSlowSources(
+        'resolveProgressive',
+        slow,
+        abortFuture,
+      );
+      if (gen != _sweepGen) throw const PlaybackAborted();
+      if (late != null) yield await recordHit(late);
+    }
+
     final done = firstHit;
     if (done == null) {
       // Nothing answered — the same verdicts the full sweep reports, and
@@ -750,9 +1213,11 @@ class PlaybackResolver {
           'url=$blocked',
         );
       }
+      _checkProviderInventory(zmEpisodeUrl, providerSignature);
       _noSource[_winKey(zmEpisodeUrl, category)] = (
         at: DateTime.now(),
         hadTitleMatch: hadTitleMatch,
+        providers: providerSignature,
       );
       if (hadTitleMatch) {
         throw EpisodeNotAvailable(
@@ -803,6 +1268,7 @@ class PlaybackResolver {
       debugPrint('[playback] _resolve → ArgumentError: not a zm episode url');
       throw ArgumentError('not a metadata episode url: $zmEpisodeUrl');
     }
+    final providerSignature = _providerSignature(zmEpisodeUrl);
     debugPrint(
       '[playback] _resolve · url=$zmEpisodeUrl episode=${p.episode} '
       'show=${p.show.kind}/${p.show.id} fast=$fast',
@@ -838,6 +1304,10 @@ class PlaybackResolver {
 
     var hadTitleMatch = false;
 
+    // Windows: sources past their budget whose requests are still running,
+    // waited on once every wave came back empty (see [_awaitSlowSources]).
+    final slow = <String, Future<_Attempt?>>{};
+
     // One candidate, start to finish. Lifted out of the loop VERBATIM so the
     // sweep can run several at once without the per-source rules changing: the
     // try/catch is still per candidate, so one source throwing ("no sources in
@@ -845,20 +1315,28 @@ class PlaybackResolver {
     Future<_Attempt?> ask(String sourceId) async {
       debugPrint('[playback] _resolve · trying $sourceId');
       _Attempt? attempt;
-      final budget = _budgetFor(sourceId, chosen);
+      final budget = _budgetFor(sourceId, chosen, fast: fast);
+      final started = DateTime.now();
+      // Windows: read before the ask so a challenge raised DURING it shows.
+      final cfBefore = CfSolveNeeded.sourceRevision(sourceId);
+      // The request itself, kept apart from its budget so Windows can keep
+      // listening after the budget runs out.
+      final raw = runZoned(
+        () => _tryCandidate(
+          p,
+          sourceId,
+          t,
+          fast: fast,
+          category: category,
+          onTitleMatch: () => hadTitleMatch = true,
+          onMiss: (reason) =>
+              note(sourceId, _cfMissReason(sourceId, cfBefore, reason)),
+        ),
+        zoneValues: {patientLinksKey: chosen.contains(sourceId)},
+      );
+      _trackCloudflare(sourceId, cfBefore, raw, (a) => a != null);
       try {
-        final call = runZoned(
-          () => _tryCandidate(
-            p,
-            sourceId,
-            t,
-            fast: fast,
-            category: category,
-            onTitleMatch: () => hadTitleMatch = true,
-            onMiss: (reason) => note(sourceId, reason),
-          ),
-          zoneValues: {patientLinksKey: chosen.contains(sourceId)},
-        ).timeout(budget);
+        final call = raw.timeout(budget);
         if (accept == null) {
           // Stop WAITING when the viewer leaves. The request underneath is not
           // cancellable, so it finishes in the background and its answer is
@@ -875,15 +1353,29 @@ class PlaybackResolver {
           // the player must not cancel a download.
           attempt = await call;
         }
+        if (attempt != null) _slowStrikes.remove(sourceId);
       } on TimeoutException {
-        _overBudget[sourceId] = DateTime.now();
+        _overBudgetHit(sourceId, raw, started);
         note(sourceId, SweepReason.timedOut);
-        debugPrint(
-          '[playback] _resolve · $sourceId → over ${budget.inSeconds}s '
-          'budget, skipping it for ${overBudgetCooldown.inMinutes}m',
-        );
+        if (_patient) {
+          // Playback only: a download sweep keeps walking as before.
+          if (accept == null) slow[sourceId] = raw;
+          debugPrint(
+            '[playback] _resolve · $sourceId → over ${budget.inSeconds}s '
+            'budget, still listening for its answer '
+            '(window ${lifecycleLabel()})',
+          );
+        } else {
+          debugPrint(
+            '[playback] _resolve · $sourceId → over ${budget.inSeconds}s '
+            'budget, skipping it for ${overBudgetCooldown.inMinutes}m '
+            '(window ${lifecycleLabel()})',
+          );
+        }
       } catch (e) {
-        note(sourceId, SweepReason.failed);
+        // Windows: a throw right after a fresh Cloudflare challenge is
+        // reported as cloudflare (see [_cfMissReason]); otherwise "failed".
+        note(sourceId, _cfMissReason(sourceId, cfBefore, SweepReason.failed));
         debugPrint(
           '[playback] _resolve · $sourceId → error during resolution: $e',
         );
@@ -907,6 +1399,43 @@ class PlaybackResolver {
     final remembered = accept == null
         ? _rememberedPlaybackSource(p.show, ordered)
         : null;
+
+    // Set when the sweep stopped at a hand-picked source that did not answer.
+    var pinnedStopped = false;
+
+    // The playback winner: remembered for poll/prefetch and per-title ranking.
+    Future<ResolvedPlayback> settle(_Attempt attempt) async {
+      // Written here rather than inside _tryCandidate so an abandoned
+      // (timed-out) candidate that finishes later can never overwrite the
+      // winner of the source we actually settled on.
+      _winners[_winKey(zmEpisodeUrl, category)] = (
+        episodeUrl: attempt.episodeUrl,
+        sourceId: attempt.match.sourceId,
+        match: attempt.match,
+      );
+      // Per-title only — remembered for THIS show's own re-ranking (see
+      // `_orderedCandidates`). This must never write the kind-wide
+      // `ZSourcePrefs` default: that's an explicit, rare user choice (the
+      // "source went quiet" recovery picker), and a single successful
+      // Auto Resolve play silently promoting itself to play EVERY title of
+      // the kind is exactly the bug this design fixes.
+      if (!attempt.match.pinned) {
+        await _store.rememberLastPlayed(p.show, attempt.match.sourceId);
+        await _scores?.bump(attempt.match.sourceId);
+      }
+      debugPrint(
+        '[playback] $zmEpisodeUrl -> ${attempt.match.sourceId} '
+        '(${attempt.streams.length} streams)',
+      );
+      return ResolvedPlayback(
+        match: attempt.match,
+        episodeUrl: attempt.episodeUrl,
+        streams: attempt.streams,
+        show: p.show,
+        episode: p.episode,
+      );
+    }
+
     outer:
     for (final candidates in _candidateWaves(
       ordered,
@@ -940,7 +1469,7 @@ class PlaybackResolver {
           note(sourceId, SweepReason.streamsDead);
           continue;
         }
-        if (CfSolveNeeded.sourceFlagged(sourceId)) {
+        if (_skipForCloudflare(sourceId)) {
           debugPrint('[playback] _resolve · skip $sourceId (CF blocked)');
           note(sourceId, SweepReason.cloudflare);
           continue;
@@ -967,6 +1496,7 @@ class PlaybackResolver {
       // `ask` never throws — every failure inside it is caught and returns
       // null — so one bad source in a wave cannot take the others down.
       final answers = await Future.wait([for (final id in wave) ask(id)]);
+      if (accept == null) _checkProviderInventory(zmEpisodeUrl, providerSignature);
 
       // Again on the way out, not only on the way in. Every candidate in the
       // wave races the abort signal and comes back null the moment it fires,
@@ -1005,6 +1535,7 @@ class PlaybackResolver {
             // The whole sweep, not just this wave: the point is that no OTHER
             // source gets substituted, and the rest of the wave is other
             // sources. Their answers are discarded with the loop.
+            pinnedStopped = true;
             break outer;
           }
           continue;
@@ -1036,35 +1567,27 @@ class PlaybackResolver {
           );
         }
 
-        // Written here rather than inside _tryCandidate so an abandoned
-        // (timed-out) candidate that finishes later can never overwrite the
-        // winner of the source we actually settled on.
-        _winners[_winKey(zmEpisodeUrl, category)] = (
-          episodeUrl: attempt.episodeUrl,
-          sourceId: attempt.match.sourceId,
-          match: attempt.match,
-        );
-        // Per-title only — remembered for THIS show's own re-ranking (see
-        // `_orderedCandidates`). This must never write the kind-wide
-        // `ZSourcePrefs` default: that's an explicit, rare user choice (the
-        // "source went quiet" recovery picker), and a single successful
-        // Auto Resolve play silently promoting itself to play EVERY title of
-        // the kind is exactly the bug this design fixes.
-        if (!attempt.match.pinned) {
-          await _store.rememberLastPlayed(p.show, attempt.match.sourceId);
-          await _scores?.bump(attempt.match.sourceId);
-        }
+        return settle(attempt);
+      }
+    }
+
+    // Windows: every wave came back empty but some sources only ran out of
+    // budget. Keep waiting for them instead of calling the episode missing.
+    // After a hand-picked source failed, only that source is waited on, so
+    // no other source gets substituted for it.
+    if (accept == null && slow.isNotEmpty) {
+      if (pinnedStopped) slow.removeWhere((id, _) => id != pinned);
+      final late = await _awaitSlowSources('_resolve', slow, abortFuture);
+      if (gen != _sweepGen) {
         debugPrint(
-          '[playback] $zmEpisodeUrl -> ${attempt.match.sourceId} '
-          '(${attempt.streams.length} streams)',
+          '[playback] _resolve · abandoned while waiting for slow sources — '
+          'the viewer left',
         );
-        return ResolvedPlayback(
-          match: attempt.match,
-          episodeUrl: attempt.episodeUrl,
-          streams: attempt.streams,
-          show: p.show,
-          episode: p.episode,
-        );
+        throw const PlaybackAborted();
+      }
+      if (late != null) {
+        _checkProviderInventory(zmEpisodeUrl, providerSignature);
+        return settle(late);
       }
     }
 
@@ -1078,9 +1601,11 @@ class PlaybackResolver {
       // cfBlockedUrl covers suppressed searches.
     }
 
+    if (accept == null) _checkProviderInventory(zmEpisodeUrl, providerSignature);
     _noSource[_winKey(zmEpisodeUrl, category)] = (
       at: DateTime.now(),
       hadTitleMatch: hadTitleMatch,
+      providers: providerSignature,
     );
     if (hadTitleMatch) {
       debugPrint(
@@ -1114,13 +1639,32 @@ class PlaybackResolver {
     bool fast = false,
     String category = 'sub',
   }) async {
-    final hit = _winners[_winKey(zmEpisodeUrl, category)];
+    final key = _winKey(zmEpisodeUrl, category);
+    final hit = _availableWinner(key);
     if (hit != null) {
-      return _sources.sources(
+      // Bounded: the cached winner used to be asked with no limit at all, so
+      // one source that stopped answering spun its caller forever with no
+      // fallback. Over budget now drops the winner and sweeps the rest.
+      final p = ZmodeIds.parseEpisode(zmEpisodeUrl);
+      final budget = p == null
+          ? _budget
+          : _budgetFor(hit.sourceId, _chosenSources(p.show), fast: fast);
+      final started = DateTime.now();
+      final raw = _sources.sources(
         hit.episodeUrl,
         sourceId: hit.sourceId,
         fast: fast,
       );
+      try {
+        return await raw.timeout(budget);
+      } on TimeoutException {
+        debugPrint(
+          '[playback] sources · cached ${hit.sourceId} over '
+          '${budget.inSeconds}s budget — sweeping the others',
+        );
+        if (_winners[key] == hit) _winners.remove(key);
+        _overBudgetHit(hit.sourceId, raw, started);
+      }
     }
     return (await resolveForPlayback(
       zmEpisodeUrl,
@@ -1134,11 +1678,28 @@ class PlaybackResolver {
     String category = 'sub',
   }) async {
     final key = _winKey(zmEpisodeUrl, category);
-    var winner = _winners[key];
+    var winner = _availableWinner(key);
     if (winner == null) {
       await resolveForPlayback(zmEpisodeUrl, category: category);
-      winner = _winners[key];
+      winner = _availableWinner(key);
     }
+    if (winner == null) {
+      return (sources: const <VideoSource>[], done: true);
+    }
+    return _sources.polledSources(winner.episodeUrl, sourceId: winner.sourceId);
+  }
+
+  /// Reads the late links of the source that already won [zmEpisodeUrl] in
+  /// [category], and nothing else. Unlike [polledSources], it never starts a
+  /// new sweep of the sites: when there is no winner for that cut it simply
+  /// answers "nothing more". The Windows player's background late-mirror
+  /// poll (plan item R5) uses this, so a read during playback can never kick
+  /// off a fresh search or read links of the other Sub/Dub cut.
+  Future<({List<VideoSource> sources, bool done})> polledWinnerSources(
+    String zmEpisodeUrl, {
+    String category = 'sub',
+  }) async {
+    final winner = _availableWinner(_winKey(zmEpisodeUrl, category));
     if (winner == null) {
       return (sources: const <VideoSource>[], done: true);
     }
@@ -1147,7 +1708,7 @@ class PlaybackResolver {
 
   /// The source that last resolved [zmEpisodeUrl], if any this session.
   String? resolvedSourceId(String zmEpisodeUrl, {String category = 'sub'}) =>
-      _winners[_winKey(zmEpisodeUrl, category)]?.sourceId;
+      _availableWinner(_winKey(zmEpisodeUrl, category))?.sourceId;
 
   /// Drop the cached winner for [zmEpisodeUrl] so the next
   /// [resolveForPlayback] re-sweeps sources instead of reusing the failed one.
@@ -1163,10 +1724,19 @@ class PlaybackResolver {
     // EVERY category: the keys carry one now, and a caller retrying an episode
     // means "forget what you know about it", not "forget the sub cut".
     bool mine(String k) => k == zmEpisodeUrl || k.startsWith('$zmEpisodeUrl|');
+    // Windows: a pick the viewer just made in "search all sources" survives
+    // this call ONCE (see [useProbed]). The player calls this right before
+    // opening, and wiping the pick there made it play whatever a fresh sweep
+    // found instead. The marker is consumed here, so a later Retry clears it
+    // like any other winner.
+    final spared = _patient ? _takeProbedPick(zmEpisodeUrl) : null;
     // BOTH maps, independently. A sweep that found nothing leaves a _noSource
     // entry and no winner at all, so walking _winners alone would clear
     // nothing and Retry would keep answering from the remembered no.
-    final winners = _winners.keys.where(mine).toList();
+    final winners = _winners.keys
+        .where(mine)
+        .where((k) => k != spared)
+        .toList();
     final misses = _noSource.keys.where(mine).toList();
     for (final k in winners) {
       _winners.remove(k);
@@ -1179,6 +1749,8 @@ class PlaybackResolver {
     }
     final clearedBudget = _overBudget.isNotEmpty;
     if (clearedBudget) _overBudget.clear();
+    // A tap or Retry starts every source with a clean record again.
+    _slowStrikes.clear();
     if (winners.isNotEmpty || misses.isNotEmpty || clearedBudget) {
       debugPrint(
         '[playback] invalidateWinner · $zmEpisodeUrl '
@@ -1186,6 +1758,24 @@ class PlaybackResolver {
         '${clearedBudget ? ', over-budget cleared' : ''})',
       );
     }
+  }
+
+  /// Windows: winner keys set by [useProbed] that the next [invalidateWinner]
+  /// must spare, with when they were set. One-shot and short-lived: a pick
+  /// is only spared by the "start fresh" call of the open that follows it.
+  final Map<String, DateTime> _probedPick = {};
+
+  /// How long a [useProbed] pick may wait for its player open and still be
+  /// spared. Past this the pick is treated like any other winner.
+  static const Duration _probedPickLife = Duration(minutes: 2);
+
+  /// Removes and returns the spared winner key for [zmEpisodeUrl], or null
+  /// when there is none, it expired, or the winner under it is already gone.
+  String? _takeProbedPick(String zmEpisodeUrl) {
+    final key = _winKey(zmEpisodeUrl, 'sub');
+    final at = _probedPick.remove(key);
+    if (at == null || !_winners.containsKey(key)) return null;
+    return DateTime.now().difference(at) <= _probedPickLife ? key : null;
   }
 
   /// Drop every cached winner for [c] — the whole show, not one episode.
@@ -1219,6 +1809,8 @@ class PlaybackResolver {
     // Source switch / CF solve — same "try again" intent as an episode tap.
     final clearedBudget = _overBudget.isNotEmpty;
     if (clearedBudget) _overBudget.clear();
+    // A tap or Retry starts every source with a clean record again.
+    _slowStrikes.clear();
     if (winners.isNotEmpty ||
         misses.isNotEmpty ||
         flights.isNotEmpty ||
@@ -1261,6 +1853,107 @@ class PlaybackResolver {
     ];
   }
 
+  /// Download search: the same fallback chain playback walks for
+  /// [zmEpisodeUrl] (pin, last played, kind default, Source Priority order and
+  /// cap), with [preferred] — the source the show page matched — moved to the
+  /// front. Each candidate carries the budget playback would give it and
+  /// whether it must run serially (in-process JS). Cloudflare-flagged sources
+  /// are listed with a skip reason rather than asked, since asking would pop a
+  /// blocking challenge over the dialog.
+  ///
+  /// Windows Aniyomi sources get [downloadAniyomiBudget], but free their
+  /// search worker after the budget they had before (freeWorkerAfter) and
+  /// may get one more budget while the gate is queueing (extendIf).
+  List<
+    ({
+      String id,
+      String name,
+      Duration budget,
+      bool serial,
+      String? skipReason,
+      Duration? freeWorkerAfter,
+      bool Function(DateTime askedAt)? extendIf,
+    })
+  >
+  downloadCandidates(String zmEpisodeUrl, {String? preferred}) {
+    final p = ZmodeIds.parseEpisode(zmEpisodeUrl);
+    if (p == null) return const [];
+    final ids = _orderedCandidates(p.show).toList();
+    if (preferred != null &&
+        preferred.isNotEmpty &&
+        preferred != ZmodeIds.sourceId &&
+        _sources.hasSource(preferred)) {
+      ids
+        ..remove(preferred)
+        ..insert(0, preferred);
+    }
+    final chosen = _chosenSources(p.show);
+    return [
+      for (final id in ids)
+        (
+          id: id,
+          name: _sources.displayName(id),
+          budget: usesDownloadAniyomiBudget(id)
+              ? downloadAniyomiBudget
+              : _budgetFor(id, chosen),
+          serial: !_isNativeSource(id),
+          skipReason: _skipForCloudflare(id) ? 'Cloudflare check needed' : null,
+          freeWorkerAfter: usesDownloadAniyomiBudget(id)
+              ? _budgetFor(id, chosen)
+              : null,
+          extendIf: usesDownloadAniyomiBudget(id)
+              ? downloadAniyomiExtendIf
+              : null,
+        ),
+    ];
+  }
+
+  /// One source's whole download attempt for [zmEpisodeUrl] — title match,
+  /// episode list, every mirror (not the fast first link). Null when the
+  /// source has no match/episode/links. Unbounded on purpose: the download
+  /// search applies each candidate's budget so it can report progress.
+  /// Never touches the winner cache, miss memory or scores: picking a file to
+  /// download is not a playback verdict.
+  Future<
+    ({
+      String sourceId,
+      String showUrl,
+      String episodeUrl,
+      List<VideoSource> streams,
+    })?
+  >
+  attemptForDownload(
+    String zmEpisodeUrl,
+    String sourceId, {
+    String category = 'sub',
+  }) async {
+    final p = ZmodeIds.parseEpisode(zmEpisodeUrl);
+    if (p == null) return null;
+    final t = await _titleLookup(p.show);
+    // Windows: a download ask feeds the same Cloudflare cooldown as playback.
+    final cfBefore = CfSolveNeeded.sourceRevision(sourceId);
+    final pending = _passively(
+      () => _tryCandidate(
+        p,
+        sourceId,
+        t,
+        fast: false,
+        category: category,
+        onTitleMatch: () {},
+        onMiss: (_) {},
+      ),
+    );
+    _trackCloudflare(sourceId, cfBefore, pending, (a) => a != null);
+    final a = await pending;
+    if (a == null) return null;
+    return (
+      sourceId: a.match.sourceId,
+      showUrl: a.match.showUrl,
+      episodeUrl: a.episodeUrl,
+      streams: a.streams,
+    );
+  }
+
   /// One candidate's verdict, as [probeEach] reports it.
   ///
   /// [streams] non-empty means this source can play the episode right now.
@@ -1286,6 +1979,27 @@ class PlaybackResolver {
     String zmEpisodeUrl, {
     Duration wallClock = const Duration(seconds: 20),
     Set<String> skip = const {},
+  }) => _probeEach(zmEpisodeUrl, wallClock: wallClock, skip: skip);
+
+  /// Windows: [probeEach] plus [extra] sources outside the normal candidate
+  /// list, asked after it (once each, only while installed). The "search all
+  /// sources" sheet uses it to also ask the sources switched off for Auto
+  /// Resolve, since asking there is the viewer's deliberate, on-demand
+  /// choice. A separate method (not a new [probeEach] argument) so classes
+  /// that override [probeEach] keep compiling and behaving as before.
+  Stream<SourceProbe> probeEachWithExtra(
+    String zmEpisodeUrl, {
+    required Iterable<String> extra,
+    Duration wallClock = const Duration(seconds: 20),
+    Set<String> skip = const {},
+  }) =>
+      _probeEach(zmEpisodeUrl, wallClock: wallClock, skip: skip, extra: extra);
+
+  Stream<SourceProbe> _probeEach(
+    String zmEpisodeUrl, {
+    required Duration wallClock,
+    required Set<String> skip,
+    Iterable<String> extra = const [],
   }) {
     final out = StreamController<SourceProbe>();
     final clock = Stopwatch()..start();
@@ -1299,6 +2013,12 @@ class PlaybackResolver {
       final all = _orderedCandidates(
         p.show,
       ).where((id) => !skip.contains(id)).toList();
+      // Extra sources go last, once each, and only while still installed.
+      for (final id in extra) {
+        if (!skip.contains(id) && !all.contains(id) && _sources.hasSource(id)) {
+          all.add(id);
+        }
+      }
       debugPrint(
         '[probe] ── pass start · ${all.length} to ask · '
         'up to ${wallClock.inSeconds}s',
@@ -1308,7 +2028,7 @@ class PlaybackResolver {
       Future<bool> probeOne(String sourceId) async {
         if (full()) return false;
         final name = _sources.displayName(sourceId);
-        if (CfSolveNeeded.sourceFlagged(sourceId) ||
+        if (_skipForCloudflare(sourceId) ||
             _health.isSkippable(sourceId) ||
             _recentlyOverBudget(sourceId)) {
           if (!out.isClosed) {
@@ -1330,18 +2050,25 @@ class PlaybackResolver {
         // unrelated lines, with nothing saying who was being waited on.
         final sw = Stopwatch()..start();
         var how = 'no';
+        final started = DateTime.now();
+        Future<(SourceMatch?, Episode?)>? raw;
         try {
           // Passive: a survey must never pop the blocking Cloudflare WebView.
           // One challenged source did exactly that and stalled the app for
           // twelve seconds — after its own probe had already been abandoned.
           // Challenged sources are recorded via CfSolveNeeded instead, so the
           // solve can still be offered when the viewer actually picks one.
-          (match, srcEp) = await _passively(
-            () => _hasEpisode(p, sourceId, t),
-          ).timeout(probeBudget);
+          final cfBefore = CfSolveNeeded.sourceRevision(sourceId);
+          raw = _passively(() => _hasEpisode(p, sourceId, t));
+          // Windows: a listing found clears the Cloudflare cooldown, a miss
+          // behind a fresh challenge starts it (see [_trackCloudflare]).
+          _trackCloudflare(sourceId, cfBefore, raw, (r) => r.$2 != null);
+          (match, srcEp) = await raw.timeout(probeBudget);
           how = srcEp != null ? 'HAS' : 'no';
         } on TimeoutException {
-          _overBudget[sourceId] = DateTime.now();
+          // Windows: a slow 5s browse probe alone no longer skips the source
+          // for playback; see [_overBudgetHit].
+          _overBudgetHit(sourceId, raw ?? Future<Object?>.value(), started);
           how = 'timeout';
         } catch (e) {
           how = 'error: $e';
@@ -1453,13 +2180,31 @@ class PlaybackResolver {
   }) async {
     final p = ZmodeIds.parseEpisode(zmEpisodeUrl);
     if (p == null) return const [];
-    final t = await _titleLookup(p.show);
-    final (match, ep) = await _hasEpisode(p, sourceId, t, category: category);
-    if (match == null || ep == null) {
-      debugPrint('[playback] sourcesFrom · $sourceId has no ep ${p.episode}');
+    Future<List<VideoSource>> body() async {
+      final t = await _titleLookup(p.show);
+      final (match, ep) = await _hasEpisode(p, sourceId, t, category: category);
+      if (match == null || ep == null) {
+        debugPrint('[playback] sourcesFrom · $sourceId has no ep ${p.episode}');
+        return const [];
+      }
+      return _sources.sources(ep.url, sourceId: match.sourceId, fast: fast);
+    }
+
+    // Bounded like a sweep candidate. Unbounded, a hung source held every
+    // caller (download re-resolve, the Windows download dialog) forever.
+    // Always the full limit, even for a fast ask: a named source has no sweep
+    // and no "keep listening" behind it, so on Windows the shorter playback
+    // limit (plan item C2) would turn a slow first link into "nothing found".
+    final budget = _budgetFor(sourceId, _chosenSources(p.show));
+    try {
+      return await body().timeout(budget);
+    } on TimeoutException {
+      debugPrint(
+        '[playback] sourcesFrom · $sourceId → over ${budget.inSeconds}s budget '
+        '(window ${lifecycleLabel()})',
+      );
       return const [];
     }
-    return _sources.sources(ep.url, sourceId: match.sourceId, fast: fast);
   }
 
   /// Warms Continue Watching from the source already remembered for this
@@ -1475,7 +2220,10 @@ class PlaybackResolver {
   }) async {
     final parsed = ZmodeIds.parseEpisode(zmEpisodeUrl);
     if (parsed == null) return const [];
-    final remembered = _store.bestFor(parsed.show);
+    final remembered = _store.bestFor(
+      parsed.show,
+      available: _sources.hasSource,
+    );
     if (remembered == null) return const [];
     final title = await _titleLookup(parsed.show);
     await _hasEpisode(parsed, remembered.sourceId, title, category: category);
@@ -1534,8 +2282,26 @@ class PlaybackResolver {
     final url = probe.episodeUrl;
     final m = probe.match;
     if (url == null || m == null) return;
-    _noSource.remove(zmEpisodeUrl);
-    _winners[zmEpisodeUrl] = (episodeUrl: url, sourceId: m.sourceId, match: m);
+    if (_patient) {
+      // Windows: store the pick under the key every reader uses
+      // ([_winKey], category 'sub' because [probeEach] always asks the sub
+      // list). The bare url below is never read, so on the phone a pick from
+      // the sheet is silently re-swept; that plain key bug is left for the
+      // phone code's owners. The pick is also marked so the player's
+      // "start fresh" [invalidateWinner], which runs right before it opens,
+      // spares it once instead of wiping it.
+      final key = _winKey(zmEpisodeUrl, 'sub');
+      _noSource.remove(key);
+      _winners[key] = (episodeUrl: url, sourceId: m.sourceId, match: m);
+      _probedPick[key] = DateTime.now();
+    } else {
+      _noSource.remove(zmEpisodeUrl);
+      _winners[zmEpisodeUrl] = (
+        episodeUrl: url,
+        sourceId: m.sourceId,
+        match: m,
+      );
+    }
     final p = ZmodeIds.parseEpisode(zmEpisodeUrl);
     if (p != null && !m.pinned) {
       await _store.rememberLastPlayed(p.show, m.sourceId);
@@ -1630,17 +2396,38 @@ class PlaybackResolver {
 
   List<String> _orderedCandidates(ZCanonical c) {
     final all = _candidates(c.kind);
-    if (all.isEmpty) return const [];
-
     final ids = all.map((s) => s.id).toList();
     final pinned = _matcher.pinnedSource(c);
+    // Automatic content filtering must not erase a source picked by hand.
+    // An uninstalled pin stays excluded rather than resurrecting a dead source.
+    if (pinned != null && !ids.contains(pinned) && _sources.hasSource(pinned)) {
+      ids.insert(0, pinned);
+    }
+    if (ids.isEmpty) return const [];
     final last = _store.lastPlayed(c);
     final preferred = _prefs.get(c.kind);
+    // Windows: the preferred source (Settings > Source Priority, "try first")
+    // outranks the source that merely happened to play last, so one lucky
+    // play no longer overrides the user's setting. Only when a preferred
+    // source is set, is a candidate here, and differs from last-played; then
+    // last-played is no longer first, so it is not asked alone either (see
+    // [_rememberedPlaybackSource]) and the first wave is the normal 3-wide
+    // one. Phone/TV keep last-played first.
+    final preferredFirst =
+        SourceMatcher.preferredIsTryFirst &&
+        preferred != null &&
+        preferred != last &&
+        ids.contains(preferred);
 
     int rank(String id) {
       if (id == pinned) return 0;
-      if (id == last) return 1;
-      if (id == preferred) return 2;
+      if (preferredFirst) {
+        if (id == preferred) return 1;
+        if (id == last) return 2;
+      } else {
+        if (id == last) return 1;
+        if (id == preferred) return 2;
+      }
       return 3 + _healthRank(id);
     }
 
@@ -1660,7 +2447,8 @@ class PlaybackResolver {
     // all 32 here — the setting meant one thing on that screen and another in
     // the player, which makes it not a setting.
     //
-    // A pinned source and the last one that played rank 0 and 1 above, so the
+    // A pinned source and the last one that played rank 0 and 1 above (on
+    // Windows the preferred source can take 1 and last-played 2), so the
     // sources most likely to work are inside any cap, however small.
     //
     // The cost, deliberately taken: set it low and if those few serve dead

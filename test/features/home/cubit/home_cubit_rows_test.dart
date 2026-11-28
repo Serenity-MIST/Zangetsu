@@ -75,14 +75,14 @@ class _FakeTracker implements Tracker {
   _FakeTracker({
     this.name = 'AniList',
     this.connected = true,
-    this.reading = true,
     List<TrackerListItem>? library,
     this.error,
   }) : library = library ?? const [];
 
   final String name;
   bool connected;
-  final bool reading;
+  // Every fake tracker in these tests supports reading.
+  final bool reading = true;
   List<TrackerListItem> library;
   Object? error;
   int fetchCount = 0;
@@ -123,6 +123,7 @@ TrackerListItem _entry(
   int? totalEpisodes,
   int? nextAiringEpisode,
   DateTime? updatedAt,
+  DateTime? latestReleaseAt,
 }) => TrackerListItem(
   item: _item(title),
   status: status,
@@ -130,6 +131,7 @@ TrackerListItem _entry(
   totalEpisodes: totalEpisodes,
   nextAiringEpisode: nextAiringEpisode,
   updatedAt: updatedAt,
+  latestReleaseAt: latestReleaseAt,
 );
 
 void main() {
@@ -152,6 +154,37 @@ void main() {
     _FakeTracker t, {
     List<HomeSection> sections = const [],
   }) => HomeCubit(_StubRepo(sections), trackerHub: TrackerHub([t]));
+
+  test(
+    'desktop releases use cached matching tracker without extra requests',
+    () async {
+      final tracker = _FakeTracker(
+        library: [
+          _entry('Fresh series', progress: 2, totalEpisodes: 12,
+              latestReleaseAt: DateTime.now().subtract(const Duration(days: 2))),
+          // Finished long ago: unwatched episodes, but nothing is NEW.
+          _entry('Old finished', progress: 2, totalEpisodes: 12,
+              latestReleaseAt: DateTime(2023, 6, 1)),
+          _entry('Caught up', progress: 12, totalEpisodes: 12),
+          _entry('Unknown release', progress: 1),
+        ],
+      );
+      final cubit = cubitWith(tracker, sections: [_zmSection('Trending')]);
+      addTearDown(cubit.close);
+      await cubit.load();
+      expect(cubit.desktopReleaseRow?.items.map((e) => e.item.title), [
+        'Fresh series',
+      ]);
+      final requests = tracker.fetchCount;
+      cubit.desktopReleaseRow;
+      expect(tracker.fetchCount, requests);
+      await ZModePrefs.setStreamKind(StreamKind.movie);
+      expect(cubit.desktopReleaseRow, isNull);
+      await ZModePrefs.setStreamKind(StreamKind.anime);
+      expect(cubit.desktopReleaseRow?.items.single.item.title, 'Fresh series');
+      expect(tracker.fetchCount, requests);
+    },
+  );
 
   test('relayout re-merges a saved arrangement without refetching', () async {
     final t = _FakeTracker(library: [_entry('One Piece', progress: 100)]);

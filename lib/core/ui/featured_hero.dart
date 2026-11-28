@@ -38,10 +38,18 @@ double heroTopReserve(double topInset) =>
 /// Lightweight metadata shown under the hero title: a few genres + episode
 /// count (or year for movies). Lazily fetched, so it never blocks the banner.
 class HeroMeta {
-  const HeroMeta({this.genres = const [], this.episodeCount = 0, this.year});
+  const HeroMeta({
+    this.genres = const [],
+    this.episodeCount = 0,
+    this.year,
+    this.description,
+  });
   final List<String> genres;
   final int episodeCount;
   final String? year;
+
+  /// Optional synopsis already loaded for the hero; no separate request.
+  final String? description;
 }
 
 /// Apple-TV+-style cinematic hero: a rounded inset artwork card floating on the

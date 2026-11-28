@@ -2,6 +2,130 @@
 part of 'detail_screen.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Muted credit line: "Starring: a, b, c… more" / "Creators: …" / "Genres: …".
+// The label is slightly dimmer than the value, matching Netflix's hierarchy.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A muted "Label: value" credit line used by the Windows desktop detail
+/// layout (Starring / Genres / Creators).
+class _CreditLine extends StatelessWidget {
+  const _CreditLine({
+    required this.label,
+    required this.value,
+    this.more = false,
+    this.onMore,
+  });
+
+  final String label;
+  final String value;
+
+  /// When true, append a "… more" affordance. When [onMore] is also set, the
+  /// whole line is tappable and jumps to the relevant tab (Cast).
+  final bool more;
+
+  /// Tapping the line (or its "… more") jumps to the related tab. Null = inert.
+  final VoidCallback? onMore;
+
+  @override
+  Widget build(BuildContext context) {
+    final base = AppText.caption.copyWith(color: AppColors.textSecondary);
+    // `highlighted` is only ever true on Windows (hover / keyboard focus):
+    // the "… more" then turns a brighter accent and gets underlined.
+    Widget line(bool highlighted) => Padding(
+      padding: const EdgeInsets.only(bottom: 2),
+      child: Text.rich(
+        TextSpan(
+          children: [
+            TextSpan(
+              text: '$label: ',
+              style: base.copyWith(color: AppColors.textTertiary),
+            ),
+            TextSpan(text: value, style: base),
+            if (more)
+              TextSpan(
+                text: '… more',
+                style: base.copyWith(
+                  color: highlighted
+                      ? DesktopHoverLink.highlightColor()
+                      : AppColors.accent,
+                  fontWeight: FontWeight.w600,
+                  decoration: highlighted ? TextDecoration.underline : null,
+                  decorationColor: highlighted
+                      ? DesktopHoverLink.highlightColor()
+                      : null,
+                ),
+              ),
+          ],
+        ),
+        maxLines: _windowsDesktopUi ? 1 : 2,
+        overflow: TextOverflow.ellipsis,
+      ),
+    );
+    final onMore = this.onMore;
+    if (onMore == null) return line(false);
+    // Plain tap area off Windows; hand cursor, hover highlight and keyboard
+    // focus on Windows.
+    return DesktopHoverLink(
+      key: const ValueKey('detail-credit-more-link'),
+      onTap: onMore,
+      builder: (context, highlighted) => line(highlighted),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Description: synopsis clamped to 3 lines + a red "Read more" that opens the
+// Details tab (which shows the full synopsis). No inline expand.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The clamped synopsis with a "Read more" link, used by the Windows desktop
+/// detail layout.
+class _Description extends StatelessWidget {
+  const _Description({required this.text, required this.onReadMore});
+
+  final String text;
+
+  /// Jumps to the Details tab (full synopsis) — no inline expansion.
+  final VoidCallback onReadMore;
+
+  @override
+  Widget build(BuildContext context) {
+    // Plain tap area off Windows. On Windows the block gets the hand cursor
+    // and keyboard focus, and "Read more" brightens and underlines while the
+    // block is hovered or focused (`highlighted` is never true elsewhere).
+    return DesktopHoverLink(
+      key: const ValueKey('detail-read-more-link'),
+      onTap: onReadMore,
+      builder: (context, highlighted) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            text,
+            style: AppText.body,
+            maxLines: _windowsDesktopUi ? 2 : 3,
+            overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(height: 6),
+          Text(
+            context.l10n.readMore,
+            style: AppText.caption.copyWith(
+              color: highlighted
+                  ? DesktopHoverLink.highlightColor()
+                  : AppColors.accent,
+              fontWeight: FontWeight.w700,
+              decoration: highlighted ? TextDecoration.underline : null,
+              decorationColor: highlighted
+                  ? DesktopHoverLink.highlightColor()
+                  : null,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // One of the 5 outlined icon actions.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -25,6 +149,42 @@ class _IconAction extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final color = active ? AppColors.accent : AppColors.textPrimary;
+    if (_windowsDesktopUi) {
+      return Tooltip(
+        message: tooltip,
+        child: Material(
+          color: active
+              ? AppColors.accent.withValues(alpha: 0.1)
+              : AppColors.surface2,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(10),
+            side: BorderSide(
+              color: active
+                  ? AppColors.accent.withValues(alpha: 0.25)
+                  : AppColors.hairline,
+            ),
+          ),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(10),
+            onTap: onTap,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(icon, size: 17, color: color),
+                  const SizedBox(width: 6),
+                  Text(
+                    label,
+                    style: AppText.caption.copyWith(color: color, fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
     return Tooltip(
       message: tooltip,
       child: InkResponse(
@@ -51,6 +211,20 @@ class _IconAction extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Wraps compact desktop actions while retaining evenly spaced mobile actions.
+class _DetailActionRow extends StatelessWidget {
+  const _DetailActionRow({required this.children});
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) => _windowsDesktopUi
+      ? Wrap(spacing: 8, runSpacing: 8, children: children)
+      : Row(
+          mainAxisAlignment: MainAxisAlignment.spaceAround,
+          children: children,
+        );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

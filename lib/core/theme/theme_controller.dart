@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:dynamic_color/dynamic_color.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
 import 'package:hive/hive.dart';
@@ -167,8 +168,26 @@ class ThemeController {
   /// Device-wide, like [adaptiveColour].
   static Color? get backgroundColour {
     if (!Hive.isBoxOpen(boxName)) return null;
-    final v = _box.get(_bgKey) as int?;
+    final raw = _box.get(_bgKey);
+    if (_strictColours) return storedColour(raw);
+    final v = raw as int?;
     return v == null ? null : Color(v);
+  }
+
+  /// Whether saved colours are read defensively and custom backgrounds are
+  /// forced opaque. Windows only: the desktop window chrome paints straight
+  /// from [AppColors.bg], so a see-through or malformed saved colour shows
+  /// through the frame there.
+  static bool get _strictColours =>
+      defaultTargetPlatform == TargetPlatform.windows;
+
+  /// Reads a saved colour, or null when the saved value is not a colour at
+  /// all. Settings restores write this box straight from a backup file, so a
+  /// value can arrive as text, a fraction or a number too big to be a colour.
+  /// Those fall back to the stock look instead of breaking the theme.
+  static Color? storedColour(Object? value) {
+    if (value is! int || value < 0 || value > 0xFFFFFFFF) return null;
+    return Color(value);
   }
 
   /// Persist a custom app background and rebuild listeners. Home and Detail
@@ -186,10 +205,15 @@ class ThemeController {
 
   /// Clamps a pick to a dark tone, keeping its hue and saturation. Only the
   /// value changes, so a vivid red still reads as red — just a background red.
+  ///
+  /// On Windows the result is always fully opaque. A see-through saved colour
+  /// (for example white with its alpha at zero) would let whatever sits behind
+  /// a page show through, and white text on that can disappear.
   static Color darkened(Color colour) {
-    final hsv = HSVColor.fromColor(colour);
+    final solid = _strictColours ? colour.withAlpha(0xFF) : colour;
+    final hsv = HSVColor.fromColor(solid);
     return hsv.value <= maxBackgroundValue
-        ? colour
+        ? solid
         : hsv.withValue(maxBackgroundValue).toColor();
   }
 
@@ -244,7 +268,9 @@ class ThemeController {
   /// The active profile's accent, or the saved device fallback.
   static Color get accent {
     if (_profileAccent != null) return _profileAccent!;
-    final v = _box.get(_key) as int?;
+    final raw = _box.get(_key);
+    if (_strictColours) return storedColour(raw) ?? AppColors.defaultAccent;
+    final v = raw as int?;
     return v == null ? AppColors.defaultAccent : Color(v);
   }
 

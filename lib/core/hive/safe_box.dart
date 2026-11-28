@@ -1,3 +1,4 @@
+import 'package:crypto/crypto.dart';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -5,6 +6,7 @@ import 'package:hive_flutter/hive_flutter.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../platform/apple_tv.dart';
+import 'legacy_boxes.dart';
 
 /// Directory Hive keeps its box files in.
 ///
@@ -13,6 +15,7 @@ import '../platform/apple_tv.dart';
 /// tests that call `Hive.init` directly set it themselves.
 @visibleForTesting
 String? hiveBoxDir;
+String? _legacyHiveDir;
 
 /// Box names whose file couldn't be read this launch and were reopened empty.
 ///
@@ -28,6 +31,16 @@ final Set<String> quarantinedBoxes = <String>{};
 /// during boot then crashes. tvOS only permits writes to Library/Caches (and
 /// tmp); see path_provider_tvos PathProviderPlugin.
 Future<void> initHiveForApp() async {
+  if (Platform.isWindows) {
+    _legacyHiveDir = (await getApplicationDocumentsDirectory()).path;
+    hiveBoxDir = '${(await getApplicationSupportDirectory()).path}/database';
+    await Directory(hiveBoxDir!).create(recursive: true);
+    for (final name in legacyZangetsuBoxes) {
+      await migrateLegacyBox(name, _legacyHiveDir!, hiveBoxDir!);
+    }
+    Hive.init(hiveBoxDir!);
+    return;
+  }
   if (isAppleTv) {
     final cache = await getApplicationCacheDirectory();
     hiveBoxDir = '${cache.path}/hive';
@@ -60,9 +73,14 @@ Future<void> initHiveForApp() async {
 /// If the *reopen* also fails (e.g. the disk is full) there's nothing we can
 /// do — that rethrows.
 Future<Box<E>> openBoxSafely<E>(String name) async {
+  if (Platform.isWindows && _legacyHiveDir != null) {
+    await migrateLegacyBox(name, _legacyHiveDir!, hiveBoxDir!);
+  }
   try {
     return await Hive.openBox<E>(name);
   } catch (e) {
+    // Permission/lock failure or an incompatible live box is not corruption.
+    if (e is FileSystemException || Hive.isBoxOpen(name)) rethrow;
     debugPrint('[Hive] box "$name" is unreadable ($e) — quarantining it.');
     await _quarantine(name);
     quarantinedBoxes.add(name);
@@ -70,8 +88,28 @@ Future<Box<E>> openBoxSafely<E>(String name) async {
   }
 }
 
-/// Renames the unreadable file to `<name>.hive.corrupt`, falling back to the
-/// old delete if it can't be moved — booting still matters more than the bytes.
+/// Migrate only the exact box requested by Zangetsu. Preserve older copies as
+/// backups when the new database already exists; never overwrite the library.
+@visibleForTesting
+Future<void> migrateLegacyBox(String name, String from, String to) async {
+  if (!RegExp(r'^[a-z0-9_]+$').hasMatch(name) || from == to) return;
+  for (final extension in ['hive', 'lock', 'hive.corrupt']) {
+    final old = File('$from/$name.$extension');
+    if (!await old.exists()) continue;
+    var target = File('$to/$name.$extension');
+    if (await target.exists()) {
+      final backup = Directory('$to/legacy-backup');
+      await backup.create(recursive: true);
+      target = File(
+        '${backup.path}/$name.${DateTime.now().microsecondsSinceEpoch}.$extension',
+      );
+    }
+    await target.parent.create(recursive: true);
+    await old.rename(target.path);
+  }
+}
+
+/// Preserve every unreadable generation;verify copies before resetting bytes.
 Future<void> _quarantine(String name) async {
   final dir = hiveBoxDir;
   if (dir != null) {
@@ -81,28 +119,37 @@ Future<void> _quarantine(String name) async {
     final file = File('$dir/${name.toLowerCase()}.hive');
     try {
       if (file.existsSync()) {
-        final kept = '${file.path}.corrupt';
-        // One kept copy per box, so repeated failures can't fill the disk.
-        final previous = File(kept);
-        if (previous.existsSync()) previous.deleteSync();
-        await file.rename(kept);
+        var kept = '${file.path}.corrupt';
+        // Earlier backups may be the only surviving library;never overwrite them.
+        var suffix = 0;
+        final stamp = DateTime.now().microsecondsSinceEpoch;
+        while (await File(kept).exists()) {
+          kept = '${file.path}.corrupt.$stamp.${suffix++}';
+        }
+        try {
+          await file.rename(kept);
+        } on FileSystemException {
+          // Windows can keep the failed read handle open without delete sharing.
+          // Copy first, then reset in place; the user's bytes stay recoverable.
+          final before = await file.stat();
+          final copy = await file.copy(kept);
+          final originalHash = await sha256.bind(file.openRead()).first;
+          final copiedHash = await sha256.bind(copy.openRead()).first;
+          final after = await file.stat();
+          if (before.size != after.size || before.modified != after.modified || originalHash != copiedHash) {
+            throw FileSystemException('Database backup verification failed', file.path);
+          }
+          await file.writeAsBytes(const [], flush: true);
+        }
         debugPrint('[Hive] kept the unreadable "$name" at $kept');
         return;
       }
     } catch (e) {
-      debugPrint('[Hive] could not move "$name" aside ($e) — deleting it.');
+      throw FileSystemException('Could not preserve database $name: $e');
     }
   }
-  try {
-    await Hive.deleteBoxFromDisk(name);
-  } catch (deleteError) {
-    // deleteBoxFromDisk removes the data (.hive) file first, then the .lock —
-    // and its exists()/delete() on the .lock is a TOCTOU race: the lock can be
-    // released in the gap, throwing PathNotFoundException even though the data
-    // file is already gone. Don't let that abort recovery; the reopen above is
-    // what actually matters.
-    debugPrint(
-      '[Hive] cleanup of "$name" hit $deleteError — reopening anyway.',
-    );
-  }
+  if (dir == null)
+    throw StateError('Initialize app storage before recovering a database');
+  // No file means no safe recovery;do not remove another process's lock.
+  throw FileSystemException('Database file unavailable for safe recovery', '$dir/$name.hive');
 }

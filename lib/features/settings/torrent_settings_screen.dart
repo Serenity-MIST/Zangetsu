@@ -20,7 +20,7 @@ class _TorrentSettingsScreenState extends State<TorrentSettingsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar(context.l10n.torrents),
       body: ListView(
         padding: const EdgeInsets.only(top: 4, bottom: 28),

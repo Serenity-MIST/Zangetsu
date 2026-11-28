@@ -1,4 +1,8 @@
+import 'dart:async';
+import '../../core/playback/list_auto_status.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, TargetPlatform;
 import 'package:flutter_widget_from_html/flutter_widget_from_html.dart';
 
 import '../../core/di/injector.dart';
@@ -17,16 +21,21 @@ import '../../core/tracker/tracker.dart';
 import '../../core/tracker/tracker_hub.dart';
 import 'novel_paginator.dart';
 import 'reader_chrome.dart';
+import 'desktop_reader_input.dart';
+import 'desktop_page_scroller.dart';
+import 'package:flutter/services.dart';
 import 'reader_auto_scroll.dart';
 import 'reader_auto_scroll_ui.dart';
 import 'reader_comfort.dart';
 import 'reader_pull_chapter.dart';
+import 'novel_chapter_list_panel.dart';
+import 'novel_desktop_fonts.dart';
+import 'novel_desktop_selection.dart';
 import '../../l10n/l10n.dart';
 
 /// Text reader for manga/novel chapters — the reading counterpart of the
-/// video player. Phone-only (no TV twin, no TV focus handling needed).
-///
-/// Nothing routes here yet; Task 11 wires the Detail screen to push it.
+/// video player. Desktop uses transient hover controls and keyboard/mouse input;
+/// touch platforms retain their configured tap zones.
 class NovelReaderScreen extends StatefulWidget {
   const NovelReaderScreen({
     super.key,
@@ -114,6 +123,20 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
   // change/dispose can all observe the same finished chapter).
   final Set<String> _scrobbled = {};
 
+  /// Windows: reaches the input layer to pin the bars (M, middle click, the
+  /// middle click zone).
+  final GlobalKey<DesktopReaderInputState> _inputKey = GlobalKey();
+
+  /// Windows (reader-6 B): the end page's Next chapter button, focused when
+  /// the end page comes up so Enter continues.
+  final FocusNode _endPageFocus = FocusNode(debugLabel: 'novel-end-page');
+
+  /// Windows (reader-11 A): the selected text, and whether there was any
+  /// when the last click started — such a click only clears the selection,
+  /// it does not turn the page.
+  String _selectedText = '';
+  bool _selectionAtDown = false;
+
   @override
   void initState() {
     super.initState();
@@ -140,6 +163,7 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
     _pageController.dispose();
+    _endPageFocus.dispose();
     super.dispose();
   }
 
@@ -178,6 +202,8 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
   }
 
   Future<void> _load() async {
+    // A slow previous request must not replace a newly selected chapter.
+    final chapterId = _chapter.id;
     setState(() {
       _loading = true;
       _error = null;
@@ -187,14 +213,14 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
         _chapter.url,
         sourceId: widget.sourceId,
       );
-      if (!mounted) return;
+      if (!mounted || _chapter.id != chapterId) return;
       setState(() {
         _text = text;
         _loading = false;
       });
       _restoreScrollPosition();
     } catch (_) {
-      if (!mounted) return;
+      if (!mounted || _chapter.id != chapterId) return;
       setState(() {
         _error = "Couldn't load this chapter.";
         _loading = false;
@@ -223,12 +249,18 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     // Set now, not after the poll lands — a dispose before the poll settles
     // must not fall back to 0 (see `_lastScrollPermille`'s own doc).
     _lastScrollPermille = saved.pos;
-    WidgetsBinding.instance.addPostFrameCallback(
-      (_) => _pollRestoreScroll(saved.pos / 1000),
-    );
+    final chapterId = _chapter.id;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _chapter.id == chapterId) {
+        _pollRestoreScroll(saved.pos / 1000, chapterId: chapterId);
+      }
+    });
   }
 
-  Future<void> _pollRestoreScroll(double fraction) async {
+  Future<void> _pollRestoreScroll(
+    double fraction, {
+    required String chapterId,
+  }) async {
     // Bounded by a fixed tick count, NOT a DateTime.now() deadline: widget
     // tests run on a faked clock where wall-time barely advances, so a
     // real-clock deadline would never trip and this loop would spin forever
@@ -236,7 +268,10 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     double? lastMax;
     for (
       var tick = 0;
-      tick < 60 && mounted && _scrollController.hasClients;
+      tick < 60 &&
+          mounted &&
+          _chapter.id == chapterId &&
+          _scrollController.hasClients;
       tick++
     ) {
       final pos = _scrollController.position;
@@ -372,6 +407,21 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
       ),
       flush: flush,
     );
+    // Windows: keeps My List in step with reading (Plan to read -> Reading,
+    // the last chapter of a finished series -> Completed). No-op elsewhere.
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      unawaited(
+        ListAutoStatus.instance.onReadProgress(
+          widget.showUrl,
+          ep.number,
+          finished: sl<ReadStore>().finished(
+            widget.sourceId,
+            widget.showId,
+            ep.id,
+          ),
+        ),
+      );
+    }
     if (sl<ReadStore>().finished(widget.sourceId, widget.showId, ep.id)) {
       _maybeScrobble(ep);
     }
@@ -429,7 +479,148 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     _load();
   }
 
-  void _toggleChrome() => setState(() => _chromeVisible = !_chromeVisible);
+  bool get _desktopReader => defaultTargetPlatform == TargetPlatform.windows;
+
+  void _toggleChrome() {
+    // Windows: the bars follow the mouse; this pins them open or closed.
+    if (_desktopReader) {
+      _inputKey.currentState?.toggleBars();
+      return;
+    }
+    setState(() => _chromeVisible = !_chromeVisible);
+  }
+
+  /// Shares the visible scroll controller so wheel/key input saves progress.
+  void _desktopScroll(double delta) {
+    if (!_scrollController.hasClients || _loading) return;
+    final position = _scrollController.position;
+    _scrollController.jumpTo(
+      (position.pixels + delta).clamp(
+        position.minScrollExtent,
+        position.maxScrollExtent,
+      ),
+    );
+  }
+
+  /// Keyboard and side-button scrolling (reader-3): a short glide so the
+  /// eye can follow, through the same controller so progress still saves.
+  void _desktopKeyScroll(double delta) {
+    if (!_scrollController.hasClients || _loading) return;
+    desktopAnimatedScrollBy(_scrollController, delta);
+  }
+
+  /// Windows paged mode has an end page after the last text page
+  /// (reader-6 B); phones keep their pages exactly as before.
+  bool get _hasEndPage => _desktopReader && _pages.isNotEmpty;
+
+  /// Index of the end page in the PageView (only meaningful with one).
+  int get _endPageIndex => _pages.length;
+
+  /// Logical page order is independent of the text's visual direction.
+  void _desktopPage(bool forward) {
+    if (!_pageController.hasClients || _loading) return;
+    // reader-6 A: "next" on the end page (or on the last page when there is
+    // no end page) carries on into the next chapter.
+    if (forward && _nextIndex != null) {
+      final last = _hasEndPage ? _endPageIndex : _pages.length - 1;
+      if (_pageIndex >= last) {
+        _goToChapter(_nextIndex);
+        return;
+      }
+    }
+    if (forward) {
+      _pageController.nextPage(
+        duration: const Duration(milliseconds: 140),
+        curve: Curves.easeOut,
+      );
+    } else {
+      _pageController.previousPage(
+        duration: const Duration(milliseconds: 140),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
+  /// Windows keys handled ahead of DesktopReaderInput: Space (Shift+Space
+  /// back) pages or glides a screenful, Home/End jump to the chapter's start
+  /// or end (first/last page in paged mode). Everything else falls through
+  /// unchanged.
+  KeyEventResult _desktopKey(KeyEvent event) {
+    if (_loading || _text == null) return KeyEventResult.ignored;
+    final key = event.logicalKey;
+    final paged = sl<ReaderPrefs>().novelPaginated;
+    if (key == LogicalKeyboardKey.space) {
+      final forward = !HardwareKeyboard.instance.isShiftPressed;
+      if (paged) {
+        _desktopPage(forward);
+      } else {
+        final height = _scrollController.hasClients
+            ? _scrollController.position.viewportDimension
+            : MediaQuery.sizeOf(context).height;
+        _desktopKeyScroll((forward ? 0.85 : -0.85) * height);
+      }
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.home || key == LogicalKeyboardKey.end) {
+      final end = key == LogicalKeyboardKey.end;
+      if (paged) {
+        if (!_pageController.hasClients || _pages.isEmpty) {
+          return KeyEventResult.ignored;
+        }
+        _pageController.jumpToPage(end ? _pages.length - 1 : 0);
+        return KeyEventResult.handled;
+      }
+      if (!_scrollController.hasClients) return KeyEventResult.ignored;
+      final position = _scrollController.position;
+      _scrollController.jumpTo(
+        end ? position.maxScrollExtent : position.minScrollExtent,
+      );
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  /// Ctrl+= / Ctrl+- (reader-11 B): one text-size step per press.
+  void _zoomText(double factor, Offset? _) {
+    final prefs = sl<ReaderPrefs>();
+    prefs.stepFontSize(factor > 1 ? 1 : -1).then((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  /// Ctrl+0: back to the default text size.
+  void _resetTextZoom() {
+    sl<ReaderPrefs>().setFontSize(ReaderPrefs.defaultFontSize).then((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  /// A left click on the page (reader-7): in paged mode, with "Click to turn
+  /// pages" on, runs the paged tap-zone layout — mirrored for right-to-left
+  /// text — so the sides turn the page and the middle pins the bars. Scroll
+  /// mode is left to text selection.
+  void _desktopPageClick(Offset local, Size size) {
+    final prefs = sl<ReaderPrefs>();
+    if (!prefs.novelPaginated || !prefs.clickToTurn || _loading) return;
+    // That click only cleared a selection.
+    if (_selectionAtDown) return;
+    if (size.width <= 0 || size.height <= 0) return;
+    final rtl =
+        resolveNovelDirection(prefs, _text?.html ?? '') == TextDirection.rtl;
+    final action = prefs
+        .tapZones(TapZoneLayout.paged)
+        .actionAt(
+          Offset(
+            (local.dx / size.width).clamp(0.0, 1.0),
+            (local.dy / size.height).clamp(0.0, 1.0),
+          ),
+          rtl: rtl,
+        );
+    _runReaderAction(action);
+  }
+
+  /// A: start auto-scroll, or stop it when it is running.
+  void _toggleAutoScroll() => _setAutoScroll(!_autoScroll.running.value);
 
   @override
   Widget build(BuildContext context) {
@@ -437,47 +628,103 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     final theme = _readerTheme(prefs.theme);
     return Scaffold(
       backgroundColor: _dimmedBg(theme, prefs.novelBgOpacity),
-      body: Stack(
-        children: [
-          Positioned.fill(
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTapUp: (d) => _dispatchTap(d.globalPosition),
-              // Touch pauses; lifting resumes after a grace. See the manga
-              // reader — stopping outright on a drag made a nudge fatal.
-              child: Listener(
-                onPointerDown: (_) => _autoScroll.pauseForTouch(),
-                onPointerUp: (_) => _autoScroll.resumeAfterTouch(),
-                onPointerCancel: (_) => _autoScroll.resumeAfterTouch(),
-                child: ReaderPullChapter(
-                  enabled: prefs.overscrollChapter,
-                  hasPrev: _prevIndex != null,
-                  hasNext: _nextIndex != null,
-                  prevLabel: _chapterLabel(_prevIndex),
-                  nextLabel: _chapterLabel(_nextIndex),
-                  onChangeChapter: (d) =>
-                      _goToChapter(d > 0 ? _nextIndex : _prevIndex),
+      body: _desktopReader
+          ? DesktopReaderInput(
+              key: _inputKey,
+              direction: !prefs.novelPaginated
+                  ? 'vertical'
+                  : resolveNovelDirection(prefs, _text?.html ?? '') ==
+                        TextDirection.rtl
+                  ? 'rtl'
+                  : 'ltr',
+              onVerticalScroll: _desktopScroll,
+              onVerticalKeyScroll: _desktopKeyScroll,
+              onPageStep: _desktopPage,
+              // reader-4: chapter, panel and auto-scroll keys. Full screen
+              // goes through the comfort mixin so closing the reader puts
+              // the window back as it was.
+              onNextChapter: () => _goToChapter(_nextIndex),
+              onPreviousChapter: () => _goToChapter(_prevIndex),
+              onChapterList: _openChapterSheet,
+              onSettings: _openSettingsSheet,
+              onAutoScroll: _toggleAutoScroll,
+              onToggleFullscreen: toggleReaderFullscreen,
+              onZoomBy: _zoomText,
+              onZoomReset: _resetTextZoom,
+              onPageClick: _desktopPageClick,
+              // Selectable text: a double click selects a word, so a single
+              // click waits a moment before it turns the page.
+              deferClicks: true,
+              builder: (top, bottom) => DesktopReaderKeyScope(
+                onKey: _desktopKey,
+                child: _buildReaderStack(
+                  theme,
+                  prefs,
+                  topVisible: top,
+                  bottomVisible: bottom,
+                ),
+              ),
+            )
+          : _buildReaderStack(theme, prefs),
+    );
+  }
+
+  /// Keeps content mounted while independently fading the two desktop edges.
+  Widget _buildReaderStack(
+    _ReaderTheme theme,
+    ReaderPrefs prefs, {
+    bool? topVisible,
+    bool? bottomVisible,
+  }) => Stack(
+    children: [
+      Positioned.fill(
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapUp: (d) => _dispatchTap(d.globalPosition),
+          // Touch pauses; lifting resumes after a grace. See the manga
+          // reader — stopping outright on a drag made a nudge fatal.
+          child: Listener(
+            onPointerDown: (_) {
+              // Remembered before the press can clear the selection.
+              _selectionAtDown = _selectedText.isNotEmpty;
+              _autoScroll.pauseForTouch();
+            },
+            onPointerUp: (_) => _autoScroll.resumeAfterTouch(),
+            onPointerCancel: (_) => _autoScroll.resumeAfterTouch(),
+            child: ReaderPullChapter(
+              enabled: !_desktopReader && prefs.overscrollChapter,
+              hasPrev: _prevIndex != null,
+              hasNext: _nextIndex != null,
+              prevLabel: _chapterLabel(_prevIndex),
+              nextLabel: _chapterLabel(_nextIndex),
+              onChangeChapter: (d) =>
+                  _goToChapter(d > 0 ? _nextIndex : _prevIndex),
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxWidth: _desktopReader ? 960 : double.infinity,
+                  ),
                   child: _buildBody(theme, prefs),
                 ),
               ),
             ),
           ),
-          // Always mounted now (fade instead of build-if-visible) — see the
-          // IgnorePointer inside each for why that doesn't eat page taps.
-          _buildTopBar(),
-          _buildBottomBar(),
-          if (prefs.autoScrollButton)
-            ReaderAutoScrollButton(
-              autoScroll: _autoScroll,
-              onTap: _openAutoScrollSheet,
-              initialX: prefs.autoScrollButtonX,
-              initialY: prefs.autoScrollButtonY,
-              onMoved: prefs.setAutoScrollButtonPos,
-            ),
-        ],
+        ),
       ),
-    );
-  }
+      // Always mounted now (fade instead of build-if-visible) — see the
+      // IgnorePointer inside each for why that doesn't eat page taps.
+      _buildTopBar(visible: topVisible),
+      _buildBottomBar(visible: bottomVisible),
+      if (!_desktopReader && prefs.autoScrollButton)
+        ReaderAutoScrollButton(
+          autoScroll: _autoScroll,
+          onTap: _openAutoScrollSheet,
+          initialX: prefs.autoScrollButtonX,
+          initialY: prefs.autoScrollButtonY,
+          onMoved: prefs.setAutoScrollButtonPos,
+        ),
+    ],
+  );
 
   /// Display name for a neighbouring chapter, for the pull indicator.
   String? _chapterLabel(int? i) {
@@ -504,6 +751,7 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
 
     final base = TextStyle(
       fontFamily: novelFontFamily(prefs.fontFamily),
+      fontFamilyFallback: novelFontFallback(prefs.fontFamily),
       fontSize: prefs.fontSize,
       height: prefs.lineHeight,
       letterSpacing: prefs.letterSpacing,
@@ -532,80 +780,98 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     return SafeArea(
       child: Directionality(
         textDirection: direction,
-        child: CustomScrollView(
-          controller: _scrollController,
-          physics: const AlwaysScrollableScrollPhysics(),
-          slivers: [
-            SliverPadding(
-              padding: EdgeInsets.symmetric(
-                horizontal: prefs.marginWidth,
-                vertical: 32,
+        child: _selectable(
+          CustomScrollView(
+            controller: _scrollController,
+            physics: const AlwaysScrollableScrollPhysics(),
+            slivers: [
+              SliverPadding(
+                padding: EdgeInsets.symmetric(
+                  horizontal: prefs.marginWidth,
+                  vertical: 32,
+                ),
+                sliver: HtmlWidget(
+                  cleanNovelHtml(text.html),
+                  renderMode: RenderMode.sliverList,
+                  // Only a downloaded chapter carries a folder — resolves an
+                  // image's relative `src` (the download saves them bare, e.g.
+                  // `img_0.jpg`) to the local file next to the saved HTML.
+                  // Null for anything read live, same as before this existed.
+                  baseUrl: text.folder == null
+                      ? null
+                      : Uri.file('${text.folder}/'),
+                  textStyle: base,
+                  // HtmlWidget caches its built tree and only re-renders when the
+                  // HTML or one of these triggers changes — a changed `textStyle`
+                  // alone does NOT re-render it. So every setting that feeds `base`
+                  // (font size/family/line height/colour) or `customStylesBuilder`
+                  // (spacing/alignment/direction) has to be listed here, or the
+                  // slider moves but the text doesn't.
+                  rebuildTriggers: [
+                    prefs.fontSize,
+                    prefs.fontFamily,
+                    prefs.lineHeight,
+                    theme.text,
+                    prefs.paragraphSpacing,
+                    prefs.textAlignJustify,
+                    // Letter/word spacing also feed ase; without these the
+                    // in-reader sliders moved but the scrolled text did not.
+                    prefs.letterSpacing,
+                    prefs.wordSpacing,
+                    direction,
+                  ],
+                  customStylesBuilder: (element) {
+                    // Force font size + line height as CSS on every element so a
+                    // source that baked its own sizing in can't win over the
+                    // reader's setting (textStyle alone loses to inline CSS).
+                    final styles = <String, String>{
+                      'font-size': '${prefs.fontSize}px',
+                      'line-height': '${prefs.lineHeight}',
+                      'direction': direction == TextDirection.rtl
+                          ? 'rtl'
+                          : 'ltr',
+                    };
+                    if (element.localName == 'p' ||
+                        element.localName == 'div') {
+                      styles['margin'] = '0 0 ${prefs.paragraphSpacing}px 0';
+                      styles['text-align'] = prefs.textAlignJustify
+                          ? 'justify'
+                          : 'start';
+                    }
+                    return styles;
+                  },
+                ),
               ),
-              sliver: HtmlWidget(
-                cleanNovelHtml(text.html),
-                renderMode: RenderMode.sliverList,
-                // Only a downloaded chapter carries a folder — resolves an
-                // image's relative `src` (the download saves them bare, e.g.
-                // `img_0.jpg`) to the local file next to the saved HTML.
-                // Null for anything read live, same as before this existed.
-                baseUrl: text.folder == null
-                    ? null
-                    : Uri.file('${text.folder}/'),
-                textStyle: base,
-                // HtmlWidget caches its built tree and only re-renders when the
-                // HTML or one of these triggers changes — a changed `textStyle`
-                // alone does NOT re-render it. So every setting that feeds `base`
-                // (font size/family/line height/colour) or `customStylesBuilder`
-                // (spacing/alignment/direction) has to be listed here, or the
-                // slider moves but the text doesn't.
-                rebuildTriggers: [
-                  prefs.fontSize,
-                  prefs.fontFamily,
-                  prefs.lineHeight,
-                  theme.text,
-                  prefs.paragraphSpacing,
-                  prefs.textAlignJustify,
-                  direction,
-                ],
-                customStylesBuilder: (element) {
-                  // Force font size + line height as CSS on every element so a
-                  // source that baked its own sizing in can't win over the
-                  // reader's setting (textStyle alone loses to inline CSS).
-                  final styles = <String, String>{
-                    'font-size': '${prefs.fontSize}px',
-                    'line-height': '${prefs.lineHeight}',
-                    'direction': direction == TextDirection.rtl ? 'rtl' : 'ltr',
-                  };
-                  if (element.localName == 'p' || element.localName == 'div') {
-                    styles['margin'] = '0 0 ${prefs.paragraphSpacing}px 0';
-                    styles['text-align'] = prefs.textAlignJustify
-                        ? 'justify'
-                        : 'start';
-                  }
-                  return styles;
-                },
-              ),
-            ),
-            if (showNext)
-              SliverToBoxAdapter(
-                child: Padding(
-                  padding: const EdgeInsets.only(top: 28, bottom: 40),
-                  child: Center(
-                    child: TextButton(
-                      onPressed: () => _goToChapter(_nextIndex),
-                      child: Text(
-                        context.l10n.nextChapter2,
-                        style: AppText.body.copyWith(color: AppColors.accent),
+              if (showNext)
+                SliverToBoxAdapter(
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 28, bottom: 40),
+                    child: Center(
+                      child: TextButton(
+                        onPressed: () => _goToChapter(_nextIndex),
+                        child: Text(
+                          context.l10n.nextChapter2,
+                          style: AppText.body.copyWith(color: AppColors.accent),
+                        ),
                       ),
                     ),
                   ),
                 ),
-              ),
-          ],
+            ],
+          ),
         ),
       ),
     );
   }
+
+  /// Windows (reader-11 A): chapter text can be selected and copied, with a
+  /// right-click menu. Phones keep their plain, tap-driven text.
+  Widget _selectable(Widget child) => _desktopReader
+      ? NovelSelectionArea(
+          onSelectionText: (text) => _selectedText = text,
+          child: child,
+        )
+      : child;
 
   Widget _buildError(_ReaderTheme theme) {
     return Center(
@@ -647,6 +913,7 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
   Widget _buildPaged(_ReaderTheme theme, ReaderPrefs prefs, ChapterText text) {
     final base = TextStyle(
       fontFamily: novelFontFamily(prefs.fontFamily),
+      fontFamilyFallback: novelFontFallback(prefs.fontFamily),
       fontSize: prefs.fontSize,
       height: prefs.lineHeight,
       letterSpacing: prefs.letterSpacing,
@@ -674,34 +941,149 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
             );
             _ensurePaginated(text.html, base, pageSize);
             final pages = _pages;
+            final endPage = _hasEndPage;
             return GestureDetector(
               behavior: HitTestBehavior.opaque,
               onTapUp: (d) => _dispatchTap(d.globalPosition),
-              child: PageView.builder(
-                controller: _pageController,
-                itemCount: pages.isEmpty ? 1 : pages.length,
-                onPageChanged: _onPageChanged,
-                itemBuilder: (context, index) {
-                  if (pages.isEmpty) return const SizedBox.shrink();
-                  return Padding(
-                    padding: EdgeInsets.symmetric(
-                      horizontal: prefs.marginWidth,
-                      vertical: 32,
-                    ),
-                    child: Align(
-                      alignment: AlignmentDirectional.topStart,
-                      child: Text.rich(
-                        pages[index],
-                        textAlign: prefs.textAlignJustify
-                            ? TextAlign.justify
-                            : TextAlign.start,
+              child: _selectable(
+                PageView.builder(
+                  controller: _pageController,
+                  itemCount: pages.isEmpty
+                      ? 1
+                      : pages.length + (endPage ? 1 : 0),
+                  onPageChanged: _onPageChanged,
+                  itemBuilder: (context, index) {
+                    if (pages.isEmpty) return const SizedBox.shrink();
+                    if (endPage && index == pages.length) {
+                      return _novelEndPage(theme);
+                    }
+                    return Padding(
+                      padding: EdgeInsets.symmetric(
+                        horizontal: prefs.marginWidth,
+                        vertical: 32,
                       ),
-                    ),
-                  );
-                },
+                      child: Align(
+                        alignment: AlignmentDirectional.topStart,
+                        child: Text.rich(
+                          pages[index],
+                          textAlign: prefs.textAlignJustify
+                              ? TextAlign.justify
+                              : TextAlign.start,
+                        ),
+                      ),
+                    );
+                  },
+                ),
               ),
             );
           },
+        ),
+      ),
+    );
+  }
+
+  /// Windows paged mode's last page (reader-6 B), like the manga reader's:
+  /// the chapter just finished and, when there is one, the next chapter as
+  /// a focused button — Enter, Space or "next" carries on.
+  Widget _novelEndPage(_ReaderTheme theme) {
+    final next = _nextIndex;
+    final caption = AppText.caption.copyWith(
+      color: theme.text.withValues(alpha: 0.5),
+      fontSize: 10,
+      letterSpacing: 1.4,
+      fontWeight: FontWeight.w700,
+    );
+    return Center(
+      key: const ValueKey('novel-end-page'),
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(20, 34, 20, 48),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(context.l10n.finishedCaps, style: caption),
+            const SizedBox(height: 5),
+            Text(
+              _chapterLabel(_index) ?? '',
+              textAlign: TextAlign.center,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: AppText.body.copyWith(
+                color: theme.text,
+                fontWeight: FontWeight.w600,
+                fontSize: 14.5,
+              ),
+            ),
+            const SizedBox(height: 20),
+            if (next == null)
+              Text(
+                context.l10n.noNextChapterYet,
+                style: AppText.caption.copyWith(
+                  color: theme.text.withValues(alpha: 0.6),
+                ),
+              )
+            else ...[
+              Text(context.l10n.upNextCaps, style: caption),
+              const SizedBox(height: 10),
+              _endPageButton(next),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// The end page's Next chapter pill. Focusable (unlike the bar buttons) so
+  /// Enter activates it; an accent ring shows while it holds focus.
+  Widget _endPageButton(int next) {
+    final radius = BorderRadius.circular(22);
+    return ListenableBuilder(
+      listenable: _endPageFocus,
+      builder: (context, child) => DecoratedBox(
+        decoration: BoxDecoration(
+          color: const Color(0xFF15151B),
+          borderRadius: radius,
+          border: Border.all(
+            color: _endPageFocus.hasFocus
+                ? AppColors.accent
+                : Colors.white.withValues(alpha: 0.1),
+            width: _endPageFocus.hasFocus ? 2 : 1,
+          ),
+        ),
+        child: child,
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          key: const ValueKey('novel-end-page-next'),
+          focusNode: _endPageFocus,
+          borderRadius: radius,
+          onTap: () => _goToChapter(next),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 11),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Flexible(
+                  child: Text(
+                    _chapterLabel(next) ?? context.l10n.nextChapter,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: AppText.body.copyWith(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 13.5,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                const Icon(
+                  Icons.arrow_forward_rounded,
+                  color: Colors.white,
+                  size: 18,
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
@@ -716,12 +1098,20 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     final key =
         '${identityHashCode(_text)}|${base.fontSize}|${base.fontFamily}'
         '|${base.height}|${base.letterSpacing}|${base.wordSpacing}'
+        '|${sl<ReaderPrefs>().paragraphSpacing}'
         '|${pageSize.width.toStringAsFixed(1)}'
         '|${pageSize.height.toStringAsFixed(1)}';
     if (key == _paginationKey) return;
     final carry = _pages.isEmpty ? _savedPermille() : _pagedPermille();
     _paginationKey = key;
-    final spans = novelSpans(html, base); // paragraphSpacing 0 → pure TextSpans
+    // Paged text uses styled newline gaps: WidgetSpan gaps cannot be measured
+    // by TextPainter and used to make paragraph spacing silently do nothing.
+    final spans = novelSpans(
+      html,
+      base,
+      paragraphSpacing: sl<ReaderPrefs>().paragraphSpacing,
+      textOnly: true,
+    );
     _pages = paginateSpans(
       TextSpan(style: base, children: spans),
       pageSize: pageSize,
@@ -741,6 +1131,21 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     if (index == _pageIndex) return; // e.g. the restore jump landing on target
     setState(() => _pageIndex = index); // refresh the page x / y indicator
     _saveProgress(flush: false); // same save/scrobble path as scroll mode
+    if (!_hasEndPage) return;
+    if (index == _endPageIndex) {
+      // reader-6 B: the end page's button takes focus so Enter continues.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _pageIndex == _endPageIndex) {
+          _endPageFocus.requestFocus();
+        }
+      });
+    } else if (_endPageFocus.hasFocus) {
+      // Back on a text page: the page keys get the focus again, so Enter
+      // cannot open the next chapter from here.
+      _endPageFocus.unfocus(
+        disposition: UnfocusDisposition.previouslyFocusedChild,
+      );
+    }
   }
 
   /// Run whatever the reader's tap zones say for a tap at [global].
@@ -748,6 +1153,7 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
   /// Paged and scroll mode use different layouts: turning a page means nothing
   /// in a continuous scroll, and scrolling means nothing on a fixed page.
   void _dispatchTap(Offset global) {
+    if (_desktopReader) return;
     final size = MediaQuery.sizeOf(context);
     if (size.width <= 0 || size.height <= 0) return;
     final prefs = sl<ReaderPrefs>();
@@ -773,6 +1179,12 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
         return;
       case ReaderAction.toggleMenu:
         _toggleChrome();
+      // Windows clicks go through the same paging as the keys, so the end
+      // page and "next on the last page" behave alike (reader-6/7).
+      case ReaderAction.nextPage when _desktopReader:
+        _desktopPage(true);
+      case ReaderAction.prevPage when _desktopReader:
+        _desktopPage(false);
       case ReaderAction.nextPage:
         if (_pageController.hasClients) {
           _pageController.nextPage(duration: dur, curve: Curves.easeOut);
@@ -809,7 +1221,8 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
   // a shared dark overlay reads over any of the three page themes (dark/
   // black/sepia) the same way the player's own control bars read over any
   // video, so these no longer take the page theme as a parameter.
-  Widget _buildTopBar() {
+  Widget _buildTopBar({bool? visible}) {
+    final show = visible ?? _chromeVisible;
     // IgnorePointer, not the old `if (_chromeVisible) build it at all` — the
     // bar is always in the tree so AnimatedOpacity has something to fade,
     // but that means it'd otherwise sit invisible on top of the page
@@ -820,10 +1233,10 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
       left: 0,
       right: 0,
       child: IgnorePointer(
-        ignoring: !_chromeVisible,
+        ignoring: !show,
         child: AnimatedOpacity(
           duration: const Duration(milliseconds: 200),
-          opacity: _chromeVisible ? 1 : 0,
+          opacity: show ? 1 : 0,
           // Same floating pills as the manga reader: back · title (tap for
           // chapters) · settings.
           child: SafeArea(
@@ -888,11 +1301,11 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
 
   void _openAutoScrollSheet() {
     final prefs = sl<ReaderPrefs>();
-    showModalBottomSheet<void>(
+    // Side panel on Windows, bottom sheet on phones (see showReaderPanel).
+    showReaderPanel<void>(
       context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
       builder: (_) => ReaderAutoScrollSheet(
+        desktop: _desktopReader,
         running: _autoScroll.running.value,
         speed: prefs.autoScrollSpeed,
         showButton: prefs.autoScrollButton,
@@ -909,7 +1322,8 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     );
   }
 
-  Widget _buildBottomBar() {
+  Widget _buildBottomBar({bool? visible}) {
+    final show = visible ?? _chromeVisible;
     final hasPrev = _prevIndex != null;
     final hasNext = _nextIndex != null;
     final paged = sl<ReaderPrefs>().novelPaginated;
@@ -919,10 +1333,10 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
       right: 0,
       bottom: 0,
       child: IgnorePointer(
-        ignoring: !_chromeVisible,
+        ignoring: !show,
         child: AnimatedOpacity(
           duration: const Duration(milliseconds: 200),
-          opacity: _chromeVisible ? 1 : 0,
+          opacity: show ? 1 : 0,
           // One floating pill: prev · page slider · text size · next.
           // The slider only exists in PAGED mode, where pages are discrete and
           // a PageController can jump to one. Scrolling mode has no page to
@@ -963,7 +1377,8 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
                         : Center(
                             child: Text(
                               paged
-                                  ? 'Page ${_pageIndex + 1} / ${_pages.length}'
+                                  // The Windows end page counts as the last.
+                                  ? 'Page ${_pageIndex.clamp(0, _pages.isEmpty ? 0 : _pages.length - 1) + 1} / ${_pages.length}'
                                   : 'Chapter '
                                         '${chapterNumberLabel(_chapters, _index)}'
                                         ' / ${chapterCountLabel(_chapters)}',
@@ -1011,11 +1426,30 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
       );
       return;
     }
+    // Windows (reader-10 B): filter box, read/downloaded markers, keyboard
+    // navigation and a right-click menu.
+    if (_desktopReader) {
+      showReaderPanel<void>(
+        context: context,
+        builder: (ctx) => NovelChapterListPanel(
+          chapters: _chapters,
+          currentIndex: _index,
+          sourceId: widget.sourceId,
+          showId: widget.showId,
+          showTitle: widget.showTitle,
+          cover: widget.cover,
+          title: context.l10n.chapters,
+          onOpen: (i) {
+            if (i != _index) _goToChapter(i);
+          },
+        ),
+      );
+      return;
+    }
     const rowHeight = 52.0;
-    showModalBottomSheet<void>(
+    // Side panel on Windows, bottom sheet on phones (see showReaderPanel).
+    showReaderPanel<void>(
       context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
       // Not readerSheetBody: that wraps its children in a SingleChildScrollView,
       // and a lazy ListView inside one has no bounded height — it would try to
       // build all 100+ rows at once. Same grabber and title, own scrolling.
@@ -1026,17 +1460,19 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Center(
-                child: Container(
-                  margin: const EdgeInsets.fromLTRB(0, 8, 0, 4),
-                  width: 36,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: AppColors.textTertiary.withValues(alpha: 0.5),
-                    borderRadius: BorderRadius.circular(2),
+              if (_desktopReader) const SizedBox(height: 12),
+              if (!_desktopReader)
+                Center(
+                  child: Container(
+                    margin: const EdgeInsets.fromLTRB(0, 8, 0, 4),
+                    width: 36,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: AppColors.textTertiary.withValues(alpha: 0.5),
+                      borderRadius: BorderRadius.circular(2),
+                    ),
                   ),
                 ),
-              ),
               Padding(
                 padding: const EdgeInsets.fromLTRB(20, 4, 20, 2),
                 child: Text(context.l10n.chapters, style: AppText.headline),
@@ -1139,10 +1575,9 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
   /// mode re-paginates through its usual path (`_paginationKey` notices the
   /// text style changed) instead of needing anything special here.
   void _openTextSizeSheet() {
-    showModalBottomSheet<void>(
+    // Side panel on Windows, bottom sheet on phones (see showReaderPanel).
+    showReaderPanel<void>(
       context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setSheetState) {
           final prefs = sl<ReaderPrefs>();
@@ -1169,9 +1604,12 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
                     ),
                   ),
                   child: Slider(
-                    value: prefs.fontSize.clamp(12, 28),
-                    min: 12,
-                    max: 28,
+                    value: prefs.fontSize.clamp(
+                      ReaderPrefs.minFontSize,
+                      ReaderPrefs.maxFontSize,
+                    ),
+                    min: ReaderPrefs.minFontSize,
+                    max: ReaderPrefs.maxFontSize,
                     activeColor: AppColors.accent,
                     onChanged: (v) => apply(() => prefs.setFontSize(v)),
                   ),
@@ -1186,9 +1624,12 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
                     ),
                   ),
                   child: Slider(
-                    value: prefs.lineHeight.clamp(1.2, 2.4),
-                    min: 1.2,
-                    max: 2.4,
+                    value: prefs.lineHeight.clamp(
+                      ReaderPrefs.minLineHeight,
+                      ReaderPrefs.maxLineHeight,
+                    ),
+                    min: ReaderPrefs.minLineHeight,
+                    max: ReaderPrefs.maxLineHeight,
                     activeColor: AppColors.accent,
                     onChanged: (v) => apply(() => prefs.setLineHeight(v)),
                   ),
@@ -1202,10 +1643,9 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
   }
 
   void _openSettingsSheet() {
-    showModalBottomSheet<void>(
+    // Side panel on Windows, bottom sheet on phones (see showReaderPanel).
+    showReaderPanel<void>(
       context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setSheetState) {
           final prefs = sl<ReaderPrefs>();
@@ -1247,39 +1687,79 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
                       mainAxisSize: MainAxisSize.min,
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Center(
-                          child: Container(
-                            margin: const EdgeInsets.only(bottom: 4),
-                            width: 36,
-                            height: 4,
-                            decoration: BoxDecoration(
-                              color: AppColors.textTertiary.withValues(
-                                alpha: 0.5,
+                        // A drag handle means nothing on a desktop panel.
+                        if (!_desktopReader)
+                          Center(
+                            child: Container(
+                              margin: const EdgeInsets.only(bottom: 4),
+                              width: 36,
+                              height: 4,
+                              decoration: BoxDecoration(
+                                color: AppColors.textTertiary.withValues(
+                                  alpha: 0.5,
+                                ),
+                                borderRadius: BorderRadius.circular(2),
                               ),
-                              borderRadius: BorderRadius.circular(2),
                             ),
                           ),
-                        ),
-                        Text(context.l10n.readerSettings, style: AppText.headline),
+                        _readerPanelTitle(ctx, context.l10n.readerSettings),
                         readerSheetSection('Text'),
                         readerSheetGroup([
-                          readerSheetRow(
-                            icon: Icons.text_fields_rounded,
-                            label: context.l10n.font,
-                            child: ReaderSegmentedControl(
-                              options: fontOptions,
-                              selected: prefs.fontFamily,
-                              onSelect: (v) =>
-                                  apply(() => prefs.setFontFamily(v)),
+                          // Windows (reader-11 B): any installed font, from a
+                          // searchable list; phones keep the three choices.
+                          if (_desktopReader)
+                            readerSheetRow(
+                              icon: Icons.text_fields_rounded,
+                              label: context.l10n.font,
+                              trailing: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    _fontLabel(prefs.fontFamily),
+                                    style: AppText.caption.copyWith(
+                                      color: AppColors.textSecondary,
+                                    ),
+                                  ),
+                                  const Icon(
+                                    Icons.chevron_right_rounded,
+                                    color: AppColors.textSecondary,
+                                    size: 20,
+                                  ),
+                                ],
+                              ),
+                              onTap: () async {
+                                final picked = await pickNovelFont(
+                                  ctx,
+                                  current: prefs.fontFamily,
+                                  title: context.l10n.font,
+                                  systemLabel: context.l10n.system,
+                                );
+                                if (picked != null) {
+                                  apply(() => prefs.setFontFamily(picked));
+                                }
+                              },
+                            )
+                          else
+                            readerSheetRow(
+                              icon: Icons.text_fields_rounded,
+                              label: context.l10n.font,
+                              child: ReaderSegmentedControl(
+                                options: fontOptions,
+                                selected: prefs.fontFamily,
+                                onSelect: (v) =>
+                                    apply(() => prefs.setFontFamily(v)),
+                              ),
                             ),
-                          ),
                           readerSheetRow(
                             icon: Icons.format_size_rounded,
                             label: context.l10n.fontSize,
                             child: Slider(
-                              value: prefs.fontSize.clamp(12, 28),
-                              min: 12,
-                              max: 28,
+                              value: prefs.fontSize.clamp(
+                                ReaderPrefs.minFontSize,
+                                ReaderPrefs.maxFontSize,
+                              ),
+                              min: ReaderPrefs.minFontSize,
+                              max: ReaderPrefs.maxFontSize,
                               activeColor: AppColors.accent,
                               onChanged: (v) =>
                                   apply(() => prefs.setFontSize(v)),
@@ -1289,9 +1769,12 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
                             icon: Icons.format_line_spacing_rounded,
                             label: context.l10n.lineHeight,
                             child: Slider(
-                              value: prefs.lineHeight.clamp(1.2, 2.4),
-                              min: 1.2,
-                              max: 2.4,
+                              value: prefs.lineHeight.clamp(
+                                ReaderPrefs.minLineHeight,
+                                ReaderPrefs.maxLineHeight,
+                              ),
+                              min: ReaderPrefs.minLineHeight,
+                              max: ReaderPrefs.maxLineHeight,
                               activeColor: AppColors.accent,
                               onChanged: (v) =>
                                   apply(() => prefs.setLineHeight(v)),
@@ -1360,9 +1843,12 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
                             icon: Icons.view_stream_outlined,
                             label: context.l10n.paragraphSpacing,
                             child: Slider(
-                              value: prefs.paragraphSpacing.clamp(0, 24),
+                              value: prefs.paragraphSpacing.clamp(
+                                0,
+                                ReaderPrefs.maxParagraphSpacing,
+                              ),
                               min: 0,
-                              max: 24,
+                              max: ReaderPrefs.maxParagraphSpacing,
                               activeColor: AppColors.accent,
                               onChanged: (v) =>
                                   apply(() => prefs.setParagraphSpacing(v)),
@@ -1470,16 +1956,30 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
                               _openAutoScrollSheet();
                             },
                           ),
-                          readerSheetRow(
-                            icon: Icons.swipe_vertical_rounded,
-                            label: context.l10n.pullToChangeChapter,
-                            trailing: Switch(
-                              value: prefs.overscrollChapter,
-                              activeThumbColor: AppColors.accent,
-                              onChanged: (v) =>
-                                  apply(() => prefs.setOverscrollChapter(v)),
+                          // Windows (reader-7): clicking the sides of a
+                          // page turns it in paged mode.
+                          if (_desktopReader)
+                            readerSheetRow(
+                              icon: Icons.ads_click_rounded,
+                              label: context.l10n.clickToTurnPages,
+                              trailing: Switch(
+                                value: prefs.clickToTurn,
+                                activeThumbColor: AppColors.accent,
+                                onChanged: (v) =>
+                                    apply(() => prefs.setClickToTurn(v)),
+                              ),
                             ),
-                          ),
+                          if (!_desktopReader)
+                            readerSheetRow(
+                              icon: Icons.swipe_vertical_rounded,
+                              label: context.l10n.pullToChangeChapter,
+                              trailing: Switch(
+                                value: prefs.overscrollChapter,
+                                activeThumbColor: AppColors.accent,
+                                onChanged: (v) =>
+                                    apply(() => prefs.setOverscrollChapter(v)),
+                              ),
+                            ),
                         ]),
                         readerSheetSection('Comfort'),
                         readerSheetGroup([
@@ -1520,11 +2020,27 @@ class _NovelReaderScreenState extends State<NovelReaderScreen>
     );
   }
 
-  String _fontLabel(String f) => switch (f) {
-    'serif' => 'Serif',
-    'system' => context.l10n.system,
-    _ => 'Inter',
-  };
+  /// Sheet title. Phones keep the plain headline; the Windows side panel adds
+  /// a close button, since there is no sheet to swipe away.
+  Widget _readerPanelTitle(BuildContext sheetContext, String title) {
+    final text = Text(title, style: AppText.headline);
+    if (!_desktopReader) return text;
+    return Row(
+      children: [
+        Expanded(child: text),
+        IconButton(
+          key: const ValueKey('reader-panel-close'),
+          tooltip: MaterialLocalizations.of(sheetContext).closeButtonTooltip,
+          icon: const Icon(Icons.close_rounded, size: 20),
+          color: AppColors.textSecondary,
+          onPressed: () => Navigator.of(sheetContext).pop(),
+        ),
+      ],
+    );
+  }
+
+  String _fontLabel(String f) =>
+      novelFontLabel(f, systemLabel: context.l10n.system);
 
   Widget _themeSwatch(String id, bool selected, VoidCallback onTap) {
     final theme = _readerTheme(id);
@@ -1601,11 +2117,32 @@ _ReaderTheme _readerTheme(String theme) {
 /// engine resolves to a real system serif font — no bundled asset needed;
 /// 'system' returns null so the platform's default text font renders
 /// untouched.
-String? novelFontFamily(String key) => switch (key) {
-  'serif' => 'serif',
-  'system' => null,
-  _ => 'Inter',
-};
+///
+/// Windows has no generic 'serif' alias in its font manager, so Serif would
+/// silently fall back to the sans default there; it names Georgia (shipped
+/// with every Windows) instead. System names Segoe UI, the Windows UI font,
+/// so it stays distinct from Inter even when the app font is set to Inter.
+String? novelFontFamily(String key) {
+  // Windows (reader-11 B): an installed font picked by name is used as is.
+  final installed = ReaderPrefs.installedFontName(key);
+  if (installed != null) return installed;
+  final windows = defaultTargetPlatform == TargetPlatform.windows;
+  return switch (key) {
+    'serif' => windows ? 'Georgia' : 'serif',
+    'system' => windows ? 'Segoe UI' : null,
+    _ => 'Inter',
+  };
+}
+
+/// Further serif faces for Windows in case Georgia is missing a glyph or was
+/// removed; null everywhere else so other platforms are unchanged.
+List<String>? novelFontFallback(String key) {
+  if (defaultTargetPlatform != TargetPlatform.windows) return null;
+  if (key == 'serif') return const ['Cambria', 'Times New Roman'];
+  // An installed font missing a glyph falls back to the Windows UI font.
+  if (ReaderPrefs.installedFontName(key) != null) return const ['Segoe UI'];
+  return null;
+}
 
 /// One decoded run of inline HTML — a text run with its bold/italic state,
 /// or a break marker — the unit [novelSpans] walks raw chapter HTML into via
@@ -1764,16 +2301,27 @@ TextDirection resolveNovelDirection(ReaderPrefs prefs, String html) {
   }
 }
 
+/// Converts HTML styling and paragraph gaps into reader spans. [textOnly]
+/// represents gaps as styled newline runs for the page measurer; scroll layouts
+/// keep their exact-pixel widget gaps. Both honor the same spacing preference.
 List<InlineSpan> novelSpans(
   String html,
   TextStyle base, {
   double paragraphSpacing = 0,
+  bool textOnly = false,
 }) {
   final spans = <InlineSpan>[];
   for (final t in _tokenizeHtml(html)) {
     if (t.isBreak) {
       spans.add(const TextSpan(text: '\n'));
-      if (t.paragraphBreak && paragraphSpacing > 0) {
+      if (t.paragraphBreak && paragraphSpacing > 0 && textOnly) {
+        spans.add(
+          TextSpan(
+            text: '\n',
+            style: TextStyle(fontSize: paragraphSpacing, height: 1),
+          ),
+        );
+      } else if (t.paragraphBreak && paragraphSpacing > 0) {
         spans.add(
           WidgetSpan(
             child: SizedBox(height: paragraphSpacing, width: double.infinity),

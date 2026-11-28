@@ -32,6 +32,18 @@ class BackupRemote {
         .maybeSingle();
     return res;
   }
+
+  /// Only the `updated_at` column of the user's row (or null when there is no
+  /// row). The Backup page shows this date; selecting just it avoids pulling
+  /// the whole JSON payload over the network.
+  Future<String?> getUpdatedAt(String userKey) async {
+    final res = await _cloud
+        .from('backups')
+        .select('updated_at')
+        .eq('user_key', userKey)
+        .maybeSingle();
+    return res?['updated_at'] as String?;
+  }
 }
 
 /// Cloud transport for full-app backups.
@@ -70,9 +82,11 @@ class BackupCloud {
 
   /// Returns the UTC timestamp of the last successful cloud backup, or `null`
   /// if no row exists for [userId] or `updated_at` doesn't parse.
+  ///
+  /// Reads only the timestamp column, never the payload (acct-8).
   Future<DateTime?> lastBackupAt(String userId) async {
-    final row = await _remote.getRow(userId);
-    if (row == null) return null;
-    return DateTime.tryParse(row['updated_at'] as String? ?? '');
+    final updatedAt = await _remote.getUpdatedAt(userId);
+    if (updatedAt == null) return null;
+    return DateTime.tryParse(updatedAt);
   }
 }

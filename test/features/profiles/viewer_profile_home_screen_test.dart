@@ -1,12 +1,15 @@
 import 'dart:io';
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:get_it/get_it.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/app_mode.dart';
+import 'package:watch_app/core/desktop/desktop_history_opener.dart';
+import 'package:watch_app/core/desktop/desktop_settings_opener.dart';
 import 'package:watch_app/core/profiles/viewer_profile.dart';
 import 'package:watch_app/core/supabase/auth_user.dart';
 import 'package:watch_app/core/theme/app_colors.dart';
@@ -166,6 +169,155 @@ void main() {
     await tester.tap(find.text('Sign in'));
     await tester.pumpAndSettle();
     expect(find.text('Welcome back'), findsOneWidget);
+  });
+
+  group('desktop (Windows) layout', () {
+    /// Runs [body] with Flutter reporting Windows, then restores the override
+    /// (the test framework fails a test that leaves it set).
+    Future<void> onWindows(Future<void> Function() body) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      try {
+        await body();
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    }
+
+    testWidgets('fills the window and cannot scroll', (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1294, 618));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await onWindows(() async {
+        await tester.pumpWidget(_app(auth));
+
+        expect(find.byKey(const ValueKey('profile-home-desktop')), findsOneWidget);
+        // No scrolling anywhere on the page, and so no scrollbar either.
+        expect(find.byType(Scrollable), findsNothing);
+        expect(find.byType(ListView), findsNothing);
+        expect(find.byType(Scrollbar), findsNothing);
+        // The page spans the whole window instead of a narrow centred column.
+        final page = tester.getSize(find.byKey(const ValueKey('profile-home-desktop')));
+        expect(page.width, 1294);
+        expect(page.height, 618);
+        expect(tester.takeException(), isNull);
+      });
+    });
+
+    testWidgets('Settings and Donate are their own buttons, not in a menu', (
+      tester,
+    ) async {
+      await tester.binding.setSurfaceSize(const Size(1294, 618));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await onWindows(() async {
+        await tester.pumpWidget(_app(auth));
+
+        expect(find.byTooltip('Settings'), findsOneWidget);
+        expect(find.byTooltip('Donate'), findsOneWidget);
+        expect(find.byIcon(Icons.settings_outlined), findsOneWidget);
+        // The three-dots menu (and its Pair-a-TV entry) is a phone thing.
+        expect(find.byTooltip('Profile menu'), findsNothing);
+        expect(find.text('Pair a TV'), findsNothing);
+        // Everything else on the page is still there.
+        expect(find.byTooltip('Edit profile'), findsOneWidget);
+        expect(find.byKey(const ValueKey('profile-home-switch')), findsOneWidget);
+        expect(find.byKey(const ValueKey('zoro-coming-soon-gif')), findsOneWidget);
+        expect(find.text('My List'), findsOneWidget);
+        expect(find.text('In progress'), findsOneWidget);
+        expect(find.text('Completed'), findsOneWidget);
+      });
+    });
+
+    // History and Settings left the Windows sidebar; the Profile page
+    // buttons open the shell's in-frame pages through the openers.
+    testWidgets('History and Settings buttons open the shell pages', (
+      tester,
+    ) async {
+      await tester.binding.setSurfaceSize(const Size(1294, 618));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final opened = <String>[];
+      DesktopHistoryOpener.handler = () => opened.add('history');
+      DesktopSettingsOpener.handler = () => opened.add('settings');
+      addTearDown(() {
+        DesktopHistoryOpener.handler = null;
+        DesktopSettingsOpener.handler = null;
+      });
+      await onWindows(() async {
+        await tester.pumpWidget(_app(auth));
+        expect(find.byTooltip('History'), findsOneWidget);
+        await tester.tap(find.byKey(const ValueKey('profile-home-history')));
+        await tester.tap(find.byKey(const ValueKey('profile-home-settings')));
+        await tester.pump();
+        expect(opened, ['history', 'settings']);
+      });
+    });
+
+    for (final size in const [Size(1920, 1080), Size(1024, 600), Size(700, 420)]) {
+      testWidgets('fits a ${size.width.toInt()}x${size.height.toInt()} window '
+          'without overflow or scrolling', (tester) async {
+        await tester.binding.setSurfaceSize(size);
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await onWindows(() async {
+          await tester.pumpWidget(_app(auth));
+          expect(tester.takeException(), isNull);
+          expect(find.byType(Scrollable), findsNothing);
+          expect(find.text('Completed'), findsOneWidget);
+        });
+      });
+    }
+
+    testWidgets('is compact: stats share the name row and Zoro keeps his size', (
+      tester,
+    ) async {
+      await tester.binding.setSurfaceSize(const Size(1294, 618));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await onWindows(() async {
+        await tester.pumpWidget(_app(auth));
+        final name = tester.getCenter(find.text('Home').last);
+        final myList = tester.getCenter(find.text('My List'));
+        // One band: the stats sit on the same row as the name, and close to it
+        // (right after the name, not stranded at the far edge of the window).
+        expect((myList.dy - name.dy).abs(), lessThan(40));
+        expect(myList.dx, greaterThan(name.dx));
+        expect(myList.dx - name.dx, lessThan(300));
+        // The three stats are bunched together as one group.
+        final inProgress = tester.getCenter(find.text('In progress'));
+        final completed = tester.getCenter(find.text('Completed'));
+        expect(inProgress.dx - myList.dx, lessThan(160));
+        expect(completed.dx - inProgress.dx, lessThan(160));
+        // The mascot is drawn at (close to) its natural size, not squashed.
+        final zoro = tester.getRect(
+          find.byKey(const ValueKey('zoro-coming-soon-gif')),
+        );
+        expect(zoro.width, greaterThanOrEqualTo(150));
+        // And nothing is cut off at the bottom of the window.
+        expect(zoro.bottom, lessThanOrEqualTo(618));
+      });
+    });
+
+    testWidgets('a narrow window stacks the stats under the name', (
+      tester,
+    ) async {
+      await tester.binding.setSurfaceSize(const Size(700, 520));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await onWindows(() async {
+        await tester.pumpWidget(_app(auth));
+        final name = tester.getCenter(find.text('Home').last);
+        final myList = tester.getCenter(find.text('My List'));
+        expect(myList.dy, greaterThan(name.dy));
+        expect(tester.takeException(), isNull);
+        expect(find.byType(Scrollable), findsNothing);
+      });
+    });
+
+    testWidgets('the phone layout is unchanged off Windows', (tester) async {
+      await tester.pumpWidget(_app(auth));
+      expect(find.byKey(const ValueKey('profile-home-desktop')), findsNothing);
+      // Upstream's phone page has one direct Settings icon and no menu.
+      expect(find.byTooltip('Profile menu'), findsNothing);
+      expect(find.byTooltip('Settings'), findsOneWidget);
+      expect(find.byTooltip('Donate'), findsNothing);
+      // The History button is Windows-only.
+      expect(find.byKey(const ValueKey('profile-home-history')), findsNothing);
+    });
   });
 }
 

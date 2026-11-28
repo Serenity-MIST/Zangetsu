@@ -1,3 +1,5 @@
+import 'package:flutter/gestures.dart';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text.dart';
@@ -58,7 +60,7 @@ class _ContentRowState extends State<ContentRow> {
     final keys = widget.itemKeys;
     if (keys == null || widget.itemWidthForIndex != null) return;
     if (identical(keys, _prevKeys)) return;
-    final step = widget.itemWidth + 12;
+    final step = _scaledWidth(widget.itemWidth) + _gap;
     final oldIndex = <String, int>{};
     for (var i = 0; i < _prevKeys.length; i++) {
       oldIndex.putIfAbsent(_prevKeys[i], () => i);
@@ -74,6 +76,27 @@ class _ContentRowState extends State<ContentRow> {
   }
 
   List<String> _prevKeys = const [];
+
+  /// Gap after each card: wider on Windows to match the desktop card size.
+  double get _gap => Platform.isWindows ? 20 : 12;
+
+  /// Scales a phone-sized card width to the Windows desktop card size
+  /// (portrait posters to a 166px-wide basis, landscape cards by 1.2).
+  /// Phone, TV and iOS keep [width] unchanged.
+  double _scaledWidth(double width) {
+    if (!Platform.isWindows) return width;
+    return widget.itemHeight > widget.itemWidth
+        ? width * 166 / widget.itemWidth
+        : width * 1.2;
+  }
+
+  /// Row height, scaled the same way as [_scaledWidth] on Windows.
+  double get _rowHeight {
+    if (!Platform.isWindows) return widget.itemHeight;
+    return widget.itemHeight > widget.itemWidth
+        ? (widget.itemHeight / widget.itemWidth * 166).clamp(240.0, 320.0)
+        : widget.itemHeight * 1.2;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -94,72 +117,111 @@ class _ContentRowState extends State<ContentRow> {
           onSeeAll: widget.onSeeAll,
         ),
         SizedBox(
-          height: widget.itemHeight,
-          child: ListView.builder(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            // With a screen reader on, build every item (not just the lazy
-            // window) so TalkBack can focus each one and the row auto-scrolls to
-            // it — otherwise horizontal swipe navigation stalls at the first few.
-            // Sighted users keep the lazy 600px window unchanged.
-            cacheExtent: MediaQuery.of(context).accessibleNavigation
-                ? double.infinity
-                : 600,
-            itemCount: widget.itemCount,
-            // Keyed cells: each entry's element (image included) travels to
-            // its new slot instead of a fresh card remounting there with a
-            // fade-in. Null keys (rows that don't opt in) behave exactly as
-            // before.
-            findChildIndexCallback: (key) {
-              final keys = widget.itemKeys;
-              if (keys == null || key is! ValueKey<String>) return null;
-              const prefix = 'cell:';
-              final v = key.value;
-              if (!v.startsWith(prefix)) return null;
-              final i = keys.indexOf(v.substring(prefix.length));
-              return i < 0 ? null : i;
-            },
-            itemBuilder: (context, index) {
-              final keys = widget.itemKeys;
-              final key = keys != null && index < keys.length
-                  ? keys[index]
-                  : null;
-              final from = key == null
-                  ? Offset.zero
-                  : (_placing[key] ?? Offset.zero);
-              return Padding(
-                // The key lives on the slot widget itself: only direct sliver
-                // children participate in key-based moves, so a key deeper
-                // inside would remount (and replay the entrance) on every
-                // shift.
-                key: key == null ? null : ValueKey('cell:$key'),
-                padding: const EdgeInsetsDirectional.only(end: 12),
-                child: SizedBox(
-                  width:
+          height: _rowHeight,
+          child: _DesktopHorizontalScroll(
+            builder: (controller) => ListView.builder(
+              controller: controller,
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              // With a screen reader on, build every item (not just the lazy
+              // window) so TalkBack can focus each one and the row auto-scrolls to
+              // it — otherwise horizontal swipe navigation stalls at the first few.
+              // Sighted users keep the lazy 600px window unchanged.
+              cacheExtent: MediaQuery.of(context).accessibleNavigation
+                  ? double.infinity
+                  : 600,
+              itemCount: widget.itemCount,
+              // Keyed cells: each entry's element (image included) travels to
+              // its new slot instead of a fresh card remounting there with a
+              // fade-in. Null keys (rows that don't opt in) behave exactly as
+              // before.
+              findChildIndexCallback: (key) {
+                final keys = widget.itemKeys;
+                if (keys == null || key is! ValueKey<String>) return null;
+                const prefix = 'cell:';
+                final v = key.value;
+                if (!v.startsWith(prefix)) return null;
+                final i = keys.indexOf(v.substring(prefix.length));
+                return i < 0 ? null : i;
+              },
+              itemBuilder: (context, index) {
+                final keys = widget.itemKeys;
+                final key = keys != null && index < keys.length
+                    ? keys[index]
+                    : null;
+                final from = key == null
+                    ? Offset.zero
+                    : (_placing[key] ?? Offset.zero);
+                return Padding(
+                  // The key lives on the slot widget itself: only direct sliver
+                  // children participate in key-based moves, so a key deeper
+                  // inside would remount (and replay the entrance) on every
+                  // shift.
+                  key: key == null ? null : ValueKey('cell:$key'),
+                  padding: EdgeInsetsDirectional.only(end: _gap),
+                  child: SizedBox(
+                    width: _scaledWidth(
                       widget.itemWidthForIndex?.call(index) ?? widget.itemWidth,
-                  child: RepaintBoundary(
-                    child: RevealItem(
-                      index: index,
-                      // The slide rides INSIDE the entrance wrapper for the
-                      // same reason — and stays mounted (zero travel when
-                      // still) so the subtree shape never changes and cached
-                      // images never remount.
-                      child: PlacementSlide(
-                        from: from,
-                        duration: widget.slideDuration,
-                        onDone: key == null
-                            ? () {}
-                            : () => _placing.remove(key),
-                        child: widget.itemBuilder(context, index),
+                    ),
+                    child: RepaintBoundary(
+                      child: RevealItem(
+                        index: index,
+                        // The slide rides INSIDE the entrance wrapper for the
+                        // same reason — and stays mounted (zero travel when
+                        // still) so the subtree shape never changes and cached
+                        // images never remount.
+                        child: PlacementSlide(
+                          from: from,
+                          duration: widget.slideDuration,
+                          onDone: key == null
+                              ? () {}
+                              : () => _placing.remove(key),
+                          child: widget.itemBuilder(context, index),
+                        ),
                       ),
                     ),
                   ),
-                ),
-              );
-            },
+                );
+              },
+            ),
           ),
         ),
       ],
+    );
+  }
+}
+
+/// Gives a content row an owned controller and desktop pointer drag support.
+class _DesktopHorizontalScroll extends StatefulWidget {
+  const _DesktopHorizontalScroll({required this.builder});
+  final Widget Function(ScrollController) builder;
+  @override
+  State<_DesktopHorizontalScroll> createState() =>
+      _DesktopHorizontalScrollState();
+}
+
+/// Enables mouse/trackpad drags without consuming the outer page's wheel scroll.
+class _DesktopHorizontalScrollState extends State<_DesktopHorizontalScroll> {
+  final _controller = ScrollController();
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final child = widget.builder(_controller);
+    if (!Platform.isWindows) return child;
+    return ScrollConfiguration(
+      behavior: const MaterialScrollBehavior().copyWith(
+        dragDevices: {
+          PointerDeviceKind.touch,
+          PointerDeviceKind.mouse,
+          PointerDeviceKind.trackpad,
+        },
+      ),
+      child: child,
     );
   }
 }

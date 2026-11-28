@@ -5,6 +5,43 @@ part of 'zangetsu_sources_screen.dart';
 // Phone view
 // ---------------------------------------------------------------------------
 
+/// Source metadata and controls share a compact desktop row when there is
+/// enough room. Narrow windows and enlarged text stack the same controls so
+/// labels remain readable and actions never become tiny icon-only targets.
+class _ZDesktopSourceRow extends StatelessWidget {
+  const _ZDesktopSourceRow({required this.heading, required this.actions});
+  final Widget heading;
+  final Widget actions;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 14),
+    child: LayoutBuilder(
+      builder: (context, constraints) {
+        final wide =
+            constraints.maxWidth >= 680 &&
+            MediaQuery.textScalerOf(context).scale(14) <= 21;
+        if (wide) {
+          return Row(
+            children: [
+              Expanded(flex: 3, child: heading),
+              const SizedBox(width: 16),
+              Flexible(
+                flex: 2,
+                child: Align(alignment: Alignment.centerRight, child: actions),
+              ),
+            ],
+          );
+        }
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [heading, const SizedBox(height: 12), actions],
+        );
+      },
+    ),
+  );
+}
+
 class _ZPhoneView extends StatefulWidget {
   const _ZPhoneView({this.openToRepos = false, this.scopeToReading = false});
 
@@ -33,9 +70,53 @@ class _ZPhoneViewState extends State<_ZPhoneView> {
     super.dispose();
   }
 
+  /// Desktop toolbar keeps navigation and repository creation in normal flow.
+  /// The shared provider toolbar (graphite segmented switch, square icon
+  /// buttons, secondary Add button), so Zangetsu looks like every other
+  /// ecosystem; the screen lays its own search field out below it.
+  Widget _desktopToolbar(BuildContext context) => DesktopSourcesToolbar(
+    tabs: [context.l10n.installed, context.l10n.repositories],
+    actions: [
+      // Builder: reaches the F5 keys scope the same way the other screens do.
+      Builder(
+        builder: (inner) => IconButton(
+          tooltip: inner.l10n.refreshRepositoriesF5,
+          icon: const Icon(Icons.refresh_rounded),
+          onPressed: () => DesktopSourcesKeys.maybeOf(inner)?.refresh(),
+        ),
+      ),
+    ],
+    addLabel: context.l10n.addZangetsuRepo,
+    addKey: const ValueKey('desktop-add-zangetsu-repo'),
+    onAdd: () => _showAddRepoDialog(context),
+  );
+
+  /// F5 on Windows (src-13 A): re-fetch every repository.
+  void _refreshAllRepos(BuildContext context) {
+    final bloc = context.read<SourcesBloc>();
+    for (final repo in bloc.state.repos) {
+      bloc.add(RepoRefreshed(repo.url));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    // Windows: the desktop settings look whatever opened the screen
+    // (src-3 A), plus Ctrl+F / Esc / F5 (src-13 A).
+    if (desktopPanelsEnabled) {
+      return DesktopProviderScope(
+        child: DesktopSourcesKeys(
+          onRefresh: () => _refreshAllRepos(context),
+          child: Builder(builder: _build),
+        ),
+      );
+    }
+    return _build(context);
+  }
+
+  Widget _build(BuildContext context) {
     final readingOnly = widget.scopeToReading && !_showAll;
+    final desktop = DesktopSettingsScope.contains(context);
     return BlocListener<SourcesBloc, SourcesState>(
       listenWhen: (a, b) =>
           b.notice != null &&
@@ -50,41 +131,52 @@ class _ZPhoneViewState extends State<_ZPhoneView> {
         initialIndex: widget.openToRepos ? 1 : 0,
         child: Scaffold(
           backgroundColor: AppColors.bg,
-          appBar: AppBar(
-            title: Text(
-              widget.scopeToReading
-                  ? 'Manga & Novel providers'
-                  : context.l10n.zangetsuProviders,
-              style: AppText.barTitle,
-            ),
-            bottom: TabBar(
-              indicatorColor: AppColors.accent,
-              indicatorSize: TabBarIndicatorSize.label,
-              labelColor: AppColors.textPrimary,
-              unselectedLabelColor: AppColors.textSecondary,
-              labelStyle: AppText.headline,
-              unselectedLabelStyle: AppText.headline,
-              dividerHeight: 0,
-              tabs: [
-                Tab(text: context.l10n.installed),
-                Tab(text: context.l10n.repositories),
-              ],
-            ),
-          ),
-          floatingActionButton: FloatingActionButton.extended(
-            backgroundColor: AppColors.accent,
-            foregroundColor: Colors.white,
-            onPressed: () => _showAddRepoDialog(context),
-            icon: const Icon(Icons.add),
-            label: Text(
-              context.l10n.addZangetsuRepo,
-              style: AppText.button.copyWith(color: Colors.white),
-            ),
-          ),
+          appBar: desktop
+              ? settingsAppBar(
+                  widget.scopeToReading
+                      ? 'Manga & Novel providers'
+                      : context.l10n.zangetsuProviders,
+                )
+              : AppBar(
+                  title: Text(
+                    widget.scopeToReading
+                        ? 'Manga & Novel providers'
+                        : context.l10n.zangetsuProviders,
+                    style: AppText.barTitle,
+                  ),
+                  bottom: TabBar(
+                    indicatorColor: AppColors.accent,
+                    indicatorSize: TabBarIndicatorSize.label,
+                    labelColor: AppColors.textPrimary,
+                    unselectedLabelColor: AppColors.textSecondary,
+                    labelStyle: AppText.headline,
+                    unselectedLabelStyle: AppText.headline,
+                    dividerHeight: 0,
+                    tabs: [
+                      Tab(text: context.l10n.installed),
+                      Tab(text: context.l10n.repositories),
+                    ],
+                  ),
+                ),
+          floatingActionButton: desktop
+              ? null
+              : FloatingActionButton.extended(
+                  backgroundColor: AppColors.accent,
+                  foregroundColor: Colors.white,
+                  onPressed: () => _showAddRepoDialog(context),
+                  icon: const Icon(Icons.add),
+                  label: Text(
+                    context.l10n.addZangetsuRepo,
+                    style: AppText.button.copyWith(color: Colors.white),
+                  ),
+                ),
           body: Column(
             children: [
+              if (desktop) _desktopToolbar(context),
               Padding(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                padding: desktop
+                    ? const EdgeInsets.fromLTRB(22, 12, 22, 0)
+                    : const EdgeInsets.fromLTRB(16, 12, 16, 0),
                 child: SourcesSearchField(
                   controller: _searchCtrl,
                   onChanged: (q) => setState(() => _query = q),
@@ -121,7 +213,9 @@ class _ZPhoneViewState extends State<_ZPhoneView> {
                 child: TabBarView(
                   children: [
                     ListView(
-                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
+                      padding: desktop
+                          ? const EdgeInsets.fromLTRB(22, 12, 22, 24)
+                          : const EdgeInsets.fromLTRB(16, 12, 16, 96),
                       children: [
                         _ZInstalledSection(
                           query: _query,
@@ -130,7 +224,9 @@ class _ZPhoneViewState extends State<_ZPhoneView> {
                       ],
                     ),
                     ListView(
-                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
+                      padding: desktop
+                          ? const EdgeInsets.fromLTRB(22, 12, 22, 24)
+                          : const EdgeInsets.fromLTRB(16, 12, 16, 96),
                       children: [_ZReposSection(query: _query)],
                     ),
                   ],
@@ -146,9 +242,14 @@ class _ZPhoneViewState extends State<_ZPhoneView> {
 
 Future<void> _showAddRepoDialog(BuildContext context) {
   final bloc = context.read<SourcesBloc>();
+  // Root dialog routes do not inherit the content navigator's scope marker.
+  // Capture it explicitly so the form keeps its Windows presentation.
+  final desktop = DesktopSettingsScope.contains(context);
   return showDialog<void>(
     context: context,
-    builder: (_) => _ZAddRepoDialog(bloc: bloc),
+    builder: (_) => desktop
+        ? DesktopSettingsScope(child: _ZAddRepoDialog(bloc: bloc))
+        : _ZAddRepoDialog(bloc: bloc),
   );
 }
 
@@ -327,6 +428,27 @@ class _ZInstalledGroupState extends State<_ZInstalledGroup> {
   @override
   Widget build(BuildContext context) {
     final entries = widget.entries;
+    if (DesktopSettingsScope.contains(context)) {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 18),
+        child: GraphiteSettingsPanel(
+          margin: EdgeInsets.zero,
+          children: [
+            GraphiteSettingsControl(
+              key: ValueKey('desktop-source-group-${widget.repoUrl}'),
+              icon: _expanded || widget.searching
+                  ? Icons.folder_open_outlined
+                  : Icons.folder_outlined,
+              title: widget.title,
+              subtitle: '${entries.length} installed sources',
+              onTap: () => setState(() => _expanded = !_expanded),
+            ),
+            if (_expanded || widget.searching)
+              for (final entry in entries) _ZInstalledRow(entry: entry),
+          ],
+        ),
+      );
+    }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -422,6 +544,102 @@ class _ZInstalledRow extends StatelessWidget {
     bloc.add(SourceUninstalled(_key, displayName: name));
   }
 
+  /// Opens this source's settings page (desktop button and menu).
+  void _openSettings(BuildContext context, String name) =>
+      Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => SourceSettingsScreen(
+            sourceId: entry.name,
+            repoUrl: entry.originRepoUrl,
+            displayName: name,
+          ),
+        ),
+      );
+
+  /// Desktop actions wrap below long source labels instead of squeezing
+  /// the title between a touch switch and several unlabeled icon buttons.
+  Widget _desktopRow(
+    BuildContext context,
+    String name,
+    String meta,
+    String? logo,
+    bool hasUpdate,
+    String? newVersion,
+  ) => _ZDesktopSourceRow(
+    heading: Row(
+      children: [
+        SourceIconTile(name: name, icon: logo),
+        const SizedBox(width: 14),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                name,
+                style: AppText.body.copyWith(color: AppColors.textPrimary),
+              ),
+              const SizedBox(height: 4),
+              Text(meta, style: AppText.caption),
+            ],
+          ),
+        ),
+      ],
+    ),
+    actions: Wrap(
+      spacing: 12,
+      runSpacing: 8,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Semantics(
+              label: '$name enabled',
+              child: Switch(
+                key: ValueKey('desktop-source-enabled-$_key'),
+                value: entry.enabled,
+                onChanged: (value) => context.read<SourcesBloc>().add(
+                  SourceEnabledToggled(_key, enabled: value),
+                ),
+              ),
+            ),
+            const SizedBox(width: 6),
+            Text(
+              entry.enabled ? 'Enabled' : 'Disabled',
+              style: AppText.caption,
+            ),
+          ],
+        ),
+        if (hasUpdate)
+          OutlinedButton.icon(
+            onPressed: () =>
+                context.read<SourcesBloc>().add(SourceUpdated(_key)),
+            icon: const Icon(Icons.download_outlined, size: 18),
+            label: Text('Update to v$newVersion'),
+          ),
+        OutlinedButton.icon(
+          onPressed: () => Navigator.of(context).push(
+            MaterialPageRoute(
+              builder: (_) => SourceSettingsScreen(
+                sourceId: entry.name,
+                repoUrl: entry.originRepoUrl,
+                displayName: name,
+              ),
+            ),
+          ),
+          icon: const Icon(Icons.tune_outlined, size: 18),
+          label: Text(context.l10n.sourceSettings),
+        ),
+        if (!entry.isBundled)
+          TextButton.icon(
+            onPressed: () => _confirmRemove(context),
+            icon: const Icon(Icons.delete_outline, size: 18),
+            label: Text(context.l10n.navTabsRemove),
+          ),
+      ],
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
     final bundled = entry.isBundled;
@@ -435,6 +653,34 @@ class _ZInstalledRow extends StatelessWidget {
     // Manifest first, install-time snapshot as the offline fallback.
     final saved = entry.logoUrl;
     final logo = state.manifestLogos[_key] ?? (saved.isEmpty ? null : saved);
+    if (DesktopSettingsScope.contains(context)) {
+      // Hover highlight + right-click with the row's actions (src-13 B).
+      return DesktopSourceRow(
+        tooltip: '$name · $meta',
+        items: () => desktopSourceMenuItems(
+          context,
+          onUpdate: hasUpdate
+              ? () => context.read<SourcesBloc>().add(SourceUpdated(_key))
+              : null,
+          updateLabel: hasUpdate ? 'Update to v$newVersion' : null,
+          onSettings: () => _openSettings(context, name),
+          onUninstall: bundled ? null : () => _confirmRemove(context),
+          uninstallLabel: context.l10n.navTabsRemove,
+          extra: [
+            DesktopMenuItem<Object?>(
+              label: entry.enabled ? context.l10n.disable : context.l10n.enable,
+              icon: entry.enabled
+                  ? Icons.toggle_off_outlined
+                  : Icons.toggle_on_outlined,
+              onTap: () => context.read<SourcesBloc>().add(
+                SourceEnabledToggled(_key, enabled: !entry.enabled),
+              ),
+            ),
+          ],
+        ),
+        child: _desktopRow(context, name, meta, logo, hasUpdate, newVersion),
+      );
+    }
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 8, 6, 8),
       child: Row(
@@ -561,8 +807,89 @@ class _ZRepoSectionState extends State<_ZRepoSection> {
     bloc.add(RepoRemoved(repo.url, displayName: repo.displayName));
   }
 
+  /// Desktop repositories expose common actions directly and retain normal
+  /// keyboard focus instead of hiding refresh/removal in a phone overflow menu.
+  Widget _desktopRepository(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(bottom: 16),
+    child: GraphiteSettingsPanel(
+      margin: EdgeInsets.zero,
+      children: [
+        GraphiteSettingsControl(
+          key: ValueKey('desktop-repository-${repo.url}'),
+          icon: _expanded || widget.query.trim().isNotEmpty
+              ? Icons.folder_open_outlined
+              : Icons.folder_outlined,
+          title: repo.displayName,
+          subtitle:
+              '${repo.sources.length} sources'
+              '${_updateCount > 0 ? ' · $_updateCount updates available' : ''}',
+          onTap: () => setState(() => _expanded = !_expanded),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(22, 0, 22, 14),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: Wrap(
+              spacing: 12,
+              runSpacing: 8,
+              children: [
+                OutlinedButton.icon(
+                  key: ValueKey('desktop-repository-refresh-${repo.url}'),
+                  onPressed: () =>
+                      context.read<SourcesBloc>().add(RepoRefreshed(repo.url)),
+                  icon: const Icon(Icons.refresh_outlined, size: 18),
+                  label: Text(context.l10n.checkForUpdates),
+                ),
+                if (_updateCount > 0)
+                  FilledButton.icon(
+                    onPressed: () =>
+                        context.read<SourcesBloc>().add(RepoUpdated(repo.url)),
+                    icon: const Icon(Icons.download_outlined, size: 18),
+                    label: Text(context.l10n.updateAllCount(_updateCount)),
+                  ),
+                TextButton.icon(
+                  onPressed: () => _remove(context),
+                  icon: const Icon(Icons.delete_outline, size: 18),
+                  label: Text(context.l10n.removeRepo2),
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (_expanded || widget.query.trim().isNotEmpty)
+          if (repo.sources.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(22),
+              child: Text(
+                context.l10n.noSourcesInThisRepoYet,
+                style: AppText.caption,
+              ),
+            )
+          else
+            for (final source in repo.sources.where(
+              (source) =>
+                  (!source.nsfw || sl<PlaybackPrefs>().nsfwSources) &&
+                  sourceSearchMatches(widget.query, source.name, source.lang),
+            ))
+              _ZRepoSourceRow(
+                repo: repo,
+                source: source,
+                installed: installedKeys.contains(
+                  ProviderRegistry.providerKey(repo.url, source.id),
+                ),
+                hasUpdate: updatableKeys.contains(
+                  ProviderRegistry.providerKey(repo.url, source.id),
+                ),
+              ),
+      ],
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
+    if (DesktopSettingsScope.contains(context)) {
+      return _desktopRepository(context);
+    }
     return Container(
       margin: const EdgeInsets.only(bottom: 16),
       clipBehavior: Clip.antiAlias,
@@ -795,8 +1122,86 @@ class _ZRepoSourceRow extends StatelessWidget {
     bloc.add(SourceUninstalled(_key, displayName: source.name));
   }
 
+  /// Windows actions for this catalogue row: one list for the '...' menu
+  /// and right-click (src-6 B / src-13 B).
+  List<DesktopMenuItem<Object?>> _menuItems(BuildContext context) =>
+      desktopSourceMenuItems(
+        context,
+        onInstall: installed ? null : () => _install(context),
+        onUpdate: installed && hasUpdate ? () => _update(context) : null,
+        onSettings: installed
+            ? () => Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => SourceSettingsScreen(
+                    sourceId: source.id,
+                    repoUrl: repo.url,
+                    displayName: source.name,
+                  ),
+                ),
+              )
+            : null,
+        onUninstall: installed ? () => _uninstall(context) : null,
+      );
+
+  /// Readable desktop source metadata and explicit install/update/uninstall
+  /// actions share their original bloc handlers and confirmation flow.
+  /// Installed rows show a status check and a '...' menu instead of a
+  /// clickable Uninstall (src-6 B).
+  Widget _desktopSource(BuildContext context) => DesktopSourceRow(
+    tooltip: '${source.name} · ${source.lang} · v${source.version}',
+    items: () => _menuItems(context),
+    child: _ZDesktopSourceRow(
+      heading: Row(
+        children: [
+          SourceIconTile(
+            name: source.name,
+            icon: ProviderReposRegistry.resolveLogoUrl(repo, source),
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  source.name,
+                  style: AppText.body.copyWith(color: AppColors.textPrimary),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '${source.lang} · v${source.version}',
+                  style: AppText.caption,
+                ),
+                if (source.nsfw) const _ZNsfwBadge(),
+              ],
+            ),
+          ),
+        ],
+      ),
+      actions: Wrap(
+        spacing: 12,
+        runSpacing: 8,
+        children: [
+          if (!installed)
+            FilledButton.icon(
+              onPressed: () => _install(context),
+              icon: const Icon(Icons.add, size: 18),
+              label: Text(context.l10n.install),
+            )
+          else
+            DesktopInstalledActions(
+              items: () => _menuItems(context),
+              updateAvailable: hasUpdate,
+            ),
+        ],
+      ),
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
+    if (DesktopSettingsScope.contains(context)) {
+      return _desktopSource(context);
+    }
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 10, 12, 10),
       child: Row(
@@ -944,48 +1349,75 @@ class _ZAddRepoDialogState extends State<_ZAddRepoDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final desktop = DesktopSettingsScope.contains(context);
     return AlertDialog(
+      constraints: desktop
+          ? BoxConstraints(
+              maxWidth: 560,
+              maxHeight: MediaQuery.sizeOf(context).height * .85,
+            )
+          : null,
+      shape: desktop
+          ? RoundedRectangleBorder(borderRadius: BorderRadius.circular(20))
+          : null,
+      insetPadding: desktop
+          ? const EdgeInsets.all(24)
+          : const EdgeInsets.symmetric(horizontal: 40, vertical: 24),
       backgroundColor: AppColors.surface,
       title: Text(context.l10n.addRepo, style: AppText.headline),
-      content: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            TextField(
-              controller: _nameCtrl,
-              enabled: !_loading,
-              cursorColor: AppColors.accent,
-              style: AppText.body.copyWith(color: AppColors.textPrimary),
-              textCapitalization: TextCapitalization.words,
-              decoration: InputDecoration(
-                labelText: context.l10n.customNameOptional,
-                hintText: context.l10n.leaveBlankToUseTheRepoSOwnName,
+      content: SizedBox(
+        width: desktop ? 480 : null,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              TextField(
+                controller: _nameCtrl,
+                enabled: !_loading,
+                cursorColor: AppColors.accent,
+                style: AppText.body.copyWith(color: AppColors.textPrimary),
+                textCapitalization: TextCapitalization.words,
+                decoration: InputDecoration(
+                  labelText: context.l10n.customNameOptional,
+                  hintText: context.l10n.leaveBlankToUseTheRepoSOwnName,
+                ),
               ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _urlCtrl,
-              enabled: !_loading,
-              autofocus: true,
-              keyboardType: TextInputType.url,
-              cursorColor: AppColors.accent,
-              style: AppText.body.copyWith(color: AppColors.textPrimary),
-              decoration: InputDecoration(
-                labelText: context.l10n.manifestUrl,
-                hintText: context.l10n.manifestUrlHint,
+              const SizedBox(height: 12),
+              // Windows: clipboard pre-fill + drop a link / file (src-12 B).
+              DesktopAddRepoAssist(
+                controller: _urlCtrl,
+                onFilled: () {
+                  if (_error != null) setState(() => _error = null);
+                },
+                child: TextField(
+                  controller: _urlCtrl,
+                  enabled: !_loading,
+                  autofocus: true,
+                  keyboardType: TextInputType.url,
+                  cursorColor: AppColors.accent,
+                  style: AppText.body.copyWith(color: AppColors.textPrimary),
+                  // Windows: Enter adds the (pre-filled) link (src-12 B).
+                  onSubmitted: desktopPanelsEnabled
+                      ? (_) => _loading ? null : _submit()
+                      : null,
+                  decoration: InputDecoration(
+                    labelText: context.l10n.manifestUrl,
+                    hintText: context.l10n.manifestUrlHint,
+                  ),
+                ),
               ),
-            ),
-            const SizedBox(height: 10),
-            Text(context.l10n.pasteRepoIndexJsonUrl, style: AppText.caption),
-            if (_error != null) ...[
-              const SizedBox(height: 8),
-              Text(
-                _error!,
-                style: AppText.caption.copyWith(color: AppColors.accent),
-              ),
+              const SizedBox(height: 10),
+              Text(context.l10n.pasteRepoIndexJsonUrl, style: AppText.caption),
+              if (_error != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  _error!,
+                  style: AppText.caption.copyWith(color: AppColors.accent),
+                ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
       actions: [

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
@@ -13,6 +14,7 @@ import 'package:watch_app/core/repository/catalogue_repository.dart';
 import 'package:watch_app/core/tracker/tracker.dart';
 import 'package:watch_app/core/tracker/tracker_hub.dart';
 import 'package:watch_app/core/ui/home_rows_prefs.dart';
+import 'package:watch_app/core/ui/desktop_settings_surface.dart';
 import 'package:watch_app/core/zmode/anilist_catalogue.dart';
 import 'package:watch_app/core/zmode/zmode_ids.dart';
 import 'package:watch_app/core/zmode/zmode_prefs.dart';
@@ -87,7 +89,13 @@ void main() {
     // Phone rule: the first section of a non-zm source is dropped from the
     // rows (it feeds the banner), so Discover offers only the rest.
     cubit.emit(
-      HomeState(sections: [_section('Trending'), _section('Popular'), _section('Upcoming')]),
+      HomeState(
+        sections: [
+          _section('Trending'),
+          _section('Popular'),
+          _section('Upcoming'),
+        ],
+      ),
     );
     sl.registerSingleton<HomeCubit>(cubit);
     sl.registerSingleton<CatalogueRepository>(const _StubRepo());
@@ -113,11 +121,17 @@ void main() {
   /// The editor lists every row of the layout — 15+ on AniList anime — which
   /// does not fit the 800x600 default surface, so taps on the lower rows land
   /// outside the render tree. Give it a phone.
-  Future<void> pumpEditor(WidgetTester tester) async {
+  Future<void> pumpEditor(WidgetTester tester, {bool desktop = false}) async {
     tester.view.physicalSize = const Size(1080, 2400);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
-    await tester.pumpWidget(const MaterialApp(home: HomeRowsScreen()));
+    await tester.pumpWidget(
+      MaterialApp(
+        home: desktop
+            ? const DesktopSettingsScope(child: HomeRowsScreen())
+            : const HomeRowsScreen(),
+      ),
+    );
     await tester.pumpAndSettle();
   }
 
@@ -256,32 +270,33 @@ void main() {
     expect(find.text('Continue on Simkl'), findsOneWidget);
   });
 
-  testWidgets('a reading layout drops New Episodes and reads Continue Reading', (
-    tester,
-  ) async {
-    sl.registerSingleton<TrackerHub>(TrackerHub([_FakeTracker('AniList')]));
+  testWidgets(
+    'a reading layout drops New Episodes and reads Continue Reading',
+    (tester) async {
+      sl.registerSingleton<TrackerHub>(TrackerHub([_FakeTracker('AniList')]));
 
-    await pumpEditor(tester);
-    // Anime first: the row exists there.
-    expect(find.text('New Episodes'), findsOneWidget);
-    expect(find.text('Continue Watching'), findsOneWidget);
+      await pumpEditor(tester);
+      // Anime first: the row exists there.
+      expect(find.text('New Episodes'), findsOneWidget);
+      expect(find.text('Continue Watching'), findsOneWidget);
 
-    await tester.tap(find.text('Editing'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('AniList \u00b7 Manga').last);
-    await tester.pumpAndSettle();
+      await tester.tap(find.text('Editing'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('AniList \u00b7 Manga').last);
+      await tester.pumpAndSettle();
 
-    // Chapters have no airing schedule, so there is no new-episode feed to
-    // offer — Home never builds that row for a reading kind.
-    expect(find.text('New Episodes'), findsNothing);
-    expect(switchOf('tracker:new-episodes'), findsNothing);
-    // And the local row is named for what Home actually renders here.
-    expect(find.text('Continue Reading'), findsOneWidget);
-    expect(find.text('Continue Watching'), findsNothing);
-    // The status buckets relabel too.
-    expect(find.text('Reading'), findsOneWidget);
-    expect(find.text('Plan to Read'), findsOneWidget);
-  });
+      // Chapters have no airing schedule, so there is no new-episode feed to
+      // offer — Home never builds that row for a reading kind.
+      expect(find.text('New Episodes'), findsNothing);
+      expect(switchOf('tracker:new-episodes'), findsNothing);
+      // And the local row is named for what Home actually renders here.
+      expect(find.text('Continue Reading'), findsOneWidget);
+      expect(find.text('Continue Watching'), findsNothing);
+      // The status buckets relabel too.
+      expect(find.text('Reading'), findsOneWidget);
+      expect(find.text('Plan to Read'), findsOneWidget);
+    },
+  );
 
   testWidgets('a source-backed home waits for its sections', (tester) async {
     // Only a source-backed layout depends on a fetch — a metadata layout
@@ -340,6 +355,31 @@ void main() {
     }
   });
 
+  testWidgets(
+    'desktop layout choice cancels safely and selects an edit target',
+    (tester) async {
+      await pumpEditor(tester, desktop: true);
+      await tester.tap(find.text('Editing'));
+      await tester.pumpAndSettle();
+      expect(find.byType(Dialog), findsOneWidget);
+      expect(find.byType(BottomSheet), findsNothing);
+      await tester.tap(find.byTooltip('Close'));
+      await tester.pumpAndSettle();
+      expect(find.text('AniList · Anime'), findsOneWidget);
+      await tester.tap(find.text('Editing'));
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('Simkl · Movies & TV').last);
+      await tester.tap(find.text('Simkl · Movies & TV').last);
+      await tester.pumpAndSettle();
+      expect(find.text('Trending movies'), findsOneWidget);
+      expect(find.byType(Dialog), findsNothing);
+      // Choosing an editor target neither overwrites nor saves any arrangement.
+      expect(HomeRowsPrefs.savedFor(layoutKey), isNull);
+      expect(HomeRowsPrefs.savedFor('simkl::movie'), isNull);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   testWidgets('switching layout edits that key, leaving the other alone', (
     tester,
   ) async {
@@ -387,10 +427,63 @@ void main() {
     expect(saved, contains('!tracker:planning'));
     expect(saved, contains('section:Recently released'));
     // The switch the test just flipped reflects it in the UI too.
-    expect(
-      tester.widget<Switch>(switchOf('section:Trending')).value,
-      isFalse,
-    );
+    expect(tester.widget<Switch>(switchOf('section:Trending')).value, isFalse);
+  });
+
+  testWidgets('phone keeps drag only: no up/down buttons', (tester) async {
+    sl.registerSingleton<TrackerHub>(TrackerHub([_FakeTracker('AniList')]));
+    await pumpEditor(tester);
+    expect(find.byKey(const ValueKey('home-row-up-local:continue')), findsNothing);
+    expect(find.byTooltip('Move down'), findsNothing);
+  });
+
+  testWidgets('Windows up/down buttons move a row, save it, and reset undoes it', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    try {
+      sl.registerSingleton<TrackerHub>(TrackerHub([_FakeTracker('AniList')]));
+      await pumpEditor(tester, desktop: true);
+
+      // First row cannot move up; last row cannot move down.
+      final up = find.byKey(const ValueKey('home-row-up-local:continue'));
+      expect(tester.widget<IconButton>(up).onPressed, isNull);
+      final down = find.byKey(const ValueKey('home-row-down-local:continue'));
+      expect(tester.widget<IconButton>(down).onPressed, isNotNull);
+
+      // Default order starts local:continue then the tracker continue row.
+      double y(String id) => tester.getTopLeft(find.byKey(ValueKey(id))).dy;
+      expect(y('local:continue'), lessThan(y('tracker:continue')));
+
+      await tester.tap(down);
+      await tester.pump();
+      await flushWrites(tester);
+
+      // Moved one place down, both on screen and in storage.
+      expect(y('local:continue'), greaterThan(y('tracker:continue')));
+      final saved = HomeRowsPrefs.savedFor(layoutKey)!;
+      expect(saved.indexOf('local:continue'), 1);
+      expect(tester.widget<IconButton>(up).onPressed, isNotNull);
+
+      // And back up again restores the original first slot.
+      await tester.tap(up);
+      await tester.pump();
+      await flushWrites(tester);
+      expect(HomeRowsPrefs.savedFor(layoutKey)!.indexOf('local:continue'), 0);
+
+      // Move it down again, then Reset drops the saved order entirely.
+      await tester.tap(down);
+      await tester.pump();
+      await flushWrites(tester);
+      await tester.tap(find.text('Reset'));
+      await tester.pumpAndSettle();
+      await flushWrites(tester);
+      expect(HomeRowsPrefs.savedFor(layoutKey), isNull);
+      expect(y('local:continue'), lessThan(y('tracker:continue')));
+      expect(tester.takeException(), isNull);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
   });
 
   testWidgets('reset clears the saved arrangement and restores defaults', (

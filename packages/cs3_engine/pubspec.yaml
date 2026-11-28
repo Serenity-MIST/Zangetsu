@@ -1,0 +1,12 @@
+name: cs3_engine
+version: 0.5.0
+publish_to: none
+environment:
+  sdk: ^3.13.0
+dependencies:
+  flutter:
+    sdk: flutter
+flutter:
+  assets:
+    - assets/engine/
+    - assets/runtime/

@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:watch_app/core/hive/safe_box.dart';
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 
 import '../models/episode.dart';
@@ -112,6 +113,39 @@ class EpisodeMetadataService {
 
   /// malId -> season number, 0 meaning "AniZip has no mapping".
   final Map<int, int> _seasonCache = {};
+
+  /// The AniZip payload already saved on disk for [malId], or null. Never
+  /// goes to the network; the Windows TMDB poster lookup reads it so a title
+  /// whose episodes were opened before needs no AniZip call of its own.
+  ///
+  /// Long shows save payloads of hundreds of KB, and this runs while Home is
+  /// scrolled, so a large one is decoded off the UI thread.
+  Future<Object?> cachedAniZip(int malId) async {
+    try {
+      final s = (await _box())?.get('a:$malId') as String?;
+      if (s == null) return null;
+      if (s.length < _decodeOffThreadAbove) return jsonDecode(s);
+      return await compute(jsonDecode, s);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Saved payloads longer than this are decoded on a background isolate.
+  static const int _decodeOffThreadAbove = 50 * 1024;
+
+  /// Saves an AniZip [payload] another feature (the Windows TMDB poster
+  /// lookup) fetched for [malId], under the same rule as the episode list:
+  /// only when it has episodes, and never over one already saved.
+  Future<void> rememberAniZip(int malId, Object? payload) async {
+    try {
+      if (parseAniZip(payload).isEmpty) return;
+      final box = await _box();
+      if (box == null || box.containsKey('a:$malId')) return;
+      // Encoded off the UI thread too, for the same long shows.
+      await box.put('a:$malId', await compute(jsonEncode, payload));
+    } catch (_) {/* cache is optional */}
+  }
 
   /// AniZip only attaches stills to early episodes on long shows (Shippuden:
   /// 1–32). Later range chips then fall back to the show poster. AniZip's

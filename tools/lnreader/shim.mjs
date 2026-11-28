@@ -1,4 +1,13 @@
 import { Buffer } from 'buffer';
+// AES-GCM length encoding for QuickJS builds without BigInt. JavaScript array
+// lengths fit safely in Number; reject other inputs instead of losing bits.
+globalThis.__lnSetUint64 = function (view, offset, value, littleEndian) {
+  if (!Number.isSafeInteger(value) || value < 0) throw new RangeError('Invalid uint64 length');
+  const low = value >>> 0;
+  const high = Math.floor(value / 4294967296);
+  view.setUint32(offset + (littleEndian ? 0 : 4), low, littleEndian);
+  view.setUint32(offset + (littleEndian ? 4 : 0), high, littleEndian);
+};
 globalThis.Buffer = Buffer;
 if (!globalThis.process) globalThis.process = { env: {}, nextTick: function (f) { Promise.resolve().then(f); } };
 globalThis.global = globalThis;

@@ -19,10 +19,15 @@ class DiscordAuth {
   static const String meEndpoint = 'https://discord.com/api/v10/users/@me';
   static const String scopes = 'identify sdk.social_layer_presence';
 
+  /// Per-application URL scheme Discord redirects to. Android/iOS declare it
+  /// in the manifest/plist; Windows registers it per user at sign-in time.
+  static String redirectScheme(String applicationId) =>
+      'discord-$applicationId';
+
   /// Custom-scheme redirect registered in the Discord portal (OAuth2 panel)
   /// and in the Android manifest / iOS plist.
   static String redirectUri(String applicationId) =>
-      'discord-$applicationId:/authorize/callback';
+      '${redirectScheme(applicationId)}:/authorize/callback';
 
   static Uri nativeAuthorizeUri(Uri browserUri) =>
       browserUri.replace(scheme: 'discord', host: 'action');

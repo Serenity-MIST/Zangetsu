@@ -3202,5 +3202,1837 @@
 	"autoPlayerFallbackDescription": "Experimental · Retry failed playback",
 	"ambientPlayer": "Ambient player screen",
 	"ambientPlayerDescription": "Tinted glow behind the portrait player, matched to the video",
-	"portraitVideoEdgeToEdge": "Edge-to-edge portrait video"
+	"portraitVideoEdgeToEdge": "Edge-to-edge portrait video",
+	"noChaptersAvailableFromThisSource": "No chapters available from this source",
+	"selectShort": "Select",
+	"cloudStreamEngine": "CloudStream engine",
+	"trayStillRunningTitle": "Zangetsu is still running",
+	"trayStillRunningBusy": "Downloads keep going in the background. Open the app again from the tray icon.",
+	"trayStillRunningIdle": "Open the app again from the tray icon.",
+	"closeDownloadsInProgress": "{count, plural, =1{1 download in progress} other{{count} downloads in progress}}",
+	"@closeDownloadsInProgress": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"closeQuitStopsDownloads": "Quitting stops them. Keep Zangetsu running in the tray to let them finish.",
+	"quit": "Quit",
+	"keepRunningInTray": "Keep running in tray",
+	"verifyCheckingWebsite": "Checking the website…",
+	"verifyLoadingWebsite": "Loading the website…",
+	"verifyCompleteCheckBelow": "Complete the check below. This window closes by itself once the site opens.",
+	"verifySignInBelow": "Sign in below, then press Continue.",
+	"verifyHost": "Verify {host}",
+	"@verifyHost": {
+		"placeholders": {
+			"host": {
+				"type": "String"
+			}
+		}
+	},
+	"checkingEllipsis": "Checking…",
+	"reload": "Reload",
+	"shortcutAppSection": "Go to sidebar item {n}",
+	"@shortcutAppSection": {
+		"placeholders": {
+			"n": {
+				"type": "int"
+			}
+		}
+	},
+	"shortcutAppMode": "Switch to mode {n}",
+	"@shortcutAppMode": {
+		"placeholders": {
+			"n": {
+				"type": "int"
+			}
+		}
+	},
+	"shortcutShowTab": "Go to tab {n}",
+	"@shortcutShowTab": {
+		"placeholders": {
+			"n": {
+				"type": "int"
+			}
+		}
+	},
+	"shortcutAppSettings": "Open Settings",
+	"shortcutAppBack": "Go back",
+	"shortcutAppFullscreen": "Toggle full screen",
+	"shortcutAppHelp": "Show keyboard shortcuts",
+	"shortcutAppLockProfile": "Lock profile now",
+	"shortcutAppContextMenu": "Open the menu for the focused item",
+	"shortcutHomeFirst": "First item in the row",
+	"shortcutHomeLast": "Last item in the row",
+	"shortcutHomeOpen": "Open the focused title",
+	"shortcutShowPlay": "Play or continue",
+	"shortcutShowDownload": "Download the focused episode",
+	"shortcutShowFilter": "Search episodes",
+	"shortcutShowSelectAll": "Select all episodes",
+	"shortcutShowClearSelection": "Clear the selection",
+	"shortcutPlayerPlayPause": "Play / pause",
+	"shortcutPlayerSeekBack": "Seek back",
+	"shortcutPlayerSeekForward": "Seek forward",
+	"shortcutPlayerSeekBackLong": "Seek back 1 minute",
+	"shortcutPlayerSeekForwardLong": "Seek forward 1 minute",
+	"shortcutPlayerVolumeUp": "Volume up",
+	"shortcutPlayerVolumeDown": "Volume down",
+	"shortcutPlayerMute": "Mute",
+	"shortcutPlayerExit": "Leave full screen or the player",
+	"shortcutPlayerSkip": "Skip intro or ending",
+	"shortcutPlayerSpeedDown": "Slower",
+	"shortcutPlayerSpeedUp": "Faster",
+	"shortcutPlayerSubtitles": "Subtitles on / off",
+	"shortcutPlayerJumpPercent": "Jump to 0-90%",
+	"shortcutPlayerFrameBack": "Previous frame",
+	"shortcutPlayerFrameForward": "Next frame",
+	"shortcutPlayerSubDelayDown": "Subtitles earlier",
+	"shortcutPlayerSubDelayUp": "Subtitles later",
+	"shortcutPlayerMiniPlayer": "Mini player",
+	"shortcutPlayerAlwaysOnTop": "Keep on top",
+	"shortcutReaderNextPage": "Next page",
+	"shortcutReaderPreviousPage": "Previous page",
+	"shortcutReaderFirstPage": "First page",
+	"shortcutReaderLastPage": "Last page",
+	"shortcutReaderChapterList": "Chapter list",
+	"shortcutReaderToggleBars": "Show or hide the bars",
+	"shortcutReaderBack": "Leave the reader",
+	"shortcutReaderZoomIn": "Zoom in",
+	"shortcutReaderZoomOut": "Zoom out",
+	"shortcutReaderZoomReset": "Reset zoom",
+	"shortcutReaderShiftSpread": "Shift two-page spread",
+	"shortcutDownloadsDelete": "Delete selected",
+	"shortcutDownloadsOpen": "Open the focused download",
+	"shortcutListsSearch": "Search the list",
+	"shortcutListsPreviousDay": "Previous day",
+	"shortcutListsNextDay": "Next day",
+	"shortcutSettingsNextSection": "Next section",
+	"shortcutSettingsPreviousSection": "Previous section",
+	"shortcutAppBackDescription": "The mouse Back button also goes back",
+	"shortcutWhilePaused": "While paused",
+	"shortcutListsSearchDescription": "History and My List",
+	"noMatches": "No matches",
+	"undo": "Undo",
+	"catalogue": "Catalogue",
+	"chooseCatalogue": "Choose catalogue",
+	"catalogueNamed": "Catalogue: {name}",
+	"@catalogueNamed": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"open": "Open",
+	"pauseAllDownloads": "Pause all downloads",
+	"previous": "Previous",
+	"shortcutNotSet": "Not set",
+	"extensionsFailedToLoad": "{count, plural, =1{1 extension or plugin failed to load} other{{count} extensions or plugins failed to load}}",
+	"@extensionsFailedToLoad": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"someExtensionsDidNotLoad": "Some extensions did not load",
+	"extensionSourcesMissingUntilLoad": "Their sources are missing until they load.",
+	"everythingLoaded": "Everything loaded.",
+	"sourceTimedOutSlow": "Source timed out. It may be slow or down right now.",
+	"sourceTimedOutTitle": "Source timed out",
+	"sourceTookTooLong": "The source took too long to answer. It may be slow or down right now.",
+	"extensionEngine": "Extension engine",
+	"installedExtensions": "Installed extensions",
+	"startupEntry": "Startup",
+	"aniyomiMihonEngine": "Aniyomi / Mihon engine",
+	"extensionEngineNotFound": "Extension engine not found. Re-extract the app folder.",
+	"downloadFinished": "Download finished",
+	"downloadNameIsReady": "{name} is ready",
+	"@downloadNameIsReady": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"downloadsFinished": "Downloads finished",
+	"downloadsAreReady": "{count} downloads are ready",
+	"@downloadsAreReady": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"downloadNameFailed": "{name} failed",
+	"@downloadNameFailed": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"downloadsCountFailed": "{count} downloads failed",
+	"@downloadsCountFailed": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"downloadsFailedAndFinished": "{failed}, {count} finished",
+	"@downloadsFailedAndFinished": {
+		"placeholders": {
+			"failed": {
+				"type": "String"
+			},
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"downloadFailed": "Download failed",
+	"downloadsFailedTitle": "Downloads failed",
+	"episodeNumberLabel": "Episode {number}",
+	"@episodeNumberLabel": {
+		"placeholders": {
+			"number": {
+				"type": "String"
+			}
+		}
+	},
+	"timeLeftSeconds": "{seconds} s left",
+	"@timeLeftSeconds": {
+		"placeholders": {
+			"seconds": {
+				"type": "int"
+			}
+		}
+	},
+	"timeLeftMinutes": "{minutes} min left",
+	"@timeLeftMinutes": {
+		"placeholders": {
+			"minutes": {
+				"type": "int"
+			}
+		}
+	},
+	"timeLeftHours": "{hours} h left",
+	"@timeLeftHours": {
+		"placeholders": {
+			"hours": {
+				"type": "int"
+			}
+		}
+	},
+	"timeLeftHoursMinutes": "{hours} h {minutes} min left",
+	"@timeLeftHoursMinutes": {
+		"placeholders": {
+			"hours": {
+				"type": "int"
+			},
+			"minutes": {
+				"type": "int"
+			}
+		}
+	},
+	"chapterIsOut": "Chapter {number} is out",
+	"@chapterIsOut": {
+		"placeholders": {
+			"number": {
+				"type": "String"
+			}
+		}
+	},
+	"episodeIsOut": "Episode {number} is out",
+	"@episodeIsOut": {
+		"placeholders": {
+			"number": {
+				"type": "String"
+			}
+		}
+	},
+	"streamLinkAndHeadersCopied": "Stream link and headers copied",
+	"streamLinkCopied": "Stream link copied",
+	"couldNotCopyLink": "Could not copy link",
+	"installFailNoSource": "The extension installed but no source loaded",
+	"downloadCancelled": "Download cancelled",
+	"installFailTimedOut": "Download timed out: the connection is slow or blocked",
+	"installFailBlocked": "Download blocked by network",
+	"installFailCertificate": "Download blocked: the server certificate was rejected",
+	"installFailNotFound": "Extension file not found in the repository (HTTP 404)",
+	"installFailRefused": "Download refused by the server (HTTP {status})",
+	"@installFailRefused": {
+		"placeholders": {
+			"status": {
+				"type": "String"
+			}
+		}
+	},
+	"installFailServerError": "Repository server error (HTTP {status})",
+	"@installFailServerError": {
+		"placeholders": {
+			"status": {
+				"type": "String"
+			}
+		}
+	},
+	"installFailEngineNotRunning": "Extension engine not running",
+	"installFailNewerApp": "Extension needs a newer app version",
+	"installFailEngineSlow": "The extension engine took too long to load it",
+	"installFailNotLoaded": "The extension could not be loaded",
+	"installFailDisk": "Could not save the extension file (disk error)",
+	"installFailedPlain": "Install failed",
+	"trackerNeedsSignInSaved": "{tracker} needs you to sign in again. Updates are saved and will sync after you reconnect.",
+	"@trackerNeedsSignInSaved": {
+		"placeholders": {
+			"tracker": {
+				"type": "String"
+			}
+		}
+	},
+	"trackerSyncFailedRetry": "{tracker} sync failed. Updates are saved and will retry automatically.",
+	"@trackerSyncFailedRetry": {
+		"placeholders": {
+			"tracker": {
+				"type": "String"
+			}
+		}
+	},
+	"colourHex": "Hex",
+	"enterColourLike": "Enter a colour like {example}",
+	"@enterColourLike": {
+		"placeholders": {
+			"example": {
+				"type": "String"
+			}
+		}
+	},
+	"pasteColour": "Paste colour",
+	"whereToWatch": "Where to watch",
+	"showInFolder": "Show in folder",
+	"markAsUnread": "Mark as unread",
+	"markAsUnwatched": "Mark as unwatched",
+	"markAsWatched": "Mark as watched",
+	"markThisAndAboveRead": "Mark this and all above as read",
+	"markAllAboveWatched": "Mark all above as watched",
+	"selectSourceText": "Select source",
+	"rightClickToPinSource": "Right-click a source, or hover it and click the pin, to keep it on top",
+	"hidePassword": "Hide password",
+	"showPassword": "Show password",
+	"couldNotReadImageFile": "Could not read that image file.",
+	"logOutLibraryStays": "Log out? Your library stays in your account.",
+	"logOutOfEmailLibraryStays": "Log out of {email}? Your library stays in your account.",
+	"@logOutOfEmailLibraryStays": {
+		"placeholders": {
+			"email": {
+				"type": "String"
+			}
+		}
+	},
+	"everyDay": "Every day",
+	"everyWeek": "Every week",
+	"chooseAutoBackupFolder": "Choose where automatic backups are saved",
+	"folderNoLongerExists": "That folder no longer exists",
+	"howOften": "How often",
+	"keepLabel": "Keep",
+	"olderAutoBackupsDeleted": "Older automatic backups are deleted.",
+	"lastNBackups": "Last {count} backups",
+	"@lastNBackups": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"noAutoBackupYet": "No automatic backup yet",
+	"lastBackupAt": "Last backup: {when}",
+	"@lastBackupAt": {
+		"placeholders": {
+			"when": {
+				"type": "String"
+			}
+		}
+	},
+	"automaticBackups": "Automatic backups",
+	"backUpAutomatically": "Back up automatically",
+	"saveBackupOnSchedule": "Save a backup to a folder on a schedule",
+	"notChosen": "Not chosen",
+	"openFolder": "Open folder",
+	"lastN": "Last {count}",
+	"@lastN": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"yourCloudBackup": "Your cloud backup",
+	"backupFile": "Backup file",
+	"restoreUndone": "Restore undone. Your library and settings are back as they were.",
+	"restartNow": "Restart now",
+	"savedBackups": "Saved backups",
+	"noBackupsInFoldersYet": "No backups in your backup folders yet.",
+	"lookingForBackups": "Looking for backups…",
+	"automaticBackup": "Automatic backup",
+	"safetyCopyBeforeRestore": "Safety copy before a restore",
+	"backupKind": "Backup",
+	"restore": "Restore",
+	"backupIntroWindows": "Save your sources, list and settings — to a file on this PC or to your Zangetsu account. Restoring adds your library back without deleting anything, replaces app settings, and saves a safety copy first so you can undo it.",
+	"sourcesAndReposText": "Sources and repos",
+	"backupCountSources": "{count, plural, =1{1 source} other{{count} sources}}",
+	"@backupCountSources": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"backupCountRepos": "{count, plural, =1{1 repo} other{{count} repos}}",
+	"@backupCountRepos": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"backupCountListItems": "{count, plural, =1{1 list item} other{{count} list items}}",
+	"@backupCountListItems": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"backupCountContinueWatching": "{count} in Continue Watching",
+	"@backupCountContinueWatching": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"backupCountReadingHistory": "{count} reading history",
+	"@backupCountReadingHistory": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"backupCountCategories": "{count, plural, =1{1 category} other{{count} categories}}",
+	"@backupCountCategories": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"backupCountResumePoints": "{count, plural, =1{1 resume point} other{{count} resume points}}",
+	"@backupCountResumePoints": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"backupCountSettingGroups": "{count, plural, =1{1 setting group} other{{count} setting groups}}",
+	"@backupCountSettingGroups": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"backupCountTitleMatches": "{count, plural, =1{1 hand-made title match} other{{count} hand-made title matches}}",
+	"@backupCountTitleMatches": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"restoredParts": "Restored: {parts}",
+	"@restoredParts": {
+		"placeholders": {
+			"parts": {
+				"type": "String"
+			}
+		}
+	},
+	"couldntReinstall": "Couldn't reinstall:\n{items}",
+	"@couldntReinstall": {
+		"placeholders": {
+			"items": {
+				"type": "String"
+			}
+		}
+	},
+	"safetyCopyOfPreviousData": "Safety copy of your previous data: {path}",
+	"@safetyCopyOfPreviousData": {
+		"placeholders": {
+			"path": {
+				"type": "String"
+			}
+		}
+	},
+	"restartToSeeRestored": "Restart Zangetsu to see the restored library and sources everywhere.",
+	"undoRestore": "Undo restore",
+	"nothingSavedInPart": "Nothing saved in this part",
+	"restoreThisBackup": "Restore this backup?",
+	"backupSourceDateUnknown": "{source} · date unknown",
+	"@backupSourceDateUnknown": {
+		"placeholders": {
+			"source": {
+				"type": "String"
+			}
+		}
+	},
+	"backupSourceMadeOn": "{source} · made {date}",
+	"@backupSourceMadeOn": {
+		"placeholders": {
+			"source": {
+				"type": "String"
+			},
+			"date": {
+				"type": "String"
+			}
+		}
+	},
+	"chooseWhatToRestore": "Choose what to restore",
+	"settingsWillBeReplaced": "Your current app settings will be replaced by the ones in this backup.",
+	"safetyCopySourcesNoUndo": "A safety copy of your current library and settings is saved first, so you can undo those. Restored sources can't be undone.",
+	"safetyCopyUndoRestore": "A safety copy of your current library and settings is saved first, so you can undo this restore.",
+	"notInThisBackup": "Not in this backup",
+	"markedChaptersAsUnread": "Marked {count} chapters as unread",
+	"@markedChaptersAsUnread": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"markedEpisodesAsUnwatched": "Marked {count} episodes as unwatched",
+	"@markedEpisodesAsUnwatched": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"filterChapters": "Filter chapters",
+	"noChaptersMatchQuery": "No chapters match \"{query}\"",
+	"@noChaptersMatchQuery": {
+		"placeholders": {
+			"query": {
+				"type": "String"
+			}
+		}
+	},
+	"noEpisodesMatchQuery": "No episodes match \"{query}\"",
+	"@noEpisodesMatchQuery": {
+		"placeholders": {
+			"query": {
+				"type": "String"
+			}
+		}
+	},
+	"selectChapters": "Select chapters",
+	"clearFilter": "Clear filter",
+	"clearSelectionEsc": "Clear selection (Esc)",
+	"countSelected": "{count} selected",
+	"@countSelected": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"markRead": "Mark read",
+	"markWatched": "Mark watched",
+	"markUnread": "Mark unread",
+	"markUnwatched": "Mark unwatched",
+	"playTrailer": "Play trailer",
+	"pauseTrailer": "Pause trailer",
+	"unmute": "Unmute",
+	"tryAgainInSeconds": "Try again in {seconds}s",
+	"@tryAgainInSeconds": {
+		"placeholders": {
+			"seconds": {
+				"type": "int"
+			}
+		}
+	},
+	"linkCopied": "Link copied",
+	"copyTitle": "Copy title",
+	"titleCopied": "Title copied",
+	"openSourcePage": "Open source page",
+	"shareViaWindows": "Share via Windows",
+	"sourceDoesntHaveTitle": "{source} doesn't have this title",
+	"@sourceDoesntHaveTitle": {
+		"placeholders": {
+			"source": {
+				"type": "String"
+			}
+		}
+	},
+	"deleteDownloadQuestion": "Delete download?",
+	"downloadedFileWillBeDeleted": "The downloaded file for \"{label}\" will be deleted.",
+	"@downloadedFileWillBeDeleted": {
+		"placeholders": {
+			"label": {
+				"type": "String"
+			}
+		}
+	},
+	"downloadDeleted": "Download deleted",
+	"playOffline": "Play offline",
+	"couldntFindDownloadedFile": "Couldn't find the downloaded file",
+	"downloadAgain": "Download again",
+	"dubbed": "Dubbed",
+	"subbed": "Subbed",
+	"existingDownloadedEpisodes": "Existing downloaded episodes",
+	"recoveredFilesQuestion": "{count} selected episodes already have recovered local files. Their audio language is unknown. Use those files, or download the selected {label} version?",
+	"@recoveredFilesQuestion": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			},
+			"label": {
+				"type": "String"
+			}
+		}
+	},
+	"downloadSelectedVersion": "Download selected version",
+	"useExistingFiles": "Use existing files",
+	"retryInSeconds": "Retry in {seconds}s",
+	"@retryInSeconds": {
+		"placeholders": {
+			"seconds": {
+				"type": "int"
+			}
+		}
+	},
+	"downloadThisLink": "Download this link",
+	"couldNotCopyTitle": "Could not copy title",
+	"couldNotOpenLink": "Could not open the link",
+	"searchLinksHint": "Search links (release, codec, addon)",
+	"clearSearch": "Clear search",
+	"sortLinks": "Sort links",
+	"anyQuality": "Any quality",
+	"noLinksMatchFilters": "No links match these filters",
+	"otherQuality": "Other",
+	"addonOrder": "Addon order",
+	"largestFirst": "Largest first",
+	"smallestFirst": "Smallest first",
+	"sourceTookTooLongNamed": "{source} took too long to answer. It may be slow or down right now.",
+	"@sourceTookTooLongNamed": {
+		"placeholders": {
+			"source": {
+				"type": "String"
+			}
+		}
+	},
+	"sourceBlockedByCloudflare": "{source} blocked the search with a Cloudflare check. Open it from Sources to pass the check, then try again.",
+	"@sourceBlockedByCloudflare": {
+		"placeholders": {
+			"source": {
+				"type": "String"
+			}
+		}
+	},
+	"couldntReachSource": "Couldn't reach {source}. Check your connection or try another source.",
+	"@couldntReachSource": {
+		"placeholders": {
+			"source": {
+				"type": "String"
+			}
+		}
+	},
+	"couldntLoadMoreResults": "Couldn't load more results.",
+	"loadMore": "Load more",
+	"retryFailedCount": "Retry failed ({count})",
+	"@retryFailedCount": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"movedToRecycleBin": "Moved to the Recycle Bin",
+	"queueCountDownloading": "{count} downloading",
+	"@queueCountDownloading": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"queueCountWaiting": "{count} waiting",
+	"@queueCountWaiting": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"queueCountPaused": "{count} paused",
+	"@queueCountPaused": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"queueCountFailed": "{count} failed",
+	"@queueCountFailed": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"downloadQueue": "Download queue",
+	"pauseAll": "Pause all",
+	"resumeAll": "Resume all",
+	"retryFailed": "Retry failed",
+	"episodeShort": "E{number}",
+	"@episodeShort": {
+		"placeholders": {
+			"number": {
+				"type": "String"
+			}
+		}
+	},
+	"finishingUp": "Finishing up",
+	"findingASource": "Finding a source",
+	"waitingToRetry": "Waiting to retry",
+	"waitingForFreeSlot": "Waiting for a free slot",
+	"downloadNext": "Download next",
+	"bulkDeleteShows": "{count, plural, =1{1 show} other{{count} shows}}",
+	"@bulkDeleteShows": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"bulkDeleteDownloads": "{count, plural, =1{1 download} other{{count} downloads}}",
+	"@bulkDeleteDownloads": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"bulkDeleteAtLeast": " (at least {size})",
+	"@bulkDeleteAtLeast": {
+		"placeholders": {
+			"size": {
+				"type": "String"
+			}
+		}
+	},
+	"bulkDeleteActiveCanceled": " {count} still downloading will be canceled.",
+	"@bulkDeleteActiveCanceled": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"bulkDeleteRecycle": "Delete {shows} and all {items}{size} from this PC? Finished files go to the Recycle Bin; unfinished downloads are removed.{active}",
+	"@bulkDeleteRecycle": {
+		"placeholders": {
+			"shows": {
+				"type": "String"
+			},
+			"items": {
+				"type": "String"
+			},
+			"size": {
+				"type": "String"
+			},
+			"active": {
+				"type": "String"
+			}
+		}
+	},
+	"bulkDeletePermanent": "Delete {shows} and all {items}{size} from this PC? The saved files are removed and this cannot be undone.{active}",
+	"@bulkDeletePermanent": {
+		"placeholders": {
+			"shows": {
+				"type": "String"
+			},
+			"items": {
+				"type": "String"
+			},
+			"size": {
+				"type": "String"
+			},
+			"active": {
+				"type": "String"
+			}
+		}
+	},
+	"sortRecent": "Recent",
+	"sortMostUnwatched": "Most unwatched",
+	"storageUsed": "{size} used",
+	"@storageUsed": {
+		"placeholders": {
+			"size": {
+				"type": "String"
+			}
+		}
+	},
+	"storageUsedFree": "{used} - {free} free",
+	"@storageUsedFree": {
+		"placeholders": {
+			"used": {
+				"type": "String"
+			},
+			"free": {
+				"type": "String"
+			}
+		}
+	},
+	"storageUsedFreeOnDrive": "{used} - {free} free on {drive}",
+	"@storageUsedFreeOnDrive": {
+		"placeholders": {
+			"used": {
+				"type": "String"
+			},
+			"free": {
+				"type": "String"
+			},
+			"drive": {
+				"type": "String"
+			}
+		}
+	},
+	"showInExplorer": "Show in Explorer",
+	"openShowPage": "Open show page",
+	"deleteNShows": "Delete {count} shows",
+	"@deleteNShows": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"deleteSelectedDownloadsRecycle": "Delete the selected downloads? Finished files go to the Recycle Bin. Active downloads will be canceled.",
+	"deleteSelectedDownloadsPermanent": "Delete the selected downloads and their saved files? Active downloads will be canceled.",
+	"notifyDownloadsFinishOrFail": "Notify when downloads finish or fail",
+	"notifyDownloadsSubtitle": "A Windows notification when a batch completes or something goes wrong.",
+	"taskbarProgressTitle": "Show download progress on the taskbar button",
+	"taskbarProgressSubtitle": "Fills the Zangetsu taskbar button and turns red if a download fails.",
+	"desktopParallelDownloadsNote": "Applies right away: raising it starts waiting episodes now, and the rest of a season joins as each episode's source is found. Lowering it lets running downloads finish first.",
+	"desktopConnectionsPerDownloadNote": "Direct-file and HLS episodes and manga pages use it. Hosts that can't split a file, DASH episodes and novel chapter images use one. Applies to downloads that start after the change.",
+	"dropFolderToImport": "Drop a folder to import downloads from it.",
+	"scanningEllipsis": "Scanning…",
+	"scanningNFolders": "Scanning {count} folders…",
+	"@scanningNFolders": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"folderNoLongerOnDisk": "This folder is no longer on disk.",
+	"dropFoldersToImport": "Drop folders to import their downloads",
+	"showFoldersAddedOrReconnected": "Zangetsu show folders inside are added or reconnected.",
+	"playEpisodeShort": "Play E{number}",
+	"@playEpisodeShort": {
+		"placeholders": {
+			"number": {
+				"type": "int"
+			}
+		}
+	},
+	"removedFromHistory": "Removed \"{title}\" from History",
+	"@removedFromHistory": {
+		"placeholders": {
+			"title": {
+				"type": "String"
+			}
+		}
+	},
+	"changeListStatusEllipsis": "Change list status…",
+	"addToMyListEllipsis": "Add to My List…",
+	"markAsFinished": "Mark as finished",
+	"searchHistoryCtrlF": "Search history (Ctrl+F)",
+	"nothingInTabMatches": "Nothing in this tab matches \"{query}\".",
+	"@nothingInTabMatches": {
+		"placeholders": {
+			"query": {
+				"type": "String"
+			}
+		}
+	},
+	"previousFeature": "Previous feature",
+	"plusNMore": "+{count} more",
+	"@plusNMore": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"refreshWithKeys": "Refresh ({keys})",
+	"@refreshWithKeys": {
+		"placeholders": {
+			"keys": {
+				"type": "String"
+			}
+		}
+	},
+	"featuredTitleNofM": "Featured title {index} of {count}",
+	"@featuredTitleNofM": {
+		"placeholders": {
+			"index": {
+				"type": "int"
+			},
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"trackerNeedsSignInOpenSettings": "{name} needs you to sign in again. Open its settings to reconnect.",
+	"@trackerNeedsSignInOpenSettings": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"trackerLastSyncFailedRetry": "Last {name} sync failed. It will retry automatically.",
+	"@trackerLastSyncFailedRetry": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"trackerUpdatesWaiting": "{count, plural, =1{1 update waiting to sync to {name}.} other{{count} updates waiting to sync to {name}.}}",
+	"@trackerUpdatesWaiting": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			},
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"browseNGenres": "{count, plural, =1{Browse 1 genre} other{Browse {count} genres}}",
+	"@browseNGenres": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"removedFromContinueWatching": "Removed from Continue watching",
+	"couldntRemoveFromContinueWatching": "Couldn't remove from Continue Watching",
+	"removedFromContinueReading": "Removed from Continue reading",
+	"couldntRemoveFromContinueReading": "Couldn't remove from Continue Reading",
+	"cataloguesGroup": "Catalogues",
+	"extensionsGroup": "Extensions",
+	"readChapterFromStart": "Read chapter from the start",
+	"markChapterRead": "Mark chapter read",
+	"restartEpisode": "Restart episode",
+	"markEpisodeWatched": "Mark episode watched",
+	"chapterNAvailable": "Chapter {number} available",
+	"@chapterNAvailable": {
+		"placeholders": {
+			"number": {
+				"type": "String"
+			}
+		}
+	},
+	"episodeNAvailable": "Episode {number} available",
+	"@episodeNAvailable": {
+		"placeholders": {
+			"number": {
+				"type": "String"
+			}
+		}
+	},
+	"openTrackerList": "Open {tracker} list",
+	"@openTrackerList": {
+		"placeholders": {
+			"tracker": {
+				"type": "String"
+			}
+		}
+	},
+	"refreshF5": "Refresh (F5)",
+	"couldntLoadThisList": "Couldn't load this list.",
+	"changeStatusEllipsis": "Change status…",
+	"categoriesEllipsis": "Categories…",
+	"editOnTracker": "Edit on {tracker}…",
+	"@editOnTracker": {
+		"placeholders": {
+			"tracker": {
+				"type": "String"
+			}
+		}
+	},
+	"trackerFallbackName": "tracker",
+	"recentSearchesCleared": "Recent searches cleared",
+	"fillInSearchBox": "Fill in search box",
+	"noNewEpisodes": "No new episodes",
+	"markAllRead": "Mark all read",
+	"newEpisodesHeader": "New episodes",
+	"newChaptersCount": "{count, plural, =1{1 new chapter} other{{count} new chapters}}",
+	"@newChaptersCount": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"newEpisodesCount": "{count, plural, =1{1 new episode} other{{count} new episodes}}",
+	"@newEpisodesCount": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"muted": "Muted",
+	"unmuteWithKey": "Unmute · {key}",
+	"@unmuteWithKey": {
+		"placeholders": {
+			"key": {
+				"type": "String"
+			}
+		}
+	},
+	"muteWithKey": "Mute · {key}",
+	"@muteWithKey": {
+		"placeholders": {
+			"key": {
+				"type": "String"
+			}
+		}
+	},
+	"volumeTooltipKeys": "Volume · ↑ / ↓   M to mute",
+	"keyboardShortcutsWithKey": "Keyboard shortcuts · ?",
+	"subtitlesOn": "Subtitles on",
+	"subtitlesOff": "Subtitles off",
+	"subtitleDelayMs": "Subtitle delay {delay}ms",
+	"@subtitleDelayMs": {
+		"placeholders": {
+			"delay": {
+				"type": "String"
+			}
+		}
+	},
+	"openedInApp": "Opened in {app}",
+	"@openedInApp": {
+		"placeholders": {
+			"app": {
+				"type": "String"
+			}
+		}
+	},
+	"couldNotStartApp": "Could not start {app}",
+	"@couldNotStartApp": {
+		"placeholders": {
+			"app": {
+				"type": "String"
+			}
+		}
+	},
+	"aspectRatio": "Aspect ratio",
+	"screenshot": "Screenshot",
+	"copyStreamLink": "Copy stream link",
+	"openInExternalPlayer": "Open in external player",
+	"noExternalPlayerFound": "No external player found",
+	"alwaysOnTop": "Always on top",
+	"playerSettings": "Player settings",
+	"restoreWithKey": "Restore · {key}",
+	"@restoreWithKey": {
+		"placeholders": {
+			"key": {
+				"type": "String"
+			}
+		}
+	},
+	"installExternalPlayerHint": "Install mpv, VLC or MPC-HC, then look again.",
+	"lookAgain": "Look again",
+	"playerMayNotPlayHeaders": "May not play: cannot send the headers this stream needs",
+	"uploadImageEllipsis": "Upload image…",
+	"uploadGifEllipsis": "Upload GIF…",
+	"searchGifsEllipsis": "Search GIFs…",
+	"avatarGifTooLarge": "This GIF is too large to optimize safely. Try a smaller file.",
+	"avatarImageTooLarge": "This image is too large. Try a smaller file.",
+	"linkIsNotImage": "That link is not an image.",
+	"couldNotDownloadImage": "Could not download that image.",
+	"dropAvatarImageTypes": "Drop a PNG, JPG, WebP or GIF image.",
+	"copyImageFirst": "Copy an image first, then paste it here.",
+	"dropToUseAsAvatar": "Drop to use as avatar",
+	"setPinToLock": "Set a PIN for this profile to be able to lock it.",
+	"profileLockNeedsInternet": "Connect to the internet to manage this profile lock. The PIN set on this PC keeps protecting it until then.",
+	"editProfile": "Edit profile",
+	"changePinEllipsis": "Change PIN…",
+	"setPinEllipsis": "Set PIN…",
+	"deleteProfile": "Delete profile",
+	"selectProfileNamed": "Select profile {name}",
+	"@selectProfileNamed": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"kidsProfile": "Kids profile",
+	"pinProtected": "PIN protected",
+	"pressNToChoose": "Press {key} to choose",
+	"@pressNToChoose": {
+		"placeholders": {
+			"key": {
+				"type": "int"
+			}
+		}
+	},
+	"changeAvatarDropPaste": "Change avatar (or drop / paste an image)",
+	"donate": "Donate",
+	"lockProfileWithKeys": "Lock profile ({keys})",
+	"@lockProfileWithKeys": {
+		"placeholders": {
+			"keys": {
+				"type": "String"
+			}
+		}
+	},
+	"chapterNumberTitle": "Chapter {number}",
+	"@chapterNumberTitle": {
+		"placeholders": {
+			"number": {
+				"type": "String"
+			}
+		}
+	},
+	"markReadUpToHere": "Mark read up to here",
+	"goToChapterOrSearch": "Go to chapter or search titles",
+	"noChaptersMatch": "No chapters match",
+	"spreadsShifted": "Spreads shifted by one page",
+	"spreadsNotShifted": "Spreads not shifted",
+	"pageWidthPx": "Page width {width} px",
+	"@pageWidthPx": {
+		"placeholders": {
+			"width": {
+				"type": "int"
+			}
+		}
+	},
+	"noPreviousChapter": "No previous chapter",
+	"noNextChapter": "No next chapter",
+	"pageNOfCount": "Page {page} / {count}",
+	"@pageNOfCount": {
+		"placeholders": {
+			"page": {
+				"type": "int"
+			},
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"chapterXOfY": "{current} of {total}",
+	"@chapterXOfY": {
+		"placeholders": {
+			"current": {
+				"type": "String"
+			},
+			"total": {
+				"type": "String"
+			}
+		}
+	},
+	"markedReadUpToHere": "Marked read up to here",
+	"shiftSpreadByOnePage": "Shift spread by one page",
+	"pageWidthLongStrip": "Page width (long strip)",
+	"copyImage": "Copy image",
+	"saveToPictures": "Save to Pictures",
+	"imageCopied": "Image copied",
+	"copyFailed": "Copy failed",
+	"filterByNumberOrTitle": "Filter by number or title",
+	"fontSerifNamed": "Serif ({font})",
+	"@fontSerifNamed": {
+		"placeholders": {
+			"font": {
+				"type": "String"
+			}
+		}
+	},
+	"searchFonts": "Search fonts",
+	"searchTheWeb": "Search the web",
+	"translate": "Translate",
+	"finishedCaps": "FINISHED",
+	"noNextChapterYet": "No next chapter yet",
+	"upNextCaps": "UP NEXT",
+	"clickToTurnPages": "Click to turn pages",
+	"scheduleSavedUpdating": "Showing saved schedule from {when} · updating…",
+	"@scheduleSavedUpdating": {
+		"placeholders": {
+			"when": {
+				"type": "String"
+			}
+		}
+	},
+	"scheduleOfflineCopy": "Offline copy · showing saved schedule from {when}",
+	"@scheduleOfflineCopy": {
+		"placeholders": {
+			"when": {
+				"type": "String"
+			}
+		}
+	},
+	"scheduleCouldntRefresh": "Couldn't refresh · showing saved schedule from {when}",
+	"@scheduleCouldntRefresh": {
+		"placeholders": {
+			"when": {
+				"type": "String"
+			}
+		}
+	},
+	"couldntLoadSchedule": "Couldn't load the schedule",
+	"scheduleServiceNoAnswer": "The schedule service did not answer. Try again in a moment.",
+	"unpinSource": "Unpin source",
+	"pinSource": "Pin source",
+	"searchAllSourcesFor": "Search all sources for \"{query}\"",
+	"@searchAllSourcesFor": {
+		"placeholders": {
+			"query": {
+				"type": "String"
+			}
+		}
+	},
+	"moveToTop": "Move to top",
+	"moveUp": "Move up",
+	"moveDown": "Move down",
+	"moveToBottom": "Move to bottom",
+	"useInAutoResolve": "Use in Auto Resolve",
+	"unpinNamed": "Unpin {name}",
+	"@unpinNamed": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"moveNamedUp": "Move {name} up",
+	"@moveNamedUp": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"moveNamedDown": "Move {name} down",
+	"@moveNamedDown": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"autoResolveSearchesNamed": "Auto Resolve searches {name}",
+	"@autoResolveSearchesNamed": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"autoResolveSkipsNamed": "Auto Resolve skips {name}. You can still pick it for a title.",
+	"@autoResolveSkipsNamed": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"dragToReorderNamed": "Drag to reorder {name}",
+	"@dragToReorderNamed": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"skippedByAutoResolve": "Skipped by Auto Resolve",
+	"namePinned": "{name}, pinned",
+	"@namePinned": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"pinnedStaysHereTooltip": "Pinned: stays here. Unpinned sources below are sorted by what has worked.",
+	"someSpace": "some space",
+	"bucketCleared": "{name} cleared",
+	"@bucketCleared": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"bucketClearedFreed": "{name} cleared ({size} freed)",
+	"@bucketClearedFreed": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			},
+			"size": {
+				"type": "String"
+			}
+		}
+	},
+	"appUsesStorage": "Zangetsu uses {size} on this PC, not counting downloads.",
+	"@appUsesStorage": {
+		"placeholders": {
+			"size": {
+				"type": "String"
+			}
+		}
+	},
+	"measuringStorage": "Measuring storage…",
+	"measuringEllipsis": "Measuring…",
+	"storagePostersTitle": "Posters and artwork",
+	"storagePostersDescription": "Cover images. They download again when shown.",
+	"storageTempTitle": "Video and reading cache",
+	"storageTempDescription": "Temporary player, subtitle and manga page files. Posters are cleared too.",
+	"storageScriptsTitle": "Source scripts",
+	"storageScriptsDescription": "Downloaded provider scripts that sources run.",
+	"storageScriptsConfirmTitle": "Clear source scripts?",
+	"storageScriptsConfirmMessage": "This frees {size}. Sources download their scripts again the next time you use them, so they will not work offline until then.",
+	"@storageScriptsConfirmMessage": {
+		"placeholders": {
+			"size": {
+				"type": "String"
+			}
+		}
+	},
+	"storageExtensionsTitle": "Extension data",
+	"storageExtensionsDescription": "Installed extensions and their data. Clear removes only their cache; extensions and settings stay.",
+	"storageExtensionsConfirmTitle": "Clear extension cache?",
+	"storageExtensionsConfirmMessage": "Cached pages and images saved by extensions are removed. Installed extensions and their settings are kept. Extension data uses {size} in total.",
+	"@storageExtensionsConfirmMessage": {
+		"placeholders": {
+			"size": {
+				"type": "String"
+			}
+		}
+	},
+	"storageLogsTitle": "Logs",
+	"storageLogsDescription": "Diagnostic logs used for bug reports.",
+	"storageLogsConfirmTitle": "Clear logs?",
+	"storageLogsConfirmMessage": "This frees {size}. If something goes wrong right after, a bug report will have less to go on.",
+	"@storageLogsConfirmMessage": {
+		"placeholders": {
+			"size": {
+				"type": "String"
+			}
+		}
+	},
+	"storageDownloadsDescription": "Downloaded episodes and chapters.",
+	"manage": "Manage",
+	"discordOnlyWhileWatching": "Only while watching",
+	"discordOnlyWhileWatchingSubtitle": "Hide Browsing and Looking at. Your status also clears after 5 minutes away or while Zangetsu is minimised, but never during a video.",
+	"shortcutScopeEverywhere": "Everywhere",
+	"shortcutScopeShowPage": "Show page",
+	"shortcutScopeLists": "History, My List and Schedule",
+	"resetAllShortcutsQuestion": "Reset all shortcuts?",
+	"resetAllShortcutsMessage": "Every changed shortcut goes back to its default key.",
+	"resetAll": "Reset all",
+	"keyboardShortcuts": "Keyboard shortcuts",
+	"noShortcutsMatch": "No shortcuts match",
+	"searchShortcuts": "Search shortcuts",
+	"changedFromDefault": "Changed from default",
+	"changeShortcut": "Change shortcut",
+	"pressNewKeyCombination": "Press the new key combination",
+	"currentShortcut": "Current: {keys}",
+	"@currentShortcut": {
+		"placeholders": {
+			"keys": {
+				"type": "String"
+			}
+		}
+	},
+	"shortcutAlreadyUsedBy": "Already used by \"{action}\" ({scope}). Saving keeps both on this key.",
+	"@shortcutAlreadyUsedBy": {
+		"placeholders": {
+			"action": {
+				"type": "String"
+			},
+			"scope": {
+				"type": "String"
+			}
+		}
+	},
+	"customise": "Customise",
+	"titleBackOnAutoResolve": "\"{title}\" is back on Auto Resolve",
+	"@titleBackOnAutoResolve": {
+		"placeholders": {
+			"title": {
+				"type": "String"
+			}
+		}
+	},
+	"titlesBackOnAutoResolve": "{count} titles are back on Auto Resolve",
+	"@titlesBackOnAutoResolve": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"couldntOpenSourcePage": "Couldn't open this source's page",
+	"resetNToAuto": "Reset {count} to Auto",
+	"@resetNToAuto": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"resetToAuto": "Reset to Auto",
+	"manualMatches": "Manual matches",
+	"manualMatchesIntro": "Titles you matched by hand with \"Wrong title?\". Reset one to let Auto Resolve choose its source again.",
+	"searchManualMatches": "Search manual matches",
+	"clearSelection": "Clear selection",
+	"noManualMatchesYet": "No manual matches yet. Fix a match with \"Wrong title?\" on a title and it shows up here.",
+	"noManualMatchesForSearch": "No manual matches match your search.",
+	"readerFullscreenWindowsSubtitle": "When on, manga and novels open borderless full screen. Esc leaves it and F or F11 toggles it",
+	"clickToTurnPagesSubtitle": "In paged reading, click the left or right side of the page to turn it and the middle to show the bars. The mouse Back and Forward buttons always turn pages",
+	"clickZones": "Click zones",
+	"clickZonesSubtitle": "What clicking each part of a page does when Click to turn pages is on",
+	"cacheAndStorage": "Cache and storage",
+	"cacheAndStorageSubtitle": "Sizes and clearing for every cache are in Storage",
+	"windowAndSystem": "Window & system",
+	"windowAndSystemSubtitle": "Launch at sign-in, close button, window size, start page",
+	"keyboardShortcutsSubtitle": "See every shortcut and change the player keys",
+	"searchResults": "Search results",
+	"tapZonesWindowsNote": "On Windows these zones answer left clicks in paged reading while Click to turn pages is on. Right-to-left reading swaps the page-turn sides.",
+	"launchAtSignIn": "Launch at sign-in",
+	"closeButton": "Close button",
+	"rememberWindowSizePosition": "Remember window size and position",
+	"startPage": "Start page",
+	"autoLockAfterIdle": "Auto-lock after idle",
+	"lockWhenWindowsLocks": "Lock when Windows locks",
+	"unpinAllSourcesQuestion": "Unpin all sources?",
+	"unpinAllSourcesMessage": "{count, plural, =1{The 1 pinned source goes back to the automatic ranking. Sources switched off for Auto Resolve stay off.} other{The {count} pinned sources go back to the automatic ranking. Sources switched off for Auto Resolve stay off.}}",
+	"@unpinAllSourcesMessage": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"unpinAll": "Unpin all",
+	"unpinnedAllSources": "Unpinned all sources",
+	"sourcePriorityWindowsHelp": "Drag a handle, use Move up / Move down, or press Alt+Up / Alt+Down on a selected row. Right-click a row for Move to top. Moving a source pins it: pinned sources keep their place, the rest are sorted by what has worked.",
+	"preferredSourceAnime": "Preferred source for anime",
+	"preferredSourceManga": "Preferred source for manga",
+	"preferredSourceNovels": "Preferred source for novels",
+	"preferredSourceMoviesTv": "Preferred source for movies and TV",
+	"autoResolve": "Auto Resolve",
+	"preferredSourceDescription": "Tried first for every title without its own source. If it does not have a title, Auto Resolve tries the sources below.",
+	"noPreferredSource": "No preferred source: just the order below",
+	"preferredSourceSubtitle": "Tried first. If it does not have a title, Auto Resolve tries the sources below.",
+	"manualMatchesRowSubtitle": "Titles you matched by hand with Wrong title? They ignore the order on this page.",
+	"trackerUpToDate": "{name} is up to date",
+	"@trackerUpToDate": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"trackerStillUnreachable": "Still could not reach {name}. Will keep retrying.",
+	"@trackerStillUnreachable": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"trackerUpdatesSavedSuffix": "{count, plural, =1{ 1 update is saved and will sync automatically.} other{ {count} updates are saved and will sync automatically.}}",
+	"@trackerUpdatesSavedSuffix": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"trackerLastTrySuffix": " Last try {when}.",
+	"@trackerLastTrySuffix": {
+		"placeholders": {
+			"when": {
+				"type": "String"
+			}
+		}
+	},
+	"trackerNeedsSignIn": "{name} needs you to sign in again",
+	"@trackerNeedsSignIn": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"lastSyncFailed": "Last sync failed",
+	"updatesWaitingToSync": "Updates waiting to sync",
+	"loginExpiredOrRevoked": "The login expired or was revoked.",
+	"noConnectionDot": "No connection.",
+	"justNow": "just now",
+	"minutesAgoShort": "{minutes} min ago",
+	"@minutesAgoShort": {
+		"placeholders": {
+			"minutes": {
+				"type": "int"
+			}
+		}
+	},
+	"hoursAgoShort": "{hours} h ago",
+	"@hoursAgoShort": {
+		"placeholders": {
+			"hours": {
+				"type": "int"
+			}
+		}
+	},
+	"signInExpired": "Sign-in expired",
+	"connectedToName": "Connected to {name}",
+	"@connectedToName": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"closeAskWhenDownloading": "Ask when downloads are running",
+	"closeTrayWhileDownloading": "Keep running in the tray while downloading",
+	"closeAlwaysTray": "Always keep running in the tray",
+	"closeAskDescription": "Closing quits, but asks first if downloads would stop.",
+	"closeTrayWhileDownloadingDescription": "Hides to the tray until downloads finish; otherwise quits.",
+	"closeAlwaysTrayDescription": "Closing hides the window. Quit from the tray icon menu.",
+	"closeQuitDescription": "Closing always quits, stopping any downloads.",
+	"startPageLastUsed": "Where I left off",
+	"afterNMinutes": "After {minutes} minutes",
+	"@afterNMinutes": {
+		"placeholders": {
+			"minutes": {
+				"type": "int"
+			}
+		}
+	},
+	"windowsSignInSettingRefused": "Windows didn't allow changing the sign-in setting",
+	"couldntSaveWindowSetting": "Couldn't save the window setting",
+	"closeButtonDescription": "What the X button, Alt+F4 and the taskbar Close do.",
+	"startPageDescription": "The page Zangetsu opens on. Applies the next time you start the app.",
+	"autoLockDescription": "Lock a PIN-protected profile again when nobody has used the app for a while.",
+	"windowSection": "Window",
+	"launchAtSignInSubtitle": "Start Zangetsu when you sign in to Windows",
+	"rememberWindowSubtitle": "Reopen where you left it, on the same screen. Off opens centred.",
+	"startPageSubtitle": "The page shown when the app opens",
+	"newEpisodeAlertsWindowsSubtitle": "Show a Windows notification when a show you follow gets a new episode or chapter",
+	"autoLockSubtitle": "Locks a PIN-protected profile after no activity",
+	"lockWhenWindowsLocksSubtitle": "Win+L or the screen lock also locks your profile",
+	"keyboardSection": "Keyboard",
+	"collapseSidebar": "Collapse sidebar",
+	"expandSidebar": "Expand sidebar",
+	"syncingListProgress": "Syncing your list and progress…",
+	"synced": "Synced",
+	"syncedAtClickToSync": "Synced at {when}. Click to sync now",
+	"@syncedAtClickToSync": {
+		"placeholders": {
+			"when": {
+				"type": "String"
+			}
+		}
+	},
+	"syncOfflineTooltip": "Offline: changes will sync when you are back online",
+	"signInToSyncListProgress": "Sign in to sync your list and progress",
+	"syncFailedClickRetry": "Sync failed. Click to retry",
+	"syncFailedErrorClickRetry": "Sync failed: {error}. Click to retry",
+	"@syncFailedErrorClickRetry": {
+		"placeholders": {
+			"error": {
+				"type": "String"
+			}
+		}
+	},
+	"syncNow": "Sync now",
+	"lastSyncedAtClickToSync": "Last synced at {when}. Click to sync now",
+	"@lastSyncedAtClickToSync": {
+		"placeholders": {
+			"when": {
+				"type": "String"
+			}
+		}
+	},
+	"connectionSettingsUnavailable": "Connection settings unavailable",
+	"connectToInternetTryAgain": "Connect to the internet and try again.",
+	"clearSearchEsc": "Clear search (Esc)",
+	"sourceNoSiteToVerify": "{name} has no site to verify",
+	"@sourceNoSiteToVerify": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"verificationFailedError": "Verification failed: {error}",
+	"@verificationFailedError": {
+		"placeholders": {
+			"error": {
+				"type": "String"
+			}
+		}
+	},
+	"verificationNotCompleted": "Verification was not completed",
+	"verifiedTestingAgain": "Verified. Testing {name} again…",
+	"@verifiedTestingAgain": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"openSitePassCheckTestAgain": "Open the site, pass its check, then test again",
+	"verify": "Verify",
+	"refreshRepositoriesF5": "Refresh repositories (F5)",
+	"disable": "Disable",
+	"collapse": "Collapse",
+	"expand": "Expand",
+	"eachCategorySavedSeparately": "Each category is saved separately.",
+	"addAddon": "Add addon",
+	"searchAddons": "Search addons",
+	"addonUrl": "Addon URL",
+	"openAppFolder": "Open app folder",
+	"makeActiveSource": "Make active source",
+	"installedUseMenu": "Installed. Use the ... menu to update or uninstall",
+	"moreActions": "More actions",
+	"installingEllipsis": "Installing…",
+	"updatedDoneOfTotal": "Updated {done} of {total}. {failed} failed",
+	"@updatedDoneOfTotal": {
+		"placeholders": {
+			"done": {
+				"type": "int"
+			},
+			"total": {
+				"type": "int"
+			},
+			"failed": {
+				"type": "int"
+			}
+		}
+	},
+	"updatesThatFailed": "Updates that failed",
+	"extensionsNotUpdated": "{count, plural, =1{1 extension not updated} other{{count} extensions not updated}}",
+	"@extensionsNotUpdated": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"filledFromClipboard": "Filled in from your clipboard",
+	"noRepoLinkInDrop": "No repository link found in what you dropped",
+	"linkTakenFromDrop": "Link taken from what you dropped",
+	"dropLinkHere": "Drop the link here",
+	"youCanAlsoDragLink": "You can also drag a link or a .json file here",
+	"appDataCouldNotOpen": "Your app data could not be opened",
+	"appDataCouldNotOpenBody": "Your previous files have been kept. Make sure the previous data folder or drive is available and there is enough free space, then try again.",
+	"windowMinimize": "Minimize",
+	"windowMaximize": "Maximize",
+	"downloadedEpisodesCount": "Downloaded episodes ({count})",
+	"@downloadedEpisodesCount": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"someDownloadsNotRemoved": "Some downloads could not be removed. Please try again.",
+	"selectShowsToDelete": "Select shows to delete",
+	"selectNamed": "Select {name}",
+	"@selectNamed": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			}
+		}
+	},
+	"savedEpisodes": "Saved episodes",
+	"countActive": "{count} active",
+	"@countActive": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"otherFilesAndAttempts": "Other files and previous attempts ({count})",
+	"@otherFilesAndAttempts": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"eachFileKeepsSource": "Each file keeps its original source and audio information.",
+	"nextFeature": "Next feature",
+	"newFromYourList": "New from your list",
+	"seeAllNamed": "See all {title}",
+	"@seeAllNamed": {
+		"placeholders": {
+			"title": {
+				"type": "String"
+			}
+		}
+	},
+	"openDownloads": "Open downloads",
+	"verifyWebsite": "Verify website",
+	"airingToday": "Airing today",
+	"openTheShowPage": "Open the show page",
+	"fullPlayer": "Full player",
+	"fullPlayerDoubleClick": "Full player · double-click",
+	"theatreMode": "Theatre mode",
+	"exitTheatreMode": "Exit theatre mode",
+	"fullScreenMode": "Full screen",
+	"episodeRangeText": "Episode range",
+	"searchTitlesEllipsis": "Search titles...",
+	"checkingExtensionsForUpdates": "Checking extensions for updates…",
+	"profilesAndAccount": "Profiles & account",
+	"watchingAsNameStatus": "Watching as {name} · {status}",
+	"@watchingAsNameStatus": {
+		"placeholders": {
+			"name": {
+				"type": "String"
+			},
+			"status": {
+				"type": "String"
+			}
+		}
+	},
+	"sourcePriority": "Source Priority",
+	"sourcePrioritySubtitle": "Order Auto Resolve tries sources in",
+	"switchProfile": "Switch profile",
+	"closePlayerToSwitchProfiles": "Close the player to switch profiles.",
+	"clickProfileToWatchAs": "Click a profile to watch as it. Locked profiles ask for their PIN.",
+	"windowsUpdates": "Windows updates",
+	"windowsUpdatesSubtitle": "Opens the latest Windows build changes on GitHub",
+	"playerOpensIn": "Player opens in",
+	"playDownloadedCopyIfFails": "Play downloaded copy if streaming fails",
+	"switchAutomatically": "Switch automatically",
+	"askFirst": "Ask first",
+	"adaptiveColour": "Adaptive colour",
+	"appBackgroundColour": "Background colour",
+	"titleLogoOnDetail": "Title logo on Detail",
+	"appFont": "App font",
+	"reverseEpisodeListAlwaysOn": "Reverse episode list always on",
+	"openAppDataFolder": "Open app data folder",
+	"openInFileExplorer": "Open in File Explorer",
+	"appFontSubtitle": "Everything in the app is drawn in this",
+	"desktopSortChip": "Sort: {value}",
+	"desktopMoreFilters": "More filters",
+	"desktopMoreFiltersCount": "More filters ({count})",
+	"desktopLibraryFiltersTooltip": "Filters: season, minimum score, tags",
+	"desktopSourceFiltersTooltip": "Filters: audio, sources to search",
+	"desktopQuickSearchResults": "Quick search results",
+	"desktopAddRepoSubtitle": "Works for every extension ecosystem",
+	"desktopRepoLinkLabel": "Repository link",
+	"desktopRepoLinkHint": "https://…",
+	"desktopMoreOptions": "More options…",
+	"desktopEcosystemLabel": "Ecosystem",
+	"desktopOpenEcosystemManager": "Open {ecosystem} manager",
+	"desktopOpenEcosystemManagerMenu": "Open {ecosystem} manager…",
+	"desktopManageSourcesInSettings": "Manage in Settings",
+	"desktopSourcesManagedInSettings": "Sources and their repositories are managed in Settings > Sources. Install some there and they will show up here.",
+	"desktopAllEcosystemsMenu": "All ecosystems…",
+	"desktopSearchThisRepository": "Search this repository",
+	"desktopSearchTitlesInSources": "Search titles in these sources",
+	"desktopSourceHasNoSettings": "{name} has no settings",
+	"desktopPopularOn": "Popular on {source}",
+	"desktopCouldntLoadRepository": "Couldn't load this repository.",
+	"playerHardwareDecodeRetrying": "Hardware decoding failed. Retrying in software.",
+	"floatingPlayerExpand": "Open the full player",
+	"floatingPlayerClose": "Close the mini player",
+	"desktopSourceLacksTitleStayAuto": "{source} doesn't have this title, so it stays on Auto Resolve",
+	"@desktopSourceLacksTitleStayAuto": {
+		"placeholders": {
+			"source": {
+				"type": "String"
+			}
+		}
+	},
+	"desktopDownloadedCut": "Downloaded · {cut}",
+	"@desktopDownloadedCut": {
+		"placeholders": {
+			"cut": {
+				"type": "String"
+			}
+		}
+	},
+	"desktopPlayingDownloadedCut": "Playing your downloaded {cut} copy",
+	"@desktopPlayingDownloadedCut": {
+		"placeholders": {
+			"cut": {
+				"type": "String"
+			}
+		}
+	},
+	"desktopSliderDefaultValue": "Default: {value}",
+	"@desktopSliderDefaultValue": {
+		"placeholders": {
+			"value": {
+				"type": "String"
+			}
+		}
+	},
+	"desktopDownloadsAtOnceUnit": "at once",
+	"desktopConnectionsUnit": "{count, plural, =1{connection} other{connections}}",
+	"@desktopConnectionsUnit": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"desktopPagesAheadUnit": "{count, plural, =1{page ahead} other{pages ahead}}",
+	"@desktopPagesAheadUnit": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"desktopSecondsUnit": "{count, plural, =1{second} other{seconds}}",
+	"@desktopSecondsUnit": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"desktopSourcesUnit": "{count, plural, =1{source} other{sources}}",
+	"@desktopSourcesUnit": {
+		"placeholders": {
+			"count": {
+				"type": "int"
+			}
+		}
+	},
+	"desktopEpisodesAlreadyDownloaded": "These episodes are already downloaded.",
+	"desktopApproveInBrowserHint": "Approve in your browser, then choose \"Open Zangetsu\". Click here to cancel."
 }

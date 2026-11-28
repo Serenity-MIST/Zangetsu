@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -133,8 +134,9 @@ void main() {
   Future<void> openSheet(
     WidgetTester tester,
     ValueGetter<VideoSource?> read,
-    void Function(VideoSource?) write,
-  ) async {
+    void Function(VideoSource?) write, {
+    ValueChanged<VideoSource>? onDownloadLink,
+  }) async {
     await tester.pumpWidget(
       MaterialApp(
         home: Builder(
@@ -147,6 +149,7 @@ void main() {
                     manager: manager,
                     ref: ref,
                     title: 'Game of Thrones · Winter Is Coming',
+                    onDownloadLink: onDownloadLink,
                   ),
                 );
               },
@@ -356,6 +359,178 @@ void main() {
     expect(picked!.url, 'https://cdn.example/video.m3u8');
     expect(find.text('WEB-DL'), findsNothing);
   });
+
+  testWidgets('Windows: right-docked panel, click picks, Esc closes', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1280, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    VideoSource? picked;
+    await openSheet(tester, () => picked, (value) => picked = value);
+    final panel = find.byKey(const ValueKey('stremio-links-desktop-panel'));
+    expect(panel, findsOneWidget);
+    expect(find.byType(BottomSheet), findsNothing);
+    expect(tester.widget<Dialog>(panel).alignment, Alignment.centerRight);
+    // No phone drag handle (a 38x4 bar) in the panel.
+    expect(
+      find.byWidgetPredicate(
+        (w) =>
+            w is Container &&
+            w.constraints?.maxWidth == 38 &&
+            w.constraints?.maxHeight == 4,
+      ),
+      findsNothing,
+    );
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(panel, findsNothing);
+    expect(picked, isNull);
+
+    // Reopen and pick with a click.
+    await tester.tap(find.text('Open links'));
+    await tester.pump();
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 100)),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.tap(find.text('WEB-DL'));
+    await tester.pump();
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 100)),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(picked!.url, 'https://cdn.example/video.m3u8');
+    expect(panel, findsNothing);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
+
+  // show-9: Windows quality chips, search and size sort.
+  testWidgets('Windows: quality chips, search and size sort narrow the list', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1280, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    server.extraLinks = 2;
+    server.videoSize = 4 * 1073741824;
+    VideoSource? picked;
+    await openSheet(tester, () => picked, (value) => picked = value);
+
+    // '4K' stream counts as 4K, the two plain links as Other; no 720p chip.
+    expect(find.byKey(const ValueKey('filter-chip:quality:uhd')), findsOne);
+    expect(find.byKey(const ValueKey('filter-chip:quality:other')), findsOne);
+    expect(find.byKey(const ValueKey('filter-chip:quality:hd')), findsNothing);
+
+    await tester.tap(find.byKey(const ValueKey('filter-chip:quality:uhd')));
+    await tester.pumpAndSettle();
+    expect(find.text('Link 0'), findsNothing);
+    expect(find.text('WEB-DL'), findsOne);
+    // Filters hide the best-match card (it might not match them).
+    expect(find.text('BEST MATCH'), findsNothing);
+
+    // Back to any quality, then search for one plain link.
+    await tester.tap(find.byKey(const ValueKey('filter-chip:quality:any')));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const ValueKey('stremio-links-search')),
+      'link 1',
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Link 1'), findsOne);
+    expect(find.text('Link 0'), findsNothing);
+    expect(find.text('WEB-DL'), findsNothing);
+
+    // A search nothing matches offers a reset.
+    await tester.enterText(
+      find.byKey(const ValueKey('stremio-links-search')),
+      'nothing-matches',
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('No links match these filters'), findsOne);
+    await tester.tap(find.text('Clear filters'));
+    await tester.pumpAndSettle();
+    expect(find.text('Link 0'), findsWidgets);
+
+    // Largest first: the sized 4K link moves above the unsized ones.
+    await tester.tap(find.byKey(const ValueKey('stremio-links-sort')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Largest first'));
+    await tester.pumpAndSettle();
+    final bigY = tester.getTopLeft(find.text('WEB-DL')).dy;
+    final plainY = tester.getTopLeft(find.text('Link 0')).dy;
+    expect(bigY, lessThan(plainY));
+    expect(picked, isNull);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
+
+  // show-9: right-click opens a real menu instead of silently copying.
+  testWidgets('Windows: right-click opens the link menu', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1280, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final copied = <String>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(SystemChannels.platform, (call) async {
+          if (call.method == 'Clipboard.setData') {
+            copied.add((call.arguments as Map)['text'] as String);
+          }
+          return null;
+        });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform, null),
+    );
+    VideoSource? picked;
+    VideoSource? downloaded;
+    await openSheet(
+      tester,
+      () => picked,
+      (value) => picked = value,
+      onDownloadLink: (source) => downloaded = source,
+    );
+    await tester.tap(find.byKey(const ValueKey('filter-chip:Test Addon')));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('WEB-DL'), buttons: kSecondaryButton);
+    await tester.pumpAndSettle();
+    // Right-click alone neither copies nor picks.
+    expect(copied, isEmpty);
+    expect(picked, isNull);
+    for (final label in [
+      'Play',
+      'Download this link',
+      'Copy link',
+      'Copy title',
+      'Open in browser',
+    ]) {
+      expect(find.text(label), findsOne, reason: label);
+    }
+    await tester.tap(find.text('Copy link'));
+    await tester.pumpAndSettle();
+    expect(copied, ['https://cdn.example/video.m3u8']);
+
+    // Copy title copies the stream's name + description.
+    await tester.tap(find.text('WEB-DL'), buttons: kSecondaryButton);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Copy title'));
+    await tester.pumpAndSettle();
+    expect(copied.last, '4K\nWEB-DL');
+
+    // Download closes the panel without playing and hands over the source.
+    await tester.tap(find.text('WEB-DL'), buttons: kSecondaryButton);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Download this link'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pumpAndSettle();
+    expect(downloaded?.url, 'https://cdn.example/video.m3u8');
+    expect(picked, isNull);
+    expect(
+      find.byKey(const ValueKey('stremio-links-desktop-panel')),
+      findsNothing,
+    );
+  }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
 
   test('Stremio titles use the sheet for Play and Resume only', () {
     expect(usesStremioLinks('stremio'), isTrue);

@@ -14,7 +14,10 @@ import '../../core/theme/app_text.dart';
 import '../../core/tv/tv_list_focusable.dart';
 import '../../core/tv/tv_text_field.dart';
 import '../../core/ui/settings_widgets.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import '../../core/ui/states.dart';
+import '../../core/ui/desktop_docked_panel.dart';
+import 'sources_desktop_kit.dart' show DesktopProviderScope;
 import '../../l10n/l10n.dart';
 
 /// Generic per-provider settings form rendered from the provider's
@@ -44,6 +47,7 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
   // (separate from our app-side schema settings). Always false for non-CS.
   late Future<bool> _nativeSettingsFuture;
   Map<String, dynamic> _values = <String, dynamic>{};
+  int _textResetRevision = 0;
 
   /// The bare CloudStream api name for this source (`cs:AnimePahe` → `AnimePahe`),
   /// or null when this isn't a CloudStream source.
@@ -61,6 +65,13 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
 
   bool get _isTv => sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
 
+  /// Desktop layout inside the settings workspace and, on Windows, from any
+  /// other entry point too (a provider screen pushed it on the root
+  /// navigator, outside the workspace scope) — src-3 A.
+  bool get _isDesktop =>
+      !_isTv &&
+      (DesktopSettingsScope.contains(context) || desktopPanelsEnabled);
+
   @override
   void initState() {
     super.initState();
@@ -73,9 +84,12 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
 
   @override
   void dispose() {
-    for (final t in _textDebounce.values) {
-      t.cancel();
+    final hasPendingText = _textDebounce.values.any((timer) => timer.isActive);
+    for (final timer in _textDebounce.values) {
+      timer.cancel();
     }
+    // Leaving immediately after typing must not discard the last edit.
+    if (hasPendingText) unawaited(_persist());
     super.dispose();
   }
 
@@ -146,8 +160,13 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
   /// Persist the full map and mirror it into the JS runtime so the next
   /// provider call reads the updated values.
   Future<void> _persist() async {
-    await _repo.setFor(_key, _values);
-    _manager.setSettings(widget.sourceId, _values);
+    // Capture this edit before awaiting Hive: a later edit/reset must not make
+    // an older write apply a different map to the runtime.
+    final values = Map<String, dynamic>.from(_values);
+    final manager = _manager;
+    final sourceId = widget.sourceId;
+    await _repo.setFor(_key, values);
+    manager.setSettings(sourceId, values);
   }
 
   void _updateImmediate(String key, Object? value) {
@@ -169,12 +188,32 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
     final defaults = <String, dynamic>{
       for (final s in schema) s.key: s.defaultValue,
     };
+    for (final timer in _textDebounce.values) {
+      timer.cancel();
+    }
+    _textDebounce.clear();
     await _repo.clearFor(_key);
-    setState(() => _values = defaults);
+    if (!mounted) return;
+    setState(() {
+      _values = defaults;
+      _textResetRevision++;
+    });
     _manager.setSettings(widget.sourceId, defaults);
   }
 
   Future<void> _pickEnum(ProviderSettingSchema schema) async {
+    if (_isDesktop) {
+      final selected = await showGraphiteSettingsChoice<String>(
+        context,
+        title: schema.label,
+        options: [
+          for (final option in schema.options) (option.value, option.label),
+        ],
+        current: _values[schema.key] as String? ?? '',
+      );
+      if (mounted && selected != null) _updateImmediate(schema.key, selected);
+      return;
+    }
     if (_isTv) {
       final current = _values[schema.key] as String?;
       final selected = await showDialog<String>(
@@ -185,7 +224,10 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
           ),
-          insetPadding: const EdgeInsets.symmetric(horizontal: 80, vertical: 48),
+          insetPadding: const EdgeInsets.symmetric(
+            horizontal: 80,
+            vertical: 48,
+          ),
           child: SizedBox(
             width: 460,
             child: Column(
@@ -383,9 +425,7 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
 
   Future<void> _pickMultiEnum(ProviderSettingSchema schema) async {
     final raw = _values[schema.key];
-    final chosen = raw is List
-        ? raw.whereType<String>().toSet()
-        : <String>{};
+    final chosen = raw is List ? raw.whereType<String>().toSet() : <String>{};
     if (_isTv) {
       final saved = await showDialog<bool>(
         context: context,
@@ -395,7 +435,10 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
           ),
-          insetPadding: const EdgeInsets.symmetric(horizontal: 80, vertical: 48),
+          insetPadding: const EdgeInsets.symmetric(
+            horizontal: 80,
+            vertical: 48,
+          ),
           child: SizedBox(
             width: 460,
             child: Column(
@@ -442,7 +485,9 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
                                           style: AppText.headline,
                                         ),
                                       ),
-                                      if (chosen.contains(schema.options[j].value))
+                                      if (chosen.contains(
+                                        schema.options[j].value,
+                                      ))
                                         Icon(
                                           Icons.check,
                                           color: AppColors.accent,
@@ -490,16 +535,33 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
     }
   }
 
-  List<Widget> _buildSchemaList(List<ProviderSettingSchema> schema, bool hasNative) {
+  List<Widget> _buildSchemaList(
+    List<ProviderSettingSchema> schema,
+    bool hasNative,
+  ) {
+    if (_isDesktop) {
+      return [
+        GraphiteSettingsPanel(
+          margin: EdgeInsets.zero,
+          children: [for (final entry in schema) _buildDesktopEntry(entry)],
+        ),
+        const SizedBox(height: 16),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton.icon(
+            onPressed: () => _resetDefaults(schema),
+            icon: const Icon(Icons.restore_outlined, size: 20),
+            label: Text(context.l10n.resetToDefaults),
+          ),
+        ),
+      ];
+    }
     if (_isTv) {
       return [
         SettingsCard(
           children: [
             for (var i = 0; i < schema.length; i++)
-              _buildEntry(
-                schema[i],
-                autofocus: !hasNative && i == 0,
-              ),
+              _buildEntry(schema[i], autofocus: !hasNative && i == 0),
           ],
         ),
         const SizedBox(height: 16),
@@ -545,9 +607,7 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
           ),
           label: Text(
             context.l10n.resetToDefaults,
-            style: AppText.body.copyWith(
-              color: AppColors.textSecondary,
-            ),
+            style: AppText.body.copyWith(color: AppColors.textSecondary),
           ),
         ),
       ),
@@ -556,6 +616,11 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Windows: the scope gives the app bar its desktop header (src-3 A).
+    return DesktopProviderScope(child: _scaffold(context));
+  }
+
+  Widget _scaffold(BuildContext context) {
     return Scaffold(
       backgroundColor: AppColors.bg,
       appBar: settingsAppBar(widget.displayName ?? widget.sourceId),
@@ -588,9 +653,9 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
               return ListView(
                 clipBehavior: _isTv ? Clip.none : Clip.hardEdge,
                 padding: EdgeInsets.fromLTRB(
-                  _isTv ? 0 : 12,
+                  _isTv ? 0 : (_isDesktop ? 22 : 12),
                   8,
-                  _isTv ? 0 : 12,
+                  _isTv ? 0 : (_isDesktop ? 22 : 12),
                   24,
                 ),
                 children: [
@@ -656,6 +721,92 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
     ),
     child: child,
   );
+
+  /// Desktop schema controls keep the shared persistence and runtime owners;
+  /// presentation never rewrites the provider's schema or setting keys.
+  Widget _buildDesktopEntry(ProviderSettingSchema schema) {
+    switch (schema.type) {
+      case ProviderSettingType.bool_:
+        final value = _values[schema.key] as bool? ?? false;
+        return GraphiteSettingsControl(
+          icon: Icons.toggle_on_outlined,
+          title: schema.label,
+          onTap: () => _updateImmediate(schema.key, !value),
+          trailing: Switch(
+            value: value,
+            onChanged: (next) => _updateImmediate(schema.key, next),
+          ),
+        );
+      case ProviderSettingType.enum_:
+        final value = _values[schema.key] as String?;
+        final label =
+            schema.options
+                .where((option) => option.value == value)
+                .map((option) => option.label)
+                .firstOrNull ??
+            value ??
+            '';
+        return GraphiteSettingsControl(
+          icon: Icons.list_alt_outlined,
+          title: schema.label,
+          subtitle: label,
+          onTap: () => _pickEnum(schema),
+        );
+      case ProviderSettingType.multiEnum:
+        final raw = _values[schema.key];
+        final selected = raw is List
+            ? raw.whereType<String>().toSet()
+            : <String>{};
+        return Padding(
+          padding: const EdgeInsets.all(22),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                schema.label,
+                style: AppText.body.copyWith(color: AppColors.textPrimary),
+              ),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (final option in schema.options)
+                    FilterChip(
+                      label: Text(option.label),
+                      selected: selected.contains(option.value),
+                      onSelected: (next) {
+                        final updated = selected.toSet();
+                        next
+                            ? updated.add(option.value)
+                            : updated.remove(option.value);
+                        _updateImmediate(schema.key, updated.toList());
+                      },
+                    ),
+                ],
+              ),
+            ],
+          ),
+        );
+      case ProviderSettingType.text:
+        return Padding(
+          padding: const EdgeInsets.all(22),
+          child: TextFormField(
+            key: ValueKey('${schema.key}:$_textResetRevision'),
+            initialValue: _values[schema.key] as String? ?? '',
+            style: AppText.body.copyWith(color: AppColors.textPrimary),
+            decoration: InputDecoration(
+              labelText: schema.label,
+              filled: true,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
+            onChanged: (next) => _updateDebounced(schema.key, next),
+          ),
+        );
+    }
+  }
 
   Widget _buildEntry(ProviderSettingSchema schema, {bool autofocus = false}) {
     if (_isTv) {
@@ -756,6 +907,9 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
         return _card(
           padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
           child: TextFormField(
+            // Reset must replace the field's controller value, not only the
+            // backing map. Keep the key stable during ordinary typing.
+            key: ValueKey('${schema.key}:$_textResetRevision'),
             initialValue: v,
             style: AppText.body.copyWith(color: AppColors.textPrimary),
             cursorColor: AppColors.accent,
@@ -812,9 +966,7 @@ class _SourceSettingsScreenState extends State<SourceSettingsScreen> {
         return SettingsTile(
           icon: Icons.checklist_rounded,
           title: schema.label,
-          subtitle: selected.isEmpty
-              ? null
-              : '${selected.length} selected',
+          subtitle: selected.isEmpty ? null : '${selected.length} selected',
           autofocus: autofocus,
           onTap: () => _pickMultiEnum(schema),
         );

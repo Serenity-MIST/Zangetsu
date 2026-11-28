@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:watch_app/core/download/download_manager.dart';
 import 'package:watch_app/core/download/download_record.dart';
+import 'package:watch_app/core/download/download_server_preference.dart';
 import 'package:watch_app/core/models/episode.dart';
 import 'package:watch_app/core/models/video_source.dart';
 import 'package:watch_app/core/tv/tv_focusable.dart';
@@ -30,8 +31,12 @@ class _FakeDownloadManager extends ChangeNotifier implements DownloadManager {
       _byShow.values.expand((l) => l).toList();
 
   @override
-  DownloadRecord? recordFor(String sourceId, String showId, String episodeId) =>
-      null;
+  DownloadRecord? recordFor(
+    String sourceId,
+    String showId,
+    String episodeId, {
+    String? category,
+  }) => null;
 
   @override
   Future<DownloadRecord?> finishedForEpisode({
@@ -40,7 +45,12 @@ class _FakeDownloadManager extends ChangeNotifier implements DownloadManager {
     required String episodeId,
     String? episodeUrl,
     int? malId,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    int? anilistId,
     double? episodeNumber,
+    String? category,
+    int? season,
   }) async =>
       null;
 
@@ -58,8 +68,13 @@ class _FakeDownloadManager extends ChangeNotifier implements DownloadManager {
     required String category,
     required String quality,
     required List<Episode> episodes,
+    DownloadServerPreference? serverPreference,
     required int nowMs,
     int? malId,
+    int? anilistId,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    String? imdbId,
   }) async {}
 
   @override
@@ -76,6 +91,10 @@ class _FakeDownloadManager extends ChangeNotifier implements DownloadManager {
     required String qualityLabel,
     required int nowMs,
     int? malId,
+    int? anilistId,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    String? imdbId,
     List<VideoSource> fallbacks = const [],
   }) async {}
 

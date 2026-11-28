@@ -51,12 +51,13 @@ class AniyomiRepoEntry {
     required String repoBaseUrl,
     String absoluteApkUrl = '',
     String absoluteIconUrl = '',
-  })  : apkUrl = absoluteApkUrl.startsWith('http')
-            ? absoluteApkUrl
-            : '${AniyomiRepo.normalizeBase(repoBaseUrl)}/apk/$apk',
-        iconUrl = absoluteIconUrl.startsWith('http')
-            ? absoluteIconUrl
-            : '${AniyomiRepo.normalizeBase(repoBaseUrl)}/icon/$pkg.png';
+    this.jarUrl = '',
+  }) : apkUrl = absoluteApkUrl.startsWith('http')
+           ? absoluteApkUrl
+           : '${AniyomiRepo.normalizeBase(repoBaseUrl)}/apk/$apk',
+       iconUrl = absoluteIconUrl.startsWith('http')
+           ? absoluteIconUrl
+           : '${AniyomiRepo.normalizeBase(repoBaseUrl)}/icon/$pkg.png';
 
   final String name;
   final String pkg;
@@ -80,6 +81,7 @@ class AniyomiRepoEntry {
   /// reconstructed from the base — rebuilding the old path 404s on all ~1400
   /// of its extensions, so nothing installs.
   final String apkUrl;
+  final String jarUrl;
 
   /// Full URL to the extension's icon.
   ///
@@ -126,11 +128,7 @@ class AniyomiRepo {
     // here too — it's the file the fetcher now prefers, so it's the most
     // likely thing to be pasted; leaving it out meant the app asked for
     // `.../index.pb/index.pb` and the repo just 404'd.
-    for (final name in const [
-      '/index.min.json',
-      '/index.json',
-      '/index.pb',
-    ]) {
+    for (final name in const ['/index.min.json', '/index.json', '/index.pb']) {
       if (b.endsWith(name)) {
         b = b.substring(0, b.length - name.length);
         break;

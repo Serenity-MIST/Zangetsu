@@ -23,19 +23,19 @@ class _SweepSrc implements SourceRepository {
   _SweepSrc({
     required this.aEps,
     required this.bEps,
-    this.aStreams = const [VideoSource(url: 'https://a/stream')],
-    this.bStreams = const [VideoSource(url: 'https://b/stream')],
     this.hangs = const <String>{},
   });
 
   final List<Episode> aEps;
   final List<Episode> bEps;
-  final List<VideoSource> aStreams;
-  final List<VideoSource> bStreams;
+  // Fixed per source: no test needs to vary the streams.
+  final List<VideoSource> aStreams = const [VideoSource(url: 'https://a/stream')];
+  final List<VideoSource> bStreams = const [VideoSource(url: 'https://b/stream')];
 
   /// Sources whose episode call never answers — a real one measured 38s.
   final Set<String> hangs;
   final log = <String>[];
+  final removed = <String>{};
 
   /// Every category this source was asked for.
   final cats = <String>[];
@@ -45,37 +45,61 @@ class _SweepSrc implements SourceRepository {
 
   @override
   List<({String id, String name})> get loadedSources => [
-    (id: 'src-a', name: 'A'),
-    (id: 'src-b', name: 'B'),
+    if (!removed.contains('src-a')) (id: 'src-a', name: 'A'),
+    if (!removed.contains('src-b')) (id: 'src-b', name: 'B'),
   ];
 
   @override
   List<({String id, String name})> get pickableSources => loadedSources;
 
   @override
-  bool hasSource(String sourceId) => true;
+  bool hasSource(String sourceId) => !removed.contains(sourceId);
 
   @override
-  Future<bool> ensureSourceLoaded(String sourceId) async => true;
+  Future<bool> ensureSourceLoaded(String sourceId) async => hasSource(sourceId);
 
   // Shown per row by the "Where to watch" sheet.
   @override
   String displayName(String sourceId) => sourceId;
 
   @override
-  Future<List<MediaItem>> search(String q, {String category = 'sub', String? sourceId}) async {
+  Future<List<MediaItem>> search(
+    String q, {
+    String category = 'sub',
+    String? sourceId,
+  }) async {
     log.add('search:$sourceId');
     if (sourceId == 'src-a') {
-      return [MediaItem(id: 'a', title: 'FMA', url: 'https://a/show', type: ProviderType.anime, sourceId: 'src-a')];
+      return [
+        MediaItem(
+          id: 'a',
+          title: 'FMA',
+          url: 'https://a/show',
+          type: ProviderType.anime,
+          sourceId: 'src-a',
+        ),
+      ];
     }
     if (sourceId == 'src-b') {
-      return [MediaItem(id: 'b', title: 'FMA', url: 'https://b/show', type: ProviderType.anime, sourceId: 'src-b')];
+      return [
+        MediaItem(
+          id: 'b',
+          title: 'FMA',
+          url: 'https://b/show',
+          type: ProviderType.anime,
+          sourceId: 'src-b',
+        ),
+      ];
     }
     return const [];
   }
 
   @override
-  Future<List<Episode>> episodes(String url, {String category = 'sub', String? sourceId}) async {
+  Future<List<Episode>> episodes(
+    String url, {
+    String category = 'sub',
+    String? sourceId,
+  }) async {
     log.add('episodes:$url:$sourceId');
     cats.add(category);
     if (hangs.contains(sourceId)) return Completer<List<Episode>>().future;
@@ -85,11 +109,31 @@ class _SweepSrc implements SourceRepository {
   }
 
   @override
-  Future<List<VideoSource>> sources(String episodeUrl, {String? sourceId, bool fast = false}) async {
+  Future<List<VideoSource>> sources(
+    String episodeUrl, {
+    String? sourceId,
+    bool fast = false,
+  }) async {
     log.add('sources:$episodeUrl:$sourceId');
     if (sourceId == 'src-a') return aStreams;
     if (sourceId == 'src-b') return bStreams;
     return const [];
+  }
+}
+
+/// Independently gated replies reproduce provider replacement during extraction.
+class _HeldInventorySources extends _SweepSrc {
+  _HeldInventorySources() : super(aEps: const [
+    Episode(id:'1',title:'E1',number:1,url:'https://a/1'),
+    Episode(id:'2',title:'E2',number:2,url:'https://a/2')], bEps: const [
+    Episode(id:'1',title:'E1',number:1,url:'https://b/1'),
+    Episode(id:'2',title:'E2',number:2,url:'https://b/2')]);
+  final entered = {for (final id in ['src-a','src-b']) id:Completer<void>()};
+  final replies = {for (final id in ['src-a','src-b']) id:Completer<List<VideoSource>>()};
+  @override Future<List<VideoSource>> sources(String url,{String? sourceId,bool fast=false}) {
+    final id=sourceId!;
+    if (!entered[id]!.isCompleted) entered[id]!.complete();
+    return replies[id]!.future;
   }
 }
 
@@ -99,6 +143,68 @@ void main() {
   late ZSourcePrefs prefs;
   late SourceHealthStore health;
   late SourceScoreStore scores;
+
+  test(
+    'desktop companion extraction outlives the synchronous JS budget',
+    () async {
+      if (!Platform.isWindows) return;
+      final source = _SlowCompanion();
+      final matcher = SourceMatcher(
+        sources: source,
+        store: store,
+        prefs: prefs,
+        candidates: (_) => source.loadedSources,
+      );
+      final player = PlaybackResolver(
+        matcher: matcher,
+        sources: source,
+        store: store,
+        prefs: prefs,
+        health: health,
+        candidates: (_) => source.loadedSources,
+        perSourceBudget: const Duration(milliseconds: 1),
+        companionBudget: const Duration(seconds: 1),
+      )..bindTitleLookup((_) async => (title: 'FMA', alt: null, malId: 100));
+      final result = await player.resolveForPlayback(_ep2);
+      expect(result.match.sourceId, 'cs:Slow');
+      expect(result.streams, isNotEmpty);
+    },
+  );
+
+  test('an installed manual pin survives automatic kind filtering', () async {
+    final source = _SweepSrc(
+      aEps: const [
+        Episode(id: '1', title: 'E1', number: 1, url: 'https://a/1'),
+        Episode(id: '2', title: 'E2', number: 2, url: 'https://a/2'),
+      ],
+      bEps: const [],
+    );
+    final matcher = SourceMatcher(
+      sources: source,
+      store: store,
+      prefs: prefs,
+      candidates: (_) => source.loadedSources,
+    );
+    await store.pin(
+      _show,
+      const SourceMatch(
+        sourceId: 'src-a',
+        showUrl: 'https://a/show',
+        showId: 'a',
+        showTitle: 'FMA',
+        pinned: true,
+      ),
+    );
+    final player = PlaybackResolver(
+      matcher: matcher,
+      sources: source,
+      store: store,
+      prefs: prefs,
+      health: health,
+      candidates: (_) => const [(id: 'src-b', name: 'B')],
+    )..bindTitleLookup((_) async => (title: 'FMA', alt: null, malId: 100));
+    expect((await player.resolveForPlayback(_ep2)).match.sourceId, 'src-a');
+  });
 
   setUp(() async {
     dir = await Directory.systemTemp.createTemp('playback-resolver');
@@ -134,6 +240,81 @@ void main() {
     );
     r.bindTitleLookup((_) async => (title: 'FMA', alt: null, malId: 100));
     return r;
+  }
+
+  for (final progressive in [false,true]) {
+    for (final oldFirst in [false,true]) {
+      test('provider replacement protects newer lookup progressive=$progressive oldFirst=$oldFirst', () async {
+        final src=_HeldInventorySources()..removed.add('src-b');
+        final matcher=SourceMatcher(sources:src,store:store,prefs:prefs,
+          candidates:(_)=>src.loadedSources);
+        final player=PlaybackResolver(matcher:matcher,sources:src,store:store,
+          prefs:prefs,health:health,candidates:(_)=>src.loadedSources)
+          ..bindTitleLookup((_) async => (title:'FMA',alt:null,malId:100));
+        final old=progressive ? player.resolveProgressive(_ep2).toList()
+            : player.resolveForPlayback(_ep2);
+        final retired=expectLater(old,throwsA(isA<PlaybackAborted>()));
+        await src.entered['src-a']!.future.timeout(const Duration(seconds:5));
+        src.removed..add('src-a')..remove('src-b');
+        final current=player.resolveForPlayback(_ep2);
+        await src.entered['src-b']!.future.timeout(const Duration(seconds:5));
+        if (oldFirst) {
+          src.replies['src-a']!.complete(const [VideoSource(url:'https://a/late')]);
+          await retired;
+          expect(identical(player.resolveForPlayback(_ep2),current),isTrue);
+        }
+        src.replies['src-b']!.complete(const [VideoSource(url:'https://b/current')]);
+        expect((await current).streams.single.url,'https://b/current');
+        if (!oldFirst) {
+          src.replies['src-a']!.complete(const [VideoSource(url:'https://a/late')]);
+          await retired;
+        }
+        expect(player.resolvedSourceId(_ep2),'src-b');
+      });
+    }
+  }
+
+  for (final progressive in [false,true]) {
+    test('installing a provider invalidates cached miss progressive=$progressive', () async {
+      final src=_SweepSrc(aEps:const [],bEps:const [
+        Episode(id:'1',title:'E1',number:1,url:'https://b/1'),
+        Episode(id:'2',title:'E2',number:2,url:'https://b/2')]);
+      src.removed.add('src-b');
+      final matcher=SourceMatcher(sources:src,store:store,prefs:prefs,
+        candidates:(_)=>src.loadedSources);
+      final player=PlaybackResolver(matcher:matcher,sources:src,store:store,
+        prefs:prefs,health:health,candidates:(_)=>src.loadedSources)
+        ..bindTitleLookup((_) async => (title:'FMA',alt:null,malId:100));
+      await expectLater(player.resolveForPlayback(_ep2),throwsA(isA<EpisodeNotAvailable>()));
+      src.removed.remove('src-b');
+      final streams=progressive ? (await player.resolveProgressive(_ep2).last).streams
+          : await player.sources(_ep2);
+      expect(streams.single.url,'https://b/stream');
+    });
+  }
+
+  for (final progressive in [false,true]) {
+    test('removed cached provider yields to installed provider progressive=$progressive', () async {
+      final src=_SweepSrc(aEps:const [
+        Episode(id:'1',title:'E1',number:1,url:'https://a/1'),
+        Episode(id:'2',title:'E2',number:2,url:'https://a/2')],
+        bEps:const [Episode(id:'1',title:'E1',number:1,url:'https://b/1'),
+        Episode(id:'2',title:'E2',number:2,url:'https://b/2')]);
+      final matcher=SourceMatcher(sources:src,store:store,prefs:prefs,
+        candidates:(_)=>src.loadedSources);
+      final player=PlaybackResolver(matcher:matcher,sources:src,store:store,
+        prefs:prefs,health:health,candidates:(_)=>src.loadedSources)
+        ..bindTitleLookup((_) async => (title:'FMA',alt:null,malId:100));
+      await prefs.set(_show.kind,'src-a');
+      expect((await player.resolveForPlayback(_ep2)).match.sourceId,'src-a');
+      src.removed.add('src-a'); src.log.clear();
+      final streams= progressive
+          ? (await player.resolveProgressive(_ep2).last).streams
+          : await player.sources(_ep2);
+      expect(streams.single.url,'https://b/stream');
+      expect(src.log.any((entry)=>entry.contains('src-a')),isFalse);
+      expect(store.get(_show,'src-a'),isNotNull);
+    });
   }
 
   test('switching a title\'s source drops its cached winners', () async {
@@ -195,8 +376,11 @@ void main() {
     expect((await r.resolveForPlayback(_ep2)).match.sourceId, 'src-a');
 
     expect(scores.plays('src-a'), 1);
-    expect(scores.plays('src-b'), 0,
-        reason: 'only the source that served the stream is credited');
+    expect(
+      scores.plays('src-b'),
+      0,
+      reason: 'only the source that served the stream is credited',
+    );
   });
 
   test('a different show keeps its cached winner', () async {
@@ -249,13 +433,16 @@ void main() {
   });
 
   test('prefers pinned source over preferred', () async {
-    await store.pin(_show, const SourceMatch(
-      sourceId: 'src-a',
-      showUrl: 'https://a/show',
-      showId: 'a',
-      showTitle: 'FMA',
-      pinned: true,
-    ));
+    await store.pin(
+      _show,
+      const SourceMatch(
+        sourceId: 'src-a',
+        showUrl: 'https://a/show',
+        showId: 'a',
+        showTitle: 'FMA',
+        pinned: true,
+      ),
+    );
     final src = _SweepSrc(
       aEps: const [
         Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://a/1'),
@@ -279,13 +466,16 @@ void main() {
   });
 
   test('Continue Watching prewarm asks only the remembered source', () async {
-    await store.pin(_show, const SourceMatch(
-      sourceId: 'src-a',
-      showUrl: 'https://a/show',
-      showId: 'a',
-      showTitle: 'FMA',
-      pinned: true,
-    ));
+    await store.pin(
+      _show,
+      const SourceMatch(
+        sourceId: 'src-a',
+        showUrl: 'https://a/show',
+        showId: 'a',
+        showTitle: 'FMA',
+        pinned: true,
+      ),
+    );
     final src = _SweepSrc(
       aEps: const [
         Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://a/1'),
@@ -313,8 +503,12 @@ void main() {
 
   test('throws EpisodeNotAvailable when episode missing everywhere', () async {
     final src = _SweepSrc(
-      aEps: const [Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://a/1')],
-      bEps: const [Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://b/1')],
+      aEps: const [
+        Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://a/1'),
+      ],
+      bEps: const [
+        Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://b/1'),
+      ],
     );
     final matcher = SourceMatcher(
       sources: src,
@@ -325,7 +519,13 @@ void main() {
     final r = resolver(sources: src, matcher: matcher);
     expect(
       () => r.resolveForPlayback('zm://anime/mal:100/ep/5'),
-      throwsA(isA<EpisodeNotAvailable>().having((e) => e.hadTitleMatch, 'hadTitleMatch', isTrue)),
+      throwsA(
+        isA<EpisodeNotAvailable>().having(
+          (e) => e.hadTitleMatch,
+          'hadTitleMatch',
+          isTrue,
+        ),
+      ),
     );
   });
 
@@ -349,33 +549,37 @@ void main() {
     expect(identical(await a, await b), isTrue);
   });
 
-  test('a source that hangs is abandoned at the budget, and the sweep goes on',
-      () async {
-    // The freeze this budget exists for: on a real device one provider held
-    // the sweep 38 seconds and the whole tap took 100. src-a never answers.
-    final src = _SweepSrc(
-      aEps: const [],
-      bEps: const [
-        Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://b/1'),
-        Episode(id: '2', title: 'Ep 2', number: 2, url: 'https://b/2'),
-      ],
-      hangs: const {'src-a'},
-    );
-    final matcher = SourceMatcher(
-      sources: src, store: store, prefs: prefs,
-      candidates: (_) => src.loadedSources,
-    );
-    final r = resolver(
-      sources: src,
-      matcher: matcher,
-      preferred: 'src-a',
-      budget: const Duration(milliseconds: 60),
-    );
+  test(
+    'a source that hangs is abandoned at the budget, and the sweep goes on',
+    () async {
+      // The freeze this budget exists for: on a real device one provider held
+      // the sweep 38 seconds and the whole tap took 100. src-a never answers.
+      final src = _SweepSrc(
+        aEps: const [],
+        bEps: const [
+          Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://b/1'),
+          Episode(id: '2', title: 'Ep 2', number: 2, url: 'https://b/2'),
+        ],
+        hangs: const {'src-a'},
+      );
+      final matcher = SourceMatcher(
+        sources: src,
+        store: store,
+        prefs: prefs,
+        candidates: (_) => src.loadedSources,
+      );
+      final r = resolver(
+        sources: src,
+        matcher: matcher,
+        preferred: 'src-a',
+        budget: const Duration(milliseconds: 60),
+      );
 
-    final out = await r.resolveForPlayback(_ep2);
-    expect(out.match.sourceId, 'src-b');
-    expect(out.episodeUrl, 'https://b/2');
-  });
+      final out = await r.resolveForPlayback(_ep2);
+      expect(out.match.sourceId, 'src-b');
+      expect(out.episodeUrl, 'https://b/2');
+    },
+  );
 
   test('a source that blew the budget is skipped on the next sweep', () async {
     // Without this the very next resolve pays the same wait again — which is
@@ -390,7 +594,9 @@ void main() {
       hangs: const {'src-a'},
     );
     final matcher = SourceMatcher(
-      sources: src, store: store, prefs: prefs,
+      sources: src,
+      store: store,
+      prefs: prefs,
       candidates: (_) => src.loadedSources,
     );
     final r = resolver(
@@ -404,8 +610,11 @@ void main() {
     src.log.clear();
     await r.resolveForPlayback('zm://anime/mal:100/ep/3');
 
-    expect(src.log.where((l) => l.endsWith(':src-a')), isEmpty,
-        reason: 'src-a blew the budget once; it must not be asked again');
+    expect(
+      src.log.where((l) => l.endsWith(':src-a')),
+      isEmpty,
+      reason: 'src-a blew the budget once; it must not be asked again',
+    );
     expect(src.log, contains('sources:https://b/3:src-b'));
   });
 
@@ -453,46 +662,54 @@ void main() {
         reason: 'a pinned source is tried every time, not skipped');
   });
 
-  test('invalidateWinner clears over-budget so an episode tap retries', () async {
-    // A tap / Retry is intentional: sources that timed out must be eligible
-    // again. The cooldown only protects automatic follow-on sweeps.
-    final src = _SweepSrc(
-      aEps: const [
-        Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://a/1'),
-        Episode(id: '2', title: 'Ep 2', number: 2, url: 'https://a/2'),
-        Episode(id: '3', title: 'Ep 3', number: 3, url: 'https://a/3'),
-      ],
-      // b can serve ep2 (so the first sweep finishes) but not ep3 — the retry
-      // must fall through to src-a, which is only possible if the cooldown
-      // was cleared.
-      bEps: const [
-        Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://b/1'),
-        Episode(id: '2', title: 'Ep 2', number: 2, url: 'https://b/2'),
-      ],
-      hangs: const {'src-a'},
-    );
-    final matcher = SourceMatcher(
-      sources: src, store: store, prefs: prefs,
-      candidates: (_) => src.loadedSources,
-    );
-    final r = resolver(
-      sources: src,
-      matcher: matcher,
-      preferred: 'src-a',
-      budget: const Duration(milliseconds: 60),
-    );
+  test(
+    'invalidateWinner clears over-budget so an episode tap retries',
+    () async {
+      // A tap / Retry is intentional: sources that timed out must be eligible
+      // again. The cooldown only protects automatic follow-on sweeps.
+      final src = _SweepSrc(
+        aEps: const [
+          Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://a/1'),
+          Episode(id: '2', title: 'Ep 2', number: 2, url: 'https://a/2'),
+          Episode(id: '3', title: 'Ep 3', number: 3, url: 'https://a/3'),
+        ],
+        // b can serve ep2 (so the first sweep finishes) but not ep3 — the retry
+        // must fall through to src-a, which is only possible if the cooldown
+        // was cleared.
+        bEps: const [
+          Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://b/1'),
+          Episode(id: '2', title: 'Ep 2', number: 2, url: 'https://b/2'),
+        ],
+        hangs: const {'src-a'},
+      );
+      final matcher = SourceMatcher(
+        sources: src,
+        store: store,
+        prefs: prefs,
+        candidates: (_) => src.loadedSources,
+      );
+      final r = resolver(
+        sources: src,
+        matcher: matcher,
+        preferred: 'src-a',
+        budget: const Duration(milliseconds: 60),
+      );
 
-    await r.resolveForPlayback(_ep2);
-    src.log.clear();
-    r.invalidateWinner('zm://anime/mal:100/ep/3');
-    await expectLater(
-      r.resolveForPlayback('zm://anime/mal:100/ep/3'),
-      throwsA(isA<EpisodeNotAvailable>()),
-    );
+      await r.resolveForPlayback(_ep2);
+      src.log.clear();
+      r.invalidateWinner('zm://anime/mal:100/ep/3');
+      await expectLater(
+        r.resolveForPlayback('zm://anime/mal:100/ep/3'),
+        throwsA(isA<EpisodeNotAvailable>()),
+      );
 
-    expect(src.log.where((l) => l.endsWith(':src-a')), isNotEmpty,
-        reason: 'after invalidateWinner, src-a must be tried again');
-  });
+      expect(
+        src.log.where((l) => l.endsWith(':src-a')),
+        isNotEmpty,
+        reason: 'after invalidateWinner, src-a must be tried again',
+      );
+    },
+  );
 
   test('dub and sub are resolved and cached separately', () async {
     // The reported bug lives here. sub and dub are different episode lists
@@ -566,26 +783,44 @@ void main() {
     // candidate — and ran again the moment Home re-asked after backing out of
     // the player.
     final src = _SweepSrc(
-      aEps: const [Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://a/1')],
-      bEps: const [Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://b/1')],
+      aEps: const [
+        Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://a/1'),
+      ],
+      bEps: const [
+        Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://b/1'),
+      ],
     );
     final matcher = SourceMatcher(
-      sources: src, store: store, prefs: prefs,
+      sources: src,
+      store: store,
+      prefs: prefs,
       candidates: (_) => src.loadedSources,
     );
     final r = resolver(sources: src, matcher: matcher);
 
-    await expectLater(r.resolveForPlayback(_ep2), throwsA(isA<EpisodeNotAvailable>()));
+    await expectLater(
+      r.resolveForPlayback(_ep2),
+      throwsA(isA<EpisodeNotAvailable>()),
+    );
     expect(src.log.where((l) => l.startsWith('episodes:')), isNotEmpty);
 
     src.log.clear();
-    await expectLater(r.resolveForPlayback(_ep2), throwsA(isA<EpisodeNotAvailable>()));
-    expect(src.log, isEmpty,
-        reason: 'the second ask must answer from memory, not 36 more fetches');
+    await expectLater(
+      r.resolveForPlayback(_ep2),
+      throwsA(isA<EpisodeNotAvailable>()),
+    );
+    expect(
+      src.log,
+      isEmpty,
+      reason: 'the second ask must answer from memory, not 36 more fetches',
+    );
 
     // Retry / a source switch has to get a real sweep back.
     r.invalidateWinner(_ep2);
-    await expectLater(r.resolveForPlayback(_ep2), throwsA(isA<EpisodeNotAvailable>()));
+    await expectLater(
+      r.resolveForPlayback(_ep2),
+      throwsA(isA<EpisodeNotAvailable>()),
+    );
     expect(src.log.where((l) => l.startsWith('episodes:')), isNotEmpty);
   });
 
@@ -604,7 +839,9 @@ void main() {
       ],
     );
     final matcher = SourceMatcher(
-      sources: src, store: store, prefs: prefs,
+      sources: src,
+      store: store,
+      prefs: prefs,
       candidates: (_) => src.loadedSources,
     );
     final r = resolver(sources: src, matcher: matcher);
@@ -615,10 +852,7 @@ void main() {
         .toList();
     expect(asked, isEmpty, reason: 'no time left, so nothing is asked');
 
-    final full = await r
-        .probeEach(_ep2)
-        .where((p) => !p.checking)
-        .toList();
+    final full = await r.probeEach(_ep2).where((p) => !p.checking).toList();
     expect(full.length, 2, reason: 'with time, every candidate is asked');
     // The probe answers "has the episode" WITHOUT resolving streams — that is
     // the expensive half, and it measured 3-13s per source on device.
@@ -648,7 +882,9 @@ void main() {
       ],
     );
     final matcher = SourceMatcher(
-      sources: src, store: store, prefs: prefs,
+      sources: src,
+      store: store,
+      prefs: prefs,
       candidates: (_) => src.loadedSources,
     );
     final r = resolver(sources: src, matcher: matcher);
@@ -659,4 +895,95 @@ void main() {
     await Future<void>.delayed(const Duration(milliseconds: 80));
     expect(src.log, isEmpty, reason: 'cancelled means cancelled');
   });
+
+  // Windows plan item R5: the late-mirror poll reads with the player's own
+  // Sub/Dub cut. The player plays dub while the show's detail was last
+  // loaded as sub: the old shared read (polledSources with the detail's cut)
+  // started a new sweep for sub; the poll's read must not.
+  test('polledWinnerSources reads only the winner of its own cut', () async {
+    final src = _PolledSrc(
+      aEps: const [
+        Episode(id: '1', title: 'Ep 1', number: 1, url: 'https://a/1'),
+        Episode(id: '2', title: 'Ep 2', number: 2, url: 'https://a/2'),
+      ],
+      bEps: const [],
+    );
+    final matcher = SourceMatcher(
+      sources: src,
+      store: store,
+      prefs: prefs,
+      candidates: (_) => src.loadedSources,
+    );
+    final r = resolver(sources: src, matcher: matcher, preferred: 'src-a');
+    // The player resolved dub; only a dub winner exists.
+    await r.resolveForPlayback(_ep2, category: 'dub');
+    expect(r.resolvedSourceId(_ep2, category: 'dub'), 'src-a');
+    src.log.clear();
+
+    // The other cut has no winner: "nothing more", and no search at all.
+    final sub = await r.polledWinnerSources(_ep2, category: 'sub');
+    expect(sub.done, isTrue);
+    expect(sub.sources, isEmpty);
+    expect(src.log, isEmpty, reason: 'a late-mirror read started a sweep');
+    expect(r.resolvedSourceId(_ep2, category: 'sub'), isNull);
+
+    // The playing cut reads the dub winner's own episode, nothing else.
+    final dub = await r.polledWinnerSources(_ep2, category: 'dub');
+    expect(dub.sources.map((s) => s.url), ['https://a/late-dub']);
+    expect(src.log, ['polled:https://a/2:src-a']);
+  });
+}
+
+/// Records late-link reads, and answers them with one extra mirror.
+class _PolledSrc extends _SweepSrc {
+  _PolledSrc({required super.aEps, required super.bEps});
+
+  @override
+  Future<({List<VideoSource> sources, bool done})> polledSources(
+    String episodeUrl, {
+    String? sourceId,
+  }) async {
+    log.add('polled:$episodeUrl:$sourceId');
+    return (
+      sources: const [VideoSource(url: 'https://a/late-dub')],
+      done: false,
+    );
+  }
+}
+
+/// Simulates a companion which answers after the in-process JS deadline.
+class _SlowCompanion extends _SweepSrc {
+  _SlowCompanion()
+    : super(
+        aEps: const [
+          Episode(id: '1', title: 'E1', number: 1, url: 'https://a/1'),
+          Episode(id: '2', title: 'E2', number: 2, url: 'https://a/2'),
+        ],
+        bEps: const [],
+      );
+  @override
+  List<({String id, String name})> get loadedSources => const [
+    (id: 'cs:Slow', name: 'Slow'),
+  ];
+  @override
+  Future<List<MediaItem>> search(
+    String query, {
+    String category = 'sub',
+    String? sourceId,
+  }) => super.search(query, category: category, sourceId: 'src-a');
+  @override
+  Future<List<Episode>> episodes(
+    String url, {
+    String category = 'sub',
+    String? sourceId,
+  }) => super.episodes(url, category: category, sourceId: 'src-a');
+  @override
+  Future<List<VideoSource>> sources(
+    String url, {
+    String? sourceId,
+    bool fast = false,
+  }) async {
+    await Future<void>.delayed(const Duration(milliseconds: 35));
+    return super.sources(url, sourceId: 'src-a', fast: fast);
+  }
 }

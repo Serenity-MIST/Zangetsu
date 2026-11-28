@@ -63,6 +63,14 @@ class _DownloadSheet extends StatefulWidget {
 }
 
 class _DownloadSheetState extends State<_DownloadSheet> {
+  /// Keep server identity separate from quality for per-episode batch resolution.
+  VideoSource? get _selectedServer {
+    final sources = _sources;
+    return sources != null && _selectedSourceIdx < sources.length
+        ? sources[_selectedSourceIdx]
+        : null;
+  }
+
   String _quality = 'best';
   late int _season;
   late String _category;
@@ -327,6 +335,8 @@ class _DownloadSheetState extends State<_DownloadSheet> {
     if (_downloadBusy || episodes.isEmpty) return;
     final choice = (
       quality: _quality,
+      // Keep the picked server so batch downloads stay on it (desktop work).
+      server: _selectedServer,
       category: _category,
       episodes: List<Episode>.of(episodes),
     );
@@ -554,6 +564,10 @@ class _DownloadSheetState extends State<_DownloadSheet> {
                       },
                     ),
             ),
+
+            if (_windowsDesktopUi && _selectedServer != null && count > 0)
+              DownloadSizePreview(source: _selectedServer!, quality: _quality, count: count,
+                runtimeMinutes: _seasonEps.firstOrNull?.runtimeMinutes),
 
             // ── Download button ────────────────────────────────────────────
             const SizedBox(height: 16),
@@ -1084,6 +1098,9 @@ class _DownloadSheetState extends State<_DownloadSheet> {
             ),
             Center(child: _sizeLine(count, centered: true)),
             const SizedBox(height: 12),
+            if (_windowsDesktopUi && _selectedServer != null && count > 0)
+              DownloadSizePreview(source: _selectedServer!, quality: _quality, count: count,
+                runtimeMinutes: _seasonEps.firstOrNull?.runtimeMinutes),
             Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [

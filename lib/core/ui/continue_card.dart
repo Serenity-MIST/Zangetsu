@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
@@ -57,7 +58,8 @@ class _ContinueCardState extends State<ContinueCard> {
     return RepaintBoundary(
       child: GestureDetector(
         onTap: widget.onTap,
-        onLongPress: widget.onLongPress,
+        onLongPress: Platform.isWindows ? null : widget.onLongPress,
+        onSecondaryTap: Platform.isWindows ? widget.onLongPress : null,
         onTapDown: _handleTapDown,
         onTapUp: _handleTapUp,
         onTapCancel: _handleTapCancel,
@@ -165,9 +167,7 @@ class _ContinueCardState extends State<ContinueCard> {
                   child: Stack(
                     fit: StackFit.expand,
                     children: [
-                      ColoredBox(
-                        color: Colors.white.withValues(alpha: 0.25),
-                      ),
+                      ColoredBox(color: Colors.white.withValues(alpha: 0.25)),
                       FractionallySizedBox(
                         alignment: AlignmentDirectional.centerStart,
                         widthFactor: p,
@@ -229,7 +229,8 @@ class _ContinueReadingCardState extends State<ContinueReadingCard> {
     return RepaintBoundary(
       child: GestureDetector(
         onTap: widget.onTap,
-        onLongPress: widget.onLongPress,
+        onLongPress: Platform.isWindows ? null : widget.onLongPress,
+        onSecondaryTap: Platform.isWindows ? widget.onLongPress : null,
         onTapDown: (_) => setState(() => _pressed = true),
         onTapUp: (_) => setState(() => _pressed = false),
         onTapCancel: () => setState(() => _pressed = false),

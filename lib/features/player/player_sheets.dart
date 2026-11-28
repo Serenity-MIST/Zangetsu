@@ -130,15 +130,24 @@ class _AudioSubsSheetState extends State<_AudioSubsSheet> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Container(
-                  margin: const EdgeInsets.symmetric(vertical: 10),
-                  width: 36,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: AppColors.surface2,
-                    borderRadius: BorderRadius.circular(2),
+                if (_DesktopPlayerPanel.of(context))
+                  _PanelTitleBar(
+                    title: switch (widget.focus) {
+                      AudioSubsFocus.audio => context.l10n.audio,
+                      AudioSubsFocus.subtitles => context.l10n.subtitles,
+                      null => context.l10n.audioSubs,
+                    },
+                  )
+                else
+                  Container(
+                    margin: const EdgeInsets.symmetric(vertical: 10),
+                    width: 36,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: AppColors.surface2,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
                   ),
-                ),
                 ConstrainedBox(
                   constraints: BoxConstraints(maxHeight: h * 0.5),
                   child: Row(
@@ -192,6 +201,18 @@ class _AudioSubsSheetState extends State<_AudioSubsSheet> {
                     active: false,
                     onTap: () {
                       widget.onInteract();
+                      if (_DesktopPlayerPanel.of(context)) {
+                        // Windows: swap docked panels rather than stacking
+                        // a second one over this one.
+                        final nav = Navigator.of(context);
+                        nav.pop();
+                        openSubtitleStyleSheet(
+                          nav.context,
+                          c,
+                          widget.onInteract,
+                        );
+                        return;
+                      }
                       openSubtitleStyleSheet(context, c, widget.onInteract);
                     },
                   ),
@@ -434,9 +455,17 @@ class _OnlineSubtitleSheet extends StatefulWidget {
     this.initialLanguage = '',
     this.imdbId,
     this.tmdbId,
+    this.isTv = false,
+    this.season,
+    this.episode,
   });
   final String initialQuery;
   final Future<void> Function(String localPath) onApply;
+
+  /// For a series, the exact episode being watched. With an id these make the
+  /// search return subtitles for this episode, not arbitrary ones from the show.
+  final bool isTv;
+  final int? season, episode;
 
   /// ISO-639-1 code pre-selected in the language picker ('' = any language).
   final String initialLanguage;
@@ -481,7 +510,7 @@ class _OnlineSubtitleSheetState extends State<_OnlineSubtitleSheet> {
   Future<void> _search() async {
     final q = _query.text.trim();
     if (q.isEmpty || _searching) return;
-    FocusScope.of(context).unfocus();
+    DesktopFocusRepair.dropFocus(context);
     setState(() {
       _searching = true;
       _error = null;
@@ -493,6 +522,9 @@ class _OnlineSubtitleSheetState extends State<_OnlineSubtitleSheet> {
         language: _selectedLang.isEmpty ? '' : _selectedLang,
         imdbId: widget.imdbId,
         tmdbId: widget.tmdbId,
+        isTv: widget.isTv,
+        season: widget.season,
+        episode: widget.episode,
       );
       if (!mounted) return;
       setState(() {
@@ -545,22 +577,26 @@ class _OnlineSubtitleSheetState extends State<_OnlineSubtitleSheet> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Container(
-            margin: const EdgeInsets.symmetric(vertical: 10),
-            width: 36,
-            height: 4,
-            decoration: BoxDecoration(
-              color: AppColors.surface2,
-              borderRadius: BorderRadius.circular(2),
+          if (_DesktopPlayerPanel.of(context))
+            _PanelTitleBar(title: context.l10n.searchSubtitlesOnline)
+          else ...[
+            Container(
+              margin: const EdgeInsets.symmetric(vertical: 10),
+              width: 36,
+              height: 4,
+              decoration: BoxDecoration(
+                color: AppColors.surface2,
+                borderRadius: BorderRadius.circular(2),
+              ),
             ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
-            child: Text(
-              context.l10n.searchSubtitlesOnline,
-              style: AppText.headline,
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+              child: Text(
+                context.l10n.searchSubtitlesOnline,
+                style: AppText.headline,
+              ),
             ),
-          ),
+          ],
           // Language picker — defaults to the user's preferred subtitle
           // language (when set in Settings) and lets the user change it
           // per-search without leaving the sheet.
@@ -784,6 +820,635 @@ Future<void> showOnlineSubtitleSheet(
   );
 }
 
+/// True when in-player menus open as a right-docked Windows panel rather than
+/// a phone bottom sheet. TV builds (Android) never take this path.
+bool get playerMenusDocked =>
+    defaultTargetPlatform == TargetPlatform.windows &&
+    !(sl.isRegistered<AppMode>() && sl<AppMode>().isTv);
+
+/// Marks content shown inside [showDesktopPlayerPanel], so the shared sheet
+/// widgets swap the phone grabber for a title row with a close button.
+class _DesktopPlayerPanel extends InheritedWidget {
+  const _DesktopPlayerPanel({required super.child});
+
+  /// True when [context] sits inside a Windows docked player panel.
+  static bool of(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<_DesktopPlayerPanel>() != null;
+
+  @override
+  bool updateShouldNotify(_DesktopPlayerPanel oldWidget) => false;
+}
+
+/// Windows in-player menu: a graphite panel docked to the right edge over a
+/// light scrim, so the video stays visible. Clicking outside or Esc closes it
+/// (Esc is the dialog route's own DismissIntent).
+Future<T?> showDesktopPlayerPanel<T>(
+  BuildContext context, {
+  required WidgetBuilder builder,
+  double width = 440,
+  Key? dialogKey,
+}) {
+  // A row of the open More panel asked for this menu: show it inside that
+  // panel (with a back arrow) instead of stacking a second panel (player-15).
+  final host = _DesktopMorePanelState._capturing;
+  if (host != null && host.mounted) return host.pushSubPage<T>(builder);
+  return _showDockedPlayerPanel<T>(
+    context,
+    builder: builder,
+    width: width,
+    dialogKey: dialogKey,
+  );
+}
+
+/// The docked dialog itself, shared by [showDesktopPlayerPanel] and the More
+/// panel.
+Future<T?> _showDockedPlayerPanel<T>(
+  BuildContext context, {
+  required WidgetBuilder builder,
+  double width = 440,
+  Key? dialogKey,
+}) => showDialog<T>(
+  context: context,
+  useRootNavigator: false,
+  barrierColor: Colors.black26,
+  builder: (dialogContext) => Dialog(
+    key: dialogKey ?? const ValueKey('player-desktop-panel'),
+    alignment: Alignment.centerRight,
+    // Follows Pure black / Background colour; stock keeps the original grey.
+    backgroundColor: DesktopPanelColors.surface,
+    surfaceTintColor: Colors.transparent,
+    insetPadding: const EdgeInsets.all(24),
+    shape: RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(20),
+      side: BorderSide(color: DesktopPanelColors.edge),
+    ),
+    clipBehavior: Clip.antiAlias,
+    child: ConstrainedBox(
+      constraints: BoxConstraints(
+        maxWidth: width,
+        maxHeight: MediaQuery.sizeOf(dialogContext).height * 0.85,
+      ),
+      child: _DesktopPlayerPanel(
+        child: _EscCloses(
+          // Sheet bodies size to content; give them the panel's full width.
+          child: SizedBox(
+            width: width,
+            child: Builder(builder: builder),
+          ),
+        ),
+      ),
+    ),
+  ),
+);
+
+/// Esc closes the dialog it sits in. Needed because the window-level Esc
+/// binding (DesktopWindow: leave fullscreen, else pop the root navigator) sits
+/// above the dialog route and would otherwise take the key first. Autofocus
+/// puts focus inside the panel, so this handler sees Esc before that one.
+class _EscCloses extends StatelessWidget {
+  const _EscCloses({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) => CallbackShortcuts(
+    bindings: {
+      const SingleActivator(LogicalKeyboardKey.escape): () =>
+          Navigator.of(context).maybePop(),
+    },
+    child: Focus(autofocus: true, child: child),
+  );
+}
+
+/// Title row of a Windows docked panel: title, optional [actions], close.
+class _PanelTitleBar extends StatelessWidget {
+  const _PanelTitleBar({required this.title, this.actions = const []});
+
+  final String title;
+  final List<Widget> actions;
+
+  @override
+  Widget build(BuildContext context) {
+    // Inside a More-panel sub-page: a back arrow returns to the More list.
+    final back = _DesktopMoreSubPage.backOf(context);
+    return Padding(
+      padding: EdgeInsets.fromLTRB(back == null ? 20 : 6, 12, 8, 6),
+      child: Row(
+        children: [
+          if (back != null)
+            IconButton(
+              key: const ValueKey('player-panel-back'),
+              tooltip: MaterialLocalizations.of(context).backButtonTooltip,
+              onPressed: back,
+              icon: const Icon(Icons.arrow_back_rounded),
+              color: AppColors.textSecondary,
+            ),
+          Expanded(
+            child: Text(
+              title,
+              style: AppText.headline.copyWith(
+                fontSize: 20,
+                color: AppColors.textPrimary,
+              ),
+            ),
+          ),
+          ...actions,
+          IconButton(
+            key: const ValueKey('player-panel-close'),
+            tooltip: MaterialLocalizations.of(context).closeButtonTooltip,
+            onPressed: () => Navigator.of(context).maybePop(),
+            icon: const Icon(Icons.close_rounded),
+            color: AppColors.textSecondary,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Windows More panel (player-15) ───────────────────────────────────────────
+
+/// Marks a sub-page shown inside the More panel and carries its back action,
+/// so [_PanelTitleBar] can draw a back arrow.
+class _DesktopMoreSubPage extends InheritedWidget {
+  const _DesktopMoreSubPage({
+    super.key,
+    required this.onBack,
+    required super.child,
+  });
+
+  final VoidCallback onBack;
+
+  /// The back action of the sub-page around [context], or null outside one.
+  static VoidCallback? backOf(BuildContext context) => context
+      .dependOnInheritedWidgetOfExactType<_DesktopMoreSubPage>()
+      ?.onBack;
+
+  @override
+  bool updateShouldNotify(_DesktopMoreSubPage oldWidget) =>
+      oldWidget.onBack != onBack;
+}
+
+/// Windows: the More menu as the standard docked panel. Decoder, enhancement,
+/// colour, sleep timer and external player open IN the panel (with a back
+/// arrow) instead of closing it and opening a second one.
+Future<void> showDesktopPlayerMorePanel({
+  required BuildContext context,
+  required String decoderLabel,
+  required bool enhanceActive,
+  required VoidCallback onDecoder,
+  required VoidCallback onEnhance,
+  required VoidCallback onColorProfile,
+  required VoidCallback onScreenshot,
+  required bool sleepActive,
+  required VoidCallback onSleep,
+  required VoidCallback? onPip,
+  PlayerCubit? controller,
+}) => _showDockedPlayerPanel<void>(
+  context,
+  dialogKey: const ValueKey('player-more-panel'),
+  builder: (panelContext) => _DesktopMorePanel(
+    outerContext: context,
+    decoderLabel: decoderLabel,
+    enhanceActive: enhanceActive,
+    onDecoder: onDecoder,
+    onEnhance: onEnhance,
+    onColorProfile: onColorProfile,
+    onScreenshot: onScreenshot,
+    sleepActive: sleepActive,
+    onSleep: onSleep,
+    onPip: onPip,
+    controller: controller,
+  ),
+);
+
+/// Body of the Windows More panel: the list of rows and, when one opens a
+/// menu in place, that menu as a sub-page.
+class _DesktopMorePanel extends StatefulWidget {
+  const _DesktopMorePanel({
+    required this.outerContext,
+    required this.decoderLabel,
+    required this.enhanceActive,
+    required this.onDecoder,
+    required this.onEnhance,
+    required this.onColorProfile,
+    required this.onScreenshot,
+    required this.sleepActive,
+    required this.onSleep,
+    required this.onPip,
+    required this.controller,
+  });
+
+  /// The player's context (outlives the panel; used for toasts after close).
+  final BuildContext outerContext;
+  final String decoderLabel;
+  final bool enhanceActive;
+  final VoidCallback onDecoder, onEnhance, onColorProfile, onScreenshot;
+  final bool sleepActive;
+  final VoidCallback onSleep;
+  final VoidCallback? onPip;
+
+  /// Source of the stream link / headers; null hides those rows.
+  final PlayerCubit? controller;
+
+  @override
+  State<_DesktopMorePanel> createState() => _DesktopMorePanelState();
+}
+
+/// State of [_DesktopMorePanel]: which sub-page shows and where focus sits.
+class _DesktopMorePanelState extends State<_DesktopMorePanel> {
+  /// Set only while a row's action runs, so the panel that action opens
+  /// lands in here (see [showDesktopPlayerPanel]).
+  static _DesktopMorePanelState? _capturing;
+
+  // The sub-page now showing (null = the More list) and its result.
+  WidgetBuilder? _sub;
+  Completer<Object?>? _subDone;
+
+  /// Runs [action]; a docked panel it opens synchronously becomes a
+  /// sub-page here.
+  void _runInPlace(VoidCallback action) {
+    _capturing = this;
+    try {
+      action();
+    } finally {
+      _capturing = null;
+    }
+  }
+
+  /// Shows [builder] as a sub-page; completes when it is left.
+  Future<T?> pushSubPage<T>(WidgetBuilder builder) {
+    _finishSub();
+    final done = Completer<Object?>();
+    setState(() {
+      _sub = builder;
+      _subDone = done;
+    });
+    _focusCurrent();
+    return done.future.then((v) => v is T ? v : null);
+  }
+
+  /// Completes the open sub-page's result (null) and forgets it.
+  void _finishSub() {
+    final done = _subDone;
+    _subDone = null;
+    if (done != null && !done.isCompleted) done.complete(null);
+  }
+
+  /// Back to the More list.
+  void _back() {
+    if (!mounted) return;
+    _finishSub();
+    setState(() => _sub = null);
+    _focusCurrent();
+  }
+
+  @override
+  void dispose() {
+    _finishSub();
+    _rootFocus.dispose();
+    _subFocus.dispose();
+    super.dispose();
+  }
+
+  /// Closes the panel, then runs [action] (for actions that act on the
+  /// video and must not leave the panel over it).
+  void _closeThen(VoidCallback action) {
+    Navigator.of(context).pop();
+    action();
+  }
+
+  /// The first key bound to shortcut [id], as text, or null when unbound.
+  String? _hint(String id) {
+    final keys = DesktopShortcuts.activatorsFor(id);
+    return keys.isEmpty ? null : DesktopShortcuts.describe(keys.first);
+  }
+
+  /// Title for an external player window: show and episode.
+  String? _externalTitle() {
+    final c = widget.controller;
+    if (c == null || c.episodes.isEmpty) return c?.showTitle;
+    final parts = [
+      c.showTitle,
+      c.currentEpisode.title,
+    ].whereType<String>().where((s) => s.trim().isNotEmpty);
+    return parts.isEmpty ? null : parts.join(' • ');
+  }
+
+  // Keyboard focus for the list and for the sub-page. Moved explicitly on
+  // every switch so Esc always reaches the right handler (back from a
+  // sub-page, close from the list) and never the window-level Esc.
+  final FocusNode _rootFocus = FocusNode(debugLabel: 'more-root');
+  final FocusNode _subFocus = FocusNode(debugLabel: 'more-sub');
+
+  @override
+  void initState() {
+    super.initState();
+    _focusCurrent();
+  }
+
+  /// Focuses the list or the sub-page after the switch has been laid out.
+  void _focusCurrent() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      (_sub == null ? _rootFocus : _subFocus).requestFocus();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sub = _sub;
+    if (sub == null) {
+      return Focus(focusNode: _rootFocus, child: _root());
+    }
+    return _DesktopMoreSubPage(
+      key: ValueKey(sub),
+      onBack: _back,
+      // Esc in a sub-page goes back to the list (the panel's own Esc binding
+      // sits higher up and would close everything).
+      child: CallbackShortcuts(
+        bindings: {const SingleActivator(LogicalKeyboardKey.escape): _back},
+        child: Focus(
+          focusNode: _subFocus,
+          child: Builder(builder: sub),
+        ),
+      ),
+    );
+  }
+
+  /// The More list itself (no sub-page open).
+  Widget _root() {
+    final l10n = context.l10n;
+    final c = widget.controller;
+    final url = c?.previewUri;
+    final hasLink = url != null && url.trim().isNotEmpty;
+    final onPip = widget.onPip;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _PanelTitleBar(title: l10n.more),
+        Flexible(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _MoreRow(
+                  icon: Icons.memory_rounded,
+                  label: l10n.decoderColon(widget.decoderLabel),
+                  chevron: true,
+                  onTap: () => _runInPlace(widget.onDecoder),
+                ),
+                _MoreRow(
+                  icon: widget.enhanceActive
+                      ? Icons.auto_awesome_rounded
+                      : Icons.auto_awesome_outlined,
+                  label: l10n.anime4kEnhancement,
+                  chevron: true,
+                  onTap: () => _runInPlace(widget.onEnhance),
+                ),
+                _MoreRow(
+                  icon: Icons.palette_outlined,
+                  label: l10n.colour,
+                  chevron: true,
+                  onTap: () => _runInPlace(widget.onColorProfile),
+                ),
+                _MoreRow(
+                  icon: widget.sleepActive
+                      ? Icons.bedtime_rounded
+                      : Icons.bedtime_outlined,
+                  label: l10n.sleepTimer,
+                  chevron: true,
+                  onTap: () => _runInPlace(widget.onSleep),
+                ),
+                _MoreRow(
+                  icon: Icons.photo_camera_rounded,
+                  label: l10n.snapshot,
+                  // Closed first so the panel is not in the picture.
+                  onTap: () => _closeThen(widget.onScreenshot),
+                ),
+                const Divider(color: AppColors.hairline, height: 13),
+                // The player passes its floating mini player action; the old
+                // window-shrinking mini player is no longer opened. Without
+                // an action the row is left out instead of doing nothing.
+                if (onPip != null)
+                  _MoreRow(
+                    key: const ValueKey('more-mini-player'),
+                    icon: Icons.picture_in_picture_alt_rounded,
+                    label: context.l10n.shortcutPlayerMiniPlayer,
+                    hint: _hint('player.miniPlayer'),
+                    onTap: () => _closeThen(onPip),
+                  ),
+                ValueListenableBuilder<bool>(
+                  valueListenable: DesktopWindow.alwaysOnTop,
+                  builder: (context, onTop, _) => _MoreRow(
+                    key: const ValueKey('more-always-on-top'),
+                    icon: onTop ? Icons.push_pin_rounded : Icons.push_pin_outlined,
+                    label: context.l10n.alwaysOnTop,
+                    hint: _hint('player.alwaysOnTop'),
+                    // Stays open: the switch shows the new state.
+                    trailing: IgnorePointer(
+                      child: Switch(
+                        value: onTop,
+                        activeThumbColor: AppColors.accent,
+                        onChanged: (_) {},
+                      ),
+                    ),
+                    onTap: () => DesktopWindow.setAlwaysOnTop(!onTop),
+                  ),
+                ),
+                if (c != null) ...[
+                  const Divider(color: AppColors.hairline, height: 13),
+                  _MoreRow(
+                    key: const ValueKey('more-copy-link'),
+                    icon: Icons.link_rounded,
+                    label: context.l10n.copyStreamLink,
+                    enabled: hasLink,
+                    onTap: () {
+                      final outer = widget.outerContext;
+                      Navigator.of(context).pop();
+                      copyStreamLinkWithHeaders(
+                        outer,
+                        url ?? '',
+                        c.previewHeaders,
+                      );
+                    },
+                  ),
+                  _MoreRow(
+                    key: const ValueKey('more-external-player'),
+                    icon: Icons.open_in_new_rounded,
+                    label: context.l10n.openInExternalPlayer,
+                    enabled: hasLink,
+                    chevron: true,
+                    onTap: () => pushSubPage<void>(
+                      (_) => _ExternalPlayersPage(
+                        controller: c,
+                        outerContext: widget.outerContext,
+                        title: _externalTitle(),
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// More panel sub-page: the installed desktop players (mpv, VLC, MPC-HC).
+/// Picking one pauses the built-in player and opens the stream there.
+class _ExternalPlayersPage extends StatefulWidget {
+  const _ExternalPlayersPage({
+    required this.controller,
+    required this.outerContext,
+    required this.title,
+  });
+
+  final PlayerCubit controller;
+  final BuildContext outerContext;
+  final String? title;
+
+  @override
+  State<_ExternalPlayersPage> createState() => _ExternalPlayersPageState();
+}
+
+/// State of [_ExternalPlayersPage]: the detected players and the launch.
+class _ExternalPlayersPageState extends State<_ExternalPlayersPage> {
+  late Future<List<DesktopExternalPlayerApp>> _players =
+      DesktopExternalPlayers.detect();
+
+  /// Opens the stream in [app] and pauses the built-in player once it started.
+  Future<void> _open(DesktopExternalPlayerApp app) async {
+    final c = widget.controller;
+    final url = c.previewUri;
+    if (url == null || url.isEmpty) return;
+    final outer = widget.outerContext;
+    Navigator.of(context).pop();
+    final ok = await DesktopExternalPlayers.launch(
+      app,
+      url: url,
+      headers: c.previewHeaders,
+      title: widget.title,
+    );
+    // Only stop the built-in player once the other one really started.
+    if (ok && !c.isClosed && c.player.state.playing) c.togglePlay();
+    if (outer.mounted) {
+      showAppToast(
+        outer,
+        ok
+            ? outer.l10n.openedInApp(app.label)
+            : outer.l10n.couldNotStartApp(app.label),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final headers = widget.controller.previewHeaders;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _PanelTitleBar(title: context.l10n.openInExternalPlayer),
+        FutureBuilder<List<DesktopExternalPlayerApp>>(
+          future: _players,
+          builder: (context, snap) {
+            if (snap.connectionState != ConnectionState.done) {
+              return const Padding(
+                padding: EdgeInsets.all(24),
+                child: Center(child: CircularProgressIndicator()),
+              );
+            }
+            final apps = snap.data ?? const <DesktopExternalPlayerApp>[];
+            if (apps.isEmpty) {
+              return Padding(
+                padding: const EdgeInsets.fromLTRB(20, 4, 20, 16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      context.l10n.noExternalPlayerFound,
+                      style: AppText.body.copyWith(
+                        color: AppColors.textPrimary,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      context.l10n.installExternalPlayerHint,
+                      style: AppText.caption.copyWith(
+                        color: AppColors.textSecondary,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    OutlinedButton.icon(
+                      key: const ValueKey('external-players-rescan'),
+                      onPressed: () => setState(
+                        () => _players = DesktopExternalPlayers.detect(
+                          refresh: true,
+                        ),
+                      ),
+                      icon: const Icon(Icons.refresh_rounded, size: 18),
+                      label: Text(context.l10n.lookAgain),
+                    ),
+                  ],
+                ),
+              );
+            }
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  for (final app in apps)
+                    _MoreRow(
+                      key: ValueKey('external-player-${app.kind.name}'),
+                      icon: Icons.play_circle_outline_rounded,
+                      label: app.label,
+                      // Warn when this player cannot send a header the
+                      // stream needs (it may refuse to play there).
+                      subtitle: app.dropsHeaders(headers)
+                          ? context.l10n.playerMayNotPlayHeaders
+                          : null,
+                      onTap: () => _open(app),
+                    ),
+                ],
+              ),
+            );
+          },
+        ),
+      ],
+    );
+  }
+}
+
+/// Test hooks: the shared list / chip menu bodies, which are private.
+@visibleForTesting
+Widget debugPlayerMenuList(
+  String header,
+  List<String> labels, {
+  int active = -1,
+  ValueChanged<int>? onSelect,
+}) => _SheetColumn(
+  header: header,
+  children: [
+    for (var i = 0; i < labels.length; i++)
+      _SheetRow(
+        label: labels[i],
+        active: i == active,
+        onTap: () => onSelect?.call(i),
+      ),
+  ],
+);
+
+/// Test hook: the shared chip menu body with the first chip selected.
+@visibleForTesting
+Widget debugPlayerMenuChips(String header, List<String> labels) =>
+    _SheetChips(header: header, labels: labels, selected: 0, onSelect: (_) {});
+
 /// Opens the Subtitle-style sheet (font / colour / background / position /
 /// size). Lives over whatever opened it; changes apply live via the controller.
 /// Opens the shared Subtitle-style sheet (live preview + all controls). Pass a
@@ -796,6 +1461,57 @@ Future<void> openSubtitleStyleSheet(
   Future<void> Function()? onStyleChanged,
   ValueChanged<ModalRoute<dynamic>?>? onRoute,
 }) {
+  // Windows: a bounded graphite dialog instead of a phone drag-up sheet. From
+  // the player it docks to the right with a light scrim so the video and its
+  // subtitles stay visible while they are restyled live.
+  if (playerMenusDocked) {
+    final inPlayer = controller != null;
+    if (inPlayer) {
+      // Same right-docked panel as every other in-player menu.
+      return showDesktopPlayerPanel<void>(
+        context,
+        dialogKey: const ValueKey('subtitle-style-desktop-dialog'),
+        width: 520,
+        builder: (_) => _SubtitleStyleSheet(
+          controller: controller,
+          onInteract: onInteract,
+          onStyleChanged: onStyleChanged,
+          desktop: true,
+        ),
+      );
+    }
+    return showDialog<void>(
+      context: context,
+      useRootNavigator: false,
+      barrierColor: Colors.black54,
+      builder: (dialogContext) => Dialog(
+        key: const ValueKey('subtitle-style-desktop-dialog'),
+        alignment: Alignment.center,
+        backgroundColor: DesktopPanelColors.surface,
+        surfaceTintColor: Colors.transparent,
+        insetPadding: const EdgeInsets.all(24),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(20),
+          side: BorderSide(color: DesktopPanelColors.edge),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: 520,
+            maxHeight: MediaQuery.sizeOf(dialogContext).height * 0.85,
+          ),
+          child: _EscCloses(
+            child: _SubtitleStyleSheet(
+              controller: controller,
+              onInteract: onInteract,
+              onStyleChanged: onStyleChanged,
+              desktop: true,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
   return showModalBottomSheet<void>(
     context: context,
     backgroundColor: Colors.transparent,
@@ -827,10 +1543,14 @@ class _SubtitleStyleSheet extends StatefulWidget {
     required this.controller,
     required this.onInteract,
     this.onStyleChanged,
+    this.desktop = false,
   });
   final PlayerCubit? controller;
   final VoidCallback onInteract;
   final Future<void> Function()? onStyleChanged;
+
+  /// Windows dialog: no drag handle, a title row with a close button.
+  final bool desktop;
 
   @override
   State<_SubtitleStyleSheet> createState() => _SubtitleStyleSheetState();
@@ -963,24 +1683,51 @@ class _SubtitleStyleSheetState extends State<_SubtitleStyleSheet> {
     final colorHex = _prefs.subtitleColorHex.toUpperCase();
     final size = _prefs.subtitleScale;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(8, 0, 8, 12),
+      padding: EdgeInsets.fromLTRB(8, widget.desktop ? 12 : 0, 8, 12),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Container(
-            margin: const EdgeInsets.symmetric(vertical: 10),
-            width: 36,
-            height: 4,
-            decoration: BoxDecoration(
-              color: AppColors.surface2,
-              borderRadius: BorderRadius.circular(2),
+          if (widget.desktop)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 4, 4),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      context.l10n.subtitleStyle,
+                      style: AppText.headline.copyWith(
+                        fontSize: 22,
+                        color: AppColors.textPrimary,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: MaterialLocalizations.of(
+                      context,
+                    ).closeButtonTooltip,
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: const Icon(Icons.close_rounded),
+                    color: AppColors.textSecondary,
+                  ),
+                ],
+              ),
+            )
+          else ...[
+            Container(
+              margin: const EdgeInsets.symmetric(vertical: 10),
+              width: 36,
+              height: 4,
+              decoration: BoxDecoration(
+                color: AppColors.surface2,
+                borderRadius: BorderRadius.circular(2),
+              ),
             ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
-            child: Text(context.l10n.subtitleStyle, style: AppText.headline),
-          ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+              child: Text(context.l10n.subtitleStyle, style: AppText.headline),
+            ),
+          ],
           // Live WYSIWYG preview — built with the SAME buildSubtitleTextStyle as
           // the real overlay, so what you see here is what renders on the video.
           Container(
@@ -1410,6 +2157,8 @@ class _SheetSurface extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // The Windows docked panel is already the surface: no card inside a card.
+    if (_DesktopPlayerPanel.of(context)) return child;
     final r = BorderRadius.circular(24);
     return Padding(
       padding: EdgeInsets.fromLTRB(
@@ -1541,69 +2290,105 @@ class _ColorSheetState extends State<_ColorSheet> {
 
   @override
   Widget build(BuildContext context) {
+    final docked = _DesktopPlayerPanel.of(context);
+    final reset = TextButton(
+      onPressed: () {
+        widget.controller.resetColor();
+        setState(() => _b = _c = _s = _g = _h = 0);
+        widget.onInteract();
+      },
+      child: Text(context.l10n.reset),
+    );
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Padding(
-          padding: const EdgeInsets.symmetric(vertical: 10),
-          child: Center(
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                color: AppColors.surface2,
-                borderRadius: BorderRadius.circular(2),
-              ),
-              child: const SizedBox(width: 36, height: 4),
-            ),
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(20, 4, 12, 4),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(context.l10n.colour, style: AppText.headline),
-              TextButton(
-                onPressed: () {
-                  widget.controller.resetColor();
-                  setState(() => _b = _c = _s = _g = _h = 0);
-                  widget.onInteract();
-                },
-                child: Text(context.l10n.reset),
-              ),
-            ],
-          ),
-        ),
-        SizedBox(
-          height: 40,
-          child: ListView(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            children: [
-              for (final id in _quick)
-                Padding(
-                  padding: const EdgeInsetsDirectional.only(end: 8),
-                  child: GestureDetector(
-                    onTap: () => _applyPreset(ColorProfiles.byId(id)),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 8,
-                      ),
-                      decoration: BoxDecoration(
-                        color: AppColors.surface2,
-                        borderRadius: BorderRadius.circular(18),
-                      ),
-                      child: Text(
-                        ColorProfiles.byId(id).label,
-                        style: AppText.body,
+        if (docked) ...[
+          _PanelTitleBar(title: context.l10n.colour, actions: [reset]),
+          // A mouse cannot drag a sideways strip, so the presets wrap here.
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 2, 20, 0),
+            child: Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final id in _quick)
+                  Material(
+                    color: AppColors.surface2,
+                    shape: const StadiumBorder(),
+                    clipBehavior: Clip.antiAlias,
+                    child: InkWell(
+                      onTap: () => _applyPreset(ColorProfiles.byId(id)),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 8,
+                        ),
+                        child: Text(
+                          ColorProfiles.byId(id).label,
+                          style: AppText.body,
+                        ),
                       ),
                     ),
                   ),
-                ),
-            ],
+              ],
+            ),
           ),
-        ),
+        ] else ...[
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 10),
+            child: Center(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: AppColors.surface2,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+                child: const SizedBox(width: 36, height: 4),
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 4, 12, 4),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(context.l10n.colour, style: AppText.headline),
+                reset,
+              ],
+            ),
+          ),
+        ],
+        if (!docked)
+          SizedBox(
+            height: 40,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              children: [
+                for (final id in _quick)
+                  Padding(
+                    padding: const EdgeInsetsDirectional.only(end: 8),
+                    child: GestureDetector(
+                      onTap: () => _applyPreset(ColorProfiles.byId(id)),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 8,
+                        ),
+                        decoration: BoxDecoration(
+                          color: AppColors.surface2,
+                          borderRadius: BorderRadius.circular(18),
+                        ),
+                        child: Text(
+                          ColorProfiles.byId(id).label,
+                          style: AppText.body,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
         Flexible(
           child: ListView(
             shrinkWrap: true,
@@ -1670,22 +2455,26 @@ class _SheetChips extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Padding(
-          padding: const EdgeInsets.symmetric(vertical: 10),
-          child: Center(
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                color: AppColors.surface2,
-                borderRadius: BorderRadius.circular(2),
+        if (_DesktopPlayerPanel.of(context))
+          _PanelTitleBar(title: header)
+        else ...[
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 10),
+            child: Center(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: AppColors.surface2,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+                child: const SizedBox(width: 36, height: 4),
               ),
-              child: const SizedBox(width: 36, height: 4),
             ),
           ),
-        ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(20, 4, 20, 10),
-          child: Text(header, style: AppText.headline),
-        ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 4, 20, 10),
+            child: Text(header, style: AppText.headline),
+          ),
+        ],
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
           child: Wrap(
@@ -1744,22 +2533,26 @@ class _SheetColumn extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Padding(
-          padding: const EdgeInsets.symmetric(vertical: 10),
-          child: Center(
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                color: AppColors.surface2,
-                borderRadius: BorderRadius.circular(2),
+        if (_DesktopPlayerPanel.of(context))
+          _PanelTitleBar(title: header)
+        else ...[
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 10),
+            child: Center(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: AppColors.surface2,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+                child: const SizedBox(width: 36, height: 4),
               ),
-              child: const SizedBox(width: 36, height: 4),
             ),
           ),
-        ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
-          child: Text(header, style: AppText.headline),
-        ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
+            child: Text(header, style: AppText.headline),
+          ),
+        ],
         // Cap the list height so a long sheet (e.g. the ~25-language translate
         // list) scrolls instead of overflowing and clipping at whatever fits.
         // Short sheets are shorter than the cap, so shrinkWrap still sizes them
@@ -1772,6 +2565,8 @@ class _SheetColumn extends StatelessWidget {
             child: ListView(shrinkWrap: true, children: children),
           ),
         ),
+        // Breathing room above the panel's bottom border.
+        if (_DesktopPlayerPanel.of(context)) const SizedBox(height: 10),
       ],
     );
   }

@@ -1,12 +1,13 @@
-import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/material.dart';
 import 'package:zangetsu_source_bridge/zangetsu_source_bridge.dart';
 
 import '../aniyomi/aniyomi_provider.dart';
 import '../app_mode.dart';
+import '../desktop/desktop_sheet.dart';
 import '../di/injector.dart';
 import '../hive/source_icon_store.dart';
 import '../i18n/source_languages.dart';
+import 'desktop_docked_panel.dart';
 import 'source_icon_tile.dart';
 import '../lnreader/lnreader_manager.dart';
 import '../mangayomi/mangayomi_manager.dart';
@@ -29,6 +30,7 @@ import '../zmode/zmode_ids.dart';
 import '../zmode/zmode_module.dart';
 import '../zmode/zmode_prefs.dart';
 import 'states.dart';
+import '../../l10n/l10n.dart';
 
 /// Installed-and-enabled sources bucketed by category, each as an `(id, label)`
 /// row. Reused by the source switcher and the search source picker.
@@ -218,7 +220,9 @@ SourceBuckets categorizedSources() {
     );
     if (p.providerType == ProviderType.anime) {
       anime.add(csRow);
-    } else {
+    }
+    // A mixed CloudStream provider belongs in both streaming groups.
+    if (p.supportsMovies) {
       movies.add(csRow);
     }
   }
@@ -775,8 +779,15 @@ class SourceSwitcher extends StatelessWidget {
     final sheetH = (24 + 48 + searchH + autoRowH + (total + headers) * 48 + 24)
         .clamp(240.0, screenH * 0.85);
 
-    showModalBottomSheet<void>(
-      context: context,
+    // show-2: Windows docks the long source list as a graphite side panel
+    // (search, tabs and rows unchanged) with a real title bar; phone and TV
+    // keep the bottom sheet exactly as before.
+    final desktop = desktopPanelsEnabled;
+    showAdaptiveSheet<void>(
+      context,
+      title: desktop ? context.l10n.selectSourceText : null,
+      desktopStyle: DesktopSheetStyle.sidePanel,
+      desktopWidth: 480,
       backgroundColor: AppColors.surface,
       isScrollControlled: true,
       shape: const RoundedRectangleBorder(
@@ -786,7 +797,11 @@ class SourceSwitcher extends StatelessWidget {
         buckets: b,
         currentId: currentId,
         trailingBuilder: trailingBuilder ?? this.trailingBuilder,
-        height: sheetH.toDouble(),
+        // The panel caps at 85% of the window including its ~72px title
+        // bar, so the measured height is trimmed to fit under it.
+        height: desktop && sheetH > screenH * 0.85 - 72
+            ? screenH * 0.85 - 72
+            : sheetH.toDouble(),
         showSearch: showSearch,
         mode: mode,
         onInstallSources: onInstallSources,
@@ -1256,6 +1271,9 @@ class _SourcePickerSheetState extends State<_SourcePickerSheet> {
       ],
     ];
 
+    // True inside the Windows side panel (show-2).
+    final desktop = DesktopSheetScope.of(context);
+
     // TV: one grouped list (no TabBar / TextField). Tabs and search steal or
     // eat D-pad focus; the phone sheet keeps both.
     if (_isTv) {
@@ -1311,15 +1329,19 @@ class _SourcePickerSheetState extends State<_SourcePickerSheet> {
           length: tabs.length,
           child: Column(
             children: [
-              Container(
-                margin: const EdgeInsets.only(top: 12, bottom: 8),
-                width: 36,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: AppColors.textTertiary.withValues(alpha: 0.5),
-                  borderRadius: BorderRadius.circular(2),
-                ),
-              ),
+              // The Windows panel has a title bar instead of a drag handle.
+              if (!desktop)
+                Container(
+                  margin: const EdgeInsets.only(top: 12, bottom: 8),
+                  width: 36,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: AppColors.textTertiary.withValues(alpha: 0.5),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                )
+              else
+                const SizedBox(height: 4),
               if (widget.showSearch)
                 Padding(
                   padding: const EdgeInsets.fromLTRB(14, 2, 14, 6),
@@ -1364,9 +1386,18 @@ class _SourcePickerSheetState extends State<_SourcePickerSheet> {
                         color: AppColors.textTertiary,
                       ),
                       const SizedBox(width: 6),
-                      Text(
-                        'Long-press a source to pin it to the top',
-                        style: AppText.caption,
+                      // Flexible: the longer desktop wording wraps instead
+                      // of overflowing the 480px side panel.
+                      Flexible(
+                        child: Text(
+                          // Windows rows pin with a right-click or the
+                          // hover pin button (show-2, R3).
+                          desktop
+                              ? context.l10n.rightClickToPinSource
+                              : 'Long-press a source to pin it to the top',
+                          style: AppText.caption,
+                          textAlign: TextAlign.center,
+                        ),
                       ),
                     ],
                   ),
@@ -1439,7 +1470,9 @@ class _PickerSearchField extends StatelessWidget {
   }
 }
 
-class _SourceRow extends StatelessWidget {
+// Stateful only for the Windows hover pin (show-2): the row tracks whether
+// the mouse is over it so the pin button can appear. Phone/TV ignore it.
+class _SourceRow extends StatefulWidget {
   const _SourceRow({
     required this.label,
     required this.isActive,
@@ -1472,8 +1505,78 @@ class _SourceRow extends StatelessWidget {
   final Widget? trailing;
 
   @override
+  State<_SourceRow> createState() => _SourceRowState();
+}
+
+class _SourceRowState extends State<_SourceRow> {
+  /// Windows: mouse is over this row, so the pin button shows.
+  bool _hovered = false;
+
+  /// Windows: keyboard focus is on the pin button. Tab can reach it while
+  /// it is hidden, so it must show itself then.
+  bool _pinFocused = false;
+
+  /// Windows pin button for this row (hover-revealed; always shown when the
+  /// row is pinned). Calls the same toggle as long-press / right-click.
+  /// Same look as the Browse sources list's hover pin.
+  Widget _hoverPin(VoidCallback onToggle, bool trailingFollows) {
+    final pinned = widget.isPinned;
+    final visible = pinned || _hovered || _pinFocused;
+    return Padding(
+      padding: EdgeInsetsDirectional.only(
+        end: widget.isActive || trailingFollows ? 6 : 0,
+      ),
+      child: Focus(
+        // Only listens for focus changes; the IconButton owns its own node.
+        canRequestFocus: false,
+        skipTraversal: true,
+        onFocusChange: (f) {
+          if (f != _pinFocused) setState(() => _pinFocused = f);
+        },
+        child: AnimatedOpacity(
+          duration: const Duration(milliseconds: 120),
+          opacity: visible ? 1 : 0,
+          child: IgnorePointer(
+            // A hidden button must not swallow clicks meant for the row.
+            ignoring: !visible,
+            child: IconButton(
+              key: const ValueKey('source-picker-pin'),
+              tooltip: pinned
+                  ? context.l10n.unpinSource
+                  : context.l10n.pinSource,
+              onPressed: onToggle,
+              visualDensity: VisualDensity.compact,
+              iconSize: 17,
+              constraints: const BoxConstraints.tightFor(width: 32, height: 32),
+              padding: EdgeInsets.zero,
+              icon: Icon(
+                pinned ? Icons.push_pin : Icons.push_pin_outlined,
+                color: pinned ? AppColors.accent : AppColors.textTertiary,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final hasRepo = repo != null && repo!.isNotEmpty;
+    // Locals keep the original (pre-stateful) body readable unchanged.
+    final label = widget.label;
+    final repo = widget.repo;
+    final icon = widget.icon;
+    final isActive = widget.isActive;
+    final isPinned = widget.isPinned;
+    final autofocus = widget.autofocus;
+    final onTap = widget.onTap;
+    final onLongPress = widget.onLongPress;
+    final trailing = widget.trailing;
+    final isTv = sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
+    // Windows (not TV) rows that can pin get a hover pin button instead of
+    // the static pinned marker; phone keeps the marker + long-press.
+    final hoverPin = desktopPanelsEnabled && !isTv && onLongPress != null;
+    final hasRepo = repo != null && repo.isNotEmpty;
     final body = DecoratedBox(
       // Selected row: accent bar down the leading edge plus a wash, instead
       // of a tick stranded on the far right of a wide row.
@@ -1508,7 +1611,7 @@ class _SourceRow extends StatelessWidget {
                     Padding(
                       padding: const EdgeInsets.only(top: 2),
                       child: Text(
-                        repo!,
+                        repo,
                         style: AppText.body.copyWith(
                           fontSize: 11.5,
                           height: 1.0,
@@ -1519,7 +1622,9 @@ class _SourceRow extends StatelessWidget {
                 ],
               ),
             ),
-            if (isPinned)
+            if (hoverPin)
+              _hoverPin(onLongPress, trailing != null)
+            else if (isPinned)
               Padding(
                 padding: EdgeInsets.only(
                   right: isActive || trailing != null ? 10 : 0,
@@ -1536,7 +1641,6 @@ class _SourceRow extends StatelessWidget {
       ),
     );
 
-    final isTv = sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
     if (isTv) {
       return TvListFocusable(
         autofocus: autofocus,
@@ -1546,12 +1650,25 @@ class _SourceRow extends StatelessWidget {
         child: ExcludeSemantics(child: body),
       );
     }
-    return InkWell(
+    final row = InkWell(
       onTap: onTap,
       onLongPress: onLongPress,
+      // Windows: right-click pins too, matching the panel's hint (show-2).
+      onSecondaryTap: desktopPanelsEnabled ? onLongPress : null,
       splashColor: AppColors.accent.withValues(alpha: 0.08),
       highlightColor: AppColors.accent.withValues(alpha: 0.04),
       child: body,
+    );
+    if (!hoverPin) return row;
+    // Windows: track hover over the whole row to reveal the pin button.
+    return MouseRegion(
+      onEnter: (_) {
+        if (!_hovered) setState(() => _hovered = true);
+      },
+      onExit: (_) {
+        if (_hovered) setState(() => _hovered = false);
+      },
+      child: row,
     );
   }
 }

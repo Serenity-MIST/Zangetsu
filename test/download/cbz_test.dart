@@ -118,9 +118,14 @@ void main() {
       // Deflating an already-compressed image burns CPU for nothing, and
       // stored entries read back as a plain seek and copy.
       final path = await writeArchive(3);
-      final archive = ZipDecoder().decodeStream(InputFileStream(path));
-      for (final f in archive.files.where((f) => f.isFile)) {
-        expect(f.compression, CompressionType.none);
+      final input = InputFileStream(path);
+      try {
+        final archive = ZipDecoder().decodeStream(input);
+        for (final f in archive.files.where((f) => f.isFile)) {
+          expect(f.compression, CompressionType.none);
+        }
+      } finally {
+        await input.close();
       }
     });
   });

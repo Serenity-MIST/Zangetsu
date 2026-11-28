@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
 
 import '../../core/di/injector.dart';
@@ -5,6 +6,7 @@ import '../../core/mode/content_mode.dart';
 import '../../core/mode/content_mode_cubit.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import 'home_catalogue_prefs.dart';
 import '../../core/tracker/tracker_hub.dart';
 import '../../core/zmode/metadata_provider_prefs.dart';
@@ -104,116 +106,182 @@ Future<HomeCatalogueSelection?> showMetadataSwitchSheet(
       ),
   ];
 
-  final picked = await showModalBottomSheet<Object>(
-    context: context,
-    backgroundColor: AppColors.surface,
-    // Both sections in one sheet clear the default half-height cap; without
-    // this the Column below overflows on phones (and with the MAL warning).
-    isScrollControlled: true,
-    shape: const RoundedRectangleBorder(
-      borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+  // The choices themselves, shared by the phone sheet and the Windows dialog
+  // so both always offer exactly the same options.
+  List<Widget> choices(BuildContext sheet) => [
+    if (animeFirst) ...[
+      ...animeSection(sheet),
+      const SizedBox(height: 6),
+      ...videoSection(sheet),
+    ] else ...[
+      ...videoSection(sheet),
+      const SizedBox(height: 6),
+      ...animeSection(sheet),
+    ],
+    const Divider(height: 18, indent: 20, endIndent: 20),
+    ListTile(
+      leading: CircleAvatar(
+        backgroundColor: AppColors.accentSoft,
+        child: Icon(Icons.extension_outlined, color: AppColors.accent),
+      ),
+      title: const Text('Source Catalogue'),
+      subtitle: const Text('Show installed source lists in Home'),
+      trailing: Switch(
+        value: sourceCatalogueActive,
+        activeThumbColor: AppColors.accent,
+        onChanged: (selected) => Navigator.of(sheet).pop(
+          selected
+              ? _MetadataSheetAction.sourceCatalogue
+              : HomeCatalogueSelection.metadata,
+        ),
+      ),
+      onTap: () => Navigator.of(sheet).pop(
+        sourceCatalogueActive
+            ? HomeCatalogueSelection.metadata
+            : _MetadataSheetAction.sourceCatalogue,
+      ),
     ),
-    builder: (sheet) {
-      final maxHeight = MediaQuery.sizeOf(sheet).height * 0.9;
-      return SafeArea(
-        child: ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: maxHeight),
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const SizedBox(height: 10),
-                Center(
-                  child: Container(
-                    width: 38,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: AppColors.textTertiary.withValues(alpha: 0.5),
-                      borderRadius: BorderRadius.circular(2),
+    ListTile(
+      // Match the provider rows, with an initials fallback.
+      leading: ClipRRect(
+        borderRadius: BorderRadius.circular(9),
+        child: SizedBox(
+          width: 40,
+          height: 40,
+          child: Image.asset(
+            _stremioBrand().asset,
+            fit: BoxFit.cover,
+            filterQuality: FilterQuality.medium,
+            errorBuilder: (_, _, _) => _InitialsMark(brand: _stremioBrand()),
+          ),
+        ),
+      ),
+      title: const Text('Stremio'),
+      subtitle: Text(
+        stremioSelected
+            ? 'Showing installed addon catalogues'
+            : 'Browse with your installed addons',
+      ),
+      trailing: Switch(
+        value: stremioSelected,
+        activeThumbColor: AppColors.accent,
+        onChanged: (selected) => Navigator.of(sheet).pop(
+          selected
+              ? HomeCatalogueSelection.stremio
+              : HomeCatalogueSelection.metadata,
+        ),
+      ),
+      onTap: () => Navigator.of(sheet).pop(
+        stremioSelected
+            ? HomeCatalogueSelection.metadata
+            : HomeCatalogueSelection.stremio,
+      ),
+    ),
+  ];
+
+  // Windows: a centred, bounded dialog in the desktop settings style, with a
+  // title and close button instead of a drag handle. Phone keeps the sheet.
+  final picked = defaultTargetPlatform == TargetPlatform.windows
+      ? await showDialog<Object>(
+          context: context,
+          builder: (dialog) => Dialog(
+            key: const ValueKey('metadata-switch-dialog'),
+            // set-9: themed graphite colours (stock greys by default).
+            backgroundColor: GraphiteSettingsColors.dialog,
+            insetPadding: const EdgeInsets.all(24),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(20),
+              side: BorderSide(color: GraphiteSettingsColors.dialogEdge),
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: 560,
+                maxHeight: MediaQuery.sizeOf(dialog).height * 0.85,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 14, 10, 4),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            l10n.metadata,
+                            style: AppText.headline.copyWith(fontSize: 22),
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: MaterialLocalizations.of(
+                            dialog,
+                          ).closeButtonTooltip,
+                          onPressed: () => Navigator.of(dialog).pop(),
+                          icon: const Icon(Icons.close_rounded),
+                          color: AppColors.textSecondary,
+                        ),
+                      ],
                     ),
                   ),
-                ),
-                if (animeFirst) ...[
-                  ...animeSection(sheet),
-                  const SizedBox(height: 6),
-                  ...videoSection(sheet),
-                ] else ...[
-                  ...videoSection(sheet),
-                  const SizedBox(height: 6),
-                  ...animeSection(sheet),
-                ],
-                const Divider(height: 18, indent: 20, endIndent: 20),
-                ListTile(
-                  leading: CircleAvatar(
-                    backgroundColor: AppColors.accentSoft,
-                    child: Icon(
-                      Icons.extension_outlined,
-                      color: AppColors.accent,
-                    ),
-                  ),
-                  title: const Text('Source Catalogue'),
-                  subtitle: const Text('Show installed source lists in Home'),
-                  trailing: Switch(
-                    value: sourceCatalogueActive,
-                    activeThumbColor: AppColors.accent,
-                    onChanged: (selected) => Navigator.of(sheet).pop(
-                      selected
-                          ? _MetadataSheetAction.sourceCatalogue
-                          : HomeCatalogueSelection.metadata,
-                    ),
-                  ),
-                  onTap: () => Navigator.of(sheet).pop(
-                    sourceCatalogueActive
-                        ? HomeCatalogueSelection.metadata
-                        : _MetadataSheetAction.sourceCatalogue,
-                  ),
-                ),
-                ListTile(
-                  // Match the provider rows, with an initials fallback.
-                  leading: ClipRRect(
-                    borderRadius: BorderRadius.circular(9),
-                    child: SizedBox(
-                      width: 40,
-                      height: 40,
-                      child: Image.asset(
-                        _stremioBrand().asset,
-                        fit: BoxFit.cover,
-                        filterQuality: FilterQuality.medium,
-                        errorBuilder: (_, _, _) =>
-                            _InitialsMark(brand: _stremioBrand()),
+                  Divider(height: 1, color: GraphiteSettingsColors.dialogEdge),
+                  Flexible(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: choices(dialog),
                       ),
                     ),
                   ),
-                  title: const Text('Stremio'),
-                  subtitle: Text(
-                    stremioSelected
-                        ? 'Showing installed addon catalogues'
-                        : 'Browse with your installed addons',
-                  ),
-                  trailing: Switch(
-                    value: stremioSelected,
-                    activeThumbColor: AppColors.accent,
-                    onChanged: (selected) => Navigator.of(sheet).pop(
-                      selected
-                          ? HomeCatalogueSelection.stremio
-                          : HomeCatalogueSelection.metadata,
-                    ),
-                  ),
-                  onTap: () => Navigator.of(sheet).pop(
-                    stremioSelected
-                        ? HomeCatalogueSelection.metadata
-                        : HomeCatalogueSelection.stremio,
-                  ),
-                ),
-                const SizedBox(height: 10),
-              ],
+                ],
+              ),
             ),
           ),
-        ),
-      );
-    },
-  );
+        )
+      : await showModalBottomSheet<Object>(
+          context: context,
+          backgroundColor: AppColors.surface,
+          // Both sections in one sheet clear the default half-height cap;
+          // without this the Column below overflows on phones (and with the
+          // MAL warning).
+          isScrollControlled: true,
+          shape: const RoundedRectangleBorder(
+            borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+          ),
+          builder: (sheet) {
+            final maxHeight = MediaQuery.sizeOf(sheet).height * 0.9;
+            return SafeArea(
+              child: ConstrainedBox(
+                constraints: BoxConstraints(maxHeight: maxHeight),
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const SizedBox(height: 10),
+                      Center(
+                        child: Container(
+                          width: 38,
+                          height: 4,
+                          decoration: BoxDecoration(
+                            color: AppColors.textTertiary.withValues(
+                              alpha: 0.5,
+                            ),
+                            borderRadius: BorderRadius.circular(2),
+                          ),
+                        ),
+                      ),
+                      ...choices(sheet),
+                      const SizedBox(height: 10),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
 
   if (picked == null) return null;
   if (picked == _MetadataSheetAction.sourceCatalogue) {

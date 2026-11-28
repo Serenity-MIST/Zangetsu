@@ -267,7 +267,7 @@ class MalCatalogue implements AnimeCatalogue {
   }) async {
     const limit = 20;
     if (q.trim().isEmpty) return const [];
-    try {
+
       final res = await _get('/${_path(kind)}', {
         'q': q,
         'limit': limit,
@@ -277,10 +277,11 @@ class MalCatalogue implements AnimeCatalogue {
         // one filter that works here.
         'nsfw': filters?.adult ?? false,
       });
+      if ((res.statusCode ?? 500) >= 400) {
+        throw DioException(requestOptions: res.requestOptions, response: res, type: DioExceptionType.badResponse);
+      }
       return _items(res.data, kind);
-    } catch (_) {
-      return const [];
-    }
+
   }
 
   @override
@@ -290,6 +291,9 @@ class MalCatalogue implements AnimeCatalogue {
       'limit': 20,
       'fields': _listFields,
     });
+    if ((res.statusCode ?? 500) >= 400) {
+      throw DioException(requestOptions: res.requestOptions, response: res, type: DioExceptionType.badResponse);
+    }
     return _items(res.data, kind);
   }
 

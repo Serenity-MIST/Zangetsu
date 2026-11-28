@@ -98,8 +98,12 @@ class _Downloads extends DownloadManager {
   VideoSource? savedSource;
   List<VideoSource>? savedFallbacks;
   @override
-  DownloadRecord? recordFor(String sourceId, String showId, String episodeId) =>
-      record;
+  DownloadRecord? recordFor(
+    String sourceId,
+    String showId,
+    String episodeId, {
+    String? category,
+  }) => record;
   @override
   Future<void> enqueueSource({
     required String sourceId,
@@ -114,6 +118,10 @@ class _Downloads extends DownloadManager {
     required String qualityLabel,
     required int nowMs,
     int? malId,
+    int? anilistId,
+    int? tmdbId,
+    bool tmdbIsTv = false,
+    String? imdbId,
     List<VideoSource> fallbacks = const [],
   }) async {
     calls++;

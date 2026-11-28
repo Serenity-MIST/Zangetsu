@@ -7,6 +7,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:watch_app/core/models/source_pref.dart';
+import 'package:watch_app/core/ui/settings_widgets.dart';
 import 'package:watch_app/features/sources/source_prefs_screen.dart';
 
 void main() {
@@ -25,18 +26,19 @@ void main() {
     nativeOpened = 0;
   });
 
-  Widget harness(List<SourcePref> prefs, {bool leftovers = false}) => MaterialApp(
-    home: SourcePrefsScreen(
-      title: 'AnimeWorld',
-      prefs: prefs,
-      write: write,
-      onOpenNative: leftovers
-          ? () async {
-              nativeOpened++;
-            }
-          : null,
-    ),
-  );
+  Widget harness(List<SourcePref> prefs, {bool leftovers = false}) =>
+      MaterialApp(
+        home: SourcePrefsScreen(
+          title: 'AnimeWorld',
+          prefs: prefs,
+          write: write,
+          onOpenNative: leftovers
+              ? () async {
+                  nativeOpened++;
+                }
+              : null,
+        ),
+      );
 
   const toggle = SourcePref(
     key: 'pref_dub',
@@ -97,8 +99,9 @@ void main() {
     await t.pump(const Duration(seconds: 6));
   });
 
-  testWidgets('picking from a list writes the stored value, not the label',
-      (t) async {
+  testWidgets('picking from a list writes the stored value, not the label', (
+    t,
+  ) async {
     await t.pumpWidget(harness([lang]));
     await t.pumpAndSettle();
 
@@ -112,8 +115,9 @@ void main() {
     expect(find.text('Español'), findsOneWidget);
   });
 
-  testWidgets('a kind we cannot draw is not drawn, but is still reachable',
-      (t) async {
+  testWidgets('a kind we cannot draw is not drawn, but is still reachable', (
+    t,
+  ) async {
     // Half a page is fine as long as the rest has a door. Drawing nothing for
     // an odd setting AND offering no way to it is what would hide it.
     const odd = SourcePref(
@@ -129,7 +133,13 @@ void main() {
     // Not merely invisible: it must not take a slot either. SettingsCard draws
     // a divider between children, so a blank row left in the list shows up as
     // a stray line under the only real one.
-    expect(find.byType(Divider), findsNothing);
+    expect(
+      find.descendant(
+        of: find.byType(SettingsCard).first,
+        matching: find.byType(Divider),
+      ),
+      findsNothing,
+    );
 
     await t.tap(find.text('Other settings').last);
     await t.pumpAndSettle();

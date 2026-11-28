@@ -197,6 +197,68 @@ class _DetailOpeningPreview extends StatelessWidget {
   }
 }
 
+/// Shimmering placeholder shown while the desktop detail loads and there is
+/// no partial detail to paint yet. It mirrors the real layout (backdrop,
+/// title/meta, Play/Download, synopsis, credits) so the screen eases in
+/// instead of popping from a blank spinner to a full page.
+class _DetailSkeleton extends StatelessWidget {
+  /// Creates the skeleton with a backdrop [heroHeight] matching the real hero.
+  const _DetailSkeleton({required this.heroHeight});
+
+  /// Height of the backdrop placeholder; platform-dependent like the hero.
+  final double heroHeight;
+
+  @override
+  Widget build(BuildContext context) {
+    final width = MediaQuery.of(context).size.width;
+    final base = AppColors.surface2;
+    const box = _bone;
+
+    // The skeleton shapes, painted in the flat base colour. A moving highlight
+    // is swept across them by the shimmer.
+    final shapes = SingleChildScrollView(
+      physics: const NeverScrollableScrollPhysics(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: double.infinity,
+            height: heroHeight,
+            child: ColoredBox(color: base),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                box(width * 0.66, 26), // title
+                const SizedBox(height: 12),
+                box(width * 0.42, 14), // meta line
+                const SizedBox(height: 20),
+                box(double.infinity, 50, 14), // Play
+                const SizedBox(height: 10),
+                box(double.infinity, 50, 14), // Download
+                const SizedBox(height: 22),
+                box(double.infinity, 12), // synopsis line 1
+                const SizedBox(height: 9),
+                box(double.infinity, 12), // synopsis line 2
+                const SizedBox(height: 9),
+                box(width * 0.55, 12), // synopsis line 3
+                const SizedBox(height: 22),
+                box(width * 0.5, 13), // starring
+                const SizedBox(height: 12),
+                box(width * 0.4, 13), // creators / genres
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+
+    return _Shimmer(child: shapes);
+  }
+}
+
 /// Placeholder episode rows for the Episodes tab while the matched source's
 /// list is still being fetched — see [DetailState.episodesLoading]. The
 /// screen now paints before that fetch finishes, and an empty list there

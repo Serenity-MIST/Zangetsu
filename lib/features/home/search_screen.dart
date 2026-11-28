@@ -10,7 +10,12 @@ import '../search/meta_filter_sheet.dart';
 import 'phone_voice_search_sheet.dart';
 import 'stremio_discover_sheet.dart';
 import 'voice_search_artwork.dart';
+import '../../core/desktop/desktop_focus_repair.dart';
 import '../../core/ui/app_toast.dart';
+import '../../core/desktop/desktop_sheet.dart';
+import 'search_row_scroller.dart';
+import '../../core/desktop/desktop_chrome_colors.dart';
+import '../../core/desktop/desktop_undo_toast.dart';
 import '../../core/zmode/zmode_module.dart';
 import '../../core/zmode/zmode_ids.dart';
 import '../../core/zmode/metadata_filters.dart';
@@ -64,6 +69,10 @@ import 'see_all_screen.dart';
 import '../search/bloc/search_bloc.dart';
 import '../search/bloc/search_event.dart';
 import '../search/bloc/search_state.dart';
+import '../search/installed_sources_search_section.dart';
+// Windows shell results page (mockup q1): header, filter chips, skeletons.
+import '../search/desktop_poster_skeleton.dart';
+import '../search/desktop_results_header.dart';
 
 /// Dedicated search screen pushed from the Home header search icon.
 /// What a freshly opened Search starts filtered by.
@@ -277,6 +286,40 @@ class _SearchViewState extends State<_SearchView>
   late final TextEditingController _controller;
   final _focusNode = FocusNode();
 
+  /// Windows only: new keyboard behaviour on the search field (search-1,
+  /// search-7). Phone and tests pretending to be phone keep today's field.
+  bool get _windowsField => defaultTargetPlatform == TargetPlatform.windows;
+
+  /// Windows: this is the shell's in-frame results page (mockup q1), opened
+  /// from the top-bar search. The top bar is then the ONLY search box: the
+  /// page drops its own field and shows a "Results for" header with filter
+  /// chips instead, so the two boxes can never disagree.
+  ///
+  /// Only the shell's page matches: it is the one Windows caller that passes
+  /// `showBack: false` with a query. Pushed searches (detail genres, schedule,
+  /// a source's catalogue) keep `showBack: true` and their own box, which
+  /// stays usable when a pushed page covers the top bar.
+  bool get _desktopResultsPage =>
+      _windowsField &&
+      !widget.showBack &&
+      widget.fixedSourceId == null &&
+      (widget.initialQuery?.trim().isNotEmpty ?? false) &&
+      !sl<AppMode>().isTv;
+
+  /// Suggestion row picked with Up/Down on Windows; -1 = none (search-7).
+  final ValueNotifier<int> _suggestionHighlight = ValueNotifier(-1);
+
+  /// Key of the highlighted suggestion row, so it can be scrolled into view.
+  final GlobalKey _highlightedRowKey = GlobalKey();
+
+  /// Esc hid the suggestion list on Windows (search-1). Typing shows it again.
+  bool _suggestionsDismissed = false;
+
+  /// Windows only: the idle/filtered-browse list's controller, read after
+  /// each frame to page on when the first page does not fill the window
+  /// (search-2). Null on phone so its list stays the primary scroller.
+  ScrollController? _idleScroll;
+
   static const _voiceChannel = MethodChannel('zangetsu/phone_voice_search');
   static final _voiceArtwork = VoiceSearchArtwork();
 
@@ -334,6 +377,12 @@ class _SearchViewState extends State<_SearchView>
     super.initState();
     _controller = TextEditingController(text: widget.initialQuery ?? '');
     widget.focusSignal?.addListener(_onFocusSignal);
+    if (_windowsField) {
+      // The field's own node sees keys before the app-wide shortcuts, so Esc
+      // and the suggestion keys are handled here first (search-1, search-7).
+      _focusNode.onKeyEvent = _onFieldKey;
+      _idleScroll = ScrollController();
+    }
     // Arrived from a genre or tag chip: run that filtered browse straight
     // away, not a frame later. context.read is safe here, it subscribes to
     // nothing.
@@ -358,7 +407,10 @@ class _SearchViewState extends State<_SearchView>
     widget.focusSignal?.removeListener(_onFocusSignal);
     _controller.dispose();
     _focusNode.dispose();
+    _suggestionHighlight.dispose();
+    _idleScroll?.dispose();
     _ecoTabController?.dispose();
+    _installedSourcesProgress.dispose();
     super.dispose();
   }
 
@@ -431,8 +483,118 @@ class _SearchViewState extends State<_SearchView>
       text: q,
       selection: TextSelection.collapsed(offset: q.length),
     );
-    FocusScope.of(context).unfocus();
+    _suggestionHighlight.value = -1;
+    // Windows has no on-screen keyboard to dismiss: keep the box focused so
+    // the query can be refined straight away (search-7).
+    if (!_windowsField) FocusScope.of(context).unfocus();
     context.read<SearchBloc>().add(SearchRunRequested(q));
+  }
+
+  /// The suggestions currently on screen (same test as the body's
+  /// BlocBuilder), or empty when the list is hidden.
+  List<String> _visibleSuggestions() {
+    final state = context.read<SearchBloc>().state;
+    if (_suggestionsDismissed ||
+        state.status == SearchStatus.success ||
+        state.suggestions.isEmpty) {
+      return const [];
+    }
+    return state.suggestions;
+  }
+
+  /// Puts [q] in the box without running it (the row's fill-in arrow, and
+  /// Tab / Right on a highlighted suggestion).
+  void _fillIn(String q) {
+    _controller.value = TextEditingValue(
+      text: q,
+      selection: TextSelection.collapsed(offset: q.length),
+    );
+    _suggestionHighlight.value = -1;
+    if (_suggestionsDismissed) setState(() => _suggestionsDismissed = false);
+    context.read<SearchBloc>().add(SearchQueryChanged(q));
+  }
+
+  /// Windows keys on the search box.
+  ///
+  /// Esc (search-1): hide suggestions, then clear the text, then leave the
+  /// box; only an Esc with the box unfocused reaches the app-wide "go back".
+  /// Up/Down move a highlight through the suggestions, Enter runs the
+  /// highlighted one, Tab or Right (at the end of the text) fills it in
+  /// (search-7). Anything else falls through to the text field.
+  KeyEventResult _onFieldKey(FocusNode node, KeyEvent event) {
+    if (event is KeyUpEvent) return KeyEventResult.ignored;
+    final key = event.logicalKey;
+    final suggestions = _visibleSuggestions();
+    final h = _suggestionHighlight.value;
+    final highlighted = h >= 0 && h < suggestions.length
+        ? suggestions[h]
+        : null;
+
+    if (key == LogicalKeyboardKey.escape) {
+      if (event is KeyRepeatEvent) return KeyEventResult.handled;
+      if (suggestions.isNotEmpty) {
+        _suggestionHighlight.value = -1;
+        setState(() => _suggestionsDismissed = true);
+      } else if (_controller.text.isNotEmpty) {
+        _suggestionHighlight.value = -1;
+        _clear();
+      } else {
+        node.unfocus();
+      }
+      return KeyEventResult.handled;
+    }
+    if (suggestions.isEmpty) return KeyEventResult.ignored;
+
+    if (key == LogicalKeyboardKey.arrowDown) {
+      _moveHighlight(h < suggestions.length - 1 ? h + 1 : h);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowUp) {
+      // Up from the first row goes back to "nothing highlighted".
+      _moveHighlight(h > 0 ? h - 1 : -1);
+      return KeyEventResult.handled;
+    }
+    if (highlighted == null || event is KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.numpadEnter) {
+      _runQuery(highlighted);
+      return KeyEventResult.handled;
+    }
+    final atEnd =
+        _controller.selection.isCollapsed &&
+        _controller.selection.baseOffset == _controller.text.length;
+    if ((key == LogicalKeyboardKey.tab &&
+            !HardwareKeyboard.instance.isShiftPressed) ||
+        (key == LogicalKeyboardKey.arrowRight && atEnd)) {
+      _fillIn(highlighted);
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  /// Highlights suggestion [index] and keeps that row in view.
+  void _moveHighlight(int index) {
+    // Moving up reveals the row at the top edge, moving down at the bottom
+    // edge: keepVisibleAtEnd never scrolls backwards, so Up through a long
+    // list would otherwise leave the highlight above the viewport.
+    final movingUp = index < _suggestionHighlight.value;
+    _suggestionHighlight.value = index;
+    if (index < 0) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final rowContext = _highlightedRowKey.currentContext;
+      if (rowContext == null || !rowContext.mounted) return;
+      // Minimal scroll: only moves when the row is cut off at that edge.
+      final policy = movingUp || index == 0
+          ? ScrollPositionAlignmentPolicy.keepVisibleAtStart
+          : ScrollPositionAlignmentPolicy.keepVisibleAtEnd;
+      Scrollable.ensureVisible(
+        rowContext,
+        duration: const Duration(milliseconds: 90),
+        alignmentPolicy: policy,
+      );
+    });
   }
 
   void _clear() {
@@ -469,6 +631,53 @@ class _SearchViewState extends State<_SearchView>
       if (mounted) setState(() {});
     });
   }
+
+  /// Windows: a catalogue (Library) search in novel or manga mode, or in
+  /// anime mode when Home shows an installed source catalogue, also lists
+  /// what the installed sources found (R4). Phone and anime/movies on a
+  /// tracker catalogue: false.
+  bool get _installedSourcesFallback {
+    // Cheap checks first, so phone and Sources scope never read the cubit.
+    if (defaultTargetPlatform != TargetPlatform.windows) return false;
+    if (widget.scope != SearchScope.library || _stremioSearch) return false;
+    return installedSourcesFallbackApplies(
+      libraryScope: true,
+      mode: widget.forceMode ?? sl<ContentModeCubit>().state,
+    );
+  }
+
+  /// Keeps the one "From your sources" section (and its in-flight search)
+  /// alive while the body switches between loading, results and no-results.
+  final GlobalKey _installedSourcesKey = GlobalKey();
+
+  /// What the installed-sources section has found (count, still searching),
+  /// so the header counts source titles too and the page never says
+  /// "No results" while sources have titles or are still answering.
+  final ValueNotifier<InstalledSourcesProgress> _installedSourcesProgress =
+      ValueNotifier(const InstalledSourcesProgress());
+
+  /// See [installedSourcesMayHaveResults]: while true, the catalogue-empty /
+  /// catalogue-error states hold back their big block.
+  bool _sourcesMayHaveResults(InstalledSourcesProgress p, String query) =>
+      installedSourcesMayHaveResults(p, query);
+
+  /// The installed-sources section for the query the catalogue search ran.
+  Widget _installedSourcesSection(
+    SearchState state, {
+    bool catalogueEmpty = false,
+  }) => InstalledSourcesSearchSection(
+    key: _installedSourcesKey,
+    progress: _installedSourcesProgress,
+    // The query the catalogue search ran, not the live field text: typing
+    // while the catalogue loads keeps state.query moving but must not
+    // re-search sources with a half-typed title.
+    query: context.read<SearchBloc>().lastRunQuery,
+    mode: widget.forceMode ?? sl<ContentModeCubit>().state,
+    catalogueEmpty: catalogueEmpty,
+    // Same detail route the sources search uses, so a novel result opens its
+    // own source's novel page.
+    onOpen: _openDetail,
+  );
 
   /// Opens the full-grid view of ONE source's complete results for the current
   /// query. Reuses the home "See All" screen (with search-style poster tags) so
@@ -516,7 +725,7 @@ class _SearchViewState extends State<_SearchView>
     // Drop focus first. The search field autofocuses on open and keeps focus
     // behind the modal, so the keyboard can reappear over the sheet — which
     // shrinks it to a sliver and then dismisses it, losing the selection.
-    FocusScope.of(context).unfocus();
+    DesktopFocusRepair.dropFocus(context);
     final result = await showAniyomiFilterSheet(context, filters);
     if (result == null || !mounted) return;
     context.read<SearchBloc>().add(
@@ -643,7 +852,7 @@ class _SearchViewState extends State<_SearchView>
       showAppToast(context, context.l10n.filtersNeedProvider(needed));
       return;
     }
-    FocusScope.of(context).unfocus();
+    DesktopFocusRepair.dropFocus(context);
     final picked = await showMetaFilterSheet(context, kind, _metaFilters);
     if (picked == null || !mounted) return;
     setState(() => _metaFilters = picked);
@@ -669,7 +878,7 @@ class _SearchViewState extends State<_SearchView>
       return;
     }
     // Drop focus first — see [_openAniFilters] for why.
-    FocusScope.of(context).unfocus();
+    DesktopFocusRepair.dropFocus(context);
     final result = await showMihonFilterSheet(context, filters);
     if (result == null || !mounted) return;
     context.read<SearchBloc>().add(
@@ -742,8 +951,11 @@ class _SearchViewState extends State<_SearchView>
   Future<void> _openFilterSheet(BuildContext context) async {
     final bloc = context.read<SearchBloc>();
     if (_stremioSearch && sl.isRegistered<StremioProvider>()) {
-      final result = await showModalBottomSheet<StremioDiscoverSheetResult>(
-        context: context,
+      // Windows: centred dialog instead of a full-width bottom strip
+      // (search-4); phone keeps its bottom sheet.
+      final result = await showAdaptiveSheet<StremioDiscoverSheetResult>(
+        context,
+        desktopWidth: 600,
         backgroundColor: AppColors.surface,
         isScrollControlled: true,
         shape: const RoundedRectangleBorder(
@@ -766,8 +978,10 @@ class _SearchViewState extends State<_SearchView>
       }
     }
     if (!context.mounted) return;
-    await showModalBottomSheet<void>(
-      context: context,
+    // Windows: centred graphite dialog (search-4); phone: bottom sheet.
+    await showAdaptiveSheet<void>(
+      context,
+      desktopWidth: 560,
       backgroundColor: AppColors.surface,
       isScrollControlled: true,
       shape: const RoundedRectangleBorder(
@@ -803,22 +1017,36 @@ class _SearchViewState extends State<_SearchView>
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _searchBar(),
-            SizedBox(height: _stremioSearch ? 6 : 12),
+            // Windows shell results page: no second box, a "Results for"
+            // header with filter chips instead (mockup q1).
+            if (_desktopResultsPage)
+              _desktopHeader()
+            else ...[
+              _searchBar(),
+              SizedBox(height: _stremioSearch ? 6 : 12),
+            ],
             // Source line — what's being searched, one line of text, tap to
             // open the source picker. Shown idle too, so scope is always known.
             // Library scope queries the metadata catalogue, not a source, so
             // this (and the picker it opens) is Sources-only.
             if (widget.scope == SearchScope.sources && !_stremioSearch)
               _sourceLine(),
-            // Control row — ecosystem tabs (or a result count once scoped to a
-            // single source) on the left, sort + filter actions on the right.
-            _controlRow(modeSources),
-            // What the catalogue is currently narrowed to, spelled out.
-            // Arriving here from a genre or tag chip, the results are already
-            // filtered before you have typed anything — without this the
-            // screen just looks like a browse that picked those titles.
-            if (widget.scope == SearchScope.library) _activeFilterChips(),
+            // Windows results page: the header already carries the count and
+            // every filter, so only the ecosystem tabs remain from the row.
+            if (_desktopResultsPage)
+              _desktopEcosystemRow(modeSources)
+            else ...[
+              // Control row — ecosystem tabs (or a result count once scoped to
+              // a single source) on the left, sort + filter actions on the
+              // right.
+              _controlRow(modeSources),
+              // What the catalogue is currently narrowed to, spelled out.
+              // Arriving here from a genre or tag chip, the results are
+              // already filtered before you have typed anything — without
+              // this the screen just looks like a browse that picked those
+              // titles.
+              if (widget.scope == SearchScope.library) _activeFilterChips(),
+            ],
             // Per-source result pills — direct jump to one source's results.
             // Only meaningful once the scope is Sources.
             if (widget.scope == SearchScope.sources)
@@ -847,7 +1075,9 @@ class _SearchViewState extends State<_SearchView>
                   // While typing (before a search runs), show the live
                   // suggestion list instead of the idle/results body.
                   if (state.status != SearchStatus.success &&
-                      state.suggestions.isNotEmpty) {
+                      state.suggestions.isNotEmpty &&
+                      // Windows: Esc hid the list (search-1).
+                      !_suggestionsDismissed) {
                     return _suggestionList(state.suggestions);
                   }
                   switch (state.status) {
@@ -856,6 +1086,10 @@ class _SearchViewState extends State<_SearchView>
                       // box is empty, so the bloc does not consider it a
                       // search. Its own flag is what says results are coming.
                       if (state.filteredBrowseLoading) {
+                        // Windows: placeholders the size of the real cards.
+                        if (_windowsField) {
+                          return const DesktopPosterSkeletonGrid();
+                        }
                         return const Padding(
                           padding: EdgeInsets.all(20),
                           child: SkeletonGrid(),
@@ -863,11 +1097,48 @@ class _SearchViewState extends State<_SearchView>
                       }
                       return _idleView(state);
                     case SearchStatus.loading:
-                      return const Padding(
-                        padding: EdgeInsets.all(20),
-                        child: SkeletonGrid(),
-                      );
+                      // Windows: placeholders the size of the real cards, so
+                      // nothing jumps from big boxes to small posters.
+                      final Widget skeleton = _windowsField
+                          ? const DesktopPosterSkeletonGrid()
+                          : const Padding(
+                              padding: EdgeInsets.all(20),
+                              child: SkeletonGrid(),
+                            );
+                      // Windows reading-mode catalogue search: start the
+                      // installed-sources search now, hidden, so it runs
+                      // alongside the catalogue instead of after it.
+                      if (_installedSourcesFallback) {
+                        return Stack(
+                          children: [
+                            skeleton,
+                            Offstage(child: _installedSourcesSection(state)),
+                          ],
+                        );
+                      }
+                      return skeleton;
                     case SearchStatus.error:
+                      // Catalogue failed: installed sources may still have it.
+                      if (_installedSourcesFallback) {
+                        final ran = context.read<SearchBloc>().lastRunQuery;
+                        // The big error block only once the sources came up
+                        // empty too; while they answer or have titles, the
+                        // section alone (its status line says searching).
+                        return ValueListenableBuilder<InstalledSourcesProgress>(
+                          valueListenable: _installedSourcesProgress,
+                          builder: (context, progress, _) => ListView(
+                            children: [
+                              const SizedBox(height: 24),
+                              if (!_sourcesMayHaveResults(progress, ran))
+                                _errorView(state),
+                              _installedSourcesSection(
+                                state,
+                                catalogueEmpty: true,
+                              ),
+                            ],
+                          ),
+                        );
+                      }
                       return _errorView(state);
                     case SearchStatus.success:
                       return _resultsBody(state, cellW, modeSources);
@@ -994,7 +1265,7 @@ class _SearchViewState extends State<_SearchView>
                   GestureDetector(
                     behavior: HitTestBehavior.opaque,
                     onTap: () {
-                      FocusScope.of(context).unfocus();
+                      DesktopFocusRepair.dropFocus(context);
                       context.read<SearchBloc>().add(
                         SearchRunRequested(_controller.text),
                       );
@@ -1017,12 +1288,28 @@ class _SearchViewState extends State<_SearchView>
                       textInputAction: TextInputAction.search,
                       // Typing only updates suggestions — it never starts the
                       // heavy multi-source search.
-                      onChanged: (text) => context.read<SearchBloc>().add(
-                        SearchQueryChanged(text),
-                      ),
+                      onChanged: (text) {
+                        // Windows: new text drops the keyboard highlight and
+                        // brings back suggestions hidden with Esc.
+                        if (_windowsField) {
+                          _suggestionHighlight.value = -1;
+                          if (_suggestionsDismissed) {
+                            setState(() => _suggestionsDismissed = false);
+                          }
+                        }
+                        context.read<SearchBloc>().add(
+                          SearchQueryChanged(text),
+                        );
+                      },
+                      // Windows keeps the box focused after Enter (search-7):
+                      // a non-null onEditingComplete stops the field from
+                      // unfocusing itself on submit. Phone keeps the default.
+                      onEditingComplete: _windowsField
+                          ? _controller.clearComposing
+                          : null,
                       // Enter / keyboard "search" runs the full search.
                       onSubmitted: (text) {
-                        FocusScope.of(context).unfocus();
+                        if (!_windowsField) FocusScope.of(context).unfocus();
                         context.read<SearchBloc>().add(
                           SearchRunRequested(text),
                         );
@@ -1209,35 +1496,48 @@ class _SearchViewState extends State<_SearchView>
         if (b.id == activeId) return 1;
         return 0;
       });
-    showModalBottomSheet<void>(
-      context: context,
+    // Windows: a centred dialog titled "Search in" (search-4); phone keeps
+    // the bottom sheet with its own handle and heading.
+    showAdaptiveSheet<void>(
+      context,
+      title: context.l10n.searchIn,
+      desktopWidth: 440,
       backgroundColor: AppColors.surface,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
       builder: (ctx) => SafeArea(
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(0, 16, 0, 8),
+          padding: EdgeInsets.fromLTRB(
+            0,
+            DesktopSheetScope.of(ctx) ? 0 : 16,
+            0,
+            8,
+          ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Container(
-                width: 36,
-                height: 4,
-                margin: const EdgeInsets.only(bottom: 16),
-                decoration: BoxDecoration(
-                  color: AppColors.hairline,
-                  borderRadius: BorderRadius.circular(2),
+              // Handle + heading are phone-only; the Windows dialog has a
+              // title bar instead.
+              if (!DesktopSheetScope.of(ctx)) ...[
+                Container(
+                  width: 36,
+                  height: 4,
+                  margin: const EdgeInsets.only(bottom: 16),
+                  decoration: BoxDecoration(
+                    color: AppColors.hairline,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
                 ),
-              ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: Align(
-                  alignment: AlignmentDirectional.centerStart,
-                  child: Text(context.l10n.searchIn, style: AppText.headline),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 20),
+                  child: Align(
+                    alignment: AlignmentDirectional.centerStart,
+                    child: Text(context.l10n.searchIn, style: AppText.headline),
+                  ),
                 ),
-              ),
-              const SizedBox(height: 4),
+                const SizedBox(height: 4),
+              ],
               Flexible(
                 child: ListView.separated(
                   shrinkWrap: true,
@@ -1391,39 +1691,176 @@ class _SearchViewState extends State<_SearchView>
     if (chips.isEmpty) return const SizedBox.shrink();
     return SizedBox(
       height: 40,
-      child: ListView(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
-        children: [
-          for (final (label, without) in chips)
-            Padding(
-              padding: const EdgeInsetsDirectional.only(end: 8),
-              child: _ActiveFilterChip(
-                label: label,
-                onRemove: () {
-                  setState(() => _metaFilters = without);
-                  _applyMetaFilters();
-                },
+      // Windows: mouse drag + hover arrows (search-3); phone unchanged.
+      child: SearchRowScroller(
+        arrowSize: 28,
+        builder: (controller) => ListView(
+          controller: controller,
+          scrollDirection: Axis.horizontal,
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
+          children: [
+            for (final (label, without) in chips)
+              Padding(
+                padding: const EdgeInsetsDirectional.only(end: 8),
+                child: _ActiveFilterChip(
+                  label: label,
+                  onRemove: () {
+                    setState(() => _metaFilters = without);
+                    _applyMetaFilters();
+                  },
+                ),
               ),
-            ),
-          if (chips.length > 1)
-            Center(
-              child: GestureDetector(
-                onTap: () {
-                  setState(() => _metaFilters = const MetaFilters());
-                  _applyMetaFilters();
-                },
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
-                  child: Text(
-                    context.l10n.clearAll,
-                    style: AppText.caption.copyWith(color: AppColors.accent),
+            if (chips.length > 1)
+              Center(
+                child: GestureDetector(
+                  onTap: () {
+                    setState(() => _metaFilters = const MetaFilters());
+                    _applyMetaFilters();
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: Text(
+                      context.l10n.clearAll,
+                      style: AppText.caption.copyWith(color: AppColors.accent),
+                    ),
                   ),
                 ),
               ),
-            ),
-        ],
+          ],
+        ),
       ),
+    );
+  }
+
+  /// Windows results page header (mockup q1): "Results for “q”", the title
+  /// count, and one row of filter chips that replaces the old control row,
+  /// the tune icon beside the removed box and the active-filter chips.
+  ///
+  /// Where the old controls now live:
+  /// * Library: Format / Genres / Year / Status / Sort chips edit
+  ///   [_metaFilters] directly; "More filters" opens the full sheet (season,
+  ///   min score, tags); NSFW stays first in the row.
+  /// * Sources: Type / Genres / Status / Sort chips dispatch the same events
+  ///   as the filter sheet; "More filters" opens that sheet (audio, which
+  ///   sources to search, current source only); the per-source filter icon
+  ///   follows the chips when one source is searched.
+  Widget _desktopHeader() {
+    return BlocBuilder<SearchBloc, SearchState>(
+      builder: (context, state) {
+        final bloc = context.read<SearchBloc>();
+        final ran = bloc.lastRunQuery.trim();
+        final query = ran.isNotEmpty ? ran : widget.initialQuery!.trim();
+        final library = widget.scope == SearchScope.library;
+        final List<DesktopFilterChipSpec> chips;
+        final VoidCallback? clear;
+        if (library) {
+          chips = desktopLibraryFilterChips(
+            context,
+            filters: _metaFilters,
+            kind: browseKindFor(
+              widget.forceMode ?? sl<ContentModeCubit>().state,
+              ZModePrefs.streamKind,
+            ),
+            supportsFilters:
+                sl.isRegistered<MetadataRepository>() &&
+                sl<MetadataRepository>().supportsFilters,
+            onChanged: (picked) {
+              setState(() => _metaFilters = picked);
+              // A plain run (not browseDefaults): there is always a query
+              // here, and an all-default selection must clear back to the
+              // plain search rather than turn into a discover browse.
+              _applyMetaFilters();
+            },
+            onMoreFilters: _openMetaFilters,
+          );
+          clear = _metaFilters.narrowsCatalogue
+              ? () {
+                  setState(
+                    () => _metaFilters = desktopClearedMetaFilters(
+                      _metaFilters,
+                    ),
+                  );
+                  _applyMetaFilters();
+                }
+              : null;
+        } else {
+          chips = desktopSourcesFilterChips(
+            context,
+            state: state,
+            dispatch: bloc.add,
+            onMoreFilters: () => _openFilterSheet(context),
+          );
+          clear = state.activeFilterCount > 0
+              ? () {
+                  for (final event in desktopClearSourcesFilterEvents()) {
+                    bloc.add(event);
+                  }
+                }
+              : null;
+        }
+        // Same visibility rule as the NSFW toggle in [_controlRow].
+        final showAdult =
+            library &&
+            sl<PlaybackPrefs>().adultMetadata &&
+            (!sl.isRegistered<ViewerProfileStore>() ||
+                sl<ViewerProfileStore>().adultMetadataAllowed);
+        // Catalogue count (only once it answered).
+        final catalogueCount = state.status == SearchStatus.success
+            ? state.totalCount
+            : null;
+        DesktopResultsHeader header({int? count, bool searching = false}) =>
+            DesktopResultsHeader(
+              query: query,
+              count: count,
+              searchingSources: searching,
+              chips: chips,
+              leading: [if (showAdult) _adultToggle()],
+              trailing: [if (!library) _sourceFilterAction()],
+              onClearFilters: clear,
+            );
+        if (!_installedSourcesFallback) return header(count: catalogueCount);
+        // The search also asks the installed sources: their titles count
+        // too, so the header never reads "0 titles" above source results.
+        return ValueListenableBuilder<InstalledSourcesProgress>(
+          valueListenable: _installedSourcesProgress,
+          builder: (context, progress, _) {
+            final line = desktopResultsCountWithSources(
+              // A catalogue error still counts the sources' titles.
+              catalogueCount:
+                  catalogueCount ??
+                  (state.status == SearchStatus.error ? 0 : null),
+              progress: progress,
+              query: ran,
+            );
+            return header(count: line.count, searching: line.searching);
+          },
+        );
+      },
+    );
+  }
+
+  /// Windows results page: the ecosystem tabs from the old control row, kept
+  /// under the header when a sources search spans three or more ecosystems.
+  Widget _desktopEcosystemRow(List<({String id, String name})> modeSources) {
+    if (widget.scope != SearchScope.sources || _stremioSearch) {
+      return const SizedBox.shrink();
+    }
+    return BlocBuilder<SearchBloc, SearchState>(
+      buildWhen: (p, c) =>
+          p.status != c.status ||
+          p.currentSourceOnly != c.currentSourceOnly ||
+          p.ecosystem != c.ecosystem,
+      builder: (context, state) {
+        if (state.currentSourceOnly || state.status != SearchStatus.success) {
+          return const SizedBox.shrink();
+        }
+        final tabs = ecosystemTabsFor(modeSources.map((s) => s.id));
+        if (tabs.length < 3) return const SizedBox.shrink();
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 4, 0),
+          child: SizedBox(height: 40, child: _ecosystemTabs(state, tabs)),
+        );
+      },
     );
   }
 
@@ -1766,32 +2203,37 @@ class _SearchViewState extends State<_SearchView>
             if (addons.isEmpty) return const SizedBox.shrink();
             return SizedBox(
               height: 42,
-              child: ListView(
-                scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                children: [
-                  _chip(
-                    label: 'All',
-                    selected: state.sourceFilter == kAllSources,
-                    onTap: () => context.read<SearchBloc>().add(
-                      const SearchSourceFilterChanged(kAllSources),
+              // Windows: mouse drag + hover arrows (search-3).
+              child: SearchRowScroller(
+                arrowSize: 28,
+                builder: (controller) => ListView(
+                  controller: controller,
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  children: [
+                    _chip(
+                      label: 'All',
+                      selected: state.sourceFilter == kAllSources,
+                      onTap: () => context.read<SearchBloc>().add(
+                        const SearchSourceFilterChanged(kAllSources),
+                      ),
                     ),
-                  ),
-                  for (final addon in addons)
-                    Padding(
-                      padding: const EdgeInsetsDirectional.only(start: 8),
-                      child: _chip(
-                        label: addon.name,
-                        selected:
-                            state.sourceFilter == 'stremio-addon:${addon.id}',
-                        onTap: () => context.read<SearchBloc>().add(
-                          SearchSourceFilterChanged(
-                            'stremio-addon:${addon.id}',
+                    for (final addon in addons)
+                      Padding(
+                        padding: const EdgeInsetsDirectional.only(start: 8),
+                        child: _chip(
+                          label: addon.name,
+                          selected:
+                              state.sourceFilter == 'stremio-addon:${addon.id}',
+                          onTap: () => context.read<SearchBloc>().add(
+                            SearchSourceFilterChanged(
+                              'stremio-addon:${addon.id}',
+                            ),
                           ),
                         ),
                       ),
-                    ),
-                ],
+                  ],
+                ),
               ),
             );
           },
@@ -1839,32 +2281,37 @@ class _SearchViewState extends State<_SearchView>
   Widget _filterChips(SearchState state, List<SourceResultGroup> groups) {
     return SizedBox(
       height: 34,
-      child: ListView(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 16),
-        children: [
-          _chip(
-            label: context.l10n.allCount(state.totalCount),
-            selected: state.sourceFilter == kAllSources,
-            onTap: () => context.read<SearchBloc>().add(
-              const SearchSourceFilterChanged(kAllSources),
-            ),
-          ),
-          for (final g in groups)
-            Padding(
-              padding: const EdgeInsetsDirectional.only(start: 8),
-              child: _chip(
-                label: context.l10n.sourceCountBadge(
-                  g.sourceName,
-                  state.countFor(g),
-                ),
-                selected: state.sourceFilter == g.sourceId,
-                onTap: () => context.read<SearchBloc>().add(
-                  SearchSourceFilterChanged(g.sourceId),
-                ),
+      // Windows: mouse drag + hover arrows (search-3); phone unchanged.
+      child: SearchRowScroller(
+        arrowSize: 28,
+        builder: (controller) => ListView(
+          controller: controller,
+          scrollDirection: Axis.horizontal,
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          children: [
+            _chip(
+              label: context.l10n.allCount(state.totalCount),
+              selected: state.sourceFilter == kAllSources,
+              onTap: () => context.read<SearchBloc>().add(
+                const SearchSourceFilterChanged(kAllSources),
               ),
             ),
-        ],
+            for (final g in groups)
+              Padding(
+                padding: const EdgeInsetsDirectional.only(start: 8),
+                child: _chip(
+                  label: context.l10n.sourceCountBadge(
+                    g.sourceName,
+                    state.countFor(g),
+                  ),
+                  selected: state.sourceFilter == g.sourceId,
+                  onTap: () => context.read<SearchBloc>().add(
+                    SearchSourceFilterChanged(g.sourceId),
+                  ),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -1956,7 +2403,38 @@ class _SearchViewState extends State<_SearchView>
               )
               .toList();
 
+    // Windows reading-mode catalogue search: the installed sources' results
+    // go under the catalogue's (R4). Null everywhere else.
+    final sourcesFooter = _installedSourcesFallback
+        ? _installedSourcesSection(state, catalogueEmpty: groups.isEmpty)
+        : null;
+
     if (groups.isEmpty && !stillLoading && failed.isEmpty) {
+      // Catalogue found nothing: list what the installed sources found, and
+      // say "No results" only once every source came up empty too (never
+      // above source titles, never while sources are still answering).
+      if (sourcesFooter != null) {
+        final ran = context.read<SearchBloc>().lastRunQuery;
+        return ValueListenableBuilder<InstalledSourcesProgress>(
+          valueListenable: _installedSourcesProgress,
+          builder: (context, progress, _) {
+            final sourcesPending = _sourcesMayHaveResults(progress, ran);
+            return ListView(
+              keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+              children: [
+                const SizedBox(height: 24),
+                if (!sourcesPending) _noResults(state),
+                // One empty state: under "No results" the section's own
+                // "none of your sources" line would only repeat it.
+                if (sourcesPending)
+                  sourcesFooter
+                else
+                  _installedSourcesSection(state),
+              ],
+            );
+          },
+        );
+      }
       return _noResults(state);
     }
 
@@ -1973,7 +2451,36 @@ class _SearchViewState extends State<_SearchView>
     // row is cramped — regardless of the All-view layout setting. 3 columns
     // (grouped-by-source sections below are the denser 4-up grid).
     if (singleSource) {
-      return _resultsGrid(state.visibleResults, cellW);
+      return _resultsGrid(state.visibleResults, cellW, footer: sourcesFooter);
+    }
+
+    if (_stremioSearch) {
+      final addons = <String, List<SourceResultGroup>>{};
+      for (final group in groups) {
+        addons.putIfAbsent(group.sourceId, () => []).add(group);
+      }
+      final showAddonName = state.sourceFilter == kAllSources;
+      return ListView(
+        padding: EdgeInsets.only(bottom: MediaQuery.paddingOf(context).bottom),
+        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+        children: [
+          for (final addon in addons.values) ...[
+            if (showAddonName)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                child: Text(
+                  addon.first.addonName ?? '',
+                  style: AppText.headline,
+                ),
+              ),
+            for (var i = 0; i < addon.length; i++) ...[
+              _sourceRow(addon[i], cellW),
+              if (i < addon.length - 1) const SizedBox(height: 12),
+            ],
+            const SizedBox(height: 20),
+          ],
+        ],
+      );
     }
 
     if (_stremioSearch) {
@@ -2017,6 +2524,8 @@ class _SearchViewState extends State<_SearchView>
       // Sources that broke. Shown in place, with why, rather than just going
       // missing from the list with no explanation.
       for (final f in failed) _failedSection(f.key, f.value),
+      // Windows reading mode: installed sources' results last (R4).
+      ?sourcesFooter,
     ];
 
     return ListView(
@@ -2143,10 +2652,13 @@ class _SearchViewState extends State<_SearchView>
   /// Horizontal (CloudStream-style) poster row for one source. Capped to
   /// [_kSourcePreviewCap]; the header's "See all" opens the full grid.
   Widget _sourceRow(SourceResultGroup g, double cellW) {
-    final itemW = _stremioSearch
+    // Windows and upstream's Stremio search both use the shared row sizing.
+    final sharedRowSize =
+        defaultTargetPlatform == TargetPlatform.windows || _stremioSearch;
+    final itemW = sharedRowSize
         ? posterRowWidth(context)
         : (posterLayout(context) == PosterCardLayout.wide ? 184.0 : 124.0);
-    final itemH = _stremioSearch
+    final itemH = sharedRowSize
         ? posterRowHeight(context)
         : (posterLayout(context) == PosterCardLayout.wide ? 146.0 : 210.0);
     final overflows = g.items.length > _kSourcePreviewCap;
@@ -2206,57 +2718,62 @@ class _SearchViewState extends State<_SearchView>
           height: heights.isEmpty
               ? itemH
               : heights.fold<double>(0, (a, b) => a > b ? a : b),
-          child: ListView.builder(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            // With a screen reader on, build every poster (not just the lazy
-            // window) so TalkBack can reach each one and the row auto-scrolls to
-            // it — otherwise swipe navigation stalls at the first few. Sighted
-            // users keep the lazy 600px window unchanged.
-            // `accessibleNavigationOf`, not `MediaQuery.of(...)`: the latter
-            // subscribes to every aspect including viewInsets, so each row
-            // rebuilt on every frame of the keyboard sliding in or out.
-            cacheExtent: MediaQuery.accessibleNavigationOf(context)
-                ? double.infinity
-                : 600,
-            itemCount: preview.length,
-            itemBuilder: (context, i) {
-              final item = preview[i];
-              return Padding(
-                padding: const EdgeInsetsDirectional.only(end: 12),
-                child: Container(
-                  width: widths[i],
-                  alignment: Alignment.topLeft,
-                  child: SizedBox(
-                    height: heights[i],
-                    child: RepaintBoundary(
-                      child: RevealItem(
-                        index: i,
-                        child: PosterCard(
-                          title: item.title,
-                          logoItem: item,
-                          imageUrl: item.cover,
-                          wideImageUrl: item.banner,
-                          genres: item.genres,
-                          isAdult: item.isAdult,
-                          headers: item.coverHeaders,
-                          tags: _tagsFor(item),
-                          qualityBadge: item.quality,
-                          scoreBadge: item.score,
-                          dubBadge: item.dubBadge,
-                          cellWidth: widths[i],
-                          wideOverride: aspects[i] == null
-                              ? null
-                              : aspects[i]! > 1,
-                          onTap: () => _openDetail(item),
-                          onLongPress: () => _showInfo(item),
+          // Windows: mouse drag, Shift+wheel and hover arrows (search-3);
+          // phone keeps the plain touch-scrolled row.
+          child: SearchRowScroller(
+            builder: (controller) => ListView.builder(
+              controller: controller,
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              // With a screen reader on, build every poster (not just the lazy
+              // window) so TalkBack can reach each one and the row auto-scrolls to
+              // it — otherwise swipe navigation stalls at the first few. Sighted
+              // users keep the lazy 600px window unchanged.
+              // `accessibleNavigationOf`, not `MediaQuery.of(...)`: the latter
+              // subscribes to every aspect including viewInsets, so each row
+              // rebuilt on every frame of the keyboard sliding in or out.
+              cacheExtent: MediaQuery.accessibleNavigationOf(context)
+                  ? double.infinity
+                  : 600,
+              itemCount: preview.length,
+              itemBuilder: (context, i) {
+                final item = preview[i];
+                return Padding(
+                  padding: const EdgeInsetsDirectional.only(end: 12),
+                  child: Container(
+                    width: widths[i],
+                    alignment: Alignment.topLeft,
+                    child: SizedBox(
+                      height: heights[i],
+                      child: RepaintBoundary(
+                        child: RevealItem(
+                          index: i,
+                          child: PosterCard(
+                            title: item.title,
+                            logoItem: item,
+                            imageUrl: item.cover,
+                            wideImageUrl: item.banner,
+                            genres: item.genres,
+                            isAdult: item.isAdult,
+                            headers: item.coverHeaders,
+                            tags: _tagsFor(item),
+                            qualityBadge: item.quality,
+                            scoreBadge: item.score,
+                            dubBadge: item.dubBadge,
+                            cellWidth: widths[i],
+                            wideOverride: aspects[i] == null
+                                ? null
+                                : aspects[i]! > 1,
+                            onTap: () => _openDetail(item),
+                            onLongPress: () => _showInfo(item),
+                          ),
                         ),
                       ),
                     ),
                   ),
-                ),
-              );
-            },
+                );
+              },
+            ),
           ),
         ),
       ],
@@ -2289,12 +2806,7 @@ class _SearchViewState extends State<_SearchView>
           shrinkWrap: true,
           physics: const NeverScrollableScrollPhysics(),
           padding: const EdgeInsets.symmetric(horizontal: 16),
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: posterGridColumns(context),
-            childAspectRatio: posterGridAspect(context),
-            crossAxisSpacing: 12,
-            mainAxisSpacing: 16,
-          ),
+          gridDelegate: posterGridDelegate(context),
           itemCount: preview.length,
           itemBuilder: (context, i) {
             final item = preview[i];
@@ -2456,6 +2968,8 @@ class _SearchViewState extends State<_SearchView>
   /// muted, "searching…" where the count goes, grid matching [_sourceGrid].
   Widget _skeletonSection(String name, SearchLayout layout) {
     if (layout == SearchLayout.horizontal) {
+      // Windows: row placeholders at the real row-card size.
+      if (_windowsField) return const DesktopPosterSkeletonRow();
       return const RowSkeleton();
     }
     return Column(
@@ -2463,16 +2977,30 @@ class _SearchViewState extends State<_SearchView>
       mainAxisSize: MainAxisSize.min,
       children: [
         _sectionHeader(name, 0, pending: true),
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 16),
-          child: SkeletonGrid(),
-        ),
+        // Windows: same grid and padding as [_sourceGrid]'s real cards.
+        if (_windowsField)
+          const DesktopPosterSkeletonGrid(
+            count: 6,
+            padding: EdgeInsets.symmetric(horizontal: 16),
+          )
+        else
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 16),
+            child: SkeletonGrid(),
+          ),
       ],
     );
   }
 
   /// Cleaner no-results state with the searched query echoed back.
   Widget _noResults(SearchState state) {
+    // Windows results page, library scope: the header's catalogue filters
+    // can empty the results too, so they count (and clear) here as well.
+    final metaClearable =
+        _desktopResultsPage &&
+        widget.scope == SearchScope.library &&
+        _metaFilters.narrowsCatalogue;
+    final filtered = state.hasActiveFilter || metaClearable;
     return Center(
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 32),
@@ -2492,16 +3020,25 @@ class _SearchViewState extends State<_SearchView>
             ),
             const SizedBox(height: 6),
             Text(
-              state.hasActiveFilter
+              filtered
                   ? context.l10n.tryClearingYourFiltersOrSearchDifferentTitle
                   : context.l10n.checkTheSpellingOrTryADifferentTitle,
               textAlign: TextAlign.center,
               style: AppText.caption,
             ),
-            if (state.hasActiveFilter) ...[
+            if (filtered) ...[
               const SizedBox(height: 16),
               TextButton(
                 onPressed: () {
+                  if (metaClearable) {
+                    setState(
+                      () => _metaFilters = desktopClearedMetaFilters(
+                        _metaFilters,
+                      ),
+                    );
+                    _applyMetaFilters();
+                  }
+                  if (!state.hasActiveFilter) return;
                   final bloc = context.read<SearchBloc>();
                   bloc
                     ..add(
@@ -2523,7 +3060,38 @@ class _SearchViewState extends State<_SearchView>
   }
 
   // ── Flat results grid (single-source / vertical) ──────────────────────────
-  Widget _resultsGrid(List<MediaItem> items, double cellW) {
+  ///
+  /// [footer] (Windows installed-sources section, R4) scrolls under the grid.
+  /// Null keeps the plain GridView exactly as before.
+  Widget _resultsGrid(List<MediaItem> items, double cellW, {Widget? footer}) {
+    if (footer != null) {
+      // Same cells as the GridView below, as a sliver so the footer can sit
+      // under the grid in one scroll.
+      return CustomScrollView(
+        // Windows: same build-ahead as the GridView below.
+        // ignore: deprecated_member_use
+        cacheExtent: _windowsField ? 800 : null,
+        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+        slivers: [
+          SliverPadding(
+            padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+            sliver: SliverGrid(
+              gridDelegate: posterGridDelegate(context),
+              delegate: SliverChildBuilderDelegate(
+                (context, i) => _resultsGridCell(items[i], cellW),
+                childCount: items.length,
+              ),
+            ),
+          ),
+          SliverToBoxAdapter(child: footer),
+          SliverPadding(
+            padding: EdgeInsets.only(
+              bottom: MediaQuery.paddingOf(context).bottom,
+            ),
+          ),
+        ],
+      );
+    }
     return GridView.builder(
       padding: EdgeInsets.fromLTRB(
         16,
@@ -2533,34 +3101,29 @@ class _SearchViewState extends State<_SearchView>
       ),
       cacheExtent: 800,
       keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: posterGridColumns(context),
-        childAspectRatio: posterGridAspect(context),
-        crossAxisSpacing: 12,
-        mainAxisSpacing: 16,
-      ),
+      gridDelegate: posterGridDelegate(context),
       itemCount: items.length,
-      itemBuilder: (context, i) {
-        final item = items[i];
-        return PosterCard(
-          title: item.title,
-          logoItem: item,
-          imageUrl: item.cover,
-          wideImageUrl: item.banner,
-          genres: item.genres,
-          isAdult: item.isAdult,
-          headers: item.coverHeaders,
-          tags: _tagsFor(item),
-          qualityBadge: item.quality,
-          scoreBadge: item.score,
-          dubBadge: item.dubBadge,
-          cellWidth: cellW,
-          onTap: () => _openDetail(item),
-          onLongPress: () => _showInfo(item),
-        );
-      },
+      itemBuilder: (context, i) => _resultsGridCell(items[i], cellW),
     );
   }
+
+  /// One poster of [_resultsGrid], shared by its GridView and sliver forms.
+  Widget _resultsGridCell(MediaItem item, double cellW) => PosterCard(
+    title: item.title,
+    logoItem: item,
+    imageUrl: item.cover,
+    wideImageUrl: item.banner,
+    genres: item.genres,
+    isAdult: item.isAdult,
+    headers: item.coverHeaders,
+    tags: _tagsFor(item),
+    qualityBadge: item.quality,
+    scoreBadge: item.score,
+    dubBadge: item.dubBadge,
+    cellWidth: cellW,
+    onTap: () => _openDetail(item),
+    onLongPress: () => _showInfo(item),
+  );
 
   /// Idle-screen section heading — the app's usual quiet label.
   // Not const: AppText's styles follow the user's font choice now.
@@ -2660,6 +3223,12 @@ class _SearchViewState extends State<_SearchView>
     }
 
     final cellW = posterGridCellWidth(context);
+    // Windows (search-2): a big window can show the whole first page with
+    // no scrolling, so no scroll notification would ever ask for page two.
+    // Check after layout and page on while the list is short.
+    if (_windowsField && browsing && state.canLoadMoreFilteredBrowse) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _pageIfShort());
+    }
     return NotificationListener<ScrollNotification>(
       // Infinite scroll for a filtered browse, the way Aniyomi keeps paging one.
       // The bloc ignores the event unless a browse is active and idle, so this
@@ -2674,6 +3243,8 @@ class _SearchViewState extends State<_SearchView>
         return false;
       },
       child: ListView(
+        // Windows only (null on phone): lets [_pageIfShort] measure the list.
+        controller: _idleScroll,
         padding: EdgeInsets.fromLTRB(
           16,
           4,
@@ -2692,9 +3263,24 @@ class _SearchViewState extends State<_SearchView>
                   ),
                 ),
                 GestureDetector(
+                  key: const ValueKey('search-recent-clear'),
                   onTap: () async {
+                    // Windows: offer Undo instead of losing the list for
+                    // good (search-9). Phone keeps the instant clear.
+                    final before = _windowsField
+                        ? _history.recent().toList()
+                        : const <String>[];
                     await _history.clear();
                     if (mounted) setState(() {});
+                    if (!mounted || before.isEmpty) return;
+                    showUndoToast(
+                      context,
+                      message: context.l10n.recentSearchesCleared,
+                      onUndo: () async {
+                        await _history.restore(before);
+                        if (mounted) setState(() {});
+                      },
+                    );
                   },
                   behavior: HitTestBehavior.opaque,
                   child: Padding(
@@ -2771,12 +3357,7 @@ class _SearchViewState extends State<_SearchView>
             GridView.builder(
               shrinkWrap: true,
               physics: const NeverScrollableScrollPhysics(),
-              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: posterGridColumns(context),
-                childAspectRatio: posterGridAspect(context),
-                crossAxisSpacing: 12,
-                mainAxisSpacing: 16,
-              ),
+              gridDelegate: posterGridDelegate(context),
               itemCount: trending.length,
               itemBuilder: (context, i) {
                 final item = trending[i];
@@ -2814,11 +3395,44 @@ class _SearchViewState extends State<_SearchView>
                     child: CircularProgressIndicator(strokeWidth: 2),
                   ),
                 ),
+              )
+            // Windows fallback (search-2): a visible way to fetch the next
+            // page if infinite scroll never fires.
+            else if (_windowsField &&
+                browsing &&
+                state.canLoadMoreFilteredBrowse)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                child: Center(
+                  child: OutlinedButton(
+                    key: const ValueKey('search-load-more'),
+                    onPressed: () => context.read<SearchBloc>().add(
+                      const SearchFilteredBrowseMore(),
+                    ),
+                    child: Text(context.l10n.loadMore),
+                  ),
+                ),
               ),
           ],
         ],
       ),
     );
+  }
+
+  /// Windows (search-2): asks for the next filtered-browse page when the
+  /// list cannot scroll yet or is already within the infinite-scroll
+  /// threshold of its end. The bloc ignores the event unless it can page.
+  void _pageIfShort() {
+    if (!mounted) return;
+    final bloc = context.read<SearchBloc>();
+    if (!bloc.state.canLoadMoreFilteredBrowse) return;
+    final c = _idleScroll;
+    if (c == null || !c.hasClients) return;
+    final p = c.position;
+    if (!p.hasContentDimensions) return;
+    if (p.maxScrollExtent - p.pixels < 600) {
+      bloc.add(const SearchFilteredBrowseMore());
+    }
   }
 
   // ── Type-ahead suggestion list (history + live titles) ────────────────────
@@ -2834,16 +3448,33 @@ class _SearchViewState extends State<_SearchView>
       itemBuilder: (context, i) {
         final s = suggestions[i];
         final fromHistory = history.contains(s.toLowerCase());
-        return _suggestionRow(s, fromHistory: fromHistory);
+        if (!_windowsField) return _suggestionRow(s, fromHistory: fromHistory);
+        // Windows: paint the row picked with Up/Down (search-7).
+        return ValueListenableBuilder<int>(
+          valueListenable: _suggestionHighlight,
+          builder: (context, highlight, _) => _suggestionRow(
+            s,
+            fromHistory: fromHistory,
+            highlighted: highlight == i,
+          ),
+        );
       },
     );
   }
 
-  Widget _suggestionRow(String q, {required bool fromHistory}) {
-    return InkWell(
+  Widget _suggestionRow(
+    String q, {
+    required bool fromHistory,
+    bool highlighted = false,
+  }) {
+    final row = InkWell(
       onTap: () => _runQuery(q),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 13),
+        // Windows trims the vertical padding to make room for the taller
+        // fill-in button, so rows keep about the same height.
+        padding: _windowsField
+            ? const EdgeInsets.fromLTRB(20, 4, 12, 4)
+            : const EdgeInsets.symmetric(horizontal: 20, vertical: 13),
         child: Row(
           children: [
             Icon(
@@ -2861,34 +3492,76 @@ class _SearchViewState extends State<_SearchView>
               ),
             ),
             // Tap to fill the field without running yet (CloudStream-style).
-            GestureDetector(
-              onTap: () {
-                _controller.value = TextEditingValue(
-                  text: q,
-                  selection: TextSelection.collapsed(offset: q.length),
-                );
-                context.read<SearchBloc>().add(SearchQueryChanged(q));
-              },
-              child: const Padding(
-                padding: EdgeInsets.all(4),
-                child: Icon(
-                  Icons.north_west_rounded,
-                  size: 16,
-                  color: AppColors.textTertiary,
+            if (_windowsField)
+              // Windows: a mouse-sized target with a tooltip, hand cursor and
+              // hover circle (search-7).
+              Tooltip(
+                message: context.l10n.fillInSearchBox,
+                child: InkResponse(
+                  key: ValueKey('search-suggestion-fill-$q'),
+                  onTap: () => _fillIn(q),
+                  mouseCursor: SystemMouseCursors.click,
+                  radius: 18,
+                  child: const SizedBox.square(
+                    dimension: 36,
+                    child: Icon(
+                      Icons.north_west_rounded,
+                      size: 18,
+                      color: AppColors.textTertiary,
+                    ),
+                  ),
+                ),
+              )
+            else
+              GestureDetector(
+                onTap: () {
+                  _controller.value = TextEditingValue(
+                    text: q,
+                    selection: TextSelection.collapsed(offset: q.length),
+                  );
+                  context.read<SearchBloc>().add(SearchQueryChanged(q));
+                },
+                child: const Padding(
+                  padding: EdgeInsets.all(4),
+                  child: Icon(
+                    Icons.north_west_rounded,
+                    size: 16,
+                    color: AppColors.textTertiary,
+                  ),
                 ),
               ),
-            ),
           ],
         ),
       ),
     );
+    if (!_windowsField) return row;
+    // Windows: the keyboard-highlighted row gets the accent selection fill
+    // and a key so it can be scrolled into view.
+    return Container(
+      key: highlighted ? _highlightedRowKey : null,
+      color: highlighted
+          ? DesktopChrome.selectedFill(AppColors.accent)
+          : Colors.transparent,
+      child: row,
+    );
   }
 
   Widget _recentChip(String q) {
+    // Windows: every style gets a remove x that shows on hover (search-9).
+    if (_windowsField) {
+      return _HoverBuilder(builder: (hovered) => _recentChipBody(q, hovered));
+    }
+    return _recentChipBody(q, false);
+  }
+
+  /// One recent-search chip. [hovered] only matters on Windows, where it
+  /// reveals the remove x.
+  Widget _recentChipBody(String q, bool hovered) {
+    final showRemove = _windowsField || _metadataStyle;
     return GestureDetector(
       onTap: () => _runQuery(q),
       child: Container(
-        padding: _metadataStyle
+        padding: showRemove
             ? const EdgeInsets.fromLTRB(12, 7, 6, 7)
             : const EdgeInsets.fromLTRB(12, 7, 12, 7),
         decoration: BoxDecoration(
@@ -2918,7 +3591,42 @@ class _SearchViewState extends State<_SearchView>
             // Drop one term without clearing the lot. The store has always
             // had `remove`; nothing on screen ever called it, so a single bad
             // search stuck until you wiped the whole history.
-            if (_metadataStyle)
+            if (_windowsField)
+              // Windows: space is kept so chips do not jump on hover; the x
+              // only fades in (and takes clicks) while the chip is hovered.
+              IgnorePointer(
+                ignoring: !hovered,
+                child: AnimatedOpacity(
+                  opacity: hovered ? 1 : 0,
+                  duration: const Duration(milliseconds: 120),
+                  child: Tooltip(
+                    message: context.l10n.remove,
+                    child: MouseRegion(
+                      cursor: SystemMouseCursors.click,
+                      child: GestureDetector(
+                        key: ValueKey('search-recent-remove-$q'),
+                        onTap: () async {
+                          await _history.remove(q);
+                          if (mounted) setState(() {});
+                        },
+                        behavior: HitTestBehavior.opaque,
+                        child: const Padding(
+                          padding: EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          child: Icon(
+                            Icons.close_rounded,
+                            size: 14,
+                            color: AppColors.textTertiary,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              )
+            else if (_metadataStyle)
               GestureDetector(
                 onTap: () async {
                   await _history.remove(q);
@@ -2939,6 +3647,28 @@ class _SearchViewState extends State<_SearchView>
       ),
     );
   }
+}
+
+/// Rebuilds [builder] with whether the mouse is over it (Windows hover-only
+/// controls, e.g. the recent-search remove x).
+class _HoverBuilder extends StatefulWidget {
+  const _HoverBuilder({required this.builder});
+
+  final Widget Function(bool hovered) builder;
+
+  @override
+  State<_HoverBuilder> createState() => _HoverBuilderState();
+}
+
+class _HoverBuilderState extends State<_HoverBuilder> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) => MouseRegion(
+    onEnter: (_) => setState(() => _hovered = true),
+    onExit: (_) => setState(() => _hovered = false),
+    child: widget.builder(_hovered),
+  );
 }
 
 /// The filter sheet's "search in these sources" category list. Anime mode's
@@ -3086,15 +3816,19 @@ class _SearchFilterSheet extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Container(
-              width: 36,
-              height: 4,
-              margin: const EdgeInsets.fromLTRB(0, 12, 0, 12),
-              decoration: BoxDecoration(
-                color: AppColors.hairline,
-                borderRadius: BorderRadius.circular(2),
+            // Phone-only drag handle; the Windows dialog just gets a gap.
+            if (DesktopSheetScope.of(context))
+              const SizedBox(height: 12)
+            else
+              Container(
+                width: 36,
+                height: 4,
+                margin: const EdgeInsets.fromLTRB(0, 12, 0, 12),
+                decoration: BoxDecoration(
+                  color: AppColors.hairline,
+                  borderRadius: BorderRadius.circular(2),
+                ),
               ),
-            ),
             _header(context, allIds, prefs),
             Flexible(
               child: ListenableBuilder(
@@ -3595,8 +4329,12 @@ class _SearchFilterSheet extends StatelessWidget {
     SearchSourcePrefs prefs,
     ContentMode mode,
   ) {
-    showModalBottomSheet<void>(
-      context: filterSheetContext,
+    // Windows: opens as a centred dialog over the filter dialog, never a
+    // second stacked sheet (search-4); phone keeps the sub-sheet.
+    showAdaptiveSheet<void>(
+      filterSheetContext,
+      title: filterSheetContext.l10n.searchInSources,
+      desktopWidth: 520,
       backgroundColor: AppColors.surface,
       isScrollControlled: true,
       shape: const RoundedRectangleBorder(
@@ -3612,25 +4350,29 @@ class _SearchFilterSheet extends StatelessWidget {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Container(
-                  width: 36,
-                  height: 4,
-                  margin: const EdgeInsets.fromLTRB(0, 12, 0, 12),
-                  decoration: BoxDecoration(
-                    color: AppColors.hairline,
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
-                  child: Align(
-                    alignment: AlignmentDirectional.centerStart,
-                    child: Text(
-                      subCtx.l10n.searchInSources,
-                      style: AppText.headline,
+                // Handle + heading are phone-only; the Windows dialog shows
+                // the heading in its title bar.
+                if (!DesktopSheetScope.of(subCtx)) ...[
+                  Container(
+                    width: 36,
+                    height: 4,
+                    margin: const EdgeInsets.fromLTRB(0, 12, 0, 12),
+                    decoration: BoxDecoration(
+                      color: AppColors.hairline,
+                      borderRadius: BorderRadius.circular(2),
                     ),
                   ),
-                ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
+                    child: Align(
+                      alignment: AlignmentDirectional.centerStart,
+                      child: Text(
+                        subCtx.l10n.searchInSources,
+                        style: AppText.headline,
+                      ),
+                    ),
+                  ),
+                ],
                 Flexible(
                   child: sections.isEmpty
                       ? SearchSourcesEmptyView(
@@ -3889,6 +4631,10 @@ class _StremioDiscoverGridState extends State<_StremioDiscoverGrid> {
   @override
   Widget build(BuildContext context) {
     if (_loading && _items.isEmpty) {
+      // Windows: placeholders the size of the real cards.
+      if (defaultTargetPlatform == TargetPlatform.windows) {
+        return const DesktopPosterSkeletonGrid();
+      }
       return const Padding(padding: EdgeInsets.all(20), child: SkeletonGrid());
     }
     if (_failed && _items.isEmpty) {
@@ -3925,6 +4671,11 @@ class _StremioDiscoverGridState extends State<_StremioDiscoverGrid> {
               16,
               MediaQuery.paddingOf(context).bottom + 36,
             ),
+            // Windows: rows are built before they scroll into view.
+            // ignore: deprecated_member_use
+            cacheExtent: defaultTargetPlatform == TargetPlatform.windows
+                ? 800
+                : null,
             keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
             gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
               crossAxisCount: posterGridColumns(context),

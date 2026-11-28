@@ -12,6 +12,7 @@ class ResumeMark {
     required this.position,
     required this.duration,
     this.markedWatched = false,
+    this.markedUnwatched = false,
   });
   final Duration position;
   final Duration duration;
@@ -22,11 +23,22 @@ class ResumeMark {
   /// mark from a genuinely finished episode when unmarking.
   final bool markedWatched;
 
-  /// Treat as watched when within the last ~8% of the runtime.
+  /// Windows: the user explicitly marked this episode unwatched. Kept as a row
+  /// (instead of deleting it) so it can veto the tracker's high-water mark,
+  /// which would otherwise keep ticking the episode as watched.
+  final bool markedUnwatched;
+
+  /// True for a row that only says "user unmarked this" with no real playback
+  /// behind it. Continue/resume logic must not treat it as a resume mark.
+  bool get isUnwatchedOverride => markedUnwatched && position == Duration.zero;
+
+  /// Treat as watched when within the last ~8% of the runtime. An explicit
+  /// unwatched override always wins.
   bool get finished =>
-      markedWatched ||
-      (duration.inMilliseconds > 0 &&
-          position.inMilliseconds >= duration.inMilliseconds * 0.92);
+      !markedUnwatched &&
+      (markedWatched ||
+          (duration.inMilliseconds > 0 &&
+              position.inMilliseconds >= duration.inMilliseconds * 0.92));
 }
 
 /// Hive-backed per-(sourceId, episodeId) resume positions.
@@ -62,11 +74,20 @@ class ResumeStore {
   ) async {
     if (IncognitoMode.on) return; // incognito: don't remember playback position
     final key = _key(sourceId, showId, episodeId);
-    final manuallyWatched = _box.get(key)?['markedWatched'] == true;
+    final prev = _box.get(key);
+    final manuallyWatched = prev?['markedWatched'] == true;
+    // An unwatched override survives partial replays (so the tracker can't
+    // re-tick an episode being rewatched) and is dropped once playback
+    // actually reaches the end, same 92% rule as [ResumeMark.finished].
+    final reachedEnd =
+        duration.inMilliseconds > 0 &&
+        position.inMilliseconds >= duration.inMilliseconds * 0.92;
+    final keepUnwatched = prev?['markedUnwatched'] == true && !reachedEnd;
     await _box.put(key, {
       'positionMs': position.inMilliseconds,
       'durationMs': duration.inMilliseconds,
       if (manuallyWatched) 'markedWatched': true,
+      if (keepUnwatched) 'markedUnwatched': true,
     });
     // Logged because its ABSENCE is the interesting case. The flush runs from
     // the player's dispose(), so when Android kills the app straight out of
@@ -89,15 +110,23 @@ class ResumeStore {
       // Absent on every mark written before this existed, which is the whole
       // point of defaulting it: an old mark keeps being judged by position.
       markedWatched: m['markedWatched'] == true,
+      markedUnwatched: m['markedUnwatched'] == true,
     );
   }
 
+  /// Windows keeps an explicit "unwatched" row instead of deleting (see
+  /// [setWatched]); phone keeps its original delete behaviour unchanged.
+  static bool get _keepUnwatchedOverride =>
+      defaultTargetPlatform == TargetPlatform.windows;
+
   /// Mark an episode watched (or not) by hand, from the episode list.
   ///
-  /// Unmarking drops the row entirely rather than clearing the flag: "not
+  /// Unmarking clears the stale position rather than keeping it: "not
   /// watched" and "watched 4 minutes in" are different states, and keeping a
   /// stale position would leave the episode showing a progress bar it no
-  /// longer deserves.
+  /// longer deserves. On Windows the row is replaced by a zero-position
+  /// override ([ResumeMark.markedUnwatched]) so a connected tracker's
+  /// progress can't keep the episode ticked; elsewhere the row is deleted.
   Future<void> setWatched(
     String sourceId,
     String showId,
@@ -106,7 +135,16 @@ class ResumeStore {
   }) async {
     final key = _key(sourceId, showId, episodeId);
     if (!watched) {
-      await _box.delete(key);
+      if (_keepUnwatchedOverride) {
+        // Zero duration => no progress bar; the flag vetoes tracker ticks.
+        await _box.put(key, {
+          'positionMs': 0,
+          'durationMs': 0,
+          'markedUnwatched': true,
+        });
+      } else {
+        await _box.delete(key);
+      }
       return;
     }
     final raw = _box.get(key);

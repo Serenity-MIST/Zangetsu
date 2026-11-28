@@ -1,4 +1,7 @@
 import 'dart:convert';
+
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, visibleForTesting;
 import 'package:watch_app/core/hive/safe_box.dart';
 import 'package:watch_app/core/hive/hive_key.dart';
 
@@ -19,6 +22,7 @@ class HistoryEntry {
     this.cover,
     this.coverHeaders,
     this.thumbnail,
+    this.backdrop,
     required this.showUrl,
     required this.category,
     required this.episodeId,
@@ -43,6 +47,11 @@ class HistoryEntry {
   /// only (not cloud-synced) — a resumed entry from another device falls back
   /// to [cover]. Null for older entries and sources without episode thumbnails.
   final String? thumbnail;
+
+  /// Windows: the show's wide picture (TMDB backdrop / AniList banner), for
+  /// a Continue card whose episode has no [thumbnail]. Local only, never
+  /// synced; null on entries saved before it existed and on other platforms.
+  final String? backdrop;
   final double? episodeNumber;
 
   /// MyAnimeList id (anime), carried so a resume from Continue Watching can
@@ -56,6 +65,45 @@ class HistoryEntry {
   double get progress => duration.inMilliseconds == 0
       ? 0
       : (position.inMilliseconds / duration.inMilliseconds).clamp(0.0, 1.0);
+}
+
+/// Windows: the wide picture (TMDB backdrop, AniList banner) last seen for
+/// each show URL in this session, filled when a show's details load. The
+/// watch history stores it with the show's entry, so the Continue card can
+/// show a landscape picture even when the episode has none. Memory only;
+/// nothing is fetched for it.
+class ShowBackdrops {
+  ShowBackdrops._();
+
+  /// Only Windows records pictures. Read from the target platform like the
+  /// rest of the Windows desktop UI, so an Android test run on a Windows
+  /// machine records nothing either. Tests may still set it by hand.
+  static bool get enabled =>
+      _enabledOverride ?? defaultTargetPlatform == TargetPlatform.windows;
+  static set enabled(bool value) => _enabledOverride = value;
+  static bool? _enabledOverride;
+
+  /// Drops a value set by hand, so [enabled] follows the platform again.
+  @visibleForTesting
+  static void resetEnabled() => _enabledOverride = null;
+
+  static final Map<String, String> _byShowUrl = {};
+
+  /// Remembers [url] as the wide picture of the show at [showUrl]. Empty
+  /// values are ignored.
+  static void remember(String? showUrl, String? url) {
+    if (!enabled || showUrl == null || showUrl.isEmpty) return;
+    final picture = url?.trim();
+    if (picture == null || picture.isEmpty) return;
+    _byShowUrl[showUrl] = picture;
+  }
+
+  /// The wide picture remembered for [showUrl], or null.
+  static String? of(String? showUrl) =>
+      showUrl == null || !enabled ? null : _byShowUrl[showUrl];
+
+  @visibleForTesting
+  static void reset() => _byShowUrl.clear();
 }
 
 /// Thin transport seam over the cloud `history` table, injectable so
@@ -313,8 +361,27 @@ class WatchHistory {
   /// episode change, and player close.
   Future<void> save(HistoryEntry e, {bool flush = false}) async {
     if (IncognitoMode.on) return; // incognito: don't record what's watched
+    await _write(e, flush: flush);
+  }
+
+  /// Puts back an entry the user just removed (the Undo of "Remove from
+  /// Continue" / History). Unlike [save] it also runs in incognito: it only
+  /// restores a row that already existed, it records nothing new. Pushed to
+  /// the cloud straight away so the earlier cloud delete does not win.
+  Future<void> restore(HistoryEntry e) => _write(e, flush: true);
+
+  /// Local write + cloud push shared by [save] and [restore].
+  Future<void> _write(HistoryEntry e, {required bool flush}) async {
     final profileId = _profileId;
     final key = _key(e.sourceId, e.showId, profileId);
+    // Windows: keep the show's wide picture. The player saves every few
+    // seconds without one, so an entry that already has it keeps it, and an
+    // entry without one picks up the picture last seen for that show.
+    final backdrop = ShowBackdrops.enabled
+        ? e.backdrop ??
+              (_box.get(key)?['backdrop'] as String?) ??
+              ShowBackdrops.of(e.showUrl)
+        : null;
     await _box.put(key, {
       'sourceId': e.sourceId,
       'showId': e.showId,
@@ -322,6 +389,7 @@ class WatchHistory {
       'cover': e.cover,
       'coverHeaders': e.coverHeaders,
       'thumbnail': e.thumbnail,
+      'backdrop': ?backdrop,
       'showUrl': e.showUrl,
       'category': e.category,
       'episodeId': e.episodeId,
@@ -375,9 +443,15 @@ class WatchHistory {
     _lastCloudPush[key] = now;
     final pendingWrite = _markPending(key, profileId);
     try {
+      // Bounded: the cloud client has no timeout of its own, and the player
+      // waits on this when you change episode, so a dead connection used to
+      // freeze "next episode" for as long as the OS took to give up. On timeout
+      // the entry simply stays marked pending and is retried later.
       await Future.wait([
         pendingWrite,
-        _remote.upsert(_rowFor(uid, e, profileId)),
+        _remote
+            .upsert(_rowFor(uid, e, profileId))
+            .timeout(const Duration(seconds: 5)),
       ]);
       if (_matchesLocalEntry(key, e)) await _clearPending(key, profileId);
     } catch (_) {
@@ -432,7 +506,12 @@ class WatchHistory {
     }
   }
 
-  HistoryEntry _fromMap(Map raw) {
+  HistoryEntry _fromMap(Map raw) => entryFromMap(raw);
+
+  /// Parses one stored row. Public so listeners of the Hive box (the Windows
+  /// Home Continue store) can read a single changed entry without re-reading
+  /// and sorting the whole history.
+  static HistoryEntry entryFromMap(Map raw) {
     final m = Map<String, dynamic>.from(raw);
     return HistoryEntry(
       sourceId: m['sourceId'] as String,
@@ -443,6 +522,7 @@ class WatchHistory {
         (k, v) => MapEntry('$k', '$v'),
       ),
       thumbnail: m['thumbnail'] as String?,
+      backdrop: m['backdrop'] as String?,
       showUrl: m['showUrl'] as String? ?? '',
       category: m['category'] as String? ?? 'sub',
       episodeId: m['episodeId'] as String? ?? '',

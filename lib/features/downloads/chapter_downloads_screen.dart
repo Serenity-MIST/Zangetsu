@@ -1,3 +1,5 @@
+import 'package:flutter/foundation.dart' show defaultTargetPlatform, TargetPlatform;
+import 'download_thumbnail.dart';
 import 'dart:async';
 
 import 'package:cached_network_image/cached_network_image.dart';
@@ -8,6 +10,9 @@ import '../../core/di/injector.dart';
 import '../../core/download/chapter_download.dart';
 import '../../core/download/chapter_download_store.dart';
 import '../../core/download/chapter_downloader.dart';
+// Same Recycle Bin gate the store uses, for the 'Moved to the Recycle Bin'
+// message (dl-2).
+import '../../core/download/download_recycle.dart';
 import '../../core/models/episode.dart';
 import '../../core/mode/content_mode.dart';
 import '../../core/theme/app_colors.dart';
@@ -32,11 +37,17 @@ class ChapterDownloadsScreen extends StatefulWidget {
     required this.mode,
     this.embedded = false,
     this.query,
+    this.sourceId,
+    this.showId,
   });
 
   final ContentMode mode;
   final bool embedded;
   final String? query;
+
+  /// Optional exact title scope from the Windows unified offline library.
+  final String? sourceId;
+  final String? showId;
 
   @override
   State<ChapterDownloadsScreen> createState() => _ChapterDownloadsScreenState();
@@ -60,6 +71,10 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
     if (!_expanded.remove(key)) _expanded.add(key);
   });
 
+  bool _inScope(ChapterDownload c) => c.mode == widget.mode &&
+      (widget.sourceId == null || c.sourceId == widget.sourceId) &&
+      (widget.showId == null || c.showId == widget.showId);
+
   bool _matchesQuery(ChapterDownload c) {
     final q = _effectiveQuery.trim().toLowerCase();
     return q.isEmpty ||
@@ -80,7 +95,7 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
       valueListenable: store.listenable(),
       builder: (context, box, _) {
         final all = store.all();
-        if (!all.any((c) => c.mode == widget.mode)) {
+        if (!all.any(_inScope)) {
           return EmptyState(
             icon: isNovel ? Icons.article_outlined : Icons.menu_book_outlined,
             message: isNovel
@@ -128,10 +143,10 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
   }) {
     final downloader = sl<ChapterDownloader>();
     final live = Map<String, ChapterDownload>.fromEntries(
-      downloader.inFlight.entries.where((e) => e.value.mode == widget.mode),
+      downloader.inFlight.entries.where((e) => _inScope(e.value)),
     );
     final saved = all
-        .where((c) => c.mode == widget.mode)
+        .where(_inScope)
         .where(_matchesQuery)
         .toList();
 
@@ -164,6 +179,12 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
           onAction: running > 0 ? () => _confirmStopAll(running, l10n) : null,
           extra: failed > 0 ? l10n.clearFailedCount(failed) : null,
           onExtra: failed > 0 ? () => _clearFailed(l10n) : null,
+          // Windows: re-queue every failed chapter at once (dl-10). Partial
+          // pages are kept, so only what is missing is fetched again.
+          retry: _desktop && failed > 0
+              ? l10n.retryFailedCount(failed)
+              : null,
+          onRetry: _desktop && failed > 0 ? _retryFailed : null,
         ),
         for (final c in active)
           () => _ChapterProgressTile(
@@ -179,8 +200,10 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
             chapters: e.value,
             // Searching reveals the matches instead of making the user expand
             // every group.
-            expanded:
-                _effectiveQuery.trim().isNotEmpty || _expanded.contains(e.key),
+            // A Windows title-scoped view always opens its single group.
+            expanded: widget.showId != null ||
+                _effectiveQuery.trim().isNotEmpty ||
+                _expanded.contains(e.key),
             onToggle: () => _toggle(e.key),
           ),
       ],
@@ -191,7 +214,7 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
     final active = _sections(all, l10n, activeOnly: true);
     final byShow = <String, List<ChapterDownload>>{};
     for (final chapter in all) {
-      if (chapter.mode != widget.mode ||
+      if (!_inScope(chapter) ||
           chapter.status != ChapterDownloadStatus.done ||
           !_matchesQuery(chapter)) {
         continue;
@@ -282,11 +305,22 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
     VoidCallback? onAction,
     String? extra,
     VoidCallback? onExtra,
+    String? retry,
+    VoidCallback? onRetry,
   }) => Padding(
     padding: EdgeInsets.fromLTRB(16, 18, 8, action == null ? 4 : 0),
     child: Row(
       children: [
         Expanded(child: Text(text.toUpperCase(), style: AppText.overline)),
+        // 'Retry failed (N)' sits beside 'Clear failed' (Windows, dl-10).
+        if (retry != null)
+          TextButton(
+            onPressed: onRetry,
+            child: Text(
+              retry,
+              style: AppText.caption.copyWith(color: AppColors.textSecondary),
+            ),
+          ),
         if (extra != null)
           TextButton(
             onPressed: onExtra,
@@ -320,11 +354,52 @@ class _ChapterDownloadsScreenState extends State<ChapterDownloadsScreen> {
       destructive: true,
     );
     if (ok != true) return;
-    await sl<ChapterDownloader>().cancelAll();
+    final downloader = sl<ChapterDownloader>();
+    if (widget.sourceId == null && widget.showId == null) {
+      await downloader.cancelAll();
+    } else {
+      // A title-scoped desktop view must never cancel unrelated reading jobs.
+      final ids = downloader.inFlight.values.where(_inScope).map((c) => c.id).toList();
+      for (final id in ids) { await downloader.cancel(id); }
+    }
+  }
+
+  /// Windows desktop UI only: phone keeps its original chapter rows.
+  static bool get _desktop => defaultTargetPlatform == TargetPlatform.windows;
+
+  /// Re-queues the failed chapters this view shows (dl-10). A title-scoped
+  /// view only touches its own title, like Clear failed.
+  Future<void> _retryFailed() async {
+    final downloader = sl<ChapterDownloader>();
+    if (widget.sourceId == null && widget.showId == null) {
+      await downloader.retryFailed();
+      return;
+    }
+    final failed = sl<ChapterDownloadStore>().all().where(_inScope)
+        .where((c) => c.status == ChapterDownloadStatus.failed).toList();
+    // Oldest first, matching the unscoped retry order.
+    for (final c in failed.reversed) {
+      await downloader.retry(c.id);
+    }
   }
 
   Future<void> _clearFailed(AppLocalizations l10n) async {
-    final n = await sl<ChapterDownloader>().clearFailed();
+    final downloader = sl<ChapterDownloader>();
+    int n;
+    if (widget.sourceId == null && widget.showId == null) {
+      n = await downloader.clearFailed();
+    } else {
+      final store = sl<ChapterDownloadStore>();
+      final failed = store.all().where(_inScope)
+          .where((c) => c.status == ChapterDownloadStatus.failed).toList();
+      n = 0;
+      for (final c in failed) {
+        // A retry started since the snapshot still owns its files.
+        if (downloader.isBusy(c.id)) continue;
+        await store.remove(c.id);
+        n++;
+      }
+    }
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..clearSnackBars()
@@ -430,6 +505,19 @@ class _ChapterProgressTile extends StatelessWidget {
 
   Widget _tile(BuildContext context, ChapterDownload chapter, bool live) {
     final l10n = context.l10n;
+    // The X: cancels a live chapter, clears a failed one.
+    final close = IconButton(
+      visualDensity: VisualDensity.compact,
+      tooltip: live ? l10n.cancelDownloadTooltip : l10n.removeDownloadTooltip,
+      icon: const Icon(Icons.close_rounded, color: AppColors.textSecondary),
+      onPressed: () => unawaited(
+        live
+            ? sl<ChapterDownloader>().cancel(chapter.id)
+            : sl<ChapterDownloadStore>().remove(chapter.id),
+      ),
+    );
+    // Failed rows on the Windows desktop UI also get a Retry button.
+    final retryable = !live && defaultTargetPlatform == TargetPlatform.windows;
     return ListTile(
       dense: compact,
       minLeadingWidth: compact ? 28 : null,
@@ -471,16 +559,27 @@ class _ChapterProgressTile extends StatelessWidget {
           ],
         ],
       ),
-      trailing: IconButton(
-        visualDensity: VisualDensity.compact,
-        tooltip: live ? l10n.cancelDownloadTooltip : l10n.removeDownloadTooltip,
-        icon: const Icon(Icons.close_rounded, color: AppColors.textSecondary),
-        onPressed: () => unawaited(
-          live
-              ? sl<ChapterDownloader>().cancel(chapter.id)
-              : sl<ChapterDownloadStore>().remove(chapter.id),
-        ),
-      ),
+      trailing: retryable
+          // Windows: a failed chapter can be retried in place (dl-10); the
+          // pages it already fetched are reused.
+          ? Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  tooltip: l10n.retry,
+                  icon: const Icon(
+                    Icons.refresh_rounded,
+                    color: AppColors.textSecondary,
+                  ),
+                  onPressed: () =>
+                      unawaited(sl<ChapterDownloader>().retry(chapter.id)),
+                ),
+                close,
+              ],
+            )
+          // Phone (and live rows) keep the single X exactly as before.
+          : close,
     );
   }
 }
@@ -783,7 +882,13 @@ class _SavedChapterTile extends StatelessWidget {
       minLeadingWidth: compact ? 28 : null,
       onTap: onTap,
       contentPadding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
-      leading: (chapter.thumbnail?.trim().isNotEmpty ?? false)
+      // Windows keeps its scoped-header artwork tile; other platforms use the
+      // upstream chapter thumbnail.
+      leading: defaultTargetPlatform == TargetPlatform.windows
+          ? SizedBox(width: 72, height: 48, child: DownloadThumbnail(
+              thumbnail: chapter.thumbnail, cover: chapter.cover, headers: chapter.coverHeaders,
+              fallback: Center(child: Icon(chapterIcon(chapter.mode), color: AppColors.accent, size: 26))))
+          : (chapter.thumbnail?.trim().isNotEmpty ?? false)
           ? ClipRRect(
               borderRadius: BorderRadius.circular(5),
               child: SizedBox(
@@ -827,8 +932,28 @@ class _SavedChapterTile extends StatelessWidget {
           Icons.delete_outline_rounded,
           color: AppColors.textTertiary,
         ),
-        onPressed: () =>
-            unawaited(sl<ChapterDownloadStore>().remove(chapter.id)),
+        onPressed: () {
+          // Windows: the store sends the files to the Recycle Bin (dl-2);
+          // say so, so the user knows where to restore them from. Uses the
+          // same gate as the store so the message never claims a recycle
+          // that did not happen (phone, tests, unfinished chapters).
+          final messenger =
+              recycleDownloadDeletes &&
+                  chapter.status == ChapterDownloadStatus.done
+              ? ScaffoldMessenger.maybeOf(context)
+              : null;
+          unawaited(
+            sl<ChapterDownloadStore>().remove(chapter.id).then((_) {
+              messenger
+                ?..clearSnackBars()
+                ..showSnackBar(
+                  SnackBar(
+                    content: Text(appL10n.movedToRecycleBin),
+                  ),
+                );
+            }),
+          );
+        },
       ),
     );
   }

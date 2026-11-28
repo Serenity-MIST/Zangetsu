@@ -20,6 +20,7 @@ import 'package:watch_app/core/anilist/anilist_service.dart';
 import 'package:watch_app/core/announce/announcement.dart';
 import 'package:watch_app/core/announce/announcement_service.dart';
 import 'package:watch_app/core/app_mode.dart';
+import 'package:watch_app/core/desktop/desktop_settings_opener.dart';
 import 'package:watch_app/core/di/injector.dart';
 import 'package:watch_app/core/download/download_manager.dart';
 import 'package:watch_app/core/download/download_prefs.dart';
@@ -1019,6 +1020,61 @@ void main() {
     // header's icon-only action has a tooltip (not rendered as Text) instead.
     expect(find.text('Search'), findsNothing);
   });
+
+  // Windows: Settings opens as a full page pushed over the whole shell, so
+  // the left rail and top bar are covered (not an in-frame page beside the
+  // rail). Opening it twice keeps one copy, and Back returns to the tab the
+  // user was on (Home).
+  testWidgets('Windows Settings covers the rail and Back returns to Home', (
+    tester,
+  ) async {
+    sl.registerSingleton<AppMode>(const AppMode(isTv: false));
+    // SettingsScreen reads the dock prefs.
+    sl.registerSingleton<NavPrefs>(NavPrefs());
+    await tester.runAsync(NavPrefs.init);
+    await tester.pumpWidget(wrap(const RootShell()));
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+
+    // The shell installed its opener (the Profile button and Ctrl+, use it).
+    expect(find.byType(SettingsScreen), findsNothing);
+    final shell = tester.element(find.byType(RootShell));
+    expect(ModalRoute.of(shell)!.isCurrent, isTrue);
+
+    expect(DesktopSettingsOpener.open(), isTrue);
+    // A second request while it is open must not stack another copy.
+    DesktopSettingsOpener.open();
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+
+    // One Settings, on its own route above the shell route: the rail and
+    // top bar (part of the shell route) are covered.
+    expect(find.byType(SettingsScreen), findsOneWidget);
+    final settings = tester.element(find.byType(SettingsScreen));
+    expect(ModalRoute.of(settings)!.isCurrent, isTrue);
+    expect(ModalRoute.of(settings), isNot(ModalRoute.of(shell)));
+    expect(ModalRoute.of(shell)!.isCurrent, isFalse);
+
+    // Back (Esc / Alt+Left / mouse Back all pop the root navigator).
+    await Navigator.of(shell).maybePop();
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+
+    expect(find.byType(SettingsScreen), findsNothing);
+    expect(ModalRoute.of(shell)!.isCurrent, isTrue);
+    expect(find.byType(HomeScreen), findsOneWidget);
+
+    // It can be opened again after closing.
+    expect(DesktopSettingsOpener.open(), isTrue);
+    await tester.pump();
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.byType(SettingsScreen), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 5));
+    // Unmounting the shell removes its opener.
+    expect(DesktopSettingsOpener.handler, isNull);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
 }
 
 /// Home reads only [MetadataRepository.supportsFilters] to decide whether the

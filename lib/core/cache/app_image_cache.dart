@@ -16,6 +16,17 @@ class AppImageCache {
 
   static CacheManager? _tvManager;
 
+  /// Windows desktop artwork disk cache, made on first use.
+  static CacheManager? _desktopArtwork;
+
+  /// Folder / index name of the Windows desktop artwork cache.
+  static const desktopArtworkCacheKey = 'zangetsuDesktopImageCache';
+
+  /// How many artwork files the Windows desktop artwork cache keeps. The
+  /// shared default keeps only 200, which a Home page of preview plus
+  /// full-size cards fills, so scrolling back downloaded the same art again.
+  static const desktopArtworkMaxObjects = 1500;
+
   /// Call once during boot on Apple TV before any [CachedNetworkImage] mounts.
   static Future<void> init() async {
     if (!isAppleTv || _tvManager != null) return;
@@ -42,11 +53,16 @@ class AppImageCache {
     return manager;
   }
 
+  /// Disk cache for the Windows desktop artwork widgets only (desktop media
+  /// cards, the Home banner and the desktop download library). It keeps
+  /// [desktopArtworkMaxObjects] files for 30 days. Phone and TV never use it.
+  static CacheManager get desktopArtworkManager =>
+      _desktopArtwork ??= _DesktopArtworkCache();
+
   /// Pass to [CachedNetworkImage.cacheManager] / [CachedNetworkImageProvider].
   /// On Apple TV the default sqflite-backed cache is read-only — callers that
   /// omit this get empty/error images on device.
-  static CacheManager? get cacheManagerOrDefault =>
-      isAppleTv ? manager : null;
+  static CacheManager? get cacheManagerOrDefault => isAppleTv ? manager : null;
 
   /// [ImageProvider] for network covers when not using [CachedNetworkImage].
   static CachedNetworkImageProvider imageProvider(
@@ -63,4 +79,17 @@ class AppImageCache {
       cacheManager: cacheManagerOrDefault,
     );
   }
+}
+
+/// The Windows desktop artwork disk cache. It mixes in [ImageCacheManager] so
+/// callers may still ask for resized files.
+class _DesktopArtworkCache extends CacheManager with ImageCacheManager {
+  _DesktopArtworkCache()
+    : super(
+        Config(
+          AppImageCache.desktopArtworkCacheKey,
+          stalePeriod: const Duration(days: 30),
+          maxNrOfCacheObjects: AppImageCache.desktopArtworkMaxObjects,
+        ),
+      );
 }

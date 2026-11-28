@@ -1,3 +1,5 @@
+import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -12,6 +14,7 @@ import 'package:watch_app/core/playback/playback_prefs.dart';
 import 'package:watch_app/core/ui/poster_card.dart';
 import 'package:watch_app/core/tv/tv_poster_tile.dart';
 import 'package:watch_app/core/ui/settings_widgets.dart';
+import 'package:watch_app/core/ui/desktop_settings_surface.dart';
 import 'package:watch_app/features/home/home_screen_tv.dart';
 import 'package:watch_app/features/settings/poster_card_settings_screen.dart';
 
@@ -21,14 +24,118 @@ void main() {
   setUp(() async {
     temp = await Directory.systemTemp.createTemp('poster_card_prefs');
     Hive.init(temp.path);
+    // Network-image previews need the cache plugin paths in widget tests.
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('plugins.flutter.io/path_provider'),
+          (_) async => temp.path,
+        );
+
     await PlaybackPrefs.init();
     GetIt.I.registerSingleton<PlaybackPrefs>(PlaybackPrefs());
   });
 
   tearDown(() async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('plugins.flutter.io/path_provider'),
+          null,
+        );
     await GetIt.I.reset();
     await Hive.close();
     await temp.delete(recursive: true);
+  });
+
+  testWidgets(
+    'desktop poster preview uses row width and live independent choices',
+    (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      try {
+        await tester.binding.setSurfaceSize(const Size(1366, 900));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await tester.pumpWidget(
+          MaterialApp(
+            home: PosterCardScope(
+              child: const DesktopSettingsScope(
+                child: PosterCardSettingsScreen(),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        final preview = find.byKey(const ValueKey('desktop-poster-preview'));
+        expect(tester.getSize(preview).width, 166);
+        expect(
+          tester.widget<PosterCard>(find.byType(PosterCard)).qualityBadge,
+          'HD',
+        );
+        await tester.runAsync(() async {
+          await tester.tap(find.byKey(const ValueKey('Shape-Landscape')));
+          await Hive.box(PlaybackPrefs.boxName).flush();
+        });
+        await tester.pumpAndSettle();
+        expect(PlaybackPrefs().posterCardLayout, PosterCardLayout.wide);
+        expect(tester.getSize(preview).width, 248);
+        final size = find.byKey(const ValueKey('Portrait card size-Large'));
+        await tester.ensureVisible(size);
+        await tester.runAsync(() async {
+          await tester.tap(size);
+          await Hive.box(PlaybackPrefs.boxName).flush();
+        });
+        await tester.pumpAndSettle();
+        expect(PlaybackPrefs().posterPortraitSize, PosterCardSize.large);
+        expect(PlaybackPrefs().posterLandscapeSize, PosterCardSize.standard);
+        expect(tester.getSize(preview).width, 248);
+        await tester.ensureVisible(
+          find.byKey(const ValueKey('poster-preview-catalogue')),
+        );
+        await tester.tap(
+          find.byKey(const ValueKey('poster-preview-catalogue')),
+        );
+        await tester.pumpAndSettle();
+        final sample = tester.widget<PosterCard>(find.byType(PosterCard));
+        expect(sample.scoreBadge, 87);
+        expect(sample.qualityBadge, isNull);
+        expect(sample.dubBadge, isNull);
+        expect(tester.takeException(), isNull);
+        // Network-image cache schedules a10s cleanup after its async DB read.
+        // Unmount images, let that read settle, then drain the virtual timer.
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)),
+        );
+        await tester.pump(const Duration(seconds: 11));
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    },
+    timeout: const Timeout(Duration(seconds: 30)),
+  );
+
+  testWidgets('desktop poster choices wrap at narrow enlarged text', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    try {
+      await tester.binding.setSurfaceSize(const Size(360, 800));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: MediaQuery(
+            data: MediaQueryData(textScaler: TextScaler.linear(2)),
+            child: DesktopSettingsScope(child: PosterCardSettingsScreen()),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final choice = find.byKey(const ValueKey('Title placement-Below image'));
+      await tester.ensureVisible(choice);
+      await tester.pumpAndSettle();
+      expect(choice.hitTestable(), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
   });
 
   testWidgets('Stremio landscape posters keep the default title below', (
@@ -1084,4 +1191,49 @@ void main() {
     expect(find.text('Title placement'), findsOneWidget);
     expect(find.text('Title artwork'), findsOneWidget);
   });
+  testWidgets(
+    'Windows browse grids stay compact at every tested window width and card size',
+    (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      try {
+        for (final layout in PosterCardLayout.values) {
+          for (final size in PosterCardSize.values) {
+            await tester.runAsync(() async {
+              await PlaybackPrefs().setPosterCardLayout(layout);
+              await PlaybackPrefs().setPosterPortraitSize(size);
+              await PlaybackPrefs().setPosterLandscapeSize(size);
+            });
+            for (final width in [480.0, 800.0, 1266.0, 1920.0, 2560.0]) {
+              tester.view.physicalSize = Size(width, 900);
+              tester.view.devicePixelRatio = 1;
+              late double cellWidth;
+              late double rowWidth;
+              await tester.pumpWidget(
+                MaterialApp(
+                  home: Builder(
+                    builder: (context) {
+                      cellWidth = posterGridCellWidth(context);
+                      rowWidth = posterRowWidth(context);
+                      return const SizedBox();
+                    },
+                  ),
+                ),
+              );
+              expect(
+                cellWidth,
+                lessThanOrEqualTo(rowWidth + 0.1),
+                reason: '$layout $size $width',
+              );
+              expect(cellWidth, greaterThan(60));
+            }
+          }
+        }
+      } finally {
+        await tester.pumpWidget(const SizedBox());
+        debugDefaultTargetPlatformOverride = null;
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      }
+    },
+  );
 }

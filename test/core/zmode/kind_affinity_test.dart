@@ -3,6 +3,8 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/provider/provider_registry.dart';
+import 'package:watch_app/core/provider/cloudstream_provider.dart';
+import 'package:watch_app/core/ui/source_switcher.dart';
 import 'package:watch_app/core/di/injector.dart';
 import 'package:watch_app/core/repository/source_repository.dart';
 import 'package:watch_app/core/zmode/zmode_ids.dart';
@@ -52,10 +54,11 @@ void main() {
     } catch (_) {}
   });
 
-  List<String> sweep(ZKind kind, {List<String> saved = const []}) =>
-      sweepOrder(candidatesForKind(repo, kind), kind, saved)
-          .map((s) => s.id)
-          .toList();
+  List<String> sweep(ZKind kind, {List<String> saved = const []}) => sweepOrder(
+    candidatesForKind(repo, kind),
+    kind,
+    saved,
+  ).map((s) => s.id).toList();
 
   test('candidatesForKind only filters — it does not reorder', () {
     // Affinity moved to the sweep layer; this list also feeds the per-title
@@ -64,6 +67,39 @@ void main() {
       'ani:42',
       'moviebox',
     ]);
+  });
+
+  test('mixed CloudStream providers survive the automatic movie filter', () {
+    final manager = sl<CloudStreamManager>();
+    manager.rebuildFromForTest([
+      {
+        'name': 'CineStream',
+        'lang': 'en',
+        'types': ['Anime', 'Movie', 'TvSeries'],
+        'hasMainPage': true,
+      },
+      {
+        'name': 'AnimeOnly',
+        'lang': 'en',
+        'types': ['Anime', 'AnimeMovie'],
+        'hasMainPage': true,
+      },
+    ]);
+    try {
+      final buckets = categorizedSources();
+      final result = automaticKindPool(
+        const [
+          (id: 'cs:CineStream', name: 'CineStream'),
+          (id: 'cs:AnimeOnly', name: 'AnimeOnly'),
+        ],
+        ZKind.movie,
+        anime: {for (final source in buckets.anime) source.id},
+        movies: {for (final source in buckets.movies) source.id},
+      );
+      expect(result.map((s) => s.id), ['cs:CineStream']);
+    } finally {
+      manager.rebuildFromForTest([]);
+    }
   });
 
   test('anime sweeps anime sources first', () {

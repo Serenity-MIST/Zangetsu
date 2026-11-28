@@ -134,12 +134,20 @@ class _CastTab extends StatelessWidget {
       shrinkWrap: nested,
       physics: nested ? const NeverScrollableScrollPhysics() : null,
       padding: padding,
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 3,
-        mainAxisSpacing: 16,
-        crossAxisSpacing: 12,
-        childAspectRatio: 0.66,
-      ),
+      // Cap faces by the actual detail-pane width, not three phone columns.
+      gridDelegate: _windowsDesktopUi
+          ? const SliverGridDelegateWithMaxCrossAxisExtent(
+              maxCrossAxisExtent: 160,
+              mainAxisSpacing: 16,
+              crossAxisSpacing: 12,
+              childAspectRatio: 0.66,
+            )
+          : const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 3,
+              mainAxisSpacing: 16,
+              crossAxisSpacing: 12,
+              childAspectRatio: 0.66,
+            ),
       itemCount: members.length,
       itemBuilder: (_, i) {
         final m = members[i];
@@ -578,7 +586,12 @@ class _DetailsTab extends StatelessWidget {
             style: AppText.caption.copyWith(color: AppColors.textTertiary),
           ),
           const SizedBox(height: 8),
-          Text(desc, style: AppText.body),
+          // Windows (show-11): the full synopsis can be selected and copied
+          // with the mouse / Ctrl+C. Phones keep the plain text.
+          if (_windowsDesktopUi)
+            SelectionArea(child: Text(desc, style: AppText.body))
+          else
+            Text(desc, style: AppText.body),
         ],
       ],
     );
@@ -914,12 +927,7 @@ class _CardGridSkeleton extends StatelessWidget {
       child: GridView.builder(
         padding: const EdgeInsets.fromLTRB(16, 20, 16, 40),
         physics: const NeverScrollableScrollPhysics(),
-        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: posterGridColumns(context),
-          childAspectRatio: wide ? 0.95 : 0.47,
-          crossAxisSpacing: 12,
-          mainAxisSpacing: 16,
-        ),
+        gridDelegate: posterGridDelegate(context),
         // Enough to fill the fold and no more — rows nobody can see still
         // cost a frame to lay out.
         itemCount: 9,

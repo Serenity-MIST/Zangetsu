@@ -240,13 +240,20 @@ class TitleLogoService {
     final previous = _posterLogoQueue;
     final done = Completer<void>();
     _posterLogoQueue = done.future;
+    _posterLogosWaiting++;
     await previous;
     try {
       return await logoFor(item);
     } finally {
+      _posterLogosWaiting--;
       done.complete();
     }
   }
+
+  /// Poster logos still queued or being looked up. Windows Home builds its
+  /// far-away shelves only while this is low.
+  int get posterLogosWaiting => _posterLogosWaiting;
+  int _posterLogosWaiting = 0;
 
   /// Fetches TMDB's `/images` for [item] (search-by-title when it has no
   /// tmdbId) and pulls both the logo and the lead backdrop out of the one

@@ -14,6 +14,13 @@ MediaItem _item(String title, {String? english, int? malId}) => MediaItem(
 
 void main() {
   group('bestTitleMatch', () {
+    test('exact season identity ranks ahead of a stripped sequel title', () {
+      final results = [_item('Yi Nian Yongheng 4'), _item('Yi Nian Yongheng')];
+      expect(
+        bestTitleMatch(results, 'Yi Nian Yong Heng')?.title,
+        'Yi Nian Yongheng',
+      );
+    });
     test('returns null for empty results', () {
       expect(bestTitleMatch([], 'anything'), isNull);
     });

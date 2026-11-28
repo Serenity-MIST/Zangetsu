@@ -1,5 +1,7 @@
 import 'dart:ui' show Color;
 
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, TargetPlatform;
 import 'package:hive/hive.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
 
@@ -27,11 +29,41 @@ class ReaderPrefs {
 
   Box get _box => Hive.box(boxName);
 
+  /// Windows gets wider typography ranges (reader-11): a desktop monitor is
+  /// read from further away and has room for larger text. Phones keep the
+  /// ranges they always had.
+  static bool get _wideRanges =>
+      defaultTargetPlatform == TargetPlatform.windows;
+
+  /// Text size the reader starts with, and what Ctrl+0 returns to.
+  static const double defaultFontSize = 16.0;
+
+  /// Smallest and largest novel text size the sliders and Ctrl+=/- allow.
+  static double get minFontSize => _wideRanges ? 10 : 12;
+  static double get maxFontSize => _wideRanges ? 40 : 28;
+
+  /// Line-height range for novel text.
+  static double get minLineHeight => _wideRanges ? 1.0 : 1.2;
+  static double get maxLineHeight => _wideRanges ? 3.0 : 2.4;
+
+  /// Largest gap between paragraphs, in logical pixels.
+  static double get maxParagraphSpacing => _wideRanges ? 48 : 24;
+
   // ── Novel ───────────────────────────────────────────────────────────────
   /// Reader text size in logical pixels.
   double get fontSize =>
-      (_box.get('fontSize', defaultValue: 16.0) as num).toDouble();
+      (_box.get('fontSize', defaultValue: defaultFontSize) as num).toDouble();
   Future<void> setFontSize(double value) => _box.put('fontSize', value);
+
+  /// Moves the text size one step (Ctrl+= / Ctrl+- on Windows), kept inside
+  /// [minFontSize]..[maxFontSize]. Returns the new size.
+  Future<double> stepFontSize(int steps) async {
+    final next = (fontSize.roundToDouble() + steps)
+        .clamp(minFontSize, maxFontSize)
+        .toDouble();
+    await setFontSize(next);
+    return next;
+  }
 
   /// Line-height multiplier for reader body text.
   double get lineHeight =>
@@ -79,8 +111,23 @@ class ReaderPrefs {
   /// a clock and three nav buttons sitting over it are not. `immersiveSticky`
   /// rather than plain `immersive`, so a swipe from either edge brings the
   /// bars back for a moment without leaving the page.
-  bool get fullscreen => _box.get('fullscreen', defaultValue: true) as bool;
+  ///
+  /// Windows defaults to OFF (reader-4 C): a desktop reader opens in the
+  /// user's own window, and F / F11 is the quick way into full screen.
+  bool get fullscreen =>
+      _box.get(
+            'fullscreen',
+            defaultValue: defaultTargetPlatform != TargetPlatform.windows,
+          )
+          as bool;
   Future<void> setFullscreen(bool value) => _box.put('fullscreen', value);
+
+  /// Windows (reader-7): a left click on the page turns it in paged modes —
+  /// the left or right part (from the paged tap-zone layout, mirrored for
+  /// right-to-left) turns back or forward and the middle shows the bars.
+  /// On by default; it only acts in paged reading.
+  bool get clickToTurn => _box.get('clickToTurn', defaultValue: true) as bool;
+  Future<void> setClickToTurn(bool value) => _box.put('clickToTurn', value);
 
   /// Turn manga pages with the hardware volume keys.
   ///
@@ -391,10 +438,26 @@ class ReaderPrefs {
   Future<void> setOrientation(String value) => _box.put('orientation', value);
 
   // ── Novel (typography) ─────────────────────────────────────────────────
-  /// Body font family: 'inter' | 'serif' | 'system'.
+  /// Body font family: 'inter' | 'serif' | 'system', or on Windows
+  /// `font:<Family name>` for any installed font (reader-11 B).
   String get fontFamily =>
       _box.get('fontFamily', defaultValue: 'inter') as String;
   Future<void> setFontFamily(String value) => _box.put('fontFamily', value);
+
+  /// Prefix of a [fontFamily] value that names an installed font directly.
+  static const String installedFontPrefix = 'font:';
+
+  /// The [fontFamily] value for an installed font named [family].
+  static String installedFontKey(String family) =>
+      '$installedFontPrefix$family';
+
+  /// The family name inside an installed-font [key], or null for the three
+  /// built-in keys.
+  static String? installedFontName(String key) =>
+      key.startsWith(installedFontPrefix) &&
+          key.length > installedFontPrefix.length
+      ? key.substring(installedFontPrefix.length)
+      : null;
 
   /// Whether body text is justified instead of ragged-edge.
   bool get textAlignJustify =>

@@ -1,10 +1,30 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import '../../core/desktop/desktop_context_menu.dart';
+import '../../core/desktop/desktop_dialogs.dart';
+import '../../core/desktop/desktop_reveal.dart';
 import '../../core/di/injector.dart';
 import '../../core/download/download_manager.dart';
 import '../../core/download/download_record.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
+import '../../core/ui/app_toast.dart';
+import '../../core/ui/desktop_docked_panel.dart';
 import '../../l10n/l10n.dart';
+import 'downloads_screen.dart' show launchDownloadedEpisode;
+
+/// What an episode's download icon should stand for. On Windows a download
+/// that failed or turned out unsupported left no episode behind, so the row
+/// simply offers the download again (the queue panel in Downloads tells why it
+/// failed). Phone and TV keep their own icons for those.
+DownloadStatus? shownDownloadStatus(DownloadStatus? status) =>
+    defaultTargetPlatform == TargetPlatform.windows &&
+        (status == DownloadStatus.failed ||
+            status == DownloadStatus.unsupported)
+    ? null
+    : status;
 
 class EpisodeDownloadIcon extends StatelessWidget {
   const EpisodeDownloadIcon({
@@ -13,12 +33,18 @@ class EpisodeDownloadIcon extends StatelessWidget {
     required this.showId,
     required this.episodeId,
     required this.onTap,
+    this.finishedMenu = false,
   });
 
   final String sourceId;
   final String showId;
   final String episodeId;
   final VoidCallback onTap;
+
+  /// Windows (show-1): when true, clicking a finished download's tick opens
+  /// [showFinishedMenu] instead of [onTap]. Off by default so the player's
+  /// episode panel keeps today's behaviour.
+  final bool finishedMenu;
 
   @override
   Widget build(BuildContext context) {
@@ -27,7 +53,7 @@ class EpisodeDownloadIcon extends StatelessWidget {
       listenable: manager,
       builder: (context, _) {
         final rec = manager.recordFor(sourceId, showId, episodeId);
-        final s = rec?.status;
+        final s = shownDownloadStatus(rec?.status);
         // While a download is live (or paused/queued/resolving), tapping the ring
         // opens a Pause/Cancel menu instead of re-opening the server picker.
         final inProgress =
@@ -36,15 +62,104 @@ class EpisodeDownloadIcon extends StatelessWidget {
                 s == DownloadStatus.paused ||
                 s == DownloadStatus.queued ||
                 s == DownloadStatus.resolving);
-        return _glyph(
-          context.l10n,
-          s,
-          rec?.progress ?? 0,
-          onPressed: inProgress
-              ? () => showDownloadMenu(context, manager, rec)
-              : onTap,
+        // Windows (show-1): a finished tick opens the file menu.
+        final finished =
+            finishedMenu &&
+            rec != null &&
+            s == DownloadStatus.done &&
+            defaultTargetPlatform == TargetPlatform.windows;
+        return Builder(
+          // Builder: the menu anchors to the icon itself.
+          builder: (iconContext) => _glyph(
+            context.l10n,
+            s,
+            rec?.progress ?? 0,
+            onPressed: inProgress
+                ? () => showDownloadMenu(context, manager, rec)
+                : finished
+                ? () => unawaited(
+                    showFinishedMenu(
+                      iconContext,
+                      manager,
+                      rec,
+                      onDownloadAgain: onTap,
+                    ),
+                  )
+                : onTap,
+          ),
         );
       },
+    );
+  }
+
+  /// Windows (show-1): the small menu a finished episode's tick opens, in
+  /// place of a fresh source search: Play offline, Show in folder, Delete
+  /// download (after a confirm; the manager recycles the file on Windows)
+  /// and Download again (another cut or quality, through [onDownloadAgain]).
+  /// Opens under [context]'s box, dropdown style.
+  static Future<void> showFinishedMenu(
+    BuildContext context,
+    DownloadManager manager,
+    DownloadRecord rec, {
+    required VoidCallback onDownloadAgain,
+  }) async {
+    // Follow-up toasts, the confirm and the player use the tick's own context
+    // (it stays in the page after the menu closes). Not the navigator's own
+    // context: that sits above the navigator's Overlay, so a toast from it
+    // finds no overlay and throws.
+    final host = context;
+    final label = rec.episodeTitle.trim().isNotEmpty
+        ? rec.episodeTitle
+        : rec.showTitle;
+    await showDesktopContextMenu<void>(
+      context,
+      anchor: context,
+      items: [
+        DesktopMenuItem(
+          label: host.l10n.playOffline,
+          icon: Icons.play_arrow_rounded,
+          onTap: () {
+            if (host.mounted) unawaited(launchDownloadedEpisode(host, rec));
+          },
+        ),
+        DesktopMenuItem(
+          label: host.l10n.showInFolder,
+          icon: Icons.folder_open_rounded,
+          onTap: () async {
+            final path = rec.filePath;
+            final shown = path != null && await revealInExplorer(path);
+            if (!shown && host.mounted) {
+              showAppToast(host, host.l10n.couldntFindDownloadedFile);
+            }
+          },
+        ),
+        DesktopMenuItem(
+          label: host.l10n.deleteDownload,
+          icon: Icons.delete_outline_rounded,
+          destructive: true,
+          onTap: () async {
+            if (!host.mounted) return;
+            final ok = await showDesktopConfirm(
+              host,
+              title: host.l10n.deleteDownloadQuestion,
+              message: host.l10n.downloadedFileWillBeDeleted(label),
+              confirmLabel: host.l10n.delete,
+              destructive: true,
+            );
+            if (!ok) return;
+            await manager.delete(rec);
+            if (host.mounted) showAppToast(host, host.l10n.downloadDeleted);
+          },
+        ),
+        const DesktopMenuItem<void>.divider(),
+        // Another cut or quality: the normal picker, which still says when
+        // the same cut is already saved.
+        DesktopMenuItem(
+          label: host.l10n.downloadAgain,
+          icon: Icons.download_rounded,
+          onTap: onDownloadAgain,
+        ),
+      ],
     );
   }
 
@@ -121,6 +236,66 @@ class EpisodeDownloadIcon extends StatelessWidget {
   ) {
     final l10n = context.l10n;
     final paused = rec.status == DownloadStatus.paused;
+    // Pause/Resume + Cancel rows, shared by the phone sheet and the Windows
+    // dialog.
+    List<Widget> actions(BuildContext sheetContext) => [
+      ListTile(
+        leading: Icon(
+          paused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+          color: AppColors.textPrimary,
+        ),
+        title: Text(
+          paused ? l10n.resumeDownload : l10n.pauseDownload,
+          style: AppText.body.copyWith(color: AppColors.textPrimary),
+        ),
+        onTap: () {
+          Navigator.pop(sheetContext);
+          if (paused) {
+            manager.resume(rec);
+          } else {
+            manager.pause(rec);
+          }
+        },
+      ),
+      ListTile(
+        leading: Icon(Icons.close_rounded, color: AppColors.accent),
+        title: Text(
+          l10n.cancelDownload,
+          style: AppText.body.copyWith(color: AppColors.accent),
+        ),
+        onTap: () {
+          Navigator.pop(sheetContext);
+          manager.cancel(rec);
+        },
+      ),
+    ];
+    // Windows: a small centred graphite dialog (title + close, Esc and
+    // click-outside close) instead of a phone bottom sheet.
+    if (desktopPanelsEnabled) {
+      showDesktopDockedPanel<void>(
+        context,
+        centred: true,
+        width: 380,
+        dialogKey: const ValueKey('download-menu-desktop-dialog'),
+        builder: (dialogContext) => Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            DesktopPanelTitleBar(
+              title: rec.episodeTitle.trim().isNotEmpty
+                  ? rec.episodeTitle
+                  : l10n.downloading,
+              subtitle: rec.showTitle,
+            ),
+            Divider(height: 1, color: DesktopPanelColors.edge),
+            const SizedBox(height: 6),
+            ...actions(dialogContext),
+            const SizedBox(height: 10),
+          ],
+        ),
+      );
+      return;
+    }
     showModalBottomSheet<void>(
       context: context,
       backgroundColor: AppColors.surface,
@@ -131,37 +306,7 @@ class EpisodeDownloadIcon extends StatelessWidget {
       builder: (sheetContext) => SafeArea(
         child: Column(
           mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: Icon(
-                paused ? Icons.play_arrow_rounded : Icons.pause_rounded,
-                color: AppColors.textPrimary,
-              ),
-              title: Text(
-                paused ? l10n.resumeDownload : l10n.pauseDownload,
-                style: AppText.body.copyWith(color: AppColors.textPrimary),
-              ),
-              onTap: () {
-                Navigator.pop(sheetContext);
-                if (paused) {
-                  manager.resume(rec);
-                } else {
-                  manager.pause(rec);
-                }
-              },
-            ),
-            ListTile(
-              leading: Icon(Icons.close_rounded, color: AppColors.accent),
-              title: Text(
-                l10n.cancelDownload,
-                style: AppText.body.copyWith(color: AppColors.accent),
-              ),
-              onTap: () {
-                Navigator.pop(sheetContext);
-                manager.cancel(rec);
-              },
-            ),
-          ],
+          children: actions(sheetContext),
         ),
       ),
     );

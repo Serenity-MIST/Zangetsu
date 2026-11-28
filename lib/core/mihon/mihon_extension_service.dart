@@ -1,16 +1,24 @@
+import '../desktop/extension_runtime.dart';
+import '../desktop/desktop_storage.dart';
 import '../models/source_pref.dart';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
+// SnackBar/Text only: the Windows message when a verification fails.
+import 'package:flutter/material.dart' show SnackBar, Text;
 import 'package:flutter/services.dart';
 import 'package:get_it/get_it.dart';
 import 'package:hive/hive.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../aniyomi/aniyomi_repo.dart';
+import '../logging/app_logger.dart';
 import '../provider/cf_solve_needed.dart';
+import '../provider/extension_install_failure.dart';
+import '../ui/global_messenger.dart' show rootMessengerKey;
+import '../../l10n/l10n.dart' show appL10n;
 import 'mihon_manager.dart';
 import 'mihon_provider.dart';
 import 'mihon_repo.dart';
@@ -18,6 +26,8 @@ import 'mihon_source_info.dart';
 import 'mihon_update.dart';
 
 export 'mihon_source_info.dart';
+// Callers that catch install failures get the type with the service.
+export '../provider/extension_install_failure.dart';
 
 /// Dart-side wrapper around the `zangetsu/mihon` [MethodChannel].
 ///
@@ -37,7 +47,7 @@ export 'mihon_source_info.dart';
 /// `AniyomiRepo`: Mihon repos publish `index.json` in a different shape (see
 /// `mihon_repo.dart`).
 class MihonExtensionService {
-  static const MethodChannel _channel = MethodChannel('zangetsu/mihon');
+  static const ExtensionChannel _channel = ExtensionChannel('zangetsu/mihon');
 
   /// Hive box name used to persist installed pkg → apk-path entries so they
   /// can be reloaded on a cold start without re-downloading. Deliberately
@@ -60,10 +70,22 @@ class MihonExtensionService {
   /// Never throws: a failed uninstall must still leave the source list
   /// consistent, and the caller reports the reason to the user.
   static Future<String?> uninstall(String pkg, {Directory? mihonDir}) async {
+    if (DesktopExtensionRuntime.isAvailable) {
+      try {
+        // Use the same transport seam as other extension operations, so
+        // isolated Flutter tests cannot boot a real companion accidentally.
+        await _channel.invokeMethod<void>('uninstallExtension', {'pkg': pkg});
+      } catch (e) {
+        return '$e';
+      }
+    }
     String? apkPath;
     if (Hive.isBoxOpen(installedBoxName)) {
       final box = Hive.box<dynamic>(installedBoxName);
       apkPath = box.get(pkg) as String?;
+      if (Platform.isWindows && apkPath != null) {
+        apkPath = DesktopStorage.relocatedAppPath(apkPath);
+      }
       await box.delete(pkg);
     }
     // The box is only a convenience cache of the path, and it has been seen
@@ -93,7 +115,8 @@ class MihonExtensionService {
     Directory? mihonDir,
   ) async {
     try {
-      final dir = mihonDir ??
+      final dir =
+          mihonDir ??
           Directory('${(await getApplicationSupportDirectory()).path}/mihon');
       final f = File('${dir.path}/$pkg.apk');
       return await f.exists() ? f.path : null;
@@ -230,14 +253,66 @@ class MihonExtensionService {
   /// self-correcting: the next request hits the challenge and re-flags it.
   static Future<void> solveCloudflare(String url) async {
     try {
-      await _channel.invokeMethod<void>('solveCloudflare', {'url': url});
-      final host = Uri.tryParse(url)?.host;
-      if (host != null && host.isNotEmpty) CfSolveNeeded.clear(host);
+      await verifyCloudflare(url);
     } on PlatformException catch (e) {
       debugPrint('[mihon] solveCloudflare failed: $e');
-    } on MissingPluginException {
-      // Non-Android host — no native solver.
+      // Windows: callers of this best-effort entry point (home, reader,
+      // picker) used to fail in silence and simply reload into the same
+      // Cloudflare error. Say why the verification window did not work.
+      // Closing the window (CANCELLED) is the user's choice, not a failure.
+      if (defaultTargetPlatform == TargetPlatform.windows &&
+          e.code != 'CANCELLED') {
+        onDesktopSolveFailure?.call(e.message ?? e.code);
+      }
+    } catch (e) {
+      // Not a channel error (e.g. the window could not be shown yet). Same
+      // best-effort contract: log it, and tell the Windows user.
+      debugPrint('[mihon] solveCloudflare failed: $e');
+      if (defaultTargetPlatform == TargetPlatform.windows) {
+        onDesktopSolveFailure?.call('$e');
+      }
     }
+  }
+
+  /// Windows only: shows why a best-effort [solveCloudflare] failed. Defaults
+  /// to the app-wide snack bar (a no-op before the app is on screen); tests
+  /// can replace it to observe the message.
+  static void Function(String message)? onDesktopSolveFailure =
+      _showDesktopSolveFailure;
+
+  /// Default [onDesktopSolveFailure]: a longer-lived snack bar on the root
+  /// messenger, worded with the existing "Verification failed" string.
+  static void _showDesktopSolveFailure(String message) {
+    rootMessengerKey.currentState
+      ?..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(appL10n.verificationFailedError(message)),
+          duration: const Duration(seconds: 6),
+        ),
+      );
+  }
+
+  /// Strict variant of [solveCloudflare] for buttons that retry afterwards.
+  ///
+  /// Returns true once verification finished (and lifts the [CfSolveNeeded]
+  /// latch for [url]'s host), false when the user closed the window
+  /// (`CANCELLED`) or no native solver exists. Any other failure, such as the
+  /// Windows browser not starting, is rethrown so the caller can show it
+  /// instead of retrying straight into the same Cloudflare error.
+  static Future<bool> verifyCloudflare(String url) async {
+    try {
+      await _channel.invokeMethod<void>('solveCloudflare', {'url': url});
+    } on PlatformException catch (e) {
+      if (e.code == 'CANCELLED') return false;
+      rethrow;
+    } on MissingPluginException {
+      // No native solver on this host: nothing was verified.
+      return false;
+    }
+    final host = Uri.tryParse(url)?.host;
+    if (host != null && host.isNotEmpty) CfSolveNeeded.clear(host);
+    return true;
   }
 
   /// Opens the native WebView on [url] and leaves it open.
@@ -254,6 +329,12 @@ class MihonExtensionService {
       });
     } on PlatformException catch (e) {
       debugPrint('[mihon] openSourceWebView failed: $e');
+      // Windows: say why the site browser did not open (closing it is not
+      // an error worth a message).
+      if (defaultTargetPlatform == TargetPlatform.windows &&
+          e.code != 'CANCELLED') {
+        onDesktopSolveFailure?.call(e.message ?? e.code);
+      }
     } on MissingPluginException {
       // Non-Android host — no native WebView.
     }
@@ -315,7 +396,8 @@ class MihonExtensionService {
   /// 5. Register each new provider in the optional [manager] (falls back to
   ///    `GetIt.instance<MihonManager>()` when the type is registered there).
   ///
-  /// Never throws — returns `[]` on any failure and logs the error.
+  /// Never throws — returns `[]` on any failure and logs the error. Use
+  /// [installFromRepoOrThrow] to learn why it failed.
   ///
   /// [downloader] lets callers (and tests) substitute the download step without
   /// a real network connection. When omitted the method calls `sl<Dio>().download`.
@@ -325,6 +407,34 @@ class MihonExtensionService {
     Directory? apkDirectory,
     Future<void> Function(String url, String savePath)? downloader,
     MihonManager? manager,
+  }) async {
+    try {
+      return await installFromRepoOrThrow(
+        entry,
+        dio: dio,
+        apkDirectory: apkDirectory,
+        downloader: downloader,
+        manager: manager,
+      );
+    } on ExtensionInstallFailure {
+      // Already logged by installFromRepoOrThrow; this path keeps the old
+      // never-throws contract for existing callers.
+      return [];
+    }
+  }
+
+  /// Same steps as [installFromRepo], but a failure throws an
+  /// [ExtensionInstallFailure] with a readable reason and the raw error
+  /// (src-2 A). [onProgress] reports the APK (then jar) download and
+  /// [cancelToken] lets the row's Cancel button stop it (src-2 B).
+  Future<List<MihonProvider>> installFromRepoOrThrow(
+    AniyomiRepoEntry entry, {
+    Dio? dio,
+    Directory? apkDirectory,
+    Future<void> Function(String url, String savePath)? downloader,
+    MihonManager? manager,
+    ExtensionInstallProgress? onProgress,
+    CancelToken? cancelToken,
   }) async {
     try {
       // 1. Resolve the APK save directory.
@@ -337,6 +447,13 @@ class MihonExtensionService {
       }
       await apkDir.create(recursive: true);
       final apkPath = '${apkDir.path}/${entry.pkg}.apk';
+      if (DesktopExtensionRuntime.isAvailable) {
+        await DesktopExtensionRuntime.instance.invoke(
+          'mihon',
+          'prepareExtensionUpdate',
+          {'pkg': entry.pkg},
+        );
+      }
 
       // A prior load marks the apk read-only (Android W^X), which would block
       // re-downloading over it — remove any stale copy first.
@@ -352,10 +469,31 @@ class MihonExtensionService {
         await downloader(entry.apkUrl, apkPath);
       } else {
         final effectiveDio = dio ?? GetIt.instance.get<Dio>();
-        await _downloadApk(effectiveDio, entry.apkUrl, apkPath);
+        await _downloadApk(
+          effectiveDio,
+          entry.apkUrl,
+          apkPath,
+          onProgress: onProgress,
+          cancelToken: cancelToken,
+        );
       }
 
       // 3. Install and list sources.
+      if (DesktopExtensionRuntime.isAvailable &&
+          entry.jarUrl.startsWith('https://')) {
+        final jarPath = apkPath.replaceFirst(RegExp(r'\.apk$'), '.jar');
+        if (downloader != null) {
+          await downloader(entry.jarUrl, jarPath);
+        } else {
+          await _downloadApk(
+            dio ?? GetIt.instance.get<Dio>(),
+            entry.jarUrl,
+            jarPath,
+            onProgress: onProgress,
+            cancelToken: cancelToken,
+          );
+        }
+      }
       await installExtension(apkPath);
       final allSources = await listSources();
       final providers = allSources
@@ -376,10 +514,23 @@ class MihonExtensionService {
               : null);
       effectiveManager?.registerAll(providers);
 
+      // Nothing registered: say so instead of a silent empty success. Thrown
+      // after steps 4-5 so the stored state matches what the never-throws
+      // [installFromRepo] always left behind.
+      if (providers.isEmpty) {
+        throw ExtensionInstallFailure.noSource(entry.pkg);
+      }
       return providers;
     } catch (e, st) {
-      debugPrint('[mihon] installFromRepo(${entry.pkg}) failed: $e\n$st');
-      return [];
+      final failure = ExtensionInstallFailure.from(e);
+      // AppLogger keeps the line in the shareable log in release builds
+      // (debugPrint alone did not), so a reported failure can be traced.
+      AppLogger.instance.log(
+        '[mihon] installFromRepo(${entry.pkg}) failed: '
+        '${failure.reason} | ${failure.details}\n$st',
+        level: failure.cancelled ? 'I' : 'E',
+      );
+      throw failure;
     }
   }
 
@@ -399,7 +550,13 @@ class MihonExtensionService {
   /// each rolling that dice on a weak signal.
   static const Duration _apkConnectTimeout = Duration(seconds: 30);
 
-  Future<void> _downloadApk(Dio dio, String url, String savePath) async {
+  Future<void> _downloadApk(
+    Dio dio,
+    String url,
+    String savePath, {
+    ExtensionInstallProgress? onProgress,
+    CancelToken? cancelToken,
+  }) async {
     final opts = Options(
       receiveTimeout: _apkDownloadTimeout,
       sendTimeout: _apkDownloadTimeout,
@@ -413,11 +570,20 @@ class MihonExtensionService {
     Object? lastError;
     for (final u in urls) {
       try {
-        await dio.download(u, savePath, options: opts);
+        await dio.download(
+          u,
+          savePath,
+          options: opts,
+          // Progress + Cancel for the install row (src-2 B).
+          onReceiveProgress: onProgress,
+          cancelToken: cancelToken,
+        );
         return; // first success wins
       } on DioException catch (e) {
+        // A cancel is the user's choice: stop instead of trying mirrors.
+        if (e.type == DioExceptionType.cancel) rethrow;
         lastError = e;
-        debugPrint(
+        AppLogger.instance.log(
           '[mihon] download mirror failed '
           '(${e.response?.statusCode ?? e.type}): $u',
         );

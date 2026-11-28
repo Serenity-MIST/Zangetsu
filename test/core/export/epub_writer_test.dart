@@ -14,7 +14,9 @@ void _assertWellFormedXml(String xml) {
   XmlDocument.parse(xml);
 }
 
-Archive _readEpub(File f) => ZipDecoder().decodeStream(InputFileStream(f.path));
+/// Reading the small test EPUB into memory avoids leaving a lazy ZIP stream
+/// holding the file open when Windows cleans up the temporary directory.
+Archive _readEpub(File f) => ZipDecoder().decodeBytes(f.readAsBytesSync());
 
 String _entryString(Archive a, String name) =>
     utf8.decode(a.findFile(name)!.content as List<int>);

@@ -181,6 +181,30 @@ void main() {
     },
   );
 
+  test('skips the cloud merge when boot found the network offline, then merges '
+      'on a normal load', () async {
+    final remote = _MemoryProfileRemote()
+      ..rows['cloud-only'] = const ViewerProfile(
+        id: 'cloud-only',
+        name: 'Cloud only',
+      );
+    final cloudStore = ViewerProfileStore(
+      remote: remote,
+      currentUserId: () => 'test-user',
+    );
+
+    await cloudStore.loadForUser(attemptRemote: false);
+
+    // Local-only: the splash must not wait on the cloud call.
+    expect(cloudStore.profiles.map((p) => p.id), [kDefaultProfileId]);
+    expect(cloudStore.isLoadedForCurrentUser, isTrue);
+
+    // The reconnect path calls it again without the flag and picks up the
+    // cloud copy.
+    await cloudStore.loadForUser();
+    expect(cloudStore.profiles.map((p) => p.id), contains('cloud-only'));
+  });
+
   test(
     'keeps a previously saved fifth profile when loading old data',
     () async {

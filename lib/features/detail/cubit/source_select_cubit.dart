@@ -105,10 +105,20 @@ class SourceSelectCubit extends Cubit<SourceSelectState> {
       // so anything else here would name a source the viewer never gets — and
       // the row's per-source actions, Cloudflare solve included, act on this
       // id, so naming the wrong one points them at the wrong site.
-      final played = store.lastPlayed(canonical);
+      final played = canonical.kind == ZKind.manga
+          ? matcher.lastReadingSource(canonical.kind) ??
+                store.lastPlayed(canonical)
+          : store.lastPlayed(canonical);
+      // Windows: the kind's preferred source is tried right after the one that
+      // last played (see SourceMatcher.preferredIsTryFirst), so its cached
+      // match is the next best guess for what Auto Resolve will use.
+      final preferred = SourceMatcher.preferredIsTryFirst
+          ? matcher.preferredFor(canonical.kind)
+          : null;
       final order = [
         ...sources.where((s) => s.id == played),
-        ...sources.where((s) => s.id != played),
+        ...sources.where((s) => s.id == preferred && s.id != played),
+        ...sources.where((s) => s.id != played && s.id != preferred),
       ];
       for (final s in order) {
         final m = store.get(canonical, s.id);
@@ -249,9 +259,11 @@ class SourceSelectCubit extends Cubit<SourceSelectState> {
     );
   }
 
-  /// Drop this title's own pin AND the kind's explicit default — genuinely
-  /// back to sweeping, not just to whichever fixed source the kind default
-  /// names.
+  /// Back to Auto Resolve for THIS title. On phone/TV this also drops the
+  /// kind's explicit default (there it would otherwise keep outranking the
+  /// sweep). On Windows only this title's own choice is removed: the global
+  /// preferred source is a try-first hint and is changed in Settings only
+  /// (see SourceMatcher.clearAuto).
   Future<void> selectAuto() async {
     emit(
       SourceSelectState(

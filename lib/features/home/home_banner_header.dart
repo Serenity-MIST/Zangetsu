@@ -14,11 +14,16 @@ class HomeBannerHeader extends StatelessWidget {
     this.loading = false,
     required this.bannerBuilder,
     required this.headerBuilder,
+    this.headerAboveBanner = false,
   });
 
   final ValueListenable<String> bannerStyle;
   final bool hasHero;
   final bool loading;
+
+  /// Desktop layout: stacks the header above the banner instead of
+  /// overlaying it.
+  final bool headerAboveBanner;
   final Widget Function(String bannerId) bannerBuilder;
   final Widget Function(bool edgeBanner) headerBuilder;
 
@@ -29,6 +34,11 @@ class HomeBannerHeader extends StatelessWidget {
       final header = headerBuilder(bannerId == BannerStyle.edgeId);
       if (!hasHero && !loading) {
         return ColoredBox(color: AppColors.bg, child: header);
+      }
+      // Desktop variant: header stacked above the banner instead of overlaid.
+      if (headerAboveBanner) {
+        if (!hasHero) return ColoredBox(color: AppColors.bg, child: header);
+        return Column(children: [header, bannerBuilder(bannerId)]);
       }
       final height = heroHeightFor(context);
       // Keep the full banner; only reduce the blank gap before the rows.

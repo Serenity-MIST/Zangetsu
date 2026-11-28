@@ -1,3 +1,6 @@
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, kIsWeb;
+
 import '../environment.dart';
 import '../models/media_item.dart';
 import '../models/provider_info.dart';
@@ -12,6 +15,18 @@ import '../models/provider_info.dart';
 /// app catches it via `zangetsu://open?…`; otherwise the page offers the app.
 class ShareLink {
   const ShareLink._();
+
+  /// Windows: whether [value] points at a file on this PC (a `file:` link or a
+  /// drive or network path). Such a path can hold the Windows user name and
+  /// means nothing to anyone else, so it never goes into a public link. Other
+  /// platforms keep their behaviour.
+  static bool _isPrivatePath(String value) =>
+      !kIsWeb &&
+      defaultTargetPlatform == TargetPlatform.windows &&
+      RegExp(
+        r'^\s*(file:|[a-z]:[\\/]|\\\\)',
+        caseSensitive: false,
+      ).hasMatch(value);
 
   /// The short web link to share for [item].
   static String forItem(MediaItem item) {
@@ -28,7 +43,8 @@ class ShareLink {
             // source that omits the cover there it never appears at all.
             // Only the URL: covers needing a Referer are a minority and would bloat
             // every link with headers to rescue them.
-            if (cover != null && cover.isNotEmpty) 'c': cover,
+            if (cover != null && cover.isNotEmpty && !_isPrivatePath(cover))
+              'c': cover,
             // The catalogue you were looking at, so the person opening it sees the
             // same page rather than their own provider's version of the title.
             // Absent on links from older builds, and on source titles, which carry
@@ -57,6 +73,8 @@ class ShareLink {
     String? savedFrom,
   }) {
     if (sourceId.isEmpty || url == null || url.isEmpty) return null;
+    // A show known only from files on this PC has no page anyone can open.
+    if (_isPrivatePath(url)) return null;
     return forItem(
       MediaItem(
         id: url,

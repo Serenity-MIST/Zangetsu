@@ -34,7 +34,10 @@ void main() {
         pkg: 'com.test.ext.one',
         base: 'https://raw.test/owner/repo/main',
       );
-      expect(e.iconUrl, 'https://raw.test/owner/repo/main/icon/com.test.ext.one.png');
+      expect(
+        e.iconUrl,
+        'https://raw.test/owner/repo/main/icon/com.test.ext.one.png',
+      );
     });
 
     test('normalises a base that still points at the index file', () {
@@ -44,7 +47,10 @@ void main() {
         pkg: 'com.test.ext.one',
         base: 'https://raw.test/owner/repo/main/index.min.json',
       );
-      expect(e.iconUrl, 'https://raw.test/owner/repo/main/icon/com.test.ext.one.png');
+      expect(
+        e.iconUrl,
+        'https://raw.test/owner/repo/main/icon/com.test.ext.one.png',
+      );
     });
 
     test('an absolute URL from the index wins over the derived one', () {
@@ -73,7 +79,10 @@ void main() {
       "sources":[{"id":"9","language":"en","name":"Test","homeUrl":"https://t.test"}]
     }]}}
     ''';
-    final entries = MihonRepo.parseIndex(json, repoBaseUrl: 'https://raw.test/o/r/repo');
+    final entries = MihonRepo.parseIndex(
+      json,
+      repoBaseUrl: 'https://raw.test/o/r/repo',
+    );
     expect(entries, hasLength(1));
     expect(entries.single.iconUrl, 'https://cdn.test/icons/manga.png');
   });
@@ -89,8 +98,14 @@ void main() {
       "sources":[]
     }]}}
     ''';
-    final entries = MihonRepo.parseIndex(json, repoBaseUrl: 'https://raw.test/o/r/repo');
-    expect(entries.single.iconUrl, 'https://raw.test/o/r/repo/icon/com.test.manga.png');
+    final entries = MihonRepo.parseIndex(
+      json,
+      repoBaseUrl: 'https://raw.test/o/r/repo',
+    );
+    expect(
+      entries.single.iconUrl,
+      'https://raw.test/o/r/repo/icon/com.test.manga.png',
+    );
   });
 
   group('SourceIconStore', () {
@@ -114,19 +129,34 @@ void main() {
         _entry(pkg: 'com.a', base: 'https://raw.test/o/r/main'),
         _entry(pkg: 'com.b', base: 'https://raw.test/o/r/main'),
       ]);
-      expect(SourceIconStore.urlFor('com.a'), 'https://raw.test/o/r/main/icon/com.a.png');
-      expect(SourceIconStore.urlFor('com.b'), 'https://raw.test/o/r/main/icon/com.b.png');
+      expect(
+        SourceIconStore.urlFor('com.a'),
+        'https://raw.test/o/r/main/icon/com.a.png',
+      );
+      expect(
+        SourceIconStore.urlFor('com.b'),
+        'https://raw.test/o/r/main/icon/com.b.png',
+      );
     });
 
     test('a package never seen in any index has no icon', () {
-      SourceIconStore.recordAll([_entry(pkg: 'com.a', base: 'https://raw.test/o/r/main')]);
+      SourceIconStore.recordAll([
+        _entry(pkg: 'com.a', base: 'https://raw.test/o/r/main'),
+      ]);
       expect(SourceIconStore.urlFor('com.unknown'), isNull);
     });
 
     test('a later index overwrites an earlier URL for the same package', () {
-      SourceIconStore.recordAll([_entry(pkg: 'com.a', base: 'https://old.test/o/r/main')]);
-      SourceIconStore.recordAll([_entry(pkg: 'com.a', base: 'https://new.test/o/r/main')]);
-      expect(SourceIconStore.urlFor('com.a'), 'https://new.test/o/r/main/icon/com.a.png');
+      SourceIconStore.recordAll([
+        _entry(pkg: 'com.a', base: 'https://old.test/o/r/main'),
+      ]);
+      SourceIconStore.recordAll([
+        _entry(pkg: 'com.a', base: 'https://new.test/o/r/main'),
+      ]);
+      expect(
+        SourceIconStore.urlFor('com.a'),
+        'https://new.test/o/r/main/icon/com.a.png',
+      );
     });
 
     test('an empty stored value reads as no icon, not as an empty URL', () {
@@ -142,9 +172,12 @@ void main() {
       // The picker builds on every sheet open, including before the boot step
       // that opens this box has run. A cosmetic icon must never throw there.
       expect(Hive.isBoxOpen(SourceIconStore.boxName), isFalse);
-      expect(() => SourceIconStore.recordAll([
-            _entry(pkg: 'com.a', base: 'https://raw.test/o/r/main'),
-          ]), returnsNormally);
+      expect(
+        () => SourceIconStore.recordAll([
+          _entry(pkg: 'com.a', base: 'https://raw.test/o/r/main'),
+        ]),
+        returnsNormally,
+      );
       expect(SourceIconStore.urlFor('com.a'), isNull);
     });
   });

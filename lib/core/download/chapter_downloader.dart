@@ -13,6 +13,9 @@ import '../repository/source_repository.dart';
 import 'chapter_download.dart';
 import 'chapter_download_store.dart';
 import 'download_prefs.dart';
+// Windows desktop: close guard registration and taskbar / notifications.
+import '../desktop/desktop_background_work.dart';
+import 'desktop_download_signals.dart';
 
 /// Fetches manga pages / novel text for offline reading.
 ///
@@ -35,10 +38,59 @@ class ChapterDownloader extends ChangeNotifier {
               connectTimeout: const Duration(seconds: 20),
               receiveTimeout: const Duration(seconds: 60),
             ),
-          );
+          ) {
+    // Windows desktop: the close guard / tray count running chapters too,
+    // and they feed the taskbar progress + finish notifications (dl-11).
+    // Chapters have no pause, so the tray's 'Pause all' skips them.
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      DesktopBackgroundWork.register(
+        'chapter_downloads',
+        // Internal name only (never shown), so it stays English.
+        label: 'chapter downloads',
+        activeCount: () => activeCount,
+      );
+      _registeredBackgroundWork = true;
+      DesktopDownloadSignals.instance.attachChapters(this, _store);
+    }
+  }
 
   final SourceRepository _repo;
   final ChapterDownloadStore _store;
+
+  // Whether this instance registered with the Windows close guard / tray.
+  bool _registeredBackgroundWork = false;
+
+  /// Chapters queued or downloading right now.
+  int get activeCount => _live.length;
+
+  /// The store this downloader writes to (the Windows signals read the final
+  /// state of a chapter from it).
+  ChapterDownloadStore get store => _store;
+
+  // Running count last reported to the close guard / tray.
+  int _reportedActive = 0;
+
+  @override
+  void notifyListeners() {
+    // Tell the close guard only when the running count really moved, not on
+    // every page tick.
+    if (_registeredBackgroundWork && _reportedActive != _live.length) {
+      _reportedActive = _live.length;
+      DesktopBackgroundWork.notifyChanged();
+    }
+    super.notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    if (_registeredBackgroundWork) {
+      DesktopBackgroundWork.unregister('chapter_downloads');
+      DesktopDownloadSignals.instance.detachChapters(this);
+      _registeredBackgroundWork = false;
+    }
+    super.dispose();
+  }
+
   final Dio _dio;
 
   /// How many page images of ONE chapter are fetched at a time — the
@@ -108,6 +160,7 @@ class ChapterDownloader extends ChangeNotifier {
     required String showId,
     required String showTitle,
     String? cover,
+    Map<String, String>? coverHeaders,
     required ContentMode mode,
   }) => enqueueMany(
     chapters: [chapter],
@@ -115,6 +168,7 @@ class ChapterDownloader extends ChangeNotifier {
     showId: showId,
     showTitle: showTitle,
     cover: cover,
+    coverHeaders: coverHeaders,
     mode: mode,
   );
 
@@ -129,8 +183,13 @@ class ChapterDownloader extends ChangeNotifier {
     required String showId,
     required String showTitle,
     String? cover,
+    Map<String, String>? coverHeaders,
     required ContentMode mode,
   }) async {
+    if (sl.isRegistered<DownloadPrefs>() &&
+        !await sl<DownloadPrefs>().ensureDesktopFolder()) {
+      return;
+    }
     // Timestamps step by one so a batch keeps its list order. Stamping them
     // all `now` would leave the sort with nothing to separate them, and the
     // downloads screen reads this back as reading order.
@@ -150,6 +209,7 @@ class ChapterDownloader extends ChangeNotifier {
         showId: showId,
         showTitle: showTitle,
         cover: cover,
+        coverHeaders: coverHeaders,
         thumbnail: chapter.thumbnail,
         chapterId: chapter.id,
         chapterUrl: chapter.url,
@@ -221,6 +281,55 @@ class ChapterDownloader extends ChangeNotifier {
     }
     if (dead.isNotEmpty) notifyListeners();
     return dead.length;
+  }
+
+  /// Puts one failed chapter back in the queue (dl-10). Pages already in its
+  /// `.part` folder are kept, so the fetch only gets what is still missing.
+  /// Returns false when the chapter is not a failed one.
+  Future<bool> retry(String id) async {
+    final queued = _requeueFailed(id);
+    if (queued == null) return false;
+    await _store.put(queued);
+    notifyListeners();
+    unawaited(_pump());
+    return true;
+  }
+
+  /// Re-queues every failed chapter at once, in list order (dl-10 'Retry
+  /// failed'). One box write and one notify for the whole batch, like
+  /// [enqueueMany]. Returns how many were queued.
+  Future<int> retryFailed() async {
+    // all() is newest first; reverse so the oldest failure runs first.
+    final failed = _store
+        .all()
+        .where((c) => c.status == ChapterDownloadStatus.failed)
+        .toList()
+        .reversed;
+    final queued = <ChapterDownload>[];
+    for (final c in failed) {
+      final rec = _requeueFailed(c.id, known: c);
+      if (rec != null) queued.add(rec);
+    }
+    if (queued.isEmpty) return 0;
+    await _store.putAll(queued);
+    notifyListeners();
+    unawaited(_pump());
+    return queued.length;
+  }
+
+  /// Moves a failed chapter into the live queue; null when it can't be.
+  ChapterDownload? _requeueFailed(String id, {ChapterDownload? known}) {
+    if (_live.containsKey(id)) return null;
+    final rec = known ?? _store.get(id);
+    if (rec == null || rec.status != ChapterDownloadStatus.failed) return null;
+    _cancelled.remove(id);
+    final queued = rec.copyWith(
+      status: ChapterDownloadStatus.queued,
+      error: () => null,
+    );
+    _live[id] = queued;
+    _queue.add(id);
+    return queued;
   }
 
   Future<void> _pump() async {

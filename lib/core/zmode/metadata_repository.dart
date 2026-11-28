@@ -10,6 +10,7 @@ import '../models/media_detail.dart';
 import '../models/media_item.dart';
 import '../models/provider_info.dart';
 import '../playback/source_health_store.dart';
+import '../playback/watch_history.dart' show ShowBackdrops;
 import '../models/video_source.dart';
 import '../mode/content_mode.dart';
 import '../repository/catalogue_repository.dart';
@@ -740,6 +741,9 @@ class MetadataRepository implements CatalogueRepository {
       ...d.synonyms,
     ];
     _titles[c.key] = (title: d.title, alt: d.englishTitle, malId: d.malId);
+    // Windows: remember the show's wide picture so its Continue entry can
+    // store it (no-op on other platforms).
+    ShowBackdrops.remember(url, d.banner);
     AppLogger.instance.log(
       '[metadata] detail catalogue title="${d.title}" eps=${d.episodes.length} '
       '${sw.elapsedMilliseconds}ms',
@@ -787,7 +791,9 @@ class MetadataRepository implements CatalogueRepository {
         // source the reader has never opened. Video never did this: it keeps
         // the page and raises Cloudflare at playback, where the user acted.
         final reading = _matcher.sourceForTitle(c);
-        final blocked = reading == null ? null : CfSolveNeeded.urlFor(reading);
+        final blocked = reading == null
+            ? _matcher.blockedForTitle(c)
+            : CfSolveNeeded.urlFor(reading);
         if (blocked != null) throw CloudflareRequiredException(blocked);
         AppLogger.instance.log(
           '[metadata] detail no source match ${sw.elapsedMilliseconds}ms',
@@ -800,7 +806,9 @@ class MetadataRepository implements CatalogueRepository {
         // it tries to read one.
         return d.copyWith(episodes: const <Episode>[]);
       }
-      final chapters = await _src.episodes(m.showUrl, sourceId: m.sourceId);
+      final chapters = c.kind == ZKind.manga
+          ? await _matcher.chaptersFor(c, m)
+          : await _src.episodes(m.showUrl, sourceId: m.sourceId);
       AppLogger.instance.log(
         '[metadata] detail matched ${m.sourceId} chapters=${chapters.length} '
         '${sw.elapsedMilliseconds}ms',
@@ -1039,8 +1047,10 @@ class MetadataRepository implements CatalogueRepository {
     String episodeUrl, {
     String? sourceId,
     bool fast = false,
+    String? category,
   }) async {
-    final cut = _cutFor(episodeUrl);
+    // Queued jobs supply their persisted cut; browsing keeps remembered state.
+    final cut = category ?? _cutFor(episodeUrl);
     if (sourceId != null &&
         sourceId.isNotEmpty &&
         sourceId != ZmodeIds.sourceId) {
@@ -1070,12 +1080,13 @@ class MetadataRepository implements CatalogueRepository {
   /// undownloadable (all-DASH), which is a thing only the caller can judge.
   Future<({List<VideoSource> streams, String sourceId})> sourcesWhere(
     String episodeUrl,
-    bool Function(List<VideoSource> streams) accept,
-  ) async {
+    bool Function(List<VideoSource> streams) accept, {
+    String? category,
+  }) async {
     final r = await _playback.resolveForPlayback(
       episodeUrl,
       accept: accept,
-      category: _cutFor(episodeUrl),
+      category: category ?? _cutFor(episodeUrl),
     );
     return (streams: r.streams, sourceId: r.match.sourceId);
   }

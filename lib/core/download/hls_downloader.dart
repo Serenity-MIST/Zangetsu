@@ -1,4 +1,9 @@
+import 'download_failure.dart';
+import 'hls_audio_selection.dart';
+import 'subtitle_selection.dart';
+import 'dart:async';
 import 'dart:io';
+import 'dart:convert';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
@@ -6,6 +11,16 @@ import 'package:pointycastle/export.dart';
 
 import '../playback/hls.dart';
 import 'webvtt_merge.dart';
+
+/// Platform merge capability for already-downloaded files, never remote URLs.
+typedef HlsAudioMux =
+    Future<String?> Function(
+      String video,
+      String audio,
+      String output,
+      String? language,
+      bool Function() canceled,
+    );
 
 /// Downloads an HLS (m3u8) stream to a single local file by fetching every
 /// segment, decrypting AES-128 if needed, and concatenating into one .mp4.
@@ -17,7 +32,140 @@ import 'webvtt_merge.dart';
 /// background_downloader equivalent for segmented HLS. Progress is reported via
 /// [onProgress]; [canceled] is polled between segments to abort.
 class HlsDownloader {
-  HlsDownloader(this._dio);
+  HlsDownloader(
+    this._dio, {
+    this.muxAudio,
+    this.isHostCoolingDown,
+    this.onRateLimited,
+    this.resilient = false,
+    this.waitForNetwork,
+    this.networkPatience = const Duration(minutes: 3),
+    List<Duration>? retryDelays,
+  }) : retryDelays = retryDelays ?? _patientRetryDelays;
+  final HlsAudioMux? muxAudio;
+
+  /// Windows only (the Windows download manager passes true). A resilient
+  /// download rides out a weak or dropping connection instead of failing:
+  /// it writes to `<output>.part` with a small progress file beside it, keeps
+  /// both when it stops, and carries on from the last saved segment the next
+  /// time it runs. Off (the default) keeps the original behaviour exactly.
+  final bool resilient;
+
+  /// Resilient mode: completes when the network is back (at once when it is
+  /// already up). Time spent waiting here does not count against
+  /// [networkPatience], so a long outage never fails the download.
+  final Future<void> Function()? waitForNetwork;
+
+  /// Resilient mode: how long one request may keep failing while the network
+  /// looks up before the download stops with [networkResult].
+  final Duration networkPatience;
+
+  /// Resilient mode: the waits between tries of one failed request. The last
+  /// one repeats until [networkPatience] runs out.
+  final List<Duration> retryDelays;
+
+  static const List<Duration> _patientRetryDelays = [
+    Duration(seconds: 1),
+    Duration(seconds: 2),
+    Duration(seconds: 4),
+    Duration(seconds: 8),
+    Duration(seconds: 15),
+  ];
+
+  /// Results of a resilient [download] that are not plain failures. The
+  /// partial file is kept for every one of these except [canceledResult].
+  static const String canceledResult = 'canceled';
+
+  /// Stopped by a pause (or the app closing); the partial file is kept.
+  static const String pausedResult = 'paused';
+
+  /// The connection kept failing for [networkPatience]; try again later.
+  static const String networkResult = 'network';
+
+  /// The host refused a segment (403/410), usually an expired signed link.
+  /// Fetching the stream link again carries on from the saved segment.
+  static const String expiredResult = 'playlist-expired';
+
+  /// Another download is already writing this same partial file.
+  static const String busyResult = 'busy';
+
+  /// Every segment is saved, but the finished file could not take its real
+  /// name yet (an older copy is open in a player, or antivirus holds the
+  /// file). Everything is kept; trying again later only renames it.
+  static const String finishLaterResult = 'finish-later';
+
+  /// Partial files being written right now in this app, so two jobs can never
+  /// write into one file at the same time.
+  static final Set<String> _openParts = {};
+
+  /// Resilient mode: the checkpoint file format. Bump it when the fields change.
+  /// 2: the chosen quality, the playlist's link path and the source are part
+  /// of the match, so another quality or language is never joined on.
+  static const int _checkpointVersion = 2;
+
+  /// Resilient mode: segments written and segment total of the last run, for
+  /// the manager's log line (no links in it).
+  int segmentsWritten = 0;
+  int segmentsTotal = 0;
+
+  /// Resilient mode: the segment the last run started from (0 = fresh start).
+  int resumedFrom = 0;
+
+  /// Resilient mode: why the last playlist or key request failed.
+  _Miss _lastMiss = _Miss.none;
+
+  /// Resilient mode: true when the current job should stop (pause or cancel).
+  bool Function() _stopNow = _never;
+  static bool _never() => false;
+
+  /// Resilient mode: set when one segment has failed the run, so the other
+  /// connections stop at once instead of carrying on with nothing to write to.
+  bool _abortRun = false;
+
+  /// Optional device-local policy; absent for existing background/mobile callers.
+  final bool Function(Uri url)? isHostCoolingDown;
+
+  /// Persist a server hint before this job returns its transfer capacity.
+  final Future<void> Function(Uri url, String? retryAfter)? onRateLimited;
+  bool _rateLimited = false;
+  Uri? _rateLimitedUri;
+  bool _receivedRateLimitResponse = false;
+
+  /// A cached cooldown is not another server rejection and must not extend it.
+  bool get receivedRateLimitResponse => _receivedRateLimitResponse;
+
+  /// Ephemeral final host for the manager's host-only persisted retry metadata.
+  Uri? get rateLimitedUri => _rateLimitedUri;
+
+  /// Separates host throttling from a missing playlist, segment or audio track.
+  bool get rateLimited => _rateLimited;
+
+  /// Keep response bodies and signed URLs out of user-visible error messages.
+  String? get _rateLimitMessage =>
+      _rateLimited ? downloadFailureMessage(null, statusCode: 429) : null;
+
+  /// Stop new requests after throttling; already in-flight segments may settle.
+  bool _mayRequest(Uri url) {
+    if (_rateLimited) return false;
+    if (isHostCoolingDown?.call(url) == true) {
+      _rateLimited = true;
+      _rateLimitedUri = url;
+      return false;
+    }
+    return true;
+  }
+
+  /// Observe the final redirect host, retaining no response body or credentials.
+  Future<void> _observeRateLimit(Response<dynamic> response) async {
+    if (response.statusCode != 429 || onRateLimited == null) return;
+    _rateLimited = true;
+    _receivedRateLimitResponse = true;
+    _rateLimitedUri = response.realUri;
+    await onRateLimited!(
+      response.realUri,
+      response.headers.value('retry-after'),
+    );
+  }
 
   final Dio _dio;
 
@@ -45,12 +193,62 @@ class HlsDownloader {
     required void Function(double progress) onProgress,
     required bool Function() canceled,
     int? connections,
+    String? preferredAudioLanguage,
+    bool Function()? paused,
+    String? resumeKey,
+    String? sourceTag,
+    bool discardStaleOutput = false,
   }) async {
     // Segment-fetch parallelism for THIS download (clamped); defaults to 4.
-    final concurrency = (connections ?? _concurrency).clamp(1, _concurrency * 4);
+    final concurrency = (connections ?? _concurrency).clamp(
+      1,
+      _concurrency * 4,
+    );
+    if (resilient) {
+      // [sourceTag] names the server and quality the run came from. It is
+      // saved with the progress (so the manager can go back to that same
+      // server) and must match for a resume. [discardStaleOutput]: a file
+      // already at [outputPath] is a half download from the older app
+      // version, removed once this run has its first bytes.
+      return _downloadResilient(
+        url: url,
+        headers: headers,
+        outputPath: outputPath,
+        preferredQuality: preferredQuality,
+        onProgress: onProgress,
+        canceled: canceled,
+        paused: paused ?? _never,
+        concurrency: concurrency,
+        connections: connections,
+        preferredAudioLanguage: preferredAudioLanguage,
+        resumeKey: resumeKey ?? '',
+        sourceTag: sourceTag ?? '',
+        discardStaleOutput: discardStaleOutput,
+      );
+    }
     // 1. Resolve a master playlist down to a media (segment) playlist.
-    final media = await _resolveMediaPlaylist(url, headers, preferredQuality);
-    if (media == null) return 'playlist unreachable';
+    HlsAudioRendition? selectedAudio;
+    (String, String)? media;
+    try {
+      media = await _resolveMediaPlaylist(
+        url,
+        headers,
+        preferredQuality,
+        preferredAudioLanguage: preferredAudioLanguage,
+        onAudio:
+            Platform.isWindows ||
+                muxAudio != null ||
+                preferredAudioLanguage != null
+            ? (audio) => selectedAudio = audio
+            : null,
+      );
+    } on HlsAudioSelectionException catch (error) {
+      return error.toString();
+    }
+    if (media == null) return _rateLimitMessage ?? 'playlist unreachable';
+    if (selectedAudio != null && muxAudio == null) {
+      return 'This stream requires the bundled audio merge engine';
+    }
     final mediaUrl = media.$1;
     final playlist = media.$2;
 
@@ -62,7 +260,8 @@ class HlsDownloader {
     Uint8List? key;
     if (pl.keyUrl != null) {
       key = await _fetchBytes(pl.keyUrl!, headers);
-      if (key == null || key.length != 16) return 'AES key fetch failed';
+      if (key == null || key.length != 16)
+        return _rateLimitMessage ?? 'AES key fetch failed';
     }
 
     // 4. Download segments with bounded parallelism, writing strictly in order.
@@ -121,7 +320,7 @@ class HlsDownloader {
           sink.add(pending.remove(nextWrite)!);
           nextWrite++;
           done++;
-          onProgress(done / total);
+          onProgress((done / total) * (selectedAudio == null ? 1 : .8));
         }
       }
     }
@@ -137,7 +336,7 @@ class HlsDownloader {
         try {
           if (await file.exists()) await file.delete();
         } catch (_) {}
-        return 'init segment fetch failed';
+        return _rateLimitMessage ?? 'init segment fetch failed';
       }
       sink.add(init);
     }
@@ -151,7 +350,60 @@ class HlsDownloader {
         if (await file.exists()) await file.delete();
       } catch (_) {}
       if (canceled()) return 'canceled';
-      return failReason ?? 'incomplete ($nextWrite/$total segments)';
+      return _rateLimitMessage ??
+          failReason ??
+          'incomplete ($nextWrite/$total segments)';
+    }
+    if (selectedAudio != null) {
+      final audio = selectedAudio!;
+      final scratch = await file.parent.createTemp('.zangetsu-audio-');
+      try {
+        final audioPath = '${scratch.path}/audio.media';
+        final mergedPath = '${scratch.path}/merged.ts';
+        final audioDownloader = HlsDownloader(
+          _dio,
+          isHostCoolingDown: isHostCoolingDown,
+          onRateLimited: onRateLimited,
+        );
+        final error = await audioDownloader.download(
+          url: audio.uri,
+          headers: headers,
+          outputPath: audioPath,
+          preferredQuality: 'best',
+          connections: connections,
+          onProgress: (value) => onProgress(.8 + value * .19),
+          canceled: canceled,
+        );
+        if (audioDownloader.rateLimited) {
+          _rateLimited = true;
+          _rateLimitedUri = audioDownloader.rateLimitedUri;
+          _receivedRateLimitResponse =
+              audioDownloader.receivedRateLimitResponse;
+        }
+        if (error != null) {
+          await file.delete();
+          return _rateLimitMessage ?? 'Selected audio download failed: $error';
+        }
+        final mergeError = await muxAudio!(
+          outputPath,
+          audioPath,
+          mergedPath,
+          preferredAudioLanguage ?? audio.lang,
+          canceled,
+        );
+        if (mergeError != null || canceled()) {
+          await file.delete();
+          return canceled() ? 'canceled' : mergeError;
+        }
+        await file.delete();
+        await File(mergedPath).rename(outputPath);
+        onProgress(1);
+      } catch (_) {
+        if (await file.exists()) await file.delete();
+        return 'The selected audio could not be saved';
+      } finally {
+        if (await scratch.exists()) await scratch.delete(recursive: true);
+      }
     }
     return null;
   }
@@ -179,12 +431,22 @@ class HlsDownloader {
     String masterUrl,
     Map<String, String> headers, {
     bool Function()? canceled,
+    String? preferredLanguage,
   }) async {
     final out = <({String lang, String label, bool isDefault, String vtt})>[];
     try {
       final master = await _fetchText(masterUrl, headers);
       if (master == null) return out;
-      for (final track in parseHlsSubtitles(master, masterUrl)) {
+      final tracks = parseHlsSubtitles(master, masterUrl);
+      final selected = preferredLanguage == null
+          ? tracks
+          : downloadSubtitleSelection(
+              tracks,
+              preferredLanguage,
+              language: (track) => track.lang,
+              label: (track) => track.label,
+            );
+      for (final track in selected) {
         if (canceled?.call() ?? false) return out;
         final vtt = await _mergeRendition(track.url, headers, canceled);
         if (vtt == null) continue;
@@ -245,10 +507,7 @@ class HlsDownloader {
       if (line.isEmpty) continue;
       if (line.startsWith('#EXTINF:')) {
         pending =
-            double.tryParse(
-              line.substring(8).split(',').first.trim(),
-            ) ??
-            0.0;
+            double.tryParse(line.substring(8).split(',').first.trim()) ?? 0.0;
         continue;
       }
       if (line.startsWith('#')) continue;
@@ -261,15 +520,27 @@ class HlsDownloader {
   Future<(String, String)?> _resolveMediaPlaylist(
     String url,
     Map<String, String> headers,
-    String preferredQuality,
-  ) async {
+    String preferredQuality, {
+    String? preferredAudioLanguage,
+    void Function(HlsAudioRendition audio)? onAudio,
+    void Function(HlsVariant variant)? onVariant,
+  }) async {
     var current = url;
     for (var depth = 0; depth < 3; depth++) {
       final text = await _fetchText(current, headers);
       if (text == null) return null;
       final variants = parseHlsMaster(text, current);
       if (variants.isEmpty) return (current, text); // it's a media playlist
-      current = _pickVariant(variants, preferredQuality).url;
+      final variant = _pickVariant(variants, preferredQuality);
+      onVariant?.call(variant);
+      final audio = selectDownloadAudio(
+        text,
+        current,
+        variant,
+        preferredLanguage: preferredAudioLanguage,
+      );
+      if (audio != null) onAudio?.call(audio);
+      current = variant.url;
     }
     return null;
   }
@@ -283,7 +554,11 @@ class HlsDownloader {
     HlsVariant best = variants.first;
     var bestDelta = 1 << 30;
     for (final v in variants) {
-      final h = int.tryParse(RegExp(r'(\d{3,4})').firstMatch(v.quality)?.group(1) ?? '') ?? 0;
+      final h =
+          int.tryParse(
+            RegExp(r'(\d{3,4})').firstMatch(v.quality)?.group(1) ?? '',
+          ) ??
+          0;
       final d = (h - want).abs();
       if (d < bestDelta) {
         bestDelta = d;
@@ -301,7 +576,8 @@ class HlsDownloader {
       if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
         pl.mediaSequence = int.tryParse(line.split(':').last.trim()) ?? 0;
       } else if (line.startsWith('#EXT-X-KEY:')) {
-        final method = RegExp(r'METHOD=([^,]+)').firstMatch(line)?.group(1) ?? 'NONE';
+        final method =
+            RegExp(r'METHOD=([^,]+)').firstMatch(line)?.group(1) ?? 'NONE';
         if (method.toUpperCase().contains('AES')) {
           final uri = RegExp(r'URI="([^"]+)"').firstMatch(line)?.group(1);
           if (uri != null) pl.keyUrl = _resolveRef(uri, mediaUrl);
@@ -314,6 +590,8 @@ class HlsDownloader {
         final uri = RegExp(r'URI="([^"]+)"').firstMatch(line)?.group(1);
         if (uri != null) pl.initUrl = _resolveRef(uri, mediaUrl);
       } else if (line.startsWith('#EXTINF:')) {
+        // Kept only so a resumed download can tell it is the same playlist.
+        pl.durations.add(line.substring(8).split(',').first.trim());
         for (var j = i + 1; j < lines.length; j++) {
           final c = lines[j].trim();
           if (c.isEmpty || c.startsWith('#')) continue;
@@ -328,6 +606,19 @@ class HlsDownloader {
   // ── HTTP ──────────────────────────────────────────────────────────────────
 
   Future<String?> _fetchText(String url, Map<String, String> headers) async {
+    if (resilient) {
+      // Playlist requests wait out a drop too; the reason is kept so a dead
+      // network is not mistaken for a missing stream.
+      final (text, miss) = await _patientGet<String>(
+        url,
+        headers,
+        ResponseType.plain,
+      );
+      _lastMiss = miss;
+      return text;
+    }
+    final uri = Uri.tryParse(url);
+    if (uri == null || !_mayRequest(uri)) return null;
     try {
       final r = await _dio.getUri<String>(
         Uri.parse(url),
@@ -337,7 +628,11 @@ class HlsDownloader {
           validateStatus: (s) => s != null && s < 500,
         ),
       );
+      await _observeRateLimit(r);
       return r.statusCode == 200 ? r.data : null;
+    } on DioException catch (error) {
+      if (error.response != null) await _observeRateLimit(error.response!);
+      return null;
     } catch (_) {
       return null;
     }
@@ -354,8 +649,13 @@ class HlsDownloader {
   ///
   /// A 4xx is not retried: the segment is gone or forbidden, and asking three
   /// times only makes the failure slower.
-  Future<Uint8List?> _fetchBytes(String url, Map<String, String> headers) async {
+  Future<Uint8List?> _fetchBytes(
+    String url,
+    Map<String, String> headers,
+  ) async {
     for (var attempt = 1; attempt <= _segmentAttempts; attempt++) {
+      final uri = Uri.tryParse(url);
+      if (uri == null || !_mayRequest(uri)) return null;
       try {
         final r = await _dio.getUri<List<int>>(
           Uri.parse(url),
@@ -365,11 +665,16 @@ class HlsDownloader {
             validateStatus: (s) => s != null && s < 500,
           ),
         );
+        await _observeRateLimit(r);
         if (r.statusCode == 200 && r.data != null) {
           return Uint8List.fromList(r.data!);
         }
         // Answered, but not with the segment. 4xx won't change on a retry.
         if (r.statusCode != null && r.statusCode! >= 400) return null;
+      } on DioException catch (error) {
+        if (error.response != null) await _observeRateLimit(error.response!);
+        if (_rateLimited) return null;
+        // Transient transport failures retain the bounded segment retry policy.
       } catch (_) {
         // Timeout, reset connection, DNS — exactly what a retry is for.
       }
@@ -380,6 +685,764 @@ class HlsDownloader {
     return null;
   }
 
+  // ── Resilient download (Windows) ──────────────────────────────────────────
+
+  /// True when [outputPath] has a partial file and a progress file beside it,
+  /// meaning a resilient download can carry on instead of starting over.
+  static Future<bool> hasResumableProgress(String outputPath) async {
+    try {
+      return await File('$outputPath.part').exists() &&
+          await File('$outputPath.part.json').exists();
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Removes every leftover of a resilient download of [outputPath]: the
+  /// partial video, its progress file, a separate audio track and a merge in
+  /// progress. The finished file itself is never touched.
+  static Future<void> discardPartial(String outputPath) async {
+    for (final suffix in const [
+      '.part',
+      '.part.json',
+      '.part.json.tmp',
+      '.audio',
+      '.audio.id',
+      '.audio.part',
+      '.audio.part.json',
+      '.audio.part.json.tmp',
+      '.merging',
+    ]) {
+      await _deleteQuietly('$outputPath$suffix');
+    }
+  }
+
+  /// The server and quality ([download]'s `sourceTag`) the saved progress of
+  /// [outputPath] came from, or null when there is none. The manager uses it
+  /// to go back to that same server instead of the first one on the list.
+  static Future<String?> readSourceTag(String outputPath) async {
+    try {
+      final file = File('$outputPath.part.json');
+      if (!await file.exists()) return null;
+      final data = jsonDecode(await file.readAsString());
+      final tag = data is Map ? data['source'] : null;
+      return tag is String && tag.isNotEmpty ? tag : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> _deleteQuietly(String path) async {
+    try {
+      final file = File(path);
+      if (await file.exists()) await file.delete();
+    } catch (_) {}
+  }
+
+  /// The path of [url] with anything that looks like a one-time token
+  /// replaced by `*`, so two links to the same playlist match while links to
+  /// another quality or language (a different path) do not. No host, no query.
+  static String _stablePath(String url) {
+    final uri = Uri.tryParse(url);
+    if (uri == null) return '';
+    final hasDigit = RegExp(r'\d');
+    final hasLetter = RegExp(r'[A-Za-z]');
+    return uri.pathSegments
+        .map(
+          (part) =>
+              part.length >= 32 ||
+                  (part.length >= 16 &&
+                      !part.contains('.') &&
+                      hasDigit.hasMatch(part) &&
+                      hasLetter.hasMatch(part))
+              ? '*'
+              : part,
+        )
+        .join('/');
+  }
+
+  /// True when a 200 answer is a web page (a Wi-Fi sign-in page, an error
+  /// page) rather than the playlist or media that was asked for. Saving it
+  /// would spoil the episode for good, so it is treated like a failed request.
+  static bool _looksLikeWebPage(Object? data, Headers headers) {
+    final type = headers.value('content-type')?.toLowerCase() ?? '';
+    if (type.contains('text/html')) return true;
+    String head;
+    if (data is String) {
+      head = data.length > 64 ? data.substring(0, 64) : data;
+    } else if (data is List<int>) {
+      final n = data.length < 64 ? data.length : 64;
+      head = String.fromCharCodes(data.sublist(0, n));
+    } else {
+      return false;
+    }
+    head = head.trimLeft().toLowerCase();
+    return head.startsWith('<!doctype') ||
+        head.startsWith('<html') ||
+        head.startsWith('<head') ||
+        head.startsWith('<body');
+  }
+
+  /// One spelling per file, so the same path written two ways is one claim.
+  static String _claimName(String path) {
+    final full = File(path).absolute.path;
+    return Platform.isWindows
+        ? full.replaceAll('/', r'\').toLowerCase()
+        : full;
+  }
+
+  /// A short, stable fingerprint of [text] (FNV-1a), to tell two playlists
+  /// apart without storing their links.
+  static String _fingerprint(String text) {
+    var hash = 0x811c9dc5;
+    for (final byte in utf8.encode(text)) {
+      hash ^= byte;
+      hash = (hash * 0x01000193) & 0xffffffff;
+    }
+    return '${text.length}:${hash.toRadixString(16)}';
+  }
+
+  /// The saved position, when the progress file belongs to this same job and
+  /// this same playlist. Anything else (missing, damaged, another playlist)
+  /// means a fresh start.
+  static Future<({int next, int bytes})?> _readCheckpoint(
+    String path,
+    Map<String, Object?> identity,
+  ) async {
+    try {
+      final file = File(path);
+      if (!await file.exists()) return null;
+      final data = jsonDecode(await file.readAsString());
+      if (data is! Map) return null;
+      for (final entry in identity.entries) {
+        if (data[entry.key] != entry.value) return null;
+      }
+      final next = data['next'];
+      final bytes = data['bytes'];
+      if (next is! int || bytes is! int || next < 0 || bytes < 0) return null;
+      return (next: next, bytes: bytes);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Wraps [_resilientBody]: one writer per partial file, and a real cancel
+  /// removes what was saved so far. A pause keeps it.
+  Future<String?> _downloadResilient({
+    required String url,
+    required Map<String, String> headers,
+    required String outputPath,
+    required String preferredQuality,
+    required void Function(double progress) onProgress,
+    required bool Function() canceled,
+    required bool Function() paused,
+    required int concurrency,
+    required int? connections,
+    required String? preferredAudioLanguage,
+    required String resumeKey,
+    required String sourceTag,
+    required bool discardStaleOutput,
+  }) async {
+    final claim = _claimName('$outputPath.part');
+    if (!_openParts.add(claim)) return busyResult;
+    _abortRun = false;
+    _stopNow = () => _abortRun || canceled() || paused();
+    String? result;
+    try {
+      try {
+        result = await _resilientBody(
+          url: url,
+          headers: headers,
+          outputPath: outputPath,
+          preferredQuality: preferredQuality,
+          onProgress: onProgress,
+          canceled: canceled,
+          paused: paused,
+          concurrency: concurrency,
+          connections: connections,
+          preferredAudioLanguage: preferredAudioLanguage,
+          resumeKey: resumeKey,
+          sourceTag: sourceTag,
+          discardStaleOutput: discardStaleOutput,
+        );
+      } on FileSystemException {
+        result = 'The download could not be written to disk';
+      } catch (error) {
+        // Only the kind of error: its text may hold a signed link.
+        result = 'The download stopped unexpectedly (${error.runtimeType})';
+      }
+      _stopNow = _never;
+      if (result == null) return null;
+      // Removed while this job still holds the file, so a new attempt
+      // cannot open it in between.
+      if (canceled()) {
+        await discardPartial(outputPath);
+        return canceledResult;
+      }
+      if (paused()) return pausedResult;
+      return result;
+    } finally {
+      _stopNow = _never;
+      _abortRun = false;
+      _openParts.remove(claim);
+    }
+  }
+
+  Future<String?> _resilientBody({
+    required String url,
+    required Map<String, String> headers,
+    required String outputPath,
+    required String preferredQuality,
+    required void Function(double progress) onProgress,
+    required bool Function() canceled,
+    required bool Function() paused,
+    required int concurrency,
+    required int? connections,
+    required String? preferredAudioLanguage,
+    required String resumeKey,
+    required String sourceTag,
+    required bool discardStaleOutput,
+  }) async {
+    bool stop() => canceled() || paused();
+    String stopped() => canceled() ? canceledResult : pausedResult;
+    String missResult(_Miss miss, String otherwise) => switch (miss) {
+      _Miss.stopped => stop() ? stopped() : otherwise,
+      _Miss.network => networkResult,
+      _Miss.expired => expiredResult,
+      _ => _rateLimitMessage ?? otherwise,
+    };
+
+    // 1. Playlist, fetched fresh every run (so links and tokens are new).
+    HlsAudioRendition? selectedAudio;
+    HlsVariant? pickedVariant;
+    (String, String)? media;
+    try {
+      media = await _resolveMediaPlaylist(
+        url,
+        headers,
+        preferredQuality,
+        preferredAudioLanguage: preferredAudioLanguage,
+        onAudio:
+            Platform.isWindows ||
+                muxAudio != null ||
+                preferredAudioLanguage != null
+            ? (audio) => selectedAudio = audio
+            : null,
+        onVariant: (variant) => pickedVariant = variant,
+      );
+    } on HlsAudioSelectionException catch (error) {
+      return error.toString();
+    }
+    if (media == null) return missResult(_lastMiss, 'playlist unreachable');
+    if (selectedAudio != null && muxAudio == null) {
+      return 'This stream requires the bundled audio merge engine';
+    }
+    final pl = _parseMedia(media.$2, media.$1);
+    if (pl.segments.isEmpty) return 'empty playlist (no segments)';
+
+    // 2. Decryption key.
+    Uint8List? key;
+    if (pl.keyUrl != null) {
+      final (bytes, miss) = await _patientGet<List<int>>(
+        pl.keyUrl!,
+        headers,
+        ResponseType.bytes,
+      );
+      if (bytes == null) return missResult(miss, 'AES key fetch failed');
+      key = Uint8List.fromList(bytes);
+      if (key.length != 16) return 'AES key fetch failed';
+    }
+
+    // 3. Carry on from the saved position when it is the same playlist: same
+    // job, same server and quality, same picked variant, same playlist path
+    // and the same segment list. Anything else starts fresh.
+    final total = pl.segments.length;
+    segmentsTotal = total;
+    final variant = pickedVariant;
+    final identity = <String, Object?>{
+      'version': _checkpointVersion,
+      'job': resumeKey,
+      'source': sourceTag,
+      'variant': variant == null
+          ? null
+          : '${variant.quality}|${variant.bandwidth}',
+      'media': _stablePath(media.$1),
+      'segments': total,
+      'sequence': pl.mediaSequence,
+      'durations': _fingerprint(pl.durations.join(',')),
+      'init': pl.initUrl == null ? null : _stablePath(pl.initUrl!),
+      'encrypted': pl.keyUrl != null,
+    };
+    final partPath = '$outputPath.part';
+    final checkpointPath = '$partPath.json';
+    final part = File(partPath);
+    await part.parent.create(recursive: true);
+    final saved = await _readCheckpoint(checkpointPath, identity);
+    var resuming =
+        saved != null &&
+        saved.next <= total &&
+        await part.exists() &&
+        await part.length() >= saved.bytes;
+    RandomAccessFile? raf;
+    var openedFresh = false;
+    var failed = false;
+    var failMiss = _Miss.none;
+    String? failReason;
+    Object? writeError;
+    var nextWrite = 0;
+    var bytesWritten = 0;
+    try {
+      final s = saved;
+      if (resuming && s != null) {
+        final opened = await part.open(mode: FileMode.append);
+        // Checked again now that it is open: the file may have been removed
+        // or cut short since the first look. Never fill the gap with zeros.
+        if (await opened.length() < s.bytes) {
+          resuming = false;
+          await opened.close();
+        } else {
+          raf = opened;
+          // The file can be longer than the saved position (data written
+          // after the last save), never shorter; cut it back to that point.
+          await opened.truncate(s.bytes);
+          await opened.setPosition(s.bytes);
+          nextWrite = s.next;
+          bytesWritten = s.bytes;
+        }
+      }
+      resumedFrom = nextWrite;
+      segmentsWritten = nextWrite;
+      final audioShare = selectedAudio == null ? 1.0 : .8;
+      double share(int written) => (written / total) * audioShare;
+      // The real starting point at once (0 on a fresh start).
+      onProgress(share(nextWrite));
+
+      // A fresh start leaves the old partial alone until this playlist has
+      // delivered its first bytes: if this server fails too, the progress
+      // saved from the other one is still there to go back to.
+      Future<RandomAccessFile> writer() async {
+        final open = raf;
+        if (open != null) return open;
+        await discardPartial(outputPath);
+        if (discardStaleOutput) await _deleteQuietly(outputPath);
+        final fresh = await part.open(mode: FileMode.write);
+        raf = fresh;
+        openedFresh = true;
+        return fresh;
+      }
+
+      var lastSavedAt = DateTime.now();
+      var lastSavedIndex = nextWrite;
+      // Data first, then the position that points at it, so the progress file
+      // never claims bytes that are not on disk yet.
+      Future<void> saveCheckpoint() async {
+        final open = raf;
+        if (open == null) return;
+        await open.flush(); // a real disk failure still stops the run
+        lastSavedAt = DateTime.now();
+        lastSavedIndex = nextWrite;
+        try {
+          final tmp = File('$checkpointPath.tmp');
+          await tmp.writeAsString(
+            jsonEncode({...identity, 'next': nextWrite, 'bytes': bytesWritten}),
+            flush: true,
+          );
+          await tmp.rename(checkpointPath);
+        } catch (_) {
+          // The progress file is busy for a moment (antivirus, search
+          // indexer). Skip this save; the next one tries again, and an
+          // older save only means a few segments are fetched again.
+        }
+      }
+
+      // fMP4 header first. On a resume it is already in the saved bytes.
+      if (!resuming && pl.initUrl != null) {
+        final (init, miss) = await _patientGet<List<int>>(
+          pl.initUrl!,
+          headers,
+          ResponseType.bytes,
+        );
+        if (init == null) return missResult(miss, 'init segment fetch failed');
+        await (await writer()).writeFrom(init);
+        bytesWritten += init.length;
+        await saveCheckpoint();
+      }
+
+      final pending = <int, Uint8List>{};
+      var nextIndex = nextWrite;
+      var flushing = false;
+      // Connections that ran too far ahead wait here until the writer moves.
+      final aheadWaiters = <Completer<void>>[];
+      void wakeAhead() {
+        for (final waiter in aheadWaiters) {
+          if (!waiter.isCompleted) waiter.complete();
+        }
+        aheadWaiters.clear();
+      }
+
+      void fail(_Miss miss, String reason) {
+        if (failed) return;
+        failed = true;
+        failMiss = miss;
+        failReason = reason;
+        _abortRun = true; // the other connections stop at once
+        wakeAhead();
+      }
+
+      // Only one writer at a time; whoever is writing picks up every segment
+      // that became next in line while it waited for the disk.
+      Future<void> drain() async {
+        if (flushing) return;
+        flushing = true;
+        try {
+          while (pending.containsKey(nextWrite)) {
+            final chunk = pending.remove(nextWrite)!;
+            await (await writer()).writeFrom(chunk);
+            bytesWritten += chunk.length;
+            nextWrite++;
+            segmentsWritten = nextWrite;
+            wakeAhead();
+            onProgress(share(nextWrite));
+            if (nextWrite - lastSavedIndex >= 8 ||
+                DateTime.now().difference(lastSavedAt) >=
+                    const Duration(seconds: 2)) {
+              await saveCheckpoint();
+            }
+          }
+        } finally {
+          flushing = false;
+        }
+      }
+
+      // One segment, decrypted and checked. A body that will not decrypt
+      // (a web page instead of the segment) is fetched again a few times.
+      Future<Uint8List?> fetchSegment(int i) async {
+        for (var tries = 1; ; tries++) {
+          final (data, miss) = await _patientGet<List<int>>(
+            pl.segments[i],
+            headers,
+            ResponseType.bytes,
+          );
+          if (data == null) {
+            if (miss != _Miss.stopped) {
+              fail(miss, 'segment ${i + 1}/$total unreachable');
+            }
+            return null;
+          }
+          var bytes = data is Uint8List ? data : Uint8List.fromList(data);
+          if (key == null) return bytes;
+          try {
+            final iv = pl.explicitIv ?? hlsSeqIv(pl.mediaSequence + i);
+            bytes = await compute(_decryptSegment, (
+              data: bytes,
+              key: key,
+              iv: iv,
+            ));
+            return bytes;
+          } catch (_) {
+            if (tries >= 3) {
+              fail(_Miss.gone, 'segment ${i + 1}/$total could not be decrypted');
+              return null;
+            }
+          }
+          if (_stopNow()) return null;
+        }
+      }
+
+      Future<void> worker() async {
+        try {
+          while (true) {
+            if (failed || stop()) return;
+            while (nextIndex - nextWrite > _maxAhead && !failed && !stop()) {
+              final waiter = Completer<void>();
+              aheadWaiters.add(waiter);
+              // Woken by the writer; the timer only notices a pause or cancel.
+              final timer = Timer(const Duration(milliseconds: 500), () {
+                if (!waiter.isCompleted) waiter.complete();
+              });
+              await waiter.future;
+              timer.cancel();
+            }
+            if (failed || stop()) return;
+            final i = nextIndex++;
+            if (i >= total) return;
+            var bytes = await fetchSegment(i);
+            if (bytes == null) return;
+            if (pl.initUrl == null) bytes = hlsStripToTsSync(bytes);
+            pending[i] = bytes;
+            try {
+              await drain();
+            } catch (error) {
+              writeError ??= error;
+              fail(_Miss.none, 'The download could not be written to disk');
+              return;
+            }
+          }
+        } catch (error) {
+          // Anything unexpected stops this run cleanly: every connection
+          // ends before the file is closed.
+          writeError ??= error;
+          fail(_Miss.none, 'The download stopped unexpectedly');
+        }
+      }
+
+      if (nextWrite < total) {
+        await Future.wait(List.generate(concurrency, (_) => worker()));
+      }
+      // Keep whatever finished in order, then save the final position.
+      try {
+        if (writeError == null) await drain();
+        if (bytesWritten > 0) await saveCheckpoint();
+      } catch (error) {
+        writeError ??= error;
+      }
+    } finally {
+      try {
+        await raf?.close();
+      } catch (_) {}
+    }
+    // A fresh start that saved nothing at all leaves no empty partial
+    // behind, so a Retry simply starts over.
+    if (openedFresh && bytesWritten == 0) await discardPartial(outputPath);
+    if (stop()) return stopped();
+    if (writeError != null) {
+      return writeError is FileSystemException
+          ? 'The download could not be written to disk'
+          : 'The download stopped unexpectedly';
+    }
+    if (failed) {
+      return missResult(failMiss, failReason ?? 'incomplete');
+    }
+    if (nextWrite < total) return 'incomplete ($nextWrite/$total segments)';
+
+    // 4. Separate audio track: its own resumable partial in the same folder,
+    // then one merge. An interrupted merge is simply run again next time.
+    if (selectedAudio != null) {
+      final audio = selectedAudio!;
+      final audioPath = '$outputPath.audio';
+      final audioIdPath = '$audioPath.id';
+      // Which track the finished audio file is: a track saved for another
+      // language or group is never merged in.
+      final audioTag =
+          '${audio.lang}|${audio.groupId}|${audio.name}|'
+          '${_stablePath(audio.uri)}';
+      var haveAudio = false;
+      try {
+        haveAudio =
+            await File(audioPath).exists() &&
+            await File(audioIdPath).exists() &&
+            await File(audioIdPath).readAsString() == audioTag;
+      } catch (_) {}
+      if (!haveAudio) {
+        await _deleteQuietly(audioPath);
+        await _deleteQuietly(audioIdPath);
+        final audioDownloader = HlsDownloader(
+          _dio,
+          isHostCoolingDown: isHostCoolingDown,
+          onRateLimited: onRateLimited,
+          resilient: true,
+          waitForNetwork: waitForNetwork,
+          networkPatience: networkPatience,
+          retryDelays: retryDelays,
+        );
+        final error = await audioDownloader.download(
+          url: audio.uri,
+          headers: headers,
+          outputPath: audioPath,
+          preferredQuality: 'best',
+          connections: connections,
+          onProgress: (value) => onProgress(.8 + value * .19),
+          canceled: canceled,
+          paused: paused,
+          resumeKey: '$resumeKey|audio',
+          sourceTag: 'audio|$audioTag',
+        );
+        if (audioDownloader.rateLimited) {
+          _rateLimited = true;
+          _rateLimitedUri = audioDownloader.rateLimitedUri;
+          _receivedRateLimitResponse =
+              audioDownloader.receivedRateLimitResponse;
+        }
+        if (error != null) {
+          if (stop()) return stopped();
+          if (const {
+            networkResult,
+            expiredResult,
+            busyResult,
+            finishLaterResult,
+          }.contains(error)) {
+            return error;
+          }
+          return _rateLimitMessage ?? 'Selected audio download failed: $error';
+        }
+        try {
+          await File(audioIdPath).writeAsString(audioTag, flush: true);
+        } catch (_) {
+          // Not marked: the next run only fetches the audio again.
+        }
+      }
+      final merged = '$outputPath.merging';
+      try {
+        await _deleteQuietly(merged);
+        final mergeError = await muxAudio!(
+          partPath,
+          audioPath,
+          merged,
+          preferredAudioLanguage ?? audio.lang,
+          stop,
+        );
+        if (stop() || mergeError != null) {
+          await _deleteQuietly(merged);
+          return stop() ? stopped() : mergeError;
+        }
+      } catch (_) {
+        await _deleteQuietly(merged);
+        return 'The selected audio could not be saved';
+      }
+      // Rename replaces an older file of the same name in one step.
+      try {
+        await File(merged).rename(outputPath);
+      } catch (_) {
+        await _deleteQuietly(merged);
+        return finishLaterResult;
+      }
+      await discardPartial(outputPath);
+      onProgress(1);
+      return null;
+    }
+
+    // 5. Every segment is on disk: only now does it get its real name. Rename
+    // replaces an older file of the same name in one step; when it cannot
+    // (the old file is open somewhere), everything is kept for later.
+    try {
+      await part.rename(outputPath);
+    } catch (_) {
+      return finishLaterResult;
+    }
+    await discardPartial(outputPath);
+    return null;
+  }
+
+  /// One request that waits out a weak or dropping connection: it tries
+  /// again with growing waits (1, 2, 4, 8, then every 15 s), parks while the
+  /// app knows the network is down, and gives up only after
+  /// [networkPatience] of failing while the network looked up. That time
+  /// counts the failed requests themselves and the waits between them, for
+  /// this one request; a request that succeeds starts the next one afresh.
+  ///
+  /// A 429 keeps the existing cooldown path. A 403 or 410 is reported as
+  /// expired (a fresh playlist link fixes it); any other 4xx is final. A web
+  /// page where media was expected (a Wi-Fi sign-in page) counts as a
+  /// failed try, never as data.
+  Future<(T?, _Miss)> _patientGet<T>(
+    String url,
+    Map<String, String> headers,
+    ResponseType type,
+  ) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null) return (null, _Miss.gone);
+    final online = Stopwatch();
+    var attempt = 0;
+    while (true) {
+      if (_stopNow()) return (null, _Miss.stopped);
+      if (!_mayRequest(uri)) return (null, _Miss.limited);
+      online.start();
+      // A pause or cancel ends a request that is stuck on a dead link at
+      // once, instead of after the connect or receive timeout.
+      final cancel = CancelToken();
+      final watch = Timer.periodic(const Duration(milliseconds: 250), (_) {
+        if (_stopNow() && !cancel.isCancelled) cancel.cancel();
+      });
+      try {
+        final r = await _dio.getUri<T>(
+          uri,
+          cancelToken: cancel,
+          options: Options(
+            responseType: type,
+            headers: headers,
+            validateStatus: (s) => s != null && s < 500,
+          ),
+        );
+        await _observeRateLimit(r);
+        if (_rateLimited) return (null, _Miss.limited);
+        final code = r.statusCode ?? 0;
+        if (code == 403 || code == 410) return (null, _Miss.expired);
+        if (code >= 400) return (null, _Miss.gone);
+        if (code == 200 && r.data != null) {
+          if (!_looksLikeWebPage(r.data, r.headers)) {
+            return (r.data, _Miss.none);
+          }
+          // A web page in place of the media: try again like a drop.
+        } else {
+          // Answered without the content (another 2xx, an empty body): a
+          // retry will not change that.
+          return (null, _Miss.gone);
+        }
+      } on DioException catch (error) {
+        if (error.response != null) await _observeRateLimit(error.response!);
+        if (_rateLimited) return (null, _Miss.limited);
+        // A 5xx answer or no answer at all: both usually pass, so try again.
+      } catch (_) {
+        // Reset connection, DNS failure, timeout: exactly what waiting is for.
+      } finally {
+        watch.cancel();
+      }
+      online.stop();
+      if (_stopNow()) return (null, _Miss.stopped);
+      // Park while the network is down. That time is not counted, and the
+      // waits start small again once it is back.
+      final parked = Stopwatch()..start();
+      await _untilOnline();
+      if (parked.elapsed > const Duration(milliseconds: 500)) attempt = 0;
+      if (_stopNow()) return (null, _Miss.stopped);
+      if (online.elapsed >= networkPatience) return (null, _Miss.network);
+      final delay = retryDelays.isEmpty
+          ? Duration.zero
+          : retryDelays[attempt < retryDelays.length
+                ? attempt
+                : retryDelays.length - 1];
+      attempt++;
+      online.start();
+      await _sleepUnlessStopped(delay);
+      online.stop();
+    }
+  }
+
+  /// Waits for [waitForNetwork], but wakes for a pause or cancel too. One
+  /// listener and one timer per wait, however long the outage lasts.
+  Future<void> _untilOnline() async {
+    final wait = waitForNetwork;
+    if (wait == null || _stopNow()) return;
+    final done = Completer<void>();
+    void finish() {
+      if (!done.isCompleted) done.complete();
+    }
+
+    unawaited(wait().catchError((Object _) {}).whenComplete(finish));
+    final watch = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      if (_stopNow()) finish();
+    });
+    try {
+      await done.future;
+    } finally {
+      watch.cancel();
+    }
+  }
+
+  /// Sleeps for [delay] in short steps so a pause or cancel is not kept waiting.
+  Future<void> _sleepUnlessStopped(Duration delay) async {
+    final end = DateTime.now().add(delay);
+    while (!_stopNow()) {
+      final left = end.difference(DateTime.now());
+      if (left <= Duration.zero) return;
+      await Future<void>.delayed(
+        left < const Duration(milliseconds: 250)
+            ? left
+            : const Duration(milliseconds: 250),
+      );
+    }
+  }
+
   static String _resolveRef(String ref, String base) {
     if (ref.startsWith('http://') || ref.startsWith('https://')) return ref;
     return Uri.parse(base).resolve(ref).toString();
@@ -388,6 +1451,9 @@ class HlsDownloader {
 
 class _MediaPlaylist {
   final List<String> segments = [];
+
+  /// Each segment's `#EXTINF` length as written in the playlist.
+  final List<String> durations = [];
   String? keyUrl;
   Uint8List? explicitIv;
   int mediaSequence = 0;
@@ -399,9 +1465,8 @@ class _MediaPlaylist {
 
 /// [hlsAesCbcDecrypt] shaped for [compute] — one argument, top-level, so it can
 /// cross an isolate boundary.
-Uint8List _decryptSegment(
-  ({Uint8List data, Uint8List key, Uint8List iv}) m,
-) => hlsAesCbcDecrypt(m.data, m.key, m.iv);
+Uint8List _decryptSegment(({Uint8List data, Uint8List key, Uint8List iv}) m) =>
+    hlsAesCbcDecrypt(m.data, m.key, m.iv);
 
 // ── Crypto helpers (top-level so they're unit-testable) ──────────────────────
 
@@ -672,9 +1737,10 @@ MpegTsInspect mpegTsInspect(Uint8List data) {
     final pts = _mpegTsPts(bytes, payload + 9) / 90000.0;
     if (ptsSamples.length < 8) ptsSamples.add(pts);
     final streamId = bytes[payload + 3];
-    final isVideo = (streamId >= 0xE0 && streamId <= 0xEF) ||
-        videoPids.contains(pid);
-    final isAudio = (streamId >= 0xC0 && streamId <= 0xDF) ||
+    final isVideo =
+        (streamId >= 0xE0 && streamId <= 0xEF) || videoPids.contains(pid);
+    final isAudio =
+        (streamId >= 0xC0 && streamId <= 0xDF) ||
         streamId == 0xBD ||
         audioPids.contains(pid);
     if (isVideo) videoPts ??= pts;
@@ -692,7 +1758,8 @@ MpegTsInspect mpegTsInspect(Uint8List data) {
 
 double? _mpegTsPcr(Uint8List b, int i) {
   if (i + 6 > b.length) return null;
-  final base = (b[i] << 25) |
+  final base =
+      (b[i] << 25) |
       (b[i + 1] << 17) |
       (b[i + 2] << 9) |
       (b[i + 3] << 1) |
@@ -765,9 +1832,7 @@ int? _tsPacketSize(Uint8List bytes) {
   if (bytes.length >= 188 && bytes[0] == 0x47) return 188;
   final limit = bytes.length < 4096 ? bytes.length : 4096;
   for (var i = 0; i + 564 < limit; i++) {
-    if (bytes[i] == 0x47 &&
-        bytes[i + 188] == 0x47 &&
-        bytes[i + 376] == 0x47) {
+    if (bytes[i] == 0x47 && bytes[i + 188] == 0x47 && bytes[i + 376] == 0x47) {
       return 188;
     }
   }
@@ -908,10 +1973,7 @@ String hlsPlaylistTagSummary(String playlist, {int max = 40}) {
   final tags = playlist
       .split('\n')
       .map((l) => l.trim())
-      .where(
-        (l) =>
-            l.startsWith('#') && !l.toUpperCase().startsWith('#EXTINF'),
-      )
+      .where((l) => l.startsWith('#') && !l.toUpperCase().startsWith('#EXTINF'))
       .take(max);
   return tags.join(' | ');
 }
@@ -973,7 +2035,10 @@ double? hlsLeadingExtinfSkew(
     return s;
   }
 
-  double? uniqueLead({required List<double> hay, required List<double> needle}) {
+  double? uniqueLead({
+    required List<double> hay,
+    required List<double> needle,
+  }) {
     final n = needle.length;
     if (n < 8 || hay.length < n) return null;
     double? found;
@@ -1170,4 +2235,25 @@ int _isoU64(Uint8List b, int i) {
   final hi = _isoU32(b, i);
   final lo = _isoU32(b, i + 4);
   return (hi << 32) | lo;
+}
+
+/// Why a resilient request came back empty.
+enum _Miss {
+  /// It did not fail.
+  none,
+
+  /// A pause or cancel stopped it.
+  stopped,
+
+  /// The connection kept failing for the whole patience window.
+  network,
+
+  /// 403 or 410: the signed link most likely expired.
+  expired,
+
+  /// The host is rate limiting (429 or a saved cooldown).
+  limited,
+
+  /// The host answered with another error; asking again will not help.
+  gone,
 }

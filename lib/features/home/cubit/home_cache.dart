@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:hive/hive.dart';
 
 import '../../../core/hive/safe_box.dart';
@@ -30,6 +32,37 @@ class HomeCache {
     if (!Hive.isBoxOpen(boxName)) {
       await openBoxSafely(boxName);
     }
+    // Windows: drop snapshots too old to be shown. The whole box is held in
+    // memory, so sources the user no longer opens would otherwise stay in
+    // RAM for good.
+    if (Platform.isWindows) await pruneExpired();
+  }
+
+  /// Deletes snapshots older than [maxAge] (which [read] would ignore
+  /// anyway) and compacts the file. Never throws.
+  static Future<void> pruneExpired() async {
+    try {
+      final box = _box;
+      if (box == null) return;
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final old = [
+        for (final key in box.keys)
+          if (_expired(box.get(key), now)) key,
+      ];
+      if (old.isEmpty) return;
+      await box.deleteAll(old);
+      await box.compact();
+    } catch (_) {
+      // Pruning is housekeeping only; a failure leaves the cache as it was.
+    }
+  }
+
+  /// True when [raw] is a snapshot past [maxAge] (or one with no saved time).
+  /// Anything that is not a snapshot is left alone.
+  static bool _expired(Object? raw, int nowMs) {
+    if (raw is! Map) return false;
+    final savedAt = raw['savedAtMs'];
+    return savedAt is! num || nowMs - savedAt.toInt() > maxAge.inMilliseconds;
   }
 
   static String _key(String sourceId, String kind) => '$sourceId|$kind';

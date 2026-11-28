@@ -1,4 +1,6 @@
 import '../models/video_source.dart';
+import 'package:flutter/foundation.dart';
+import '../torrent/torrent_util.dart';
 
 /// Parses a quality label like `'1080p'` into a comparable int (height in px).
 /// Unknown/empty → -1 so it sorts last.
@@ -66,10 +68,17 @@ VideoSource? pickDefault(
   List<VideoSource> sources, {
   AudioKind prefer = AudioKind.sub,
   String? preferQuality,
+  bool? torrentsSupported,
 }) {
   if (sources.isEmpty) return null;
-  final preferred = sortByQuality(sourcesForKind(sources, prefer));
-  final pool = preferred.isNotEmpty ? preferred : sortByQuality(sources);
+  // A magnet cannot play through media_kit without the Android torrent host.
+  // Prefer working direct mirrors on desktop while leaving explicit torrent
+  // choices visible so the player can explain the unsupported backend.
+  final supportsTorrents = torrentsSupported ?? defaultTargetPlatform == TargetPlatform.android;
+  final direct = supportsTorrents ? sources : sources.where((source) => !isTorrentUrl(source.url)).toList();
+  final candidates = direct.isNotEmpty ? direct : sources;
+  final preferred = sortByQuality(sourcesForKind(candidates, prefer));
+  final pool = preferred.isNotEmpty ? preferred : sortByQuality(candidates);
 
   final want = resolutionPx(preferQuality);
   if (want != null) {

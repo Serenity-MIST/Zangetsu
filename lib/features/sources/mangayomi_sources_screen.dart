@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../core/app_mode.dart';
+import '../../core/desktop/desktop_dialogs.dart';
 import '../../core/di/injector.dart';
 import '../../core/i18n/source_languages.dart';
 import '../../core/mangayomi/mangayomi_manager.dart';
@@ -13,7 +14,7 @@ import 'package:zangetsu_source_bridge/zangetsu_source_bridge.dart';
 
 import 'source_language_sheet.dart';
 import 'source_prefs_screen.dart';
-import 'sources_search_field.dart';
+import 'sources_search_field.dart'; // also brings the Windows kit
 
 import '../../core/models/source_pref.dart';
 import '../../l10n/l10n.dart';
@@ -135,28 +136,45 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
     }
   }
 
-  Future<void> _addRepository() async {
-    final typeIndex = await showModalBottomSheet<int>(
-      context: context,
-      builder: (context) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const ListTile(title: Text('Add repository')),
-            for (final (index, label, icon) in [
-              (1, 'Anime', Icons.play_circle_outline_rounded),
-              (2, 'Manga', Icons.menu_book_rounded),
-              (3, 'Novel', Icons.auto_stories_rounded),
-            ])
-              ListTile(
-                leading: Icon(icon),
-                title: Text(label),
-                onTap: () => Navigator.pop(context, index),
-              ),
-          ],
+  /// The repository-type chooser of [_addRepository]: a phone bottom sheet,
+  /// or on Windows the shared desktop choice dialog (src-7 A).
+  Future<int?> _pickRepositoryType() {
+    const types = [
+      (1, 'Anime', Icons.play_circle_outline_rounded),
+      (2, 'Manga', Icons.menu_book_rounded),
+      (3, 'Novel', Icons.auto_stories_rounded),
+    ];
+    return showAdaptiveChoice<int>(
+      context,
+      title: context.l10n.addRepository,
+      description: context.l10n.eachCategorySavedSeparately,
+      options: [for (final (index, label, _) in types) (index, label)],
+      leading: {
+        for (final (index, _, icon) in types)
+          index: Icon(icon, color: AppColors.textSecondary),
+      },
+      phonePicker: () => showModalBottomSheet<int>(
+        context: context,
+        builder: (context) => SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const ListTile(title: Text('Add repository')),
+              for (final (index, label, icon) in types)
+                ListTile(
+                  leading: Icon(icon),
+                  title: Text(label),
+                  onTap: () => Navigator.pop(context, index),
+                ),
+            ],
+          ),
         ),
       ),
     );
+  }
+
+  Future<void> _addRepository() async {
+    final typeIndex = await _pickRepositoryType();
     if (typeIndex == null || !mounted) return;
     var repositoryUrl = '';
     final value = await showDialog<String>(
@@ -178,18 +196,13 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
               style: Theme.of(context).textTheme.bodySmall,
             ),
             const SizedBox(height: 12),
-            TextField(
-              autofocus: true,
-              keyboardType: TextInputType.url,
+            // Owns its controller so Windows can pre-fill it from the
+            // clipboard or a dropped link (src-12 B).
+            _MangayomiRepoUrlField(
+              typeIndex: typeIndex,
               onChanged: (value) => repositoryUrl = value.trim(),
-              decoration: InputDecoration(
-                labelText: 'HTTPS repository URL',
-                hintText: switch (typeIndex) {
-                  1 => 'https://example.com/anime_index.json',
-                  2 => 'https://example.com/manga_index.json',
-                  _ => 'https://example.com/novel_index.json',
-                },
-              ),
+              // Windows: Enter adds the (pre-filled) link (src-12 B).
+              onSubmitted: () => Navigator.pop(context, repositoryUrl),
             ),
           ],
         ),
@@ -347,10 +360,101 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
     context,
   ).showSnackBar(SnackBar(content: Text(message)));
 
+  /// Windows layout (src-3): settings app bar, the shared toolbar (tabs,
+  /// languages, Add repository, search) with the type filter below it and no
+  /// floating button; Ctrl+F / Esc / F5 via [DesktopSourcesKeys] (src-13 A).
+  Widget _desktop(BuildContext context, Set<String> offeredLangs) =>
+      DesktopSourcesKeys(
+        onRefresh: () => _refreshRepositories(),
+        child: Scaffold(
+          backgroundColor: AppColors.bg,
+          appBar: desktopSourcesAppBar('Mangayomi'),
+          body: Column(
+            children: [
+              DesktopSourcesToolbar(
+                tabs: const ['Installed', 'Repositories'],
+                tabController: _tabs,
+                actions: [
+                  if (_langPrefs != null)
+                    IconButton(
+                      tooltip: 'Languages',
+                      onPressed: () => _pickLanguages(false),
+                      icon: const Icon(Icons.language_rounded),
+                    ),
+                  IconButton(
+                    tooltip: context.l10n.refreshRepositoriesF5,
+                    onPressed: _refreshing ? null : _refreshRepositories,
+                    icon: const Icon(Icons.refresh_rounded),
+                  ),
+                ],
+                addLabel: 'Add repository',
+                addKey: const ValueKey('desktop-add-mangayomi-repo'),
+                onAdd: _addRepository,
+                search: SourcesSearchField(
+                  controller: _search,
+                  hint: 'Search sources',
+                  onChanged: _onSearch,
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(22, 12, 22, 0),
+                child: _typeFilterBar(),
+              ),
+              Expanded(
+                child: TabBarView(
+                  controller: _tabs,
+                  children: [_installedTab(), _repositoriesTab(offeredLangs)],
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+
+  /// All / Streaming / Manga / Novel filter, shared by both layouts.
+  Widget _typeFilterBar() => DecoratedBox(
+    decoration: BoxDecoration(
+      color: AppColors.surface,
+      borderRadius: BorderRadius.circular(16),
+    ),
+    child: TabBar(
+      controller: _typeTabs,
+      onTap: (index) => setState(() => _typeIndex = index),
+      dividerColor: Colors.transparent,
+      dividerHeight: 0,
+      indicatorSize: TabBarIndicatorSize.tab,
+      indicator: BoxDecoration(
+        color: AppColors.accentSoft,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      labelColor: AppColors.accent,
+      unselectedLabelColor: AppColors.textSecondary,
+      labelStyle: AppText.body.copyWith(fontWeight: FontWeight.w600),
+      overlayColor: WidgetStateProperty.all(Colors.transparent),
+      tabs: const [
+        Tab(height: 40, text: 'All'),
+        Tab(height: 40, text: 'Streaming'),
+        Tab(height: 40, text: 'Manga'),
+        Tab(height: 40, text: 'Novel'),
+      ],
+    ),
+  );
+
+  /// List padding: Windows has no floating button to leave room for.
+  EdgeInsets get _listPadding => desktopPanelsEnabled
+      ? kDesktopSourcesListPadding
+      : const EdgeInsets.fromLTRB(16, 12, 16, 96);
+
   @override
   Widget build(BuildContext context) {
     final isTv = sl.isRegistered<AppMode>() && sl<AppMode>().isTv;
     final offeredLangs = _presentLangs();
+    // Windows: desktop settings look whatever opened it (src-3 A).
+    if (desktopPanelsEnabled) {
+      return DesktopProviderScope(
+        child: Builder(builder: (context) => _desktop(context, offeredLangs)),
+      );
+    }
     return Scaffold(
       backgroundColor: AppColors.bg,
       appBar: AppBar(
@@ -400,33 +504,7 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                color: AppColors.surface,
-                borderRadius: BorderRadius.circular(16),
-              ),
-              child: TabBar(
-                controller: _typeTabs,
-                onTap: (index) => setState(() => _typeIndex = index),
-                dividerColor: Colors.transparent,
-                dividerHeight: 0,
-                indicatorSize: TabBarIndicatorSize.tab,
-                indicator: BoxDecoration(
-                  color: AppColors.accentSoft,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                labelColor: AppColors.accent,
-                unselectedLabelColor: AppColors.textSecondary,
-                labelStyle: AppText.body.copyWith(fontWeight: FontWeight.w600),
-                overlayColor: WidgetStateProperty.all(Colors.transparent),
-                tabs: const [
-                  Tab(height: 40, text: 'All'),
-                  Tab(height: 40, text: 'Streaming'),
-                  Tab(height: 40, text: 'Manga'),
-                  Tab(height: 40, text: 'Novel'),
-                ],
-              ),
-            ),
+            child: _typeFilterBar(),
           ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
@@ -473,7 +551,7 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
     }
     if (installed.isEmpty) {
       return ListView(
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
+        padding: _listPadding,
         children: [
           EmptyState(
             icon: Icons.extension_outlined,
@@ -489,7 +567,7 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
       groups.putIfAbsent(item.source.repository, () => []).add(item);
     }
     return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
+      padding: _listPadding,
       children: [
         for (final group in groups.entries) _installedRepositoryGroup(group),
       ],
@@ -569,6 +647,8 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
                           ),
                         _sourceTile(
                           group.value[i].source,
+                          // Windows right-click (src-13 B).
+                          menu: () => _menuFor(group.value[i].source),
                           trailing: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
@@ -623,7 +703,7 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
       final type = _typeFilter;
       return ListView(
         physics: const AlwaysScrollableScrollPhysics(),
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
+        padding: _listPadding,
         children: [
           if (repositories.isEmpty && _refreshing)
             const Padding(
@@ -650,7 +730,7 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
       onRefresh: _refreshRepositories,
       child: ListView(
         physics: const AlwaysScrollableScrollPhysics(),
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
+        padding: _listPadding,
         children: [
           for (final repository in repositories)
             _repositorySection(repository, offered),
@@ -808,6 +888,8 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
                           ),
                           _sourceTile(
                             source,
+                            // Windows right-click (src-13 B).
+                            menu: () => _menuFor(source),
                             trailing: _catalogueAction(source),
                           ),
                         ],
@@ -819,7 +901,50 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
     );
   }
 
-  Widget _sourceTile(MangayomiSource source, {required Widget trailing}) {
+  /// Windows actions of one source, for its right-click and '...' menus
+  /// (src-6 B / src-13 B): Install or Update, Settings and Uninstall.
+  List<DesktopMenuItem<Object?>> _menuFor(MangayomiSource source) {
+    final installed = _manager.get(source.key)?.source;
+    final busy = _loading.contains(source.key);
+    final catalogue = _manager.repositories
+        .expand(_manager.catalogueFor)
+        .where((s) => s.key == source.key)
+        .firstOrNull;
+    final update =
+        installed != null &&
+        catalogue != null &&
+        mangayomiVersionIsNewer(catalogue.version, installed.version);
+    return desktopSourceMenuItems(
+      context,
+      onInstall: installed == null && !busy
+          ? () => _install(source.key, () => _manager.install(source))
+          : null,
+      onUpdate: update && !busy
+          ? () => _install(source.key, () => _manager.install(catalogue))
+          : null,
+      onSettings: installed == null ? null : () => _openSettings(installed),
+      onUninstall: installed == null || busy
+          ? null
+          : () => _uninstall(source.key),
+    );
+  }
+
+  Widget _sourceTile(
+    MangayomiSource source, {
+    required Widget trailing,
+    List<DesktopMenuItem<Object?>> Function()? menu,
+  }) {
+    // Windows: hover highlight, full-name tooltip, right-click (src-13 B).
+    return DesktopSourceRow(
+      items: menu,
+      tooltip:
+          '${source.name} · ${_contentType(source.contentType)} · '
+          '${source.language}',
+      child: _sourceTileBody(source, trailing: trailing),
+    );
+  }
+
+  Widget _sourceTileBody(MangayomiSource source, {required Widget trailing}) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 10, 12, 10),
       child: Row(
@@ -892,6 +1017,15 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
   Widget _catalogueAction(MangayomiSource source) {
     final installed = _manager.get(source.key)?.source;
     if (installed != null &&
+        !mangayomiVersionIsNewer(source.version, installed.version) &&
+        desktopPanelsEnabled) {
+      // A status, not a button: clicking 'Installed' no longer uninstalls;
+      // Settings / Uninstall live in the '...' menu (src-6 B).
+      return _loading.contains(source.key)
+          ? _actionButton(key: source.key, label: '', onPressed: () {})
+          : DesktopInstalledActions(items: () => _menuFor(source));
+    }
+    if (installed != null &&
         !mangayomiVersionIsNewer(source.version, installed.version)) {
       return OutlinedButton(
         onPressed: () => _uninstall(source.key),
@@ -955,4 +1089,63 @@ class _MangayomiSourcesScreenState extends State<MangayomiSourcesScreen>
           repository.pathSegments.length >= 2
       ? '${repository.pathSegments[0]}/${repository.pathSegments[1]}'
       : repository.host;
+}
+
+/// The URL field of the add-repository dialog. Stateful only to own its
+/// controller (it must outlive the dialog's exit animation), which the
+/// Windows clipboard / drop helper fills (src-12 B). Phone looks the same as
+/// the plain field it replaces.
+class _MangayomiRepoUrlField extends StatefulWidget {
+  const _MangayomiRepoUrlField({
+    required this.typeIndex,
+    required this.onChanged,
+    this.onSubmitted,
+  });
+
+  final int typeIndex;
+  final ValueChanged<String> onChanged;
+
+  /// Enter in the field; wired on Windows only so phone stays as it was.
+  final VoidCallback? onSubmitted;
+
+  @override
+  State<_MangayomiRepoUrlField> createState() => _MangayomiRepoUrlFieldState();
+}
+
+class _MangayomiRepoUrlFieldState extends State<_MangayomiRepoUrlField> {
+  final _controller = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    // A pre-filled or dropped link must reach the dialog's value too.
+    _controller.addListener(() => widget.onChanged(_controller.text));
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => DesktopAddRepoAssist(
+    controller: _controller,
+    child: TextField(
+      controller: _controller,
+      autofocus: true,
+      keyboardType: TextInputType.url,
+      onSubmitted: desktopPanelsEnabled && widget.onSubmitted != null
+          ? (_) => widget.onSubmitted!()
+          : null,
+      decoration: InputDecoration(
+        labelText: 'HTTPS repository URL',
+        hintText: switch (widget.typeIndex) {
+          1 => 'https://example.com/anime_index.json',
+          2 => 'https://example.com/manga_index.json',
+          _ => 'https://example.com/novel_index.json',
+        },
+      ),
+    ),
+  );
 }

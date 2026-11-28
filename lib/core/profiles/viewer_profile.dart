@@ -311,6 +311,11 @@ class ViewerProfileStore {
     });
   }
 
+  /// Loads this user's profiles from local storage and, when [attemptRemote]
+  /// is true, merges the cloud copy (bounded by a timeout). Boot passes false
+  /// after finding the network unreachable so the splash never waits on a
+  /// dead network; the merge runs later through a normal call once the
+  /// network returns.
   Future<void> loadForUser({
     String displayName = 'Home',
     bool attemptRemote = true,

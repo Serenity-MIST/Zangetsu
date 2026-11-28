@@ -1,10 +1,17 @@
+import 'desktop_media_card.dart';
+import 'dart:math' as math;
+
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/rendering.dart';
 
 import '../app_mode.dart';
 import '../cache/app_image_cache.dart';
 import '../di/injector.dart';
 import '../metadata/title_logo_service.dart';
+import '../metadata/tmdb.dart';
+import '../metadata/tmdb_poster_service.dart';
 import '../models/media_item.dart';
 import '../stremio/stremio_poster_shape.dart';
 import '../playback/playback_prefs.dart';
@@ -15,6 +22,7 @@ import '../aniyomi/aniyomi_image_provider.dart';
 import '../mihon/mihon_image_provider.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text.dart';
+import 'artwork_quality.dart';
 
 const _posterTextScrim = LinearGradient(
   begin: Alignment.bottomCenter,
@@ -165,6 +173,14 @@ int _responsiveColumns(
 int posterGridColumns(BuildContext context, {bool tabletFit = true}) {
   final wide = posterLayout(context) == PosterCardLayout.wide;
   final availableWidth = MediaQuery.sizeOf(context).width - 32;
+  // Desktop grids use the same card scale as Home instead of stretching the
+  // phone's two/three columns across a full PC window.
+  if (defaultTargetPlatform == TargetPlatform.windows) {
+    return math.max(
+      1,
+      ((availableWidth + 12) / (posterRowWidth(context) + 12)).ceil(),
+    );
+  }
   final base = wide ? 2 : 3;
   if (tabletFit && isTabletLayout(context)) {
     // A tablet keeps the phone's card size and fits more of them, instead of
@@ -194,11 +210,21 @@ double posterGridCellWidth(BuildContext context) {
 
 double posterRowWidth(BuildContext context) {
   final wide = posterLayout(context) == PosterCardLayout.wide;
-  return (wide ? 184 : 116) * posterCardScale(context);
+  final desktop = defaultTargetPlatform == TargetPlatform.windows;
+  return (wide ? (desktop ? 248 : 184) : (desktop ? 166 : 116)) *
+      posterCardScale(context);
 }
 
 double posterRowHeight(BuildContext context) {
   final wide = posterLayout(context) == PosterCardLayout.wide;
+  if (defaultTargetPlatform == TargetPlatform.windows) {
+    return DesktopMediaCard.height(
+      posterRowWidth(context),
+      MediaQuery.textScalerOf(context).scale(1),
+      wide: wide,
+      titleInside: posterTitleInside(context, wide: wide),
+    );
+  }
   return posterCellHeight(
     posterRowWidth(context),
     textScaler: MediaQuery.textScalerOf(context),
@@ -246,7 +272,13 @@ bool posterTitleInside(
   PosterCardScope.watch(context);
   return switch (_posterPrefs?.posterTitlePlacement ??
       PosterTitlePlacement.adaptive) {
-    PosterTitlePlacement.adaptive => item?.sourceId == 'stremio' ? false : wide,
+    // Windows keeps captions below the art; elsewhere upstream keeps Stremio
+    // addon artwork's own title placement.
+    PosterTitlePlacement.adaptive =>
+      defaultTargetPlatform == TargetPlatform.windows ||
+              item?.sourceId == 'stremio'
+          ? false
+          : wide,
     PosterTitlePlacement.inside => true,
     PosterTitlePlacement.below => false,
   };
@@ -313,6 +345,53 @@ class _PosterCardState extends State<PosterCard> {
               widget.wideImageUrl?.isNotEmpty == true
         ? widget.wideImageUrl
         : widget.imageUrl;
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      // A forced shape (wideOverride) already matches its own picture.
+      final art = widget.wideOverride == null
+          ? desktopShapedArtChoice(
+              widget.logoItem,
+              wide: wide,
+              chosen: artUrl,
+              headers: widget.headers,
+            )
+          : (url: artUrl, fallback: null);
+      final card = desktopPosterCard(
+        context,
+        title: widget.title,
+        wide: wide,
+        titleInside: titleInside,
+        artUrl: art.url,
+        fallbackArtUrl: art.fallback,
+        latchKey: _desktopLatchKey(widget.logoItem, art),
+        sourceImageUrl: widget.imageUrl,
+        headers: widget.headers,
+        logoItem: widget.logoItem,
+        cellWidth: widget.cellWidth,
+        onTap: widget.onTap,
+        onMenu: widget.onLongPress,
+        showTitle: widget.showTitle,
+        tags: widget.tags,
+        qualityBadge: widget.qualityBadge,
+        dubBadge: widget.dubBadge,
+        scoreBadge: widget.scoreBadge,
+        genres: widget.genres,
+        isAdult: widget.isAdult,
+        progressBadge: widget.progressBadge,
+      );
+      // DesktopMediaCard has no corner slot, so upstream's top-right badge
+      // (e.g. the Stremio marker in My List) is overlaid on the artwork here.
+      if (widget.topRightBadge == null) return card;
+      return Stack(
+        children: [
+          Positioned.fill(child: card),
+          Positioned(
+            top: 6,
+            right: 6,
+            child: IgnorePointer(child: widget.topRightBadge!),
+          ),
+        ],
+      );
+    }
     final overlayTitle =
         titleInside ||
         (stremio &&
@@ -572,6 +651,257 @@ class _PosterCardState extends State<PosterCard> {
   }
 }
 
+/// The Windows poster card with every Poster cards preference applied: title
+/// placement ([titleInside]), title artwork, and the score / progress / 18+ /
+/// genre / quality / sub-dub badge switches. [PosterCard] uses it on Windows,
+/// and the desktop Home shelves call it directly (with a [rank]) so Home
+/// follows exactly the same settings as search, see-all and My List.
+///
+/// [artUrl] is the artwork already chosen for the card's shape; headers are
+/// only sent when it is the source cover ([sourceImageUrl]).
+DesktopMediaCard desktopPosterCard(
+  BuildContext context, {
+  required String title,
+  required bool wide,
+  required bool titleInside,
+  String? artUrl,
+  String? fallbackArtUrl,
+  Object? latchKey,
+  String? sourceImageUrl,
+  Map<String, String>? headers,
+  MediaItem? logoItem,
+  double cellWidth = 180,
+  VoidCallback? onTap,
+  VoidCallback? onMenu,
+  bool showTitle = true,
+  List<String> tags = const [],
+  String? qualityBadge,
+  String? dubBadge,
+  int? scoreBadge,
+  List<String> genres = const [],
+  bool isAdult = false,
+  String? progressBadge,
+  int? rank,
+  Key? key,
+  Key? artworkKey,
+}) {
+  final prefs = _posterPrefs;
+  return DesktopMediaCard(
+    key: key,
+    artworkKey: artworkKey,
+    title: title,
+    rank: rank,
+    titleInside: titleInside,
+    titleWidget: prefs?.posterTitleStyle == PosterTitleStyle.artwork
+        ? PosterCardTitle(
+            title: title,
+            logoItem: logoItem,
+            width: cellWidth,
+            maxHeight: MediaQuery.textScalerOf(context).scale(34),
+            inside: titleInside,
+          )
+        : null,
+    // Upstream's art choice (Stremio shapes, catalogue wideOverride) feeds
+    // the desktop card; headers only belong to the source cover.
+    image: artUrl,
+    headers: artUrl == sourceImageUrl ? headers : null,
+    // Windows TMDB posters: the usual picture, shown if the TMDB file fails.
+    fallbackImage: fallbackArtUrl,
+    fallbackHeaders: fallbackArtUrl == sourceImageUrl ? headers : null,
+    latchKey: latchKey,
+    onTap: onTap,
+    onMenu: onMenu,
+    showTitle: showTitle,
+    score: (prefs?.posterScoreBadge ?? true) ? scoreBadge : null,
+    badges: [
+      ...tags,
+      if (progressBadge != null && prefs?.posterProgressBadge == true)
+        progressBadge,
+      if (isAdult && prefs?.posterAdultBadge == true) '18+',
+      if (wide && genres.isNotEmpty && prefs?.posterGenreBadge == true)
+        genres.first,
+      if (qualityBadge != null && (prefs?.posterQualityBadge ?? true))
+        qualityBadge,
+      if (dubBadge != null && (prefs?.posterAudioBadge ?? true)) dubBadge,
+    ],
+  );
+}
+
+/// Windows: the picture whose shape matches the card. Wide (landscape) cards
+/// take the item's landscape poster, then its banner, and only then the
+/// portrait poster (which the card then shows whole over a soft fill).
+/// Poster cards keep [chosen] (the poster) and use a landscape picture only
+/// when the item has no poster at all. Stremio items already pick their own
+/// shapes, so [chosen] is kept for them, as it is when [item] is unknown.
+///
+/// Windows poster cards then take the sharper TMDB poster when one is known
+/// (see [desktopTmdbPoster]); wide cards keep their landscape art.
+String? desktopShapedArt(
+  MediaItem? item, {
+  required bool wide,
+  String? chosen,
+  Map<String, String>? headers,
+}) => desktopShapedArtChoice(
+  item,
+  wide: wide,
+  chosen: chosen,
+  headers: headers,
+).url;
+
+/// [desktopShapedArt] with the picture it replaced: [fallback] is the usual
+/// picture when a TMDB poster was chosen instead (shown if the TMDB file
+/// fails to load), and null otherwise.
+({String? url, String? fallback}) desktopShapedArtChoice(
+  MediaItem? item, {
+  required bool wide,
+  String? chosen,
+  Map<String, String>? headers,
+}) {
+  String? clean(String? url) =>
+      url == null || url.trim().isEmpty ? null : url.trim();
+  if (item == null || item.sourceId == 'stremio') {
+    return (url: chosen, fallback: null);
+  }
+  final landscape = clean(item.landscapePoster) ?? clean(item.banner);
+  final poster = clean(chosen) ?? clean(item.cover);
+  final usual = wide ? landscape ?? poster : poster ?? landscape;
+  if (wide) return (url: usual, fallback: null);
+  final tmdb = desktopTmdbPoster(item, chosen: poster, headers: headers);
+  final ({String? url, String? fallback}) art = tmdb == null || tmdb == usual
+      ? (url: usual, fallback: null)
+      : (url: tmdb, fallback: usual);
+  if (defaultTargetPlatform != TargetPlatform.windows) return art;
+  // The first choice for this card in this session is kept (see
+  // [DesktopArtPins]), so Home's preloader and the drawn card always ask
+  // for the same picture even when a TMDB lookup finishes in between.
+  final key = _desktopLatchKey(item, art);
+  return key == null ? art : DesktopArtPins.keep(key, art);
+}
+
+/// Windows: the TMDB poster for a portrait card of [item], or null to keep
+/// the usual picture. Phone and TV always get null.
+///
+/// A poster that already comes from TMDB only changes size: it is asked for
+/// in the w342 folder and [desktopArtworkUrl] then moves it up to w500 or
+/// w780 when the card is drawn wider than that. Anything else asks the
+/// [TmdbPosterService]: a saved poster is used at once, and when none is
+/// known yet a background lookup is queued and the usual picture stays.
+/// Local files and protected source covers are never replaced.
+String? desktopTmdbPoster(
+  MediaItem item, {
+  String? chosen,
+  Map<String, String>? headers,
+}) {
+  if (defaultTargetPlatform != TargetPlatform.windows) return null;
+  final picked = chosen?.trim();
+  final own = picked != null && picked.isNotEmpty ? picked : item.cover?.trim();
+  if (own != null && own.isNotEmpty) {
+    final resized = tmdbPosterAtW342(own);
+    if (resized != null) return resized;
+    final uri = Uri.tryParse(own);
+    // A downloaded (file:) cover or an app asset stays as it is.
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+      return null;
+    }
+  }
+  final TmdbPosterService service;
+  try {
+    if (!sl.isRegistered<TmdbPosterService>()) return null;
+    service = sl<TmdbPosterService>();
+  } catch (_) {
+    return null;
+  }
+  final path = service.posterPathFor(item, headers: headers);
+  return path == null ? null : '${Tmdb.img}/w342$path';
+}
+
+/// [url] moved to TMDB's w342 poster folder when it is a TMDB poster (a
+/// w-size or the original), or null when it is not one. Episode stills
+/// (w300) and cast photos (h sizes) are left alone.
+String? tmdbPosterAtW342(String url) {
+  final uri = Uri.tryParse(url);
+  if (uri == null || uri.host != 'image.tmdb.org') return null;
+  final size = RegExp(r'^/t/p/(original|w\d+)/').firstMatch(uri.path);
+  if (size == null || size.group(1) == 'w300') return null;
+  if (size.group(1) == 'w342') return url;
+  return uri
+      .replace(path: uri.path.replaceFirst(size.group(0)!, '/t/p/w342/'))
+      .toString();
+}
+
+/// Keeps a card on the picture it first showed while it stays on screen:
+/// the item plus its usual picture, so a TMDB lookup finishing does not
+/// swap the picture, but a new item or a new card shape does.
+Object? _desktopLatchKey(
+  MediaItem? item,
+  ({String? url, String? fallback}) art,
+) => item == null
+    ? null
+    : '${item.sourceId}|${item.url}|${art.fallback ?? art.url}';
+
+/// The artwork a desktop shelf card shows for a catalogue [item], with the
+/// usual picture it replaced (see [desktopShapedArtChoice]).
+({String? url, String? fallback}) _desktopItemArt(
+  MediaItem item, {
+  required bool wide,
+}) => item.sourceId == 'stremio'
+    ? (url: stremioPosterImage(item, landscape: wide), fallback: null)
+    : desktopShapedArtChoice(item, wide: wide, chosen: item.cover);
+
+/// The picture [desktopPosterCardForItem] loads for [item] and the headers it
+/// sends, so Home can load it ahead of time. Both go through
+/// [desktopShapedArtChoice], so the preloaded picture is the drawn one.
+({String? url, Map<String, String>? headers}) desktopPosterArtForItem(
+  MediaItem item, {
+  required bool wide,
+}) {
+  final url = _desktopItemArt(item, wide: wide).url;
+  // Headers are only sent for the source's own cover, as on the card.
+  return (url: url, headers: url == item.cover ? item.coverHeaders : null);
+}
+
+/// [desktopPosterCard] for a catalogue [item], choosing its artwork the way
+/// [PosterCard] does for the current Shape setting (banner art in Landscape,
+/// Stremio's own shapes for addon items). Used by the desktop Home shelves.
+DesktopMediaCard desktopPosterCardForItem(
+  BuildContext context,
+  MediaItem item, {
+  required double cellWidth,
+  VoidCallback? onTap,
+  VoidCallback? onMenu,
+  List<String> tags = const [],
+  String? progressBadge,
+  int? rank,
+  Key? artworkKey,
+}) {
+  final wide = posterLayout(context) == PosterCardLayout.wide;
+  final art = _desktopItemArt(item, wide: wide);
+  return desktopPosterCard(
+    context,
+    title: item.title,
+    wide: wide,
+    titleInside: posterTitleInside(context, wide: wide),
+    artUrl: art.url,
+    fallbackArtUrl: art.fallback,
+    latchKey: _desktopLatchKey(item, art),
+    sourceImageUrl: item.cover,
+    headers: item.coverHeaders,
+    logoItem: item,
+    cellWidth: cellWidth,
+    onTap: onTap,
+    onMenu: onMenu,
+    tags: tags,
+    qualityBadge: item.quality,
+    dubBadge: item.dubBadge,
+    scoreBadge: item.score,
+    genres: item.genres,
+    isAdult: item.isAdult,
+    progressBadge: progressBadge,
+    rank: rank,
+    artworkKey: artworkKey,
+  );
+}
+
 class PosterCardTitle extends StatefulWidget {
   const PosterCardTitle({
     super.key,
@@ -754,15 +1084,26 @@ double posterCellAspect(
 /// [posterCellAspect] for the app's standard poster grid: three columns, 16px
 /// page padding, 12px between cells. Depends on the screen width, so it cannot
 /// be a constant — which is exactly why the hardcoded 0.62 drifted.
-double posterGridAspect(BuildContext context) => posterCellAspect(
-  posterGridCellWidth(context),
-  textScaler: MediaQuery.textScalerOf(context),
-  wide: posterLayout(context) == PosterCardLayout.wide,
-  titleInside: posterTitleInside(
-    context,
-    wide: posterLayout(context) == PosterCardLayout.wide,
-  ),
-);
+double posterGridAspect(BuildContext context) {
+  final width = posterGridCellWidth(context);
+  final wide = posterLayout(context) == PosterCardLayout.wide;
+  final titleInside = posterTitleInside(context, wide: wide);
+  if (defaultTargetPlatform == TargetPlatform.windows) {
+    return width /
+        DesktopMediaCard.height(
+          width,
+          MediaQuery.textScalerOf(context).scale(1),
+          wide: wide,
+          titleInside: titleInside,
+        );
+  }
+  return posterCellAspect(
+    width,
+    textScaler: MediaQuery.textScalerOf(context),
+    wide: wide,
+    titleInside: titleInside,
+  );
+}
 
 /// Small frosted badge drawn over poster art (e.g. "SUB", "DUB", "MOVIE").
 /// The score chip. A star rather than a bare number: "8.6" alone on a poster
@@ -852,6 +1193,71 @@ class _CountChip extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Desktop columns use the available viewport, including a sidebar or sheet.
+/// The phone keeps its established three-column layout.
+SliverGridDelegate posterGridDelegate(BuildContext context) =>
+    defaultTargetPlatform == TargetPlatform.windows
+    ? DesktopPosterGridDelegate(
+        wide: posterLayout(context) == PosterCardLayout.wide,
+        titleInside: posterTitleInside(
+          context,
+          wide: posterLayout(context) == PosterCardLayout.wide,
+        ),
+        scale: posterCardScale(context),
+        textScale: MediaQuery.textScalerOf(context).scale(1),
+      )
+    : SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: posterGridColumns(context),
+        childAspectRatio: posterGridAspect(context),
+        crossAxisSpacing: 12,
+        mainAxisSpacing: 16,
+      );
+
+/// Fits more poster columns as desktop space grows, using poster-cell sizing
+/// so cover proportions and caption space remain consistent across widths.
+class DesktopPosterGridDelegate extends SliverGridDelegate {
+  const DesktopPosterGridDelegate({
+    this.wide = false,
+    this.titleInside = false,
+    this.scale = 1,
+    this.textScale = 1,
+  });
+  final bool wide;
+  final bool titleInside;
+  final double scale;
+  final double textScale;
+  @override
+  SliverGridLayout getLayout(SliverConstraints constraints) {
+    const gap = 12.0;
+    final count =
+        ((constraints.crossAxisExtent + gap) / ((wide ? 260 : 180) * scale))
+            .ceil()
+            .clamp(1, 30);
+    final width = (constraints.crossAxisExtent - gap * (count - 1)) / count;
+    final height = DesktopMediaCard.height(
+      width,
+      textScale,
+      wide: wide,
+      titleInside: titleInside,
+    );
+    return SliverGridRegularTileLayout(
+      crossAxisCount: count,
+      mainAxisStride: height + 28,
+      crossAxisStride: width + gap,
+      childMainAxisExtent: height,
+      childCrossAxisExtent: width,
+      reverseCrossAxis: axisDirectionIsReversed(constraints.crossAxisDirection),
+    );
+  }
+
+  @override
+  bool shouldRelayout(covariant DesktopPosterGridDelegate oldDelegate) =>
+      wide != oldDelegate.wide ||
+      titleInside != oldDelegate.titleInside ||
+      scale != oldDelegate.scale ||
+      textScale != oldDelegate.textScale;
 }
 
 class _PosterTag extends StatelessWidget {

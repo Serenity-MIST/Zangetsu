@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:watch_app/core/anilist/anilist_api.dart';
 import 'package:watch_app/core/anilist/anilist_service.dart';
@@ -51,6 +52,16 @@ const _listCollectionAnimeGolden =
     r'updatedAt private customLists(asArray:true) '
     r'media { id idMal title { romaji english native } episodes '
     r'nextAiringEpisode{episode} status coverImage { large } } } } } }';
+// The Windows build also reads airingAt and endDate, which date the latest
+// release for the desktop "New from your list" row. `status` is still
+// selected once.
+const _listCollectionAnimeWindowsGolden =
+    r'query($u:String){ MediaListCollection(userName:$u, type:ANIME){ '
+    r'lists { status entries { status progress score(format:POINT_10) '
+    r'updatedAt private customLists(asArray:true) '
+    r'media { id idMal title { romaji english native } episodes '
+    r'nextAiringEpisode{episode airingAt} endDate{year month day} '
+    r'status coverImage { large } } } } } }';
 
 /// A `MediaListCollection` response shaped exactly like AniList's — two lists
 /// (Watching / Planning), the `media` sub-object carrying idMal + titles +
@@ -110,6 +121,20 @@ void main() {
       expect(
         mediaListCollectionQuery(MediaKind.anime),
         _listCollectionAnimeGolden,
+      );
+    });
+
+    test('mediaListCollectionQuery on Windows dates the latest release', () {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      expect(
+        mediaListCollectionQuery(MediaKind.anime),
+        _listCollectionAnimeWindowsGolden,
+      );
+      // The manga read never asks for airing, on Windows either.
+      expect(
+        mediaListCollectionQuery(MediaKind.manga),
+        isNot(contains('nextAiringEpisode')),
       );
     });
 

@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 
+import '../../core/desktop/desktop_sheet.dart';
 import '../../core/theme/app_colors.dart';
 
 Future<List<Map<String, dynamic>>?> showMangayomiFilterSheet(
@@ -11,8 +12,11 @@ Future<List<Map<String, dynamic>>?> showMangayomiFilterSheet(
   final selected = (jsonDecode(jsonEncode(filters)) as List)
       .map((item) => Map<String, dynamic>.from(item as Map))
       .toList();
-  return showModalBottomSheet<List<Map<String, dynamic>>>(
-    context: context,
+  // Phone: the same bottom sheet as before. Windows: a centred, width-capped
+  // graphite dialog instead of a full-width strip (search-4).
+  return showAdaptiveSheet<List<Map<String, dynamic>>>(
+    context,
+    desktopWidth: 560,
     isScrollControlled: true,
     backgroundColor: AppColors.surface,
     builder: (context) => StatefulBuilder(

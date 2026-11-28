@@ -1,5 +1,7 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import '../../core/desktop/desktop_prefs.dart';
 import '../../core/di/injector.dart';
 import '../../core/discord/discord_config.dart';
 import '../../core/discord/discord_presence.dart';
@@ -8,7 +10,10 @@ import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_text.dart';
 import '../../l10n/l10n.dart';
 import '../../core/ui/app_dialog.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import '../../core/ui/settings_widgets.dart';
+import 'desktop_settings_workspace.dart'
+    show DesktopSettingsColumn, DesktopSettingsValue;
 
 /// Connect Discord (OAuth in the external browser — no token scraping) and
 /// toggle Rich Presence. Presence shows what you're watching/browsing on your
@@ -67,140 +72,168 @@ class _DiscordSettingsScreenState extends State<DiscordSettingsScreen> {
   @override
   Widget build(BuildContext context) {
     final connected = _rpc.loggedIn;
-    return Scaffold(
-      backgroundColor: AppColors.bg,
-      appBar: settingsAppBar(context.l10n.discord),
-      body: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 640),
-          child: ListView(
-            padding: const EdgeInsets.symmetric(vertical: 16),
+    // Windows settings workspace (graphite rows and dialogs).
+    final desktop = DesktopSettingsScope.contains(context);
+    final list = ListView(
+      // Desktop: a plain list from the left edge, as on the Reader
+      // page; the cards cap themselves at the shared settings width.
+      padding: desktop
+          ? DesktopSettingsScope.listPadding(context, top: 16, bottom: 28)
+          : const EdgeInsets.symmetric(vertical: 16),
+      children: [
+        if (!DiscordConfig.configured)
+          SettingsCard(
             children: [
-              if (!DiscordConfig.configured)
-                SettingsCard(
-                  children: [
-                    SettingsTile(
-                      icon: Icons.warning_amber_rounded,
-                      title: context.l10n.notConfigured,
-                      subtitle: context
-                          .l10n
-                          .aDiscordApplicationIDMustBeSetInTheBuildFirst,
-                      subtitleMaxLines: null,
-                    ),
-                  ],
-                ),
-              SettingsCard(
-                children: [
-                  if (connected)
-                    SettingsTile(
-                      icon: Icons.person_rounded,
-                      title: _rpc.displayName.isNotEmpty
-                          ? _rpc.displayName
-                          : _rpc.username.isNotEmpty
-                          ? _rpc.username
-                          : context.l10n.discord,
-                      subtitle: _rpc.username.isNotEmpty
-                          ? '@${_rpc.username}'
-                          : null,
-                      leading: _rpc.avatarUrl.isNotEmpty
-                          ? ClipOval(
-                              child: Image.network(
-                                _rpc.avatarUrl,
-                                width: 42,
-                                height: 42,
-                                fit: BoxFit.cover,
-                                errorBuilder: (_, error, stackTrace) =>
-                                    const SizedBox(
-                                      width: 42,
-                                      height: 42,
-                                      child: Icon(Icons.person_rounded),
-                                    ),
-                              ),
-                            )
-                          : null,
-                    )
-                  else
-                    SettingsTile(
-                      autofocus: true,
-                      icon: Icons.link_rounded,
-                      iconAccent: true,
-                      title: _busy
-                          ? context.l10n.connectingEllipsis
-                          : context.l10n.connectDiscord,
-                      subtitle: _busy
-                          ? null
-                          : context.l10n.signInSoYourStatusCanShow,
-                      subtitleMaxLines: null,
-                      onTap: _busy ? null : _connect,
-                      trailing: _busy
-                          ? const SizedBox(
-                              width: 20,
-                              height: 20,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.arrow_forward_rounded),
-                    ),
-                  if (connected)
-                    SettingsTile(
-                      autofocus: true,
-                      icon: Icons.gamepad_outlined,
-                      iconAccent: true,
-                      title: context.l10n.richPresence,
-                      subtitle: context.l10n.showWhatYouReWatchingOnYourProfile,
-                      subtitleMaxLines: null,
-                      onTap: () => _setEnabled(!_rpc.enabled),
-                      trailing: Switch.adaptive(
-                        value: _rpc.enabled,
-                        activeThumbColor: AppColors.accent,
-                        onChanged: _setEnabled,
-                      ),
-                    ),
-                ],
+              SettingsTile(
+                icon: Icons.warning_amber_rounded,
+                title: context.l10n.notConfigured,
+                subtitle:
+                    context.l10n.aDiscordApplicationIDMustBeSetInTheBuildFirst,
+                subtitleMaxLines: null,
               ),
-              if (connected) ...[
-                const SizedBox(height: 12),
-                SettingsCard(
-                  children: [
-                    _statusRow(),
-                    _switchRow(
-                      icon: Icons.pause_circle_outline_rounded,
-                      title: context.l10n.presenceShowWhenPaused,
-                      value: _rpc.showWhenPaused,
-                      preference: 'showPaused',
-                    ),
-                    _switchRow(
-                      icon: Icons.explore_outlined,
-                      title: context.l10n.presenceBrowsingTitle,
-                      value: _rpc.browsingShowsTitle,
-                      preference: 'browsingTitle',
-                    ),
-                  ],
-                ),
-              ],
-              SettingsSectionLabel(context.l10n.presencePreview, muted: true),
-              _preview(),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(24, 14, 24, 20),
-                child: Text(
-                  context.l10n.discordPresenceBlurb,
-                  style: AppText.caption,
-                ),
-              ),
-              if (connected)
-                SettingsCard(
-                  children: [
-                    SettingsTile(
-                      icon: Icons.logout_rounded,
-                      title: context.l10n.disconnect,
-                      destructive: true,
-                      onTap: _disconnect,
-                    ),
-                  ],
-                ),
             ],
           ),
+        SettingsCard(
+          children: [
+            if (connected)
+              SettingsTile(
+                icon: Icons.person_rounded,
+                title: _rpc.displayName.isNotEmpty
+                    ? _rpc.displayName
+                    : _rpc.username.isNotEmpty
+                    ? _rpc.username
+                    : context.l10n.discord,
+                subtitle: _rpc.username.isNotEmpty ? '@${_rpc.username}' : null,
+                leading: _rpc.avatarUrl.isNotEmpty
+                    ? ClipOval(
+                        child: Image.network(
+                          _rpc.avatarUrl,
+                          width: 42,
+                          height: 42,
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, error, stackTrace) =>
+                              const SizedBox(
+                                width: 42,
+                                height: 42,
+                                child: Icon(Icons.person_rounded),
+                              ),
+                        ),
+                      )
+                    : null,
+              )
+            else
+              SettingsTile(
+                autofocus: true,
+                icon: Icons.link_rounded,
+                iconAccent: true,
+                title: _busy
+                    ? context.l10n.connectingEllipsis
+                    : context.l10n.connectDiscord,
+                // Desktop: while the browser is open, say what to do
+                // and let a click abandon the wait.
+                subtitle: _busy
+                    ? (desktop
+                          ? context.l10n.desktopApproveInBrowserHint
+                          : null)
+                    : context.l10n.signInSoYourStatusCanShow,
+                subtitleMaxLines: null,
+                onTap: _busy ? (desktop ? _rpc.cancelConnect : null) : _connect,
+                trailing: _busy
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.arrow_forward_rounded),
+              ),
+            if (connected)
+              SettingsTile(
+                autofocus: true,
+                icon: Icons.gamepad_outlined,
+                iconAccent: true,
+                title: context.l10n.richPresence,
+                subtitle: context.l10n.showWhatYouReWatchingOnYourProfile,
+                subtitleMaxLines: null,
+                onTap: () => _setEnabled(!_rpc.enabled),
+                trailing: Switch.adaptive(
+                  value: _rpc.enabled,
+                  activeThumbColor: AppColors.accent,
+                  onChanged: _setEnabled,
+                ),
+              ),
+          ],
         ),
-      ),
+        if (connected) ...[
+          const SizedBox(height: 12),
+          SettingsCard(
+            children: [
+              _statusRow(),
+              _switchRow(
+                icon: Icons.pause_circle_outline_rounded,
+                title: context.l10n.presenceShowWhenPaused,
+                value: _rpc.showWhenPaused,
+                preference: 'showPaused',
+              ),
+              _switchRow(
+                icon: Icons.explore_outlined,
+                title: context.l10n.presenceBrowsingTitle,
+                value: _rpc.browsingShowsTitle,
+                preference: 'browsingTitle',
+              ),
+              // Windows (track-12 C): skip Browsing / Looking at
+              // entirely; the profile only shows something in the
+              // player.
+              if (desktop && defaultTargetPlatform == TargetPlatform.windows)
+                _onlyWhileWatchingRow(),
+            ],
+          ),
+        ],
+        SettingsSectionLabel(context.l10n.presencePreview, muted: true),
+        _preview(),
+        if (desktop)
+          // Under the preview, starting where the section titles do.
+          DesktopSettingsColumn(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(2, 14, 2, 20),
+              child: Text(
+                context.l10n.discordPresenceBlurb,
+                style: AppText.caption,
+              ),
+            ),
+          )
+        else
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 14, 24, 20),
+            child: Text(
+              context.l10n.discordPresenceBlurb,
+              style: AppText.caption,
+            ),
+          ),
+        if (connected)
+          SettingsCard(
+            children: [
+              SettingsTile(
+                icon: Icons.logout_rounded,
+                title: context.l10n.disconnect,
+                destructive: true,
+                onTap: _disconnect,
+              ),
+            ],
+          ),
+      ],
+    );
+    return Scaffold(
+      backgroundColor: settingsPageBackground(context),
+      appBar: settingsAppBar(context.l10n.discord),
+      // Phone and TV keep their centred column.
+      body: desktop
+          ? list
+          : Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 640),
+                child: list,
+              ),
+            ),
     );
   }
 
@@ -235,15 +268,32 @@ class _DiscordSettingsScreenState extends State<DiscordSettingsScreen> {
     final option = _statusOptions.firstWhere(
       (item) => item.$1 == _rpc.presenceStatus,
     );
+    // Desktop: the status stands at the right edge like the Reader page's
+    // values; phone and TV keep it under the title.
+    final desktop = DesktopSettingsScope.contains(context);
     return SettingsTile(
       icon: option.$3,
       title: context.l10n.discordOnlineStatus,
-      subtitle: option.$2,
+      subtitle: desktop ? null : option.$2,
+      trailing: desktop ? DesktopSettingsValue(option.$2) : null,
       onTap: _pickStatus,
     );
   }
 
   Future<void> _pickStatus() async {
+    // Desktop uses the shared graphite choice dialog instead of the phone list.
+    if (DesktopSettingsScope.contains(context)) {
+      final picked = await showGraphiteSettingsChoice<String>(
+        context,
+        title: context.l10n.discordOnlineStatus,
+        options: [for (final o in _statusOptions) (o.$1, o.$2)],
+        current: _rpc.presenceStatus,
+      );
+      if (picked == null || picked == _rpc.presenceStatus) return;
+      await _rpc.setPresencePref('presenceStatus', picked);
+      if (mounted) setState(() {});
+      return;
+    }
     final selected = await AppDialog.show<String>(
       context,
       title: context.l10n.discordOnlineStatus,
@@ -339,6 +389,30 @@ class _DiscordSettingsScreenState extends State<DiscordSettingsScreen> {
     return SettingsTile(
       icon: icon,
       title: title,
+      onTap: () => save(!value),
+      trailing: Switch.adaptive(
+        value: value,
+        activeThumbColor: AppColors.accent,
+        onChanged: save,
+      ),
+    );
+  }
+
+  /// "Only while watching" switch (Windows). Stored in DesktopPrefs; the
+  /// presence is re-sent at once so the profile follows the switch.
+  SettingsTile _onlyWhileWatchingRow() {
+    final value = DesktopPrefs.discordOnlyWhileWatching;
+    Future<void> save(bool next) async {
+      await DesktopPrefs.setDiscordOnlyWhileWatching(next);
+      _rpc.refreshVisibility();
+      if (mounted) setState(() {});
+    }
+
+    return SettingsTile(
+      icon: Icons.visibility_off_outlined,
+      title: context.l10n.discordOnlyWhileWatching,
+      subtitle: context.l10n.discordOnlyWhileWatchingSubtitle,
+      subtitleMaxLines: null,
       onTap: () => save(!value),
       trailing: Switch.adaptive(
         value: value,

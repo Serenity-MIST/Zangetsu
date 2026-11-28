@@ -2,12 +2,14 @@ import 'package:flutter/foundation.dart';
 
 import '../error/exceptions.dart';
 import '../models/media_item.dart';
+import '../models/episode.dart';
 import '../provider/cf_solve_needed.dart';
 import '../repository/source_repository.dart';
 import 'match_store.dart';
 import 'playback_resolver.dart' show SweepReason;
 import 'zmode_ids.dart';
 import 'zmode_source_prefs.dart';
+import 'video_identity.dart';
 
 /// Thrown by playback when a metadata title has no source at all.
 class NoSourceMatch implements Exception {
@@ -74,6 +76,59 @@ class SourceMatcher {
   /// installed, at up to 3s each.
   final List<({String id, String name})> Function(ZKind) _sweepCandidates;
 
+  final Map<String, List<Episode>> _mangaChapters = {};
+  final Map<String, String> _readingBlocked = {};
+
+  /// Challenge observed in this title's current sweep, not another title's flag.
+  String? blockedForTitle(ZCanonical c) => _readingBlocked[c.key];
+
+  /// Retains a bounded set of title-specific verification targets.
+  void _recordReadingBlock(ZCanonical c, String url) {
+    if (_readingBlocked.length >= 64)
+      _readingBlocked.remove(_readingBlocked.keys.first);
+    _readingBlocked[c.key] = url;
+  }
+
+  /// Priority hint for reading; this does not represent a manually pinned pick.
+  String? lastReadingSource(ZKind kind) => _prefs.lastGood(kind);
+
+  /// Separates chapter results by canonical identity, source and matched URL.
+  String _chapterKey(ZCanonical c, SourceMatch match) =>
+      '${c.key}|${match.sourceId}|${match.showUrl}';
+
+  /// Consumes chapters already validated by Auto Resolve, avoiding a second
+  /// fetch in the detail page; explicit source choices fetch normally.
+  Future<List<Episode>> chaptersFor(ZCanonical c, SourceMatch match) async =>
+      _mangaChapters.remove(_chapterKey(c, match)) ??
+      await _sources.episodes(match.showUrl, sourceId: match.sourceId);
+
+  /// Requires a nonempty manga chapter list before accepting an automatic hit.
+  /// Failures permit another candidate; challenges retain the verification URL.
+  Future<bool> _usableAutoMatch(ZCanonical c, SourceMatch match) async {
+    if (c.kind != ZKind.manga) return true;
+    try {
+      final chapters = await _sources
+          .episodes(match.showUrl, sourceId: match.sourceId)
+          .timeout(const Duration(seconds: 35));
+      if (chapters.isEmpty) return false;
+      if (_mangaChapters.length >= 24)
+        _mangaChapters.remove(_mangaChapters.keys.first);
+      _mangaChapters[_chapterKey(c, match)] = chapters;
+      return true;
+    } catch (error) {
+      if (error is CloudflareRequiredException) {
+        _recordReadingBlock(c, error.url);
+        final host = Uri.tryParse(error.url)?.host;
+        if (host != null)
+          CfSolveNeeded.needsSolve(host, error.url, sourceId: match.sourceId);
+      }
+      debugPrint(
+        '[source-matcher] manga chapters unavailable ${match.sourceId}: $error',
+      );
+      return false;
+    }
+  }
+
   /// Called whenever a title's source changes, by any route — a pin, a
   /// correction, the recovery picker, or going back to Auto Resolve.
   ///
@@ -137,8 +192,14 @@ class SourceMatcher {
     Future<List<MediaItem>?> searchFor(String q) async {
       if (abandoned?.call() ?? false) return null;
       try {
+        final revision = CfSolveNeeded.sourceRevision(sourceId);
         final results = await _sources.search(q, sourceId: sourceId);
-        return (abandoned?.call() ?? false) ? null : results;
+        if (abandoned?.call() ?? false) return null;
+        if (CfSolveNeeded.sourceRevision(sourceId) != revision) {
+          final url = CfSolveNeeded.urlFor(sourceId);
+          if (url != null) _recordReadingBlock(c, url);
+        }
+        return videoCandidatesFor(c.kind, results);
       } catch (e) {
         // Mihon/Aniyomi/LNReader report a challenge by THROWING, and this
         // catch used to drop it on the floor — the source just vanished from
@@ -147,6 +208,7 @@ class SourceMatcher {
         // does, so the shield can be shown for the sources that actually need
         // it and only those.
         if (e is CloudflareRequiredException) {
+          _recordReadingBlock(c, e.url);
           final host = Uri.tryParse(e.url)?.host ?? '';
           if (host.isNotEmpty) {
             CfSolveNeeded.needsSolve(host, e.url, sourceId: sourceId);
@@ -234,7 +296,7 @@ class SourceMatcher {
     final found = hit!;
     debugPrint('[zmode] $sourceId MATCHED "$title" -> "${found.title}"');
     final m = SourceMatch(
-      sourceId: found.sourceId,
+      sourceId: sourceId,
       showUrl: found.url,
       showId: found.id,
       showTitle: found.title,
@@ -283,7 +345,18 @@ class SourceMatcher {
     // outranking every other source, but it is not a result: fall through and
     // ask again rather than handing back a match with nowhere to point.
     final savedIsMatch = saved != null && saved.showUrl.isNotEmpty;
-    if (savedIsMatch && (saved.pinned || _sources.hasSource(sourceId))) {
+    final savedKind = saved == null ? null : sourceVideoKind(saved.showUrl);
+    // Older automatic guesses could bind a TV series to a same-name movie.
+    // Re-search that provider without changing library data or explicit pins.
+    final incompatibleGuess =
+        saved != null &&
+        !saved.pinned &&
+        (c.kind == ZKind.tv || c.kind == ZKind.movie) &&
+        savedKind != null &&
+        savedKind != c.kind;
+    if (savedIsMatch &&
+        !incompatibleGuess &&
+        (saved.pinned || _sources.hasSource(sourceId))) {
       // Even with a cached match, the runtime may be empty on TV — ensure
       // the provider is loaded so episodes()/sources() can resolve.
       final loaded = await _sources.ensureSourceLoaded(sourceId);
@@ -308,7 +381,7 @@ class SourceMatcher {
       '[source-matcher] matchOn · "$sourceId" → fresh search '
       'for "$title"',
     );
-    return resolveOn(
+    final fresh = await resolveOn(
       c,
       sourceId,
       title: title,
@@ -317,6 +390,8 @@ class SourceMatcher {
       malId: malId,
       abandoned: abandoned,
     );
+    if (incompatibleGuess && fresh != null) _sourceChanged(c);
+    return fresh;
   }
 
   /// *A* source for this title: honours the stored selection when it's set
@@ -410,6 +485,7 @@ class SourceMatcher {
     bool Function()? abandoned,
     void Function(String sourceName, int current, int total)? onProgress,
   }) async {
+    _readingBlocked.remove(c.key);
     if (abandoned?.call() ?? false) {
       debugPrint(
         '[source-matcher] _resolve · abandoned before source selection',
@@ -420,7 +496,7 @@ class SourceMatcher {
     // A per-title pin ("Wrong title?" or the picker) is a firm choice — it
     // wins over everything else, including an explicit kind default.
     final pinned = pinnedSource(c);
-    if (pinned != null) {
+    if (pinned != null && candidates.any((s) => s.id == pinned)) {
       debugPrint(
         '[source-matcher] _resolve · kind=${c.kind} title="$title" '
         'pinned=$pinned',
@@ -437,9 +513,13 @@ class SourceMatcher {
     }
     // An explicit kind-wide default (set via the "source went quiet" recovery
     // picker) is honoured as-is — a genuine miss there is reported, not
-    // silently papered over by trying another source.
+    // silently papered over by trying another source. On Windows the default
+    // is "try first" instead (see [preferredIsTryFirst]) and is handled below,
+    // ahead of the sweep.
     final selId = _prefs.get(c.kind);
-    if (selId != null && candidates.any((s) => s.id == selId)) {
+    if (!preferredIsTryFirst &&
+        selId != null &&
+        candidates.any((s) => s.id == selId)) {
       debugPrint(
         '[source-matcher] _resolve · kind=${c.kind} title="$title" '
         'kind default=$selId',
@@ -456,31 +536,47 @@ class SourceMatcher {
     }
     final sweep = _sweepCandidates(c.kind);
 
-    // Reading uses its remembered source, and does not sweep.
-    //
-    // A sweep is only safe where something can recover from a bad pick. Video
-    // has that — PlaybackResolver re-resolves per episode at tap time, so an
-    // unlucky source costs nothing. Reading has no second chance: the matched
-    // source OWNS the chapter list, so landing on one carrying 3 of 200
-    // chapters is worse than not sweeping, and the reader cannot tell why.
-    //
-    // A miss here is reported as a miss — the screen says "no episodes
-    // available from this source" and offers the picker, which is what a
-    // reader expects and can act on. Silently reaching for a different source
-    // is how you end up reading someone else's numbering.
-    //
-    // The sweep below is a one-time bootstrap for reading: it runs when
-    // nothing is remembered yet, and whatever matches is kept. "Auto Resolve"
-    // in the per-title picker clears that memory (see [clearAuto]), so
-    // sweeping stays reachable on purpose.
+    // Reading first tries the last successful source as a priority hint.
+    // Manga Auto Resolve also verifies that the matched title has chapters;
+    // a blocked, empty or unavailable source falls through to the sweep.
+    // Explicit per-title pins and kind defaults were handled above.
     final isReading = c.kind == ZKind.manga || c.kind == ZKind.novel;
     final remembered = isReading ? _prefs.lastGood(c.kind) : null;
-    if (remembered != null && sweep.any((s) => s.id == remembered)) {
+    final tried = <String>{};
+
+    // Windows: the preferred source is tried FIRST, and a miss falls through
+    // to Auto Resolve instead of leaving the title empty. Checked against the
+    // whole installed list (not just the capped sweep) because the user
+    // picked it by hand.
+    final preferred = preferredIsTryFirst ? preferredFor(c.kind) : null;
+    if (preferred != null) {
+      tried.add(preferred);
+      debugPrint(
+        '[source-matcher] _resolve · kind=${c.kind} title="$title" '
+        'preferred first=$preferred',
+      );
+      final match = await matchOn(
+        c,
+        preferred,
+        title: title,
+        altTitle: altTitle,
+        metadataAliases: metadataAliases,
+        malId: malId,
+        abandoned: abandoned,
+      );
+      if (abandoned?.call() ?? false) return null;
+      if (match != null && await _usableAutoMatch(c, match)) return match;
+    }
+
+    if (remembered != null &&
+        !tried.contains(remembered) &&
+        sweep.any((s) => s.id == remembered)) {
+      tried.add(remembered);
       debugPrint(
         '[source-matcher] _resolve · kind=${c.kind} title="$title" '
         'reading source=$remembered',
       );
-      return matchOn(
+      final match = await matchOn(
         c,
         remembered,
         title: title,
@@ -488,6 +584,7 @@ class SourceMatcher {
         metadataAliases: metadataAliases,
         malId: malId,
       );
+      if (match != null && await _usableAutoMatch(c, match)) return match;
     }
 
     // Auto Resolve — the true default until the user pins a title or sets a
@@ -501,6 +598,7 @@ class SourceMatcher {
     );
     for (var i = 0; i < sweep.length; i++) {
       final s = sweep[i];
+      if (tried.contains(s.id)) continue;
       // The viewer left: stop before the next source. Going back out of a detail
       // screen used to leave this sweep running, so tapping titles quickly piled
       // up one live search per screen and each new tap waited behind all the
@@ -526,7 +624,8 @@ class SourceMatcher {
         abandoned: abandoned,
       );
       if (abandoned?.call() ?? false) return null;
-      if (m != null) {
+      if (m != null && await _usableAutoMatch(c, m)) {
+        if (abandoned?.call() ?? false) return null;
         debugPrint('[source-matcher] _resolve · AUTO → ${s.id}');
         if (isReading) await _prefs.rememberLastGood(c.kind, s.id);
         return m;
@@ -551,7 +650,12 @@ class SourceMatcher {
   /// what makes Auto Resolve the true default). Synchronous and never
   /// searches, so the Detail screen can name a fixed source on the first
   /// frame; it says nothing about what Auto Resolve itself will land on.
+  ///
+  /// Always null on Windows: there the kind default is only tried first (see
+  /// [preferredIsTryFirst]) and a title without its own choice is on Auto
+  /// Resolve, so nothing may name the default as this title's fixed source.
   String? selectedFor(ZKind kind) {
+    if (preferredIsTryFirst) return null;
     final list = _candidates(kind);
     final saved = _prefs.get(kind);
     if (saved != null && list.any((s) => s.id == saved)) {
@@ -577,6 +681,9 @@ class SourceMatcher {
   String? sourceForTitle(ZCanonical c) {
     final chosen = pinnedSource(c) ?? selectedFor(c.kind);
     if (chosen != null) return chosen;
+    // A last successful manga source is only the first candidate to try,
+    // never a fixed source selection. The selector must keep showing Auto.
+    if (c.kind == ZKind.manga) return null;
     if (c.kind != ZKind.manga && c.kind != ZKind.novel) return null;
     final remembered = _prefs.lastGood(c.kind);
     // Uninstalled or switched off since: fall back to Auto Resolve rather than
@@ -585,6 +692,21 @@ class SourceMatcher {
     return _sweepCandidates(c.kind).any((s) => s.id == remembered)
         ? remembered
         : null;
+  }
+
+  /// True where the kind's preferred source (Settings > Source Priority) means
+  /// "try this one first, then fall back to Auto Resolve" rather than "use
+  /// only this one". Windows only: that is where the setting is offered, and
+  /// phone/TV keep their existing fixed-default behaviour.
+  static bool get preferredIsTryFirst =>
+      defaultTargetPlatform == TargetPlatform.windows;
+
+  /// The kind's preferred source when one is set and still installed, else
+  /// null. Unlike [selectedFor] this is the raw preference on every platform.
+  String? preferredFor(ZKind kind) {
+    final saved = _prefs.get(kind);
+    if (saved == null) return null;
+    return _candidates(kind).any((s) => s.id == saved) ? saved : null;
   }
 
   /// Make [sourceId] the explicit default for [kind], for every title of that
@@ -666,8 +788,20 @@ class SourceMatcher {
   /// kind) genuinely sweeps again. A per-title pin alone isn't enough here —
   /// a kind default set earlier (e.g. via [chooseSource]) would otherwise
   /// keep outranking Auto Resolve and the picker would never actually show it.
+  ///
+  /// Windows: only THIS title's own choice is removed. The kind default is a
+  /// try-first hint there (it never outranks Auto Resolve) and the reading
+  /// hint is shared by every title of the kind, so wiping either from one
+  /// title's picker reset Settings for the whole library. The global default
+  /// is cleared from Settings > Source Priority only.
   Future<void> clearAuto(ZCanonical c) async {
     await clearTitlePin(c);
+    if (preferredIsTryFirst) {
+      // Per-title: forget which source last played this title, so its next
+      // resolve really is a fresh Auto Resolve.
+      await _store.clearLastPlayed(c);
+      return;
+    }
     await _prefs.clear(c.kind);
     // Reading remembers the source that last matched and starts there instead
     // of sweeping. Picking "Auto Resolve" has to forget that too, or the very

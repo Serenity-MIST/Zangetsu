@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../desktop/desktop_dialogs.dart';
+import '../desktop/desktop_sheet.dart';
 import '../di/injector.dart';
 import '../models/media_item.dart';
 import '../playback/category_store.dart';
@@ -23,8 +25,12 @@ Future<void> showCategoryPicker(BuildContext context, MediaItem item) async {
     if (made == null || !context.mounted) return;
   }
 
-  await showModalBottomSheet<void>(
-    context: context,
+  // Windows: a centred graphite dialog with its own title bar (Esc closes);
+  // phone/TV: the same rounded bottom sheet as before.
+  await showAdaptiveSheet<void>(
+    context,
+    title: 'Categories',
+    desktopStyle: DesktopSheetStyle.dialog,
     backgroundColor: AppColors.surface,
     shape: const RoundedRectangleBorder(
       borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
@@ -34,13 +40,15 @@ Future<void> showCategoryPicker(BuildContext context, MediaItem item) async {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 18, 20, 6),
-              child: Align(
-                alignment: AlignmentDirectional.centerStart,
-                child: Text('Categories', style: AppText.title),
+            // Phone heading; the desktop dialog's title bar already says it.
+            if (!DesktopSheetScope.of(ctx))
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 18, 20, 6),
+                child: Align(
+                  alignment: AlignmentDirectional.centerStart,
+                  child: Text('Categories', style: AppText.title),
+                ),
               ),
-            ),
             Flexible(
               child: ListView(
                 shrinkWrap: true,
@@ -91,31 +99,13 @@ Future<ListCategory?> _promptNewCategory(
   BuildContext context,
   CategoryStore store,
 ) async {
-  final controller = TextEditingController();
-  final name = await showDialog<String>(
-    context: context,
-    builder: (ctx) => AlertDialog(
-      backgroundColor: AppColors.surface,
-      title: Text('New category', style: AppText.title),
-      content: TextField(
-        controller: controller,
-        autofocus: true,
-        style: AppText.body.copyWith(color: AppColors.textPrimary),
-        decoration: const InputDecoration(hintText: 'Persona, Gym, …'),
-        onSubmitted: (v) => Navigator.pop(ctx, v),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(ctx),
-          child: const Text('Cancel'),
-        ),
-        FilledButton(
-          onPressed: () => Navigator.pop(ctx, controller.text),
-          style: FilledButton.styleFrom(backgroundColor: AppColors.accent),
-          child: const Text('Create'),
-        ),
-      ],
-    ),
+  // Graphite prompt on Windows, the same AlertDialog as before on phone.
+  final name = await showAdaptiveTextPrompt(
+    context,
+    title: 'New category',
+    hint: 'Persona, Gym, …',
+    cancelLabel: 'Cancel',
+    confirmLabel: 'Create',
   );
   if (name == null) return null;
   return store.create(name);

@@ -1,9 +1,31 @@
+import 'desktop_sidebar_pages.dart';
+import 'desktop_sync_indicator.dart';
+import '../../core/desktop/desktop_focus_repair.dart';
+import '../../core/desktop/desktop_history_opener.dart';
+import '../../core/desktop/desktop_media_selector.dart';
+import '../../core/desktop/desktop_settings_opener.dart';
+import '../../core/desktop/desktop_shortcuts.dart';
+import '../../core/desktop/desktop_window.dart';
+import '../../core/notify/new_episode_inbox.dart';
+// dl-11: the notification-click hook for the Downloads page.
+import '../../core/notify/notification_router.dart'
+    show openDownloadsFromNotification;
+import '../../core/ui/global_messenger.dart';
+import '../settings/keyboard_shortcuts_screen.dart'
+    show showKeyboardShortcutsHelp;
+import '../home/lists_hub_screen.dart';
+import '../home/genres_screen.dart';
+import '../settings/streaming_services_screen.dart';
+import '../notify/subscriptions_screen.dart';
 import 'dart:async';
+import 'desktop_shell_workspace.dart';
+import 'desktop_top_bar_avatar.dart';
 import '../../core/theme/theme_controller.dart';
 import 'dart:math' as math;
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:fluttertoast/fluttertoast.dart';
@@ -34,7 +56,9 @@ import '../../core/ui/adaptive_layout.dart';
 import '../../core/ui/frosted_surface.dart';
 import '../downloads/downloads_screen.dart';
 import '../history/history_screen.dart';
+import '../player/desktop_floating_player.dart';
 import '../profiles/profile_lock_gate.dart';
+import '../profiles/profile_unlock.dart' show ensureProfileAccess;
 import '../profiles/viewer_profiles_screen.dart';
 import '../profiles/viewer_profile_home_screen.dart';
 import '../auth/auth_cubit.dart';
@@ -95,6 +119,17 @@ String? dockSearchFixedSourceId([ContentMode? mode]) {
   return HomeCataloguePrefs.sourceIdFor(m);
 }
 
+/// Whether the shell keeps Home mounted even while another dock tab or an
+/// in-frame page (History, Settings, ...) is showing. True on Windows when
+/// Home is one of the dock tabs: Home publishes the catalogue choices of the
+/// shell pill's catalogue picker and clears them when disposed, so it must
+/// stay mounted for the picker to show on every screen. Phones (false) keep
+/// mounting Home only when it is visited. Pure, so the rule is unit-testable.
+bool desktopKeepsHomeMounted({
+  required bool windowsUi,
+  required List<DockTab> tabs,
+}) => windowsUi && tabs.contains(DockTab.home);
+
 /// App-level navigation shell — a reorderable dock (3-5 tabs, [NavPrefs])
 /// via a custom floating capsule (frosted, hovering over the content; no
 /// Material NavigationBar).
@@ -119,6 +154,164 @@ class _RootShellState extends State<RootShell>
   DockTab get _tab => _selectedTab.value;
   final _visitedTabs = <DockTab>{};
   String? _visitedTabsProfileId;
+
+  /// Extra Windows destinations do not alter the shared mobile dock schema.
+  String? _desktopPage;
+
+  /// Shows the in-frame Windows page [page] (Schedule, Genres, History, ...)
+  /// over the current tab.
+  void _selectDesktopPage(String page) {
+    if (_desktopPage == page) return;
+    _lastBackPress = null;
+    setState(() => _desktopPage = page);
+    _repairFocusAfterSwitch();
+  }
+
+  /// R1: after a tab / page switch the hidden page's focus is dropped and
+  /// the new page's autofocus does not fire again, so give the keys to the
+  /// newly shown page once it is laid out (Windows UI only).
+  void _repairFocusAfterSwitch() {
+    if (!_windowsUi) return;
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => DesktopFocusRepair.run(),
+    );
+  }
+
+  /// Windows UI (not TV). Gated on [defaultTargetPlatform] so widget tests
+  /// can switch it on and phones never see it.
+  bool get _windowsUi => defaultTargetPlatform == TargetPlatform.windows;
+
+  /// True while the full-page Settings route opened by
+  /// [_openDesktopSettings] is on the navigator, so a second click or
+  /// Ctrl+, never stacks another Settings page on top of it.
+  bool _settingsRouteOpen = false;
+
+  /// acct-3: brings the shell back on screen and opens Profile, where the
+  /// user signs in. Called from the title-bar sync icon.
+  void _openProfileForSignIn() {
+    if (!mounted) return;
+    final route = ModalRoute.of(context);
+    // Close pages pushed over the shell so Profile is actually visible.
+    if (route != null && !route.isCurrent) {
+      Navigator.of(context).popUntil((r) => r == route);
+    }
+    _onTabSelected(DockTab.profile);
+  }
+
+  /// Opens Settings as a full page pushed over the whole shell, so it covers
+  /// the left rail and the top bar (the title bar stays: it sits above the
+  /// navigator). Back (its button, Esc, Alt+Left, mouse Back) pops the page
+  /// and shows exactly the tab / page underneath, e.g. Home.
+  ///
+  /// Installed as [DesktopSettingsOpener.handler] so the Profile page's
+  /// Settings button and Ctrl+, both open it the same way (Settings is not
+  /// on the rail).
+  void _openDesktopSettings() {
+    if (!mounted || _settingsRouteOpen) return;
+    _settingsRouteOpen = true;
+    _lastBackPress = null;
+    unawaited(
+      Navigator.of(context)
+          .push<void>(
+            MaterialPageRoute<void>(
+              // showBackButton: Settings' Back pops this route instead of
+              // asking the shell to swap an in-frame page.
+              builder: (_) => const SettingsScreen(showBackButton: true),
+            ),
+          )
+          .whenComplete(() {
+            // The page closed: allow opening it again, and give the keys
+            // back to the page that is showing again (R1).
+            _settingsRouteOpen = false;
+            if (mounted) _repairFocusAfterSwitch();
+          }),
+    );
+  }
+
+  /// Opens the in-frame History page (Ctrl+H, and the Profile page button
+  /// through [DesktopHistoryOpener.handler]); History left the rail.
+  void _openDesktopHistory() => _selectDesktopPage('history');
+
+  /// shell-7: the top-bar search box, focused by Ctrl+F and '/'.
+  final FocusNode _desktopSearchFocus = FocusNode(
+    debugLabel: 'desktop-shell-search',
+  );
+  final TextEditingController _desktopSearchCtrl = TextEditingController();
+
+  /// shell-9: query of the in-frame search page, and a counter so
+  /// submitting the same text again runs a fresh search.
+  String? _desktopSearchQuery;
+  int _desktopSearchSerial = 0;
+
+  /// shell-9: top-bar search opens results in the frame, like Schedule.
+  void _openDesktopSearch(String query) {
+    final q = query.trim();
+    if (q.isEmpty) return;
+    setState(() {
+      _desktopSearchQuery = q;
+      _desktopSearchSerial++;
+    });
+    _selectDesktopPage('search');
+  }
+
+  /// True while this shell's route is the one on screen, so app shortcuts
+  /// never act behind a pushed page, dialog or the player.
+  bool get _shellOnTop =>
+      mounted && (ModalRoute.of(context)?.isCurrent ?? true);
+
+  /// Rail destinations in rail order, for Ctrl+1..N (shell-7): the primary
+  /// tabs, then the extra shortcuts (Streaming, Schedule, Genres, Downloads).
+  List<VoidCallback> _desktopSections() => [
+    for (final entry in desktopRailTabs) () => _onTabSelected(entry.$1),
+    for (final shortcut in _desktopShortcuts()) shortcut.onTap,
+  ];
+
+  /// shell-7: focuses the top-bar search and selects its text.
+  void _focusDesktopSearch() {
+    _desktopSearchFocus.requestFocus();
+    _desktopSearchCtrl.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: _desktopSearchCtrl.text.length,
+    );
+  }
+
+  /// shell-7: app-scope keyboard actions handed to DesktopWindow. Pages
+  /// with their own Ctrl+F / Ctrl+number handlers sit deeper in the focus
+  /// tree and win; these only run while the shell is the page on screen.
+  Map<String, VoidCallback> _desktopAppActions() {
+    void onShell(VoidCallback action) {
+      if (_shellOnTop) action();
+    }
+
+    return {
+      'app.search': () => onShell(_focusDesktopSearch),
+      for (var i = 1; i <= 9; i++)
+        'app.section$i': () => onShell(() {
+          final sections = _desktopSections();
+          if (i <= sections.length) sections[i - 1]();
+        }),
+      for (var i = 1; i <= modeChoices.length && i <= 4; i++)
+        'app.mode$i': () => onShell(
+          () => unawaited(DesktopMediaSelector.select(modeChoices[i - 1])),
+        ),
+      'app.settings': () => onShell(_openDesktopSettings),
+      // Ctrl+H: History opens in the frame now that it left the rail.
+      'app.history': () => onShell(_openDesktopHistory),
+      // acct-11: 'app.lockProfile' (Ctrl+L) is deliberately not bound here.
+      // DesktopProfileRelock handles and consumes it through a
+      // HardwareKeyboard handler; menus call DesktopProfileRelock.lockNow().
+      // The help overlay works over any page.
+      'app.help': () {
+        final overlayContext = rootNavigatorKey.currentContext ?? context;
+        unawaited(
+          showKeyboardShortcutsHelp(
+            overlayContext,
+            scope: DesktopShortcutScope.app,
+          ),
+        );
+      },
+    };
+  }
 
   /// Whether the floating mode bar (Anime / Movie/TV / Manga / Novel) is
   /// showing above the dock. Z Mode only — the centre button that toggles it
@@ -180,6 +373,18 @@ class _RootShellState extends State<RootShell>
     _switch = CurvedAnimation(parent: _switchCtrl, curve: Curves.easeOutCubic);
     _navPrefs.addListener(_onTabsChanged);
     ZModePrefs.revision.addListener(_onZMode);
+    if (_windowsUi && !(sl.isRegistered<AppMode>() && sl<AppMode>().isTv)) {
+      // shell-7: app-wide shortcuts.
+      DesktopWindow.setAppActions(_desktopAppActions());
+      // Profile page buttons: Settings opens as a full page over the shell,
+      // History in the frame.
+      DesktopSettingsOpener.handler = _openDesktopSettings;
+      DesktopHistoryOpener.handler = _openDesktopHistory;
+      // acct-3: the title-bar sync icon opens Profile when sign-in is needed.
+      DesktopSyncIndicator.signInHandler = _openProfileForSignIn;
+      // dl-11: a click on a download batch notification opens Downloads.
+      openDownloadsFromNotification = _openDownloadsFromNotification;
+    }
     if (sl.isRegistered<ViewerProfileStore>()) {
       sl<ViewerProfileStore>().active.addListener(_onProfileChanged);
       sl<ViewerProfileStore>().contextRevision.addListener(
@@ -265,8 +470,8 @@ class _RootShellState extends State<RootShell>
 
   /// The dock as actually rendered. Every tab suits every content mode now
   /// that Schedule lives on Home instead (see `_scheduleCard` there), so this
-  /// is just the user's order.
-  List<DockTab> _visibleTabs() => _navPrefs.tabs;
+  /// is just the user's order. The Windows rail always carries every tab.
+  List<DockTab> _visibleTabs() => _windowsUi ? DockTab.values : _navPrefs.tabs;
 
   @override
   void dispose() {
@@ -280,11 +485,39 @@ class _RootShellState extends State<RootShell>
     }
     _switchCtrl.dispose();
     _selectedTab.dispose();
+    // Only remove the Windows hooks this shell installed.
+    // The Settings opener doubles as the "this shell installed the Windows
+    // hooks" marker, so the app actions are cleared with it.
+    if (DesktopSettingsOpener.handler == _openDesktopSettings) {
+      DesktopSettingsOpener.handler = null;
+      DesktopWindow.setAppActions(null);
+    }
+    if (DesktopHistoryOpener.handler == _openDesktopHistory) {
+      DesktopHistoryOpener.handler = null;
+    }
+    if (DesktopSyncIndicator.signInHandler == _openProfileForSignIn) {
+      DesktopSyncIndicator.signInHandler = null;
+    }
+    if (openDownloadsFromNotification == _openDownloadsFromNotification) {
+      openDownloadsFromNotification = null;
+    }
+    _desktopSearchFocus.dispose();
+    _desktopSearchCtrl.dispose();
     super.dispose();
   }
 
+  /// Windows (dl-11): a download notification was clicked. Close whatever is
+  /// pushed over the shell (detail pages, dialogs) and show the Downloads tab.
+  void _openDownloadsFromNotification() {
+    if (!mounted) return;
+    rootNavigatorKey.currentState?.popUntil((route) => route.isFirst);
+    _onTabSelected(DockTab.downloads);
+  }
+
   void _onTabSelected(DockTab tab) {
-    if (tab == DockTab.profile) {
+    // The double-tap-Profile-for-Settings shortcut is phone-only: Windows
+    // opens Settings from the Profile page and Ctrl+, instead.
+    if (tab == DockTab.profile && !_windowsUi) {
       final now = DateTime.now();
       final lastTap = _lastProfileTap;
       _lastProfileTap = now;
@@ -301,9 +534,17 @@ class _RootShellState extends State<RootShell>
     } else {
       _lastProfileTap = null;
     }
-    if (tab == _tab) return; // Re-tapping the current tab: no transition.
+    // Re-tapping the current tab: no transition (unless leaving a desktop
+    // page on Windows).
+    if (tab == _tab && _desktopPage == null) return;
     DockScrollCollapse.reset();
     _selectedTab.value = tab;
+    if (_windowsUi) {
+      // The Windows workspace is built in build(), so it needs a rebuild to
+      // show the new tab and drop any in-frame page.
+      setState(() => _desktopPage = null);
+      _repairFocusAfterSwitch();
+    }
     _switchCtrl.forward(from: 0);
     if (tab == DockTab.myList && sl.isRegistered<MyListStore>()) {
       unawaited(sl<MyListStore>().pullFromCloud());
@@ -318,6 +559,19 @@ class _RootShellState extends State<RootShell>
     // search) owns this Back — its own PopScope handles it in the same event.
     // Both PopScopes share this route, so Flutter fires ours too; bail so we
     // don't flash the exit toast over a normal in-tab back-out.
+    // Extra desktop pages own Back before any retained hidden tab's interceptor.
+    if (_windowsUi) {
+      _lastBackPress = null;
+      // Settings is a route pushed over the shell, so its Back pops that
+      // route and never reaches here.
+      if (_desktopPage != null) {
+        setState(() => _desktopPage = null);
+        return;
+      }
+      // shell-1 / shell-6: on a PC, Esc and Back never quit the app, so
+      // the root never reaches the "press back again to exit" toast.
+      return;
+    }
     if (shellBackIntercepted.value) return;
     final now = DateTime.now();
     if (_lastBackPress != null &&
@@ -365,6 +619,14 @@ class _RootShellState extends State<RootShell>
     _visitedTabs
       ..retainAll(tabs)
       ..add(tabs.contains(_tab) ? _tab : tabs.first);
+    // Windows: Home is the only page that publishes the catalogue choices
+    // for the shell pill's catalogue picker ("AniList ▾"), and it clears them
+    // when it is disposed. Keeping Home mounted (hidden, tickers muted) makes
+    // the picker show on every screen that shows the pill. Phones keep lazy
+    // Home.
+    if (desktopKeepsHomeMounted(windowsUi: _windowsUi, tabs: tabs)) {
+      _visitedTabs.add(DockTab.home);
+    }
 
     if (_visitedTabs.contains(DockTab.search)) {
       final sourceId = dockSearchFixedSourceId();
@@ -381,22 +643,137 @@ class _RootShellState extends State<RootShell>
           key: ValueKey(
             '$profileId:${t.name}:${ThemeController.revision.value}',
           ),
-          child: !_visitedTabs.contains(t)
-              ? const SizedBox.shrink()
-              : switch (t) {
-                  DockTab.home =>
-                    deferInactiveTabs ? _deferredHomePage : _homePage,
-                  DockTab.search => _searchPage,
-                  DockTab.myList => const MyListScreen(),
-                  DockTab.profile => _profilePage,
-                  // Both normally get pushed with a back button; as tabs they own the
-                  // whole screen, so their own back affordance is suppressed.
-                  DockTab.downloads => const DownloadsScreen(showBack: false),
-                  DockTab.history => const HistoryScreen(showBack: false),
-                  DockTab.sources => const BrowseSourcesScreen(),
-                },
+          child: _desktopTabPage(
+            t,
+            !_visitedTabs.contains(t)
+                ? const SizedBox.shrink()
+                : switch (t) {
+                    DockTab.home =>
+                      deferInactiveTabs ? _deferredHomePage : _homePage,
+                    DockTab.search => _searchPage,
+                    DockTab.myList => const MyListScreen(),
+                    DockTab.profile => _profilePage,
+                    // Both normally get pushed with a back button; as tabs they own the
+                    // whole screen, so their own back affordance is suppressed.
+                    DockTab.downloads => const DownloadsScreen(showBack: false),
+                    DockTab.history => const HistoryScreen(showBack: false),
+                    DockTab.sources => const BrowseSourcesScreen(),
+                  },
+          ),
         ),
     ];
+  }
+
+  /// Windows only: tickers run only on the current tab, and the page is
+  /// wrapped in [TooltipVisibility] so a tooltip label that was fading out
+  /// when the tab changed is removed at once instead of freezing on screen
+  /// (its fade animation stops when the page's tickers are muted). Phones get
+  /// [page] back untouched.
+  Widget _desktopTabPage(DockTab tab, Widget page) {
+    if (!_windowsUi) return page;
+    return TooltipVisibility(
+      visible: tab == _tab,
+      child: TickerMode(enabled: tab == _tab, child: page),
+    );
+  }
+
+  /// Extra Windows rail destinations below the primary tabs, in rail order.
+  List<({String id, String label, String icon, VoidCallback onTap})>
+  _desktopShortcuts() => [
+    if (!sl<ContentModeCubit>().state.isReading)
+      (
+        id: 'streaming',
+        label: context.l10n.streamingServices,
+        icon: 'circle-play',
+        onTap: () => _selectDesktopPage('streaming'),
+      ),
+    (
+      id: 'schedule',
+      label: 'Schedule & lists',
+      icon: 'calendar-days',
+      onTap: () => _selectDesktopPage('schedule'),
+    ),
+    (
+      id: 'genres',
+      label: 'Genres',
+      icon: 'tags',
+      onTap: () => _selectDesktopPage('genres'),
+    ),
+    (
+      id: 'downloads',
+      label: 'Downloads',
+      icon: 'download',
+      onTap: () => _onTabSelected(DockTab.downloads),
+    ),
+  ];
+
+  /// The Windows window body: the icon rail, the top bar and the frame that
+  /// shows either an in-frame page or the retained dock tabs.
+  Widget _buildDesktopWorkspace() {
+    final tabs = _visibleTabs();
+    final profile = sl.isRegistered<ViewerProfileStore>()
+        ? sl<ViewerProfileStore>().activeProfile
+        : null;
+    final profileId = sl.isRegistered<ViewerProfileStore>()
+        ? sl<ViewerProfileStore>().dataProfileId
+        : 'default';
+    return DesktopShellWorkspace(
+      active: _tab,
+      activeShortcut: _desktopPage,
+      onSelected: _onTabSelected,
+      // shell-9: Notifications open in the frame like Schedule, and the
+      // bell shows the unread new-episode count.
+      onNotifications: () => _selectDesktopPage('notifications'),
+      unreadNotifications: NewEpisodeInbox.unread,
+      // shell-7: Ctrl+F and '/' focus this box.
+      searchFocusNode: _desktopSearchFocus,
+      searchController: _desktopSearchCtrl,
+      shortcuts: _desktopShortcuts(),
+      // shell-9: results open in the frame instead of a full-window page.
+      onSearch: _openDesktopSearch,
+      // The top-right avatar picks its picture the same way the Profile
+      // page does and redraws itself when the profile or account changes.
+      profile: const DesktopTopBarAvatar(),
+      child: DesktopSidebarPages(
+        key: ValueKey('desktop-pages:${profile?.id ?? 'default'}'),
+        selected: _desktopPage,
+        builders: {
+          'streaming': (_) => const StreamingServicesScreen(),
+          'schedule': (_) => const ListsHubScreen(),
+          'genres': (_) => const GenresScreen(),
+          // shell-9: top-bar search results, rebuilt for every submit.
+          'search': (_) => SearchScreen(
+            key: ValueKey('desktop-search:$_desktopSearchSerial'),
+            showBack: false,
+            initialQuery: _desktopSearchQuery,
+          ),
+          'notifications': (_) => const SubscriptionsScreen(),
+          // Settings is not an in-frame page: it opens as a full page over
+          // the rail (see _openDesktopSettings).
+          // History in the frame (Ctrl+H / Profile page); Esc returns to
+          // the tab underneath.
+          'history': (_) => const HistoryScreen(showBack: false),
+        },
+        // Rebuilds on tab and theme changes like the phone body, so retained
+        // desktop tabs pick up new colours too.
+        fallback: ListenableBuilder(
+          listenable: Listenable.merge([
+            _selectedTab,
+            ThemeController.revision,
+          ]),
+          builder: (context, _) => IndexedStack(
+            index: math.max(0, tabs.indexOf(_tab)),
+            children: _pagesFor(
+              tabs,
+              profileId,
+              deferInactiveTabs:
+                  _deferTabsForPicker ||
+                  ProfileShellScope.shouldDeferTabs(context),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   @override
@@ -407,6 +784,13 @@ class _RootShellState extends State<RootShell>
     }
     if (deferContent) {
       return ColoredBox(color: AppColors.bg, child: const SizedBox.expand());
+    }
+    // Windows lets the user choose a Start page other than Home, and Home is
+    // only built when visited, so launch checks (update dialog, daily
+    // extension auto-update) start here once the shell is unlocked and shown.
+    // AppLaunchChecks runs once per process, so Home mounting later is a no-op.
+    if (_windowsUi && !AppLaunchChecks.started) {
+      AppLaunchChecks.runOnce(this);
     }
     return PopScope(
       // Intercept Back at the app root: first press toasts, second exits.
@@ -421,202 +805,233 @@ class _RootShellState extends State<RootShell>
           // Always rebuild: the dock's items are computed in build(), so the
           // mode change has to reach it. No tab has to be bounced off any
           // more — the dock is the same in every mode now that Schedule is
-          // not in it.
-          setState(() {});
+          // not in it. Windows drops the Streaming page in reading modes.
+          setState(() {
+            if (mode.isReading && _desktopPage == 'streaming') {
+              _desktopPage = null;
+            }
+          });
         },
         child: Scaffold(
           backgroundColor: AppColors.bg,
           // Content runs under the floating dock (screens keep their own bottom
           // padding so the last row scrolls clear of it).
           extendBody: true,
-          body: NotificationListener<ScrollNotification>(
-            // One place, so no screen has to know the dock exists. Returns
-            // false throughout — it reads the scroll, never eats it.
-            onNotification: (notification) => DockScrollCollapse.onNotification(
-              notification,
-              enabled: !_keepDockExpanded,
-            ),
-            child: Builder(
-              builder: (context) {
-                final deferInactiveTabs =
-                    _deferTabsForPicker ||
-                    ProfileShellScope.shouldDeferTabs(context);
-                final visible = _visibleTabs();
-                return AnimatedBuilder(
-                  animation: _switch,
-                  builder: (context, child) {
-                    final v = _switch.value;
-                    // Incoming tab fades in from 0.4 and slides up 20px. Never blanks.
-                    return Opacity(
-                      opacity: 0.4 + 0.6 * v,
-                      child: Transform.translate(
-                        offset: Offset(0, (1 - v) * 20),
-                        child: child,
+          // Windows uses its sidebar workspace; phones keep the dock body.
+          body: _windowsUi
+              ? _buildDesktopWorkspace()
+              : NotificationListener<ScrollNotification>(
+                  // One place, so no screen has to know the dock exists. Returns
+                  // false throughout — it reads the scroll, never eats it.
+                  onNotification: (notification) =>
+                      DockScrollCollapse.onNotification(
+                        notification,
+                        enabled: !_keepDockExpanded,
                       ),
-                    );
-                  },
-                  // RepaintBoundary → the page is a single cached layer the transition
-                  // just composites (opacity + translate), so no repaint per frame.
-                  child: RepaintBoundary(
-                    child: ListenableBuilder(
-                      listenable: Listenable.merge([
-                        _selectedTab,
-                        ThemeController.revision,
-                      ]),
-                      builder: (context, _) => IndexedStack(
-                        // indexOf can be -1 for one frame if the mode flipped before
-                        // the listener ran; clamp rather than throw.
-                        index: math.max(0, visible.indexOf(_tab)),
-                        children: _pagesFor(
-                          visible,
-                          sl.isRegistered<ViewerProfileStore>()
-                              ? sl<ViewerProfileStore>().dataProfileId
-                              : 'default',
-                          deferInactiveTabs: deferInactiveTabs,
+                  child: Builder(
+                    builder: (context) {
+                      final deferInactiveTabs =
+                          _deferTabsForPicker ||
+                          ProfileShellScope.shouldDeferTabs(context);
+                      final visible = _visibleTabs();
+                      return AnimatedBuilder(
+                        animation: _switch,
+                        builder: (context, child) {
+                          final v = _switch.value;
+                          // Incoming tab fades in from 0.4 and slides up 20px. Never blanks.
+                          return Opacity(
+                            opacity: 0.4 + 0.6 * v,
+                            child: Transform.translate(
+                              offset: Offset(0, (1 - v) * 20),
+                              child: child,
+                            ),
+                          );
+                        },
+                        // RepaintBoundary → the page is a single cached layer the transition
+                        // just composites (opacity + translate), so no repaint per frame.
+                        child: RepaintBoundary(
+                          child: ListenableBuilder(
+                            listenable: Listenable.merge([
+                              _selectedTab,
+                              ThemeController.revision,
+                            ]),
+                            builder: (context, _) => IndexedStack(
+                              // indexOf can be -1 for one frame if the mode flipped before
+                              // the listener ran; clamp rather than throw.
+                              index: math.max(0, visible.indexOf(_tab)),
+                              children: _pagesFor(
+                                visible,
+                                sl.isRegistered<ViewerProfileStore>()
+                                    ? sl<ViewerProfileStore>().dataProfileId
+                                    : 'default',
+                                deferInactiveTabs: deferInactiveTabs,
+                              ),
+                            ),
+                          ),
                         ),
-                      ),
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-          bottomNavigationBar: ListenableBuilder(
-            listenable: Listenable.merge([
-              _selectedTab,
-              dockHiddenBySection,
-              HomeCataloguePrefs.revision,
-            ]),
-            builder: (context, _) {
-              // Slide the dock away only when a Settings section is open AND the
-              // Profile tab is showing — every other tab keeps its dock.
-              final hide = dockHiddenBySection.value && _tab == DockTab.profile;
-              final modesEnabled =
-                  ZModePrefs.enabled &&
-                  !(HomeCataloguePrefs.stremioSelected &&
-                      sl<ContentModeCubit>().state == ContentMode.anime);
-              return Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (modesEnabled && _navPrefs.style == NavBarStyle.dock)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: BlocBuilder<ContentModeCubit, ContentMode>(
-                        bloc: sl<ContentModeCubit>(),
-                        builder: (_, mode) => ModeBar(
-                          open: _modeBarOpen,
-                          current: (mode, ZModePrefs.streamKind),
-                          onPicked: (m, k) async {
-                            setState(() => _modeBarOpen = false);
-                            await ZModePrefs.setStreamKind(k);
-                            await sl<ContentModeCubit>().setMode(m);
-                            if (m != ContentMode.anime) {
-                              sl<HomeCubit>().load(reset: true);
-                            }
-                          },
-                        ),
-                      ),
-                    ),
-                  // Collapse the SLOT as well as sliding the dock out of it.
-                  // The dock is this Scaffold's bottomNavigationBar and the
-                  // shell sets extendBody, so its height lands in the body's
-                  // MediaQuery bottom padding whether or not it is on screen.
-                  // Sliding alone left an open Settings section reserving a
-                  // dock's worth of space for a dock that wasn't there.
-                  TweenAnimationBuilder<double>(
-                    tween: Tween<double>(begin: 1, end: hide ? 0 : 1),
-                    duration: const Duration(milliseconds: 240),
-                    // Held at one end, then changed in a step — deliberately
-                    // NOT eased across the whole 240ms.
-                    //
-                    // This factor is the dock's height, the dock is the
-                    // Scaffold's bottomNavigationBar, and the shell sets
-                    // extendBody. So every distinct value here relays out the
-                    // Scaffold and rebuilds the body — and the body is an
-                    // IndexedStack, which lays out all mounted tabs. Easing
-                    // it smoothly meant ~14 rebuilds of
-                    // Home, My List and Sources for a dock animation, which
-                    // measured 13-36ms of build per frame while raster sat
-                    // at 3-5ms. It is why opening a Settings section stuttered
-                    // and opening Playback or History never did: only the
-                    // in-page sections hide the dock.
-                    //
-                    // Collapse late and expand early, so the slide below has
-                    // its space for the whole of its travel either way.
-                    curve: hide
-                        ? const Interval(0.88, 1, curve: Curves.easeOutCubic)
-                        : const Interval(0, 0.12, curve: Curves.easeOutCubic),
-                    builder: (context, factor, child) {
-                      final aligned = Align(
-                        alignment: Alignment.topCenter,
-                        heightFactor: factor,
-                        child: child,
                       );
-                      return factor < 1 ? ClipRect(child: aligned) : aligned;
                     },
-                    child: AnimatedSlide(
-                      offset: hide ? const Offset(0, 1.6) : Offset.zero,
-                      duration: const Duration(milliseconds: 240),
-                      curve: Curves.easeOutCubic,
-                      child: IgnorePointer(
-                        ignoring: hide,
-                        // Scoped to the dock subtree on purpose. The dock's
-                        // HEIGHT never changes below, so the Scaffold keeps its
-                        // bottom inset and the body is never rebuilt by this.
-                        child: ValueListenableBuilder<bool>(
-                          valueListenable: dockCollapsedByScroll,
-                          builder: (context, collapsed, child) {
-                            final tabs = _visibleTabs();
-                            if (_navPrefs.style == NavBarStyle.liquid) {
-                              return _LiquidNavDock(
-                                tabs: tabs,
-                                active: _tab,
-                                collapsed: collapsed && !_keepDockExpanded,
-                                glassTint: _navPrefs.glassTint,
-                                glassVisibility: _navPrefs.glassVisibility,
-                                glassQuality: _navPrefs.glassQuality,
-                                glassBlurEnabled: _navPrefs.glassBlurEnabled,
-                                onSelected: _onTabSelected,
-                                modesEnabled: modesEnabled,
-                                onModeSelected: (mode, kind) async {
-                                  await ZModePrefs.setStreamKind(kind);
-                                  await sl<ContentModeCubit>().setMode(mode);
-                                  if (mode != ContentMode.anime) {
+                  ),
+                ),
+          // Windows navigates with its rail, so it has no bottom dock.
+          bottomNavigationBar: _windowsUi
+              ? null
+              : ListenableBuilder(
+                  listenable: Listenable.merge([
+                    _selectedTab,
+                    dockHiddenBySection,
+                    HomeCataloguePrefs.revision,
+                  ]),
+                  builder: (context, _) {
+                    // Slide the dock away only when a Settings section is open AND the
+                    // Profile tab is showing — every other tab keeps its dock.
+                    final hide =
+                        dockHiddenBySection.value && _tab == DockTab.profile;
+                    final modesEnabled =
+                        ZModePrefs.enabled &&
+                        !(HomeCataloguePrefs.stremioSelected &&
+                            sl<ContentModeCubit>().state == ContentMode.anime);
+                    return Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (modesEnabled && _navPrefs.style == NavBarStyle.dock)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: BlocBuilder<ContentModeCubit, ContentMode>(
+                              bloc: sl<ContentModeCubit>(),
+                              builder: (_, mode) => ModeBar(
+                                open: _modeBarOpen,
+                                current: (mode, ZModePrefs.streamKind),
+                                onPicked: (m, k) async {
+                                  setState(() => _modeBarOpen = false);
+                                  await ZModePrefs.setStreamKind(k);
+                                  await sl<ContentModeCubit>().setMode(m);
+                                  if (m != ContentMode.anime) {
                                     sl<HomeCubit>().load(reset: true);
                                   }
                                 },
-                              );
-                            }
-                            return _FloatingDock(
-                              collapsed: collapsed && !_keepDockExpanded,
-                              tabs: tabs,
-                              active: _tab,
-                              onSelected: _onTabSelected,
-                              centre: modesEnabled
-                                  ? BlocBuilder<ContentModeCubit, ContentMode>(
-                                      bloc: sl<ContentModeCubit>(),
-                                      builder: (_, mode) => ModeFab(
-                                        open: _modeBarOpen,
-                                        icon: iconForMode(
-                                          mode,
-                                          ZModePrefs.streamKind,
-                                        ),
-                                        onTap: () => setState(
-                                          () => _modeBarOpen = !_modeBarOpen,
-                                        ),
-                                      ),
-                                    )
-                                  : null,
+                              ),
+                            ),
+                          ),
+                        // Collapse the SLOT as well as sliding the dock out of it.
+                        // The dock is this Scaffold's bottomNavigationBar and the
+                        // shell sets extendBody, so its height lands in the body's
+                        // MediaQuery bottom padding whether or not it is on screen.
+                        // Sliding alone left an open Settings section reserving a
+                        // dock's worth of space for a dock that wasn't there.
+                        TweenAnimationBuilder<double>(
+                          tween: Tween<double>(begin: 1, end: hide ? 0 : 1),
+                          duration: const Duration(milliseconds: 240),
+                          // Held at one end, then changed in a step — deliberately
+                          // NOT eased across the whole 240ms.
+                          //
+                          // This factor is the dock's height, the dock is the
+                          // Scaffold's bottomNavigationBar, and the shell sets
+                          // extendBody. So every distinct value here relays out the
+                          // Scaffold and rebuilds the body — and the body is an
+                          // IndexedStack, which lays out all mounted tabs. Easing
+                          // it smoothly meant ~14 rebuilds of
+                          // Home, My List and Sources for a dock animation, which
+                          // measured 13-36ms of build per frame while raster sat
+                          // at 3-5ms. It is why opening a Settings section stuttered
+                          // and opening Playback or History never did: only the
+                          // in-page sections hide the dock.
+                          //
+                          // Collapse late and expand early, so the slide below has
+                          // its space for the whole of its travel either way.
+                          curve: hide
+                              ? const Interval(
+                                  0.88,
+                                  1,
+                                  curve: Curves.easeOutCubic,
+                                )
+                              : const Interval(
+                                  0,
+                                  0.12,
+                                  curve: Curves.easeOutCubic,
+                                ),
+                          builder: (context, factor, child) {
+                            final aligned = Align(
+                              alignment: Alignment.topCenter,
+                              heightFactor: factor,
+                              child: child,
                             );
+                            return factor < 1
+                                ? ClipRect(child: aligned)
+                                : aligned;
                           },
+                          child: AnimatedSlide(
+                            offset: hide ? const Offset(0, 1.6) : Offset.zero,
+                            duration: const Duration(milliseconds: 240),
+                            curve: Curves.easeOutCubic,
+                            child: IgnorePointer(
+                              ignoring: hide,
+                              // Scoped to the dock subtree on purpose. The dock's
+                              // HEIGHT never changes below, so the Scaffold keeps its
+                              // bottom inset and the body is never rebuilt by this.
+                              child: ValueListenableBuilder<bool>(
+                                valueListenable: dockCollapsedByScroll,
+                                builder: (context, collapsed, child) {
+                                  final tabs = _visibleTabs();
+                                  if (_navPrefs.style == NavBarStyle.liquid) {
+                                    return _LiquidNavDock(
+                                      tabs: tabs,
+                                      active: _tab,
+                                      collapsed:
+                                          collapsed && !_keepDockExpanded,
+                                      glassTint: _navPrefs.glassTint,
+                                      glassVisibility:
+                                          _navPrefs.glassVisibility,
+                                      glassQuality: _navPrefs.glassQuality,
+                                      glassBlurEnabled:
+                                          _navPrefs.glassBlurEnabled,
+                                      onSelected: _onTabSelected,
+                                      modesEnabled: modesEnabled,
+                                      onModeSelected: (mode, kind) async {
+                                        await ZModePrefs.setStreamKind(kind);
+                                        await sl<ContentModeCubit>().setMode(
+                                          mode,
+                                        );
+                                        if (mode != ContentMode.anime) {
+                                          sl<HomeCubit>().load(reset: true);
+                                        }
+                                      },
+                                    );
+                                  }
+                                  return _FloatingDock(
+                                    collapsed: collapsed && !_keepDockExpanded,
+                                    tabs: tabs,
+                                    active: _tab,
+                                    onSelected: _onTabSelected,
+                                    centre: modesEnabled
+                                        ? BlocBuilder<
+                                            ContentModeCubit,
+                                            ContentMode
+                                          >(
+                                            bloc: sl<ContentModeCubit>(),
+                                            builder: (_, mode) => ModeFab(
+                                              open: _modeBarOpen,
+                                              icon: iconForMode(
+                                                mode,
+                                                ZModePrefs.streamKind,
+                                              ),
+                                              onTap: () => setState(
+                                                () => _modeBarOpen =
+                                                    !_modeBarOpen,
+                                              ),
+                                            ),
+                                          )
+                                        : null,
+                                  );
+                                },
+                              ),
+                            ),
+                          ),
                         ),
-                      ),
-                    ),
-                  ),
-                ],
-              );
-            },
-          ),
+                      ],
+                    );
+                  },
+                ),
         ),
       ),
     );
@@ -1063,11 +1478,17 @@ class _FloatingDock extends StatelessWidget {
         ? math.max(16.0, (width - _tabletDockMax) / 2)
         : 16.0;
     final shutSide = math.max(openSide, (width - shutWidth) / 2);
-    final side = openSide + (shutSide - openSide) * t;
+    final windows = defaultTargetPlatform == TargetPlatform.windows;
+    final side = windows
+        ? math.max(
+            16.0,
+            (width - math.min(420.0, tabs.length * 60.0 + 60.0)) / 2,
+          )
+        : openSide + (shutSide - openSide) * t;
     final labels = 1 - t;
     final fab = _fabOpen - (_fabOpen - _fabShut) * t;
     // 9 open, 4 closed — the room the taller tap box needs, given back.
-    final pillPad = 9 - 5 * t;
+    final pillPad = windows ? 4.0 : 9 - 5 * t;
     return Padding(
       padding: EdgeInsets.fromLTRB(side, 0, side, bottomInset + 12),
       child: FakeFrost(
@@ -1274,13 +1695,24 @@ Future<void> _switchProfile(
   try {
     if (!context.mounted) return;
     final owner = profiles.ownerKey;
-    if (!await ensureProfileUnlocked(context, profile)) return;
+    // Windows also accepts (and moves) a PIN set by an older PC-only build.
+    final unlocked = defaultTargetPlatform == TargetPlatform.windows
+        ? await ensureProfileAccess(context, profile)
+        : await ensureProfileUnlocked(context, profile);
+    if (!unlocked) return;
     if (!context.mounted || profiles.ownerKey != owner) return;
     if (!profiles.profiles.any((p) => p.id == profile.id)) return;
     final locks = sl.isRegistered<ProfileLockStore>()
         ? sl<ProfileLockStore>()
         : null;
-    if (profiles.activeId != profile.id) locks?.approveSwitch(profile.id);
+    if (profiles.activeId != profile.id) {
+      // Windows: history is per profile, so a video in the floating mini
+      // player is saved to the profile that watched it and stopped first.
+      if (defaultTargetPlatform == TargetPlatform.windows) {
+        await closeFloatingPlayerBeforeProfileSwitch();
+      }
+      locks?.approveSwitch(profile.id);
+    }
     try {
       await profiles.switchTo(profile.id);
     } finally {

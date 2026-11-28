@@ -87,13 +87,28 @@ class NavPrefs extends ChangeNotifier {
   /// navigate out of.
   List<DockTab> get tabs {
     final raw = _box?.get(_tabsKey);
-    if (raw is! List || raw.isEmpty) return defaultTabs;
+    if (raw is! List || raw.isEmpty) return _desktopTabs(defaultTabs);
     final out = <DockTab>[];
     for (final name in raw) {
       final tab = DockTab.values.where((t) => t.name == name).firstOrNull;
       if (tab != null && !out.contains(tab)) out.add(tab);
     }
-    return _sanitize(out);
+    return _desktopTabs(_sanitize(out));
+  }
+
+  /// Preserves explicit desktop dock choices when reading saved/default tabs.
+  List<DockTab> _desktopTabs(List<DockTab> tabs) => tabs;
+
+  /// Classic has its own media filter; New follows the dock's current media.
+  String get myListStyle =>
+      _box?.get('myListStyle', defaultValue: 'classic') == 'new'
+      ? 'new'
+      : 'classic';
+
+  /// Persists a supported list style and refreshes subscribed list/settings UI.
+  Future<void> setMyListStyle(String style) async {
+    await _box?.put('myListStyle', style == 'new' ? 'new' : 'classic');
+    notifyListeners();
   }
 
   Future<void> setTabs(List<DockTab> tabs) async {
@@ -109,12 +124,29 @@ class NavPrefs extends ChangeNotifier {
   /// to. Falls back to the leftmost tab, which is where the app used to always
   /// start.
   DockTab get startTab {
-    final shown = tabs;
     final saved = DockTab.values
         .where((t) => t.name == _box?.get(_startKey))
         .firstOrNull;
+    // Windows has no dock: its fixed sidebar reaches every desktop start
+    // page, so validate against those instead of the phone dock (which may
+    // not contain Downloads) and fall back to Home.
+    if (defaultTargetPlatform == TargetPlatform.windows) {
+      return saved != null && desktopStartTabs.contains(saved)
+          ? saved
+          : DockTab.home;
+    }
+    final shown = tabs;
     return saved != null && shown.contains(saved) ? saved : shown.first;
   }
+
+  /// Pages the Windows app can open on. Each has a sidebar item, so the
+  /// highlighted item always matches the page shown at launch.
+  static const List<DockTab> desktopStartTabs = [
+    DockTab.home,
+    DockTab.myList,
+    DockTab.sources,
+    DockTab.downloads,
+  ];
 
   Future<void> setStartTab(DockTab tab) async {
     await _box?.put(_startKey, tab.name);
@@ -204,7 +236,7 @@ class NavPrefs extends ChangeNotifier {
   }
 
   bool get isDefault =>
-      listEquals(tabs, defaultTabs) &&
+      listEquals(tabs, _desktopTabs(defaultTabs)) &&
       startTab == defaultTabs.first &&
       !keepDockExpanded &&
       style == NavBarStyle.liquid &&

@@ -1,3 +1,5 @@
+import '../desktop/desktop_extension_unsupported.dart';
+import '../desktop/extension_runtime.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -13,12 +15,13 @@ import '../models/provider_info.dart';
 import '../models/video_source.dart';
 import '../error/exceptions.dart';
 import '../provider/base_provider.dart';
+import 'aniyomi_call_gate.dart';
 import 'aniyomi_filters.dart';
 import 'aniyomi_source_info.dart';
 import 'aniyomi_mapping.dart';
 
 /// Shared channel — matches the name registered in [AniyomiBridge.attach].
-const MethodChannel _aniChannel = MethodChannel('zangetsu/aniyomi');
+const ExtensionChannel _aniChannel = ExtensionChannel('zangetsu/aniyomi');
 
 /// Returns true when [provider] should be visible in source lists.
 ///
@@ -92,7 +95,8 @@ class AniyomiProvider implements BaseProvider {
   /// the corresponding native calls.  Category is unused for Aniyomi.
   @override
   Future<List<HomeSection>?> getHome({String category = 'sub'}) async {
-    if (!Platform.isAndroid) return null;
+    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable)
+      return null;
     final results = await Future.wait<List<MediaItem>>([
       popular(),
       _fetchLatest(),
@@ -124,7 +128,8 @@ class AniyomiProvider implements BaseProvider {
     int dateRange = 7,
     int page = 1,
   }) async {
-    if (!Platform.isAndroid) return const [];
+    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable)
+      return const [];
     // surfaceCloudflare: this feeds the Home rows, the one screen that can
     // offer the visible solve. See [_safeInvoke].
     return _invokeAnimeList('getPopular', {
@@ -157,7 +162,8 @@ class AniyomiProvider implements BaseProvider {
     String category = '',
     String? filtersJson,
   }) async {
-    if (!Platform.isAndroid) return const [];
+    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable)
+      return const [];
     final args = <String, dynamic>{
       'sourceId': info.id,
       'query': query,
@@ -166,13 +172,14 @@ class AniyomiProvider implements BaseProvider {
     if (filtersJson != null && filtersJson.isNotEmpty) {
       args['filters'] = filtersJson;
     }
-    return _invokeAnimeList('search', args);
+    return _invokeAnimeList('search', args, surfaceCloudflare: true);
   }
 
   /// Returns the typed filter schema for this source, or an empty list when
   /// the source has no filters or the platform is not Android.
   Future<List<AniyomiFilter>> getFilters() async {
-    if (!Platform.isAndroid) return const [];
+    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable)
+      return const [];
     final raw = await _safeInvoke('getFilterList', {'sourceId': info.id});
     if (raw == null || raw.isEmpty) return const [];
     return AniyomiFilters.parse(raw);
@@ -189,7 +196,8 @@ class AniyomiProvider implements BaseProvider {
       type: ProviderType.anime,
       sourceId: sourceId,
     );
-    if (!Platform.isAndroid) return fallback;
+    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable)
+      return fallback;
 
     // Aniyomi separates getDetails (anime metadata) from getEpisodes (list).
     // Fetch both in parallel to keep latency tight.
@@ -223,7 +231,8 @@ class AniyomiProvider implements BaseProvider {
     String url, {
     String category = 'sub',
   }) async {
-    if (!Platform.isAndroid) return const [];
+    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable)
+      return const [];
     final raw = await _safeInvoke('getEpisodes', {
       'sourceId': info.id,
       'url': url,
@@ -239,7 +248,8 @@ class AniyomiProvider implements BaseProvider {
     String episodeUrl, {
     bool fast = false,
   }) async {
-    if (!Platform.isAndroid) return const [];
+    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable)
+      return const [];
     final raw = await _safeInvoke('getVideoList', {
       'sourceId': info.id,
       'url': episodeUrl,
@@ -279,7 +289,8 @@ class AniyomiProvider implements BaseProvider {
     bool fetchDetails = true,
     bool fetchEpisodes = true,
   }) async {
-    if (!Platform.isAndroid) return const [];
+    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable)
+      return const [];
     final raw = await _safeInvoke('getAnimeEpisodeUpdate', {
       'sourceId': info.id,
       'url': url,
@@ -299,7 +310,8 @@ class AniyomiProvider implements BaseProvider {
     bool fetchDetails = true,
     bool fetchSeasons = true,
   }) async {
-    if (!Platform.isAndroid) return const [];
+    if (!Platform.isAndroid && !DesktopExtensionRuntime.isAvailable)
+      return const [];
     return _invokeAnimeList('getAnimeSeasonUpdate', {
       'sourceId': info.id,
       'url': url,
@@ -325,6 +337,14 @@ class AniyomiProvider implements BaseProvider {
     bool surfaceCloudflare = false,
   }) async {
     try {
+      // Windows: episode and video lists share one extension engine, so they
+      // go through a small gate (see [AniyomiCallGate]).
+      if (AniyomiCallGate.enabled && AniyomiCallGate.gates(method)) {
+        return await AniyomiCallGate.instance.run(
+          '$method ${jsonEncode(args)}',
+          () => _aniChannel.invokeMethod<String>(method, args),
+        );
+      }
       return await _aniChannel.invokeMethod<String>(method, args);
     } on PlatformException catch (e) {
       if (surfaceCloudflare && e.code == 'CLOUDFLARE') {
@@ -333,6 +353,12 @@ class AniyomiProvider implements BaseProvider {
         );
       }
       debugPrint('[aniyomi] $method(sourceId=${info.id}) failed: $e');
+      // Windows: "Stub!" is the engine lacking an Android class this
+      // extension needs, not a missing title. Remember the source so the
+      // player can say so (plan item B2). No-op on other platforms.
+      if (DesktopExtensionUnsupported.isStubError(e)) {
+        DesktopExtensionUnsupported.record(sourceId: sourceId, name: info.name);
+      }
       return null;
     } catch (e) {
       debugPrint('[aniyomi] $method(sourceId=${info.id}) failed: $e');

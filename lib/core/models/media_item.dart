@@ -1,4 +1,5 @@
 import 'package:equatable/equatable.dart';
+import 'package:flutter/foundation.dart';
 import 'package:json_annotation/json_annotation.dart';
 
 import 'media_detail.dart';
@@ -34,6 +35,12 @@ class MediaItem extends Equatable {
 
   @JsonKey(includeFromJson: false, includeToJson: false)
   final String? landscapePoster;
+
+  /// Short synopsis when the catalogue's list answer already carries one
+  /// (TMDB `overview`, AniList `description` on the Windows banner row).
+  /// A browse hint for the Home banner only: never saved, and null is normal.
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  final String? description;
   final String url;
   final ProviderType type;
   final String sourceId;
@@ -133,6 +140,7 @@ class MediaItem extends Equatable {
     this.titleLogo,
     this.posterShape,
     this.landscapePoster,
+    this.description,
     required this.url,
     required this.type,
     required this.sourceId,
@@ -158,6 +166,9 @@ class MediaItem extends Equatable {
   Map<String, dynamic> toJson() => _$MediaItemToJson(this);
 
   MediaItem copyWith({
+    String? id,
+    String? url,
+    ProviderType? type,
     String? title,
     String? titleLogo,
     String? posterShape,
@@ -172,7 +183,7 @@ class MediaItem extends Equatable {
     String? savedFrom,
     int? savedAtMs,
   }) => MediaItem(
-    id: id,
+    id: id ?? this.id,
     title: title ?? this.title,
     englishTitle: englishTitle,
     cover: cover,
@@ -181,8 +192,9 @@ class MediaItem extends Equatable {
     titleLogo: titleLogo ?? this.titleLogo,
     posterShape: posterShape ?? this.posterShape,
     landscapePoster: landscapePoster ?? this.landscapePoster,
-    url: url,
-    type: type,
+    description: description,
+    url: url ?? this.url,
+    type: type ?? this.type,
     sourceId: sourceId ?? this.sourceId,
     quality: quality,
     dubBadge: dubBadge,
@@ -217,6 +229,7 @@ class MediaItem extends Equatable {
     titleLogo,
     posterShape,
     landscapePoster,
+    description,
     url,
     type,
     sourceId,
@@ -357,6 +370,17 @@ MediaItem? bestTitleMatch(
   if (wantedMalId != null) {
     for (final m in results) {
       if (m.malId != null && m.malId == wantedMalId) return m;
+    }
+  }
+  // Windows: prefer exact season/part identities before permissive alias
+  // matching.
+  if (defaultTargetPlatform == TargetPlatform.windows) {
+    for (final m in results) {
+      if (titleIdentityMatches(m, wanted) ||
+          (altTitle != null && titleIdentityMatches(m, altTitle)) ||
+          metadataAliases.any((alias) => titleIdentityMatches(m, alias))) {
+        return m;
+      }
     }
   }
   for (final m in results) {

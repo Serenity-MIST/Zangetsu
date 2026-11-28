@@ -1,15 +1,26 @@
+import 'desktop_existing_downloads.dart';
+import 'desktop_source_pick.dart';
+import 'desktop_offline_episodes.dart';
+import 'desktop_batch_download_dialog.dart';
+import 'desktop_single_download_dialog.dart';
+import 'download_source_lookup.dart';
+import '../downloads/download_size_preview.dart';
+import '../../core/download/download_server_preference.dart';
 import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
+
+import 'package:hive_flutter/hive_flutter.dart';
 import 'dart:io';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:cue/cue.dart';
 import 'package:flutter/cupertino.dart' show CupertinoPicker;
 import 'package:flutter/foundation.dart'
-    show ValueListenable, defaultTargetPlatform, TargetPlatform;
+    show ValueListenable, defaultTargetPlatform, TargetPlatform, listEquals;
 import 'package:flutter/rendering.dart' show RenderRepaintBoundary;
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart' show PointerDeviceKind;
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:video_player/video_player.dart' as preview;
@@ -30,6 +41,7 @@ import '../../core/ui/detail_prefs.dart';
 import '../../core/ui/poster_palette.dart';
 import '../../core/ui/mobile_hero_art.dart';
 import '../../core/ui/tmdb_hero_banner.dart';
+import '../../core/ui/progressive_artwork.dart';
 import '../../core/metadata/synopsis.dart';
 import '../../core/models/film.dart';
 import '../../core/mode/content_mode_cubit.dart';
@@ -41,6 +53,7 @@ import '../../core/ui/app_dialog.dart';
 import '../../core/ui/app_toast.dart';
 import '../../core/download/download_size_estimate.dart';
 import '../../core/download/download_prefs.dart';
+import '../../core/download/windows_download_storage.dart';
 import '../../core/storage/storage_info.dart';
 import 'open_related.dart';
 import '../../core/ui/episode_unavailable_dialog.dart';
@@ -72,6 +85,7 @@ import '../../core/download/chapter_download.dart';
 import '../../core/download/chapter_download_store.dart';
 import '../../core/download/chapter_downloader.dart';
 import '../../core/download/download_manager.dart';
+import '../../core/download/download_record.dart';
 import '../../core/mode/content_mode.dart';
 import '../../core/models/episode.dart';
 import '../../core/models/episode_title.dart';
@@ -79,6 +93,10 @@ import '../../core/models/media_detail.dart';
 import 'chapter_meta.dart';
 import '../../core/tv/tv_episode_range_chips.dart';
 import 'episode_filter.dart';
+// The Episodes header's "Select" button (not in episode_filter's re-export).
+import 'detail_episodes_desktop.dart' show EpisodeSelectButton;
+import 'desktop_hover_link.dart';
+import '../player/desktop_floating_player.dart';
 import '../player/player_lifecycle.dart';
 import 'trailer_route_lifecycle.dart';
 import '../../core/models/media_item.dart';
@@ -94,6 +112,7 @@ import '../../core/playback/filler_service.dart';
 import '../../core/playback/list_status_store.dart';
 import '../../core/privacy/incognito_mode.dart';
 import '../../core/playback/my_list.dart';
+import '../../core/playback/library_repair.dart';
 import '../../core/ui/episode_player_sheet.dart';
 import '../../core/ui/list_status_sheet.dart';
 import '../../core/ui/tracker_list_sheet.dart';
@@ -117,6 +136,7 @@ import '../../core/provider/provider_registry.dart';
 import '../../core/reading/chapter_nav.dart';
 import '../../core/reading/read_history.dart';
 import '../../core/reading/read_store.dart';
+import '../../core/reading/reading_resume.dart';
 import '../../core/logging/app_logger.dart';
 import '../../core/repository/catalogue_repository.dart';
 import '../../core/repository/source_actions.dart' as source_actions;
@@ -146,6 +166,17 @@ import '../reader/novel_reader_screen.dart';
 import '../trailer/trailer_screen.dart';
 import 'cubit/detail_cubit.dart';
 import 'wrong_title_sheet.dart';
+import 'desktop_detail_actions.dart';
+import '../../core/download/downloaded_show_details.dart';
+// Windows desktop helpers: right-click menus, confirm dialogs, Explorer
+// reveal and the remappable page shortcuts.
+import '../../core/desktop/desktop_focus_repair.dart';
+import '../../core/desktop/desktop_context_menu.dart';
+import '../../core/desktop/desktop_dialogs.dart';
+import '../../core/desktop/desktop_reveal.dart';
+import '../../core/desktop/desktop_shortcuts.dart';
+// src-11: "Source timed out" wording for the Windows load-failure banner.
+import '../../core/desktop/source_timeout.dart';
 import '../../l10n/l10n.dart';
 
 part 'detail_hero.dart';
@@ -167,6 +198,11 @@ Future<void> _changeEpisodeVersion(
     showAppToast(context, context.l10n.somethingWentWrong);
   }
 }
+
+/// Windows desktop layout/behaviour gate. Uses the target platform rather than
+/// the host OS so phone widget tests run on a Windows machine (Android
+/// target) still take the phone path, while the real Windows app is unchanged.
+bool get _windowsDesktopUi => defaultTargetPlatform == TargetPlatform.windows;
 
 /// Last-resort friendly name for a [sourceId] that's neither a loaded JS nor CS
 /// provider (e.g. its source was uninstalled): drop the `cs:` prefix and the
@@ -275,10 +311,27 @@ String? _repoLabelFromUrl(String? repoUrl) {
 /// title opened from AniList/TMDB (Z Mode) offers the same solve instead of
 /// failing silently. Uses the SAME solver Home does and reloads on success.
 class _DetailCloudflareBlocked extends StatefulWidget {
-  const _DetailCloudflareBlocked({required this.url, this.isMangayomi = false});
+  const _DetailCloudflareBlocked({
+    required this.url,
+    this.isMangayomi = false,
+    this.canonical,
+    this.title,
+    this.altTitle,
+    this.malId,
+  });
 
   final String url;
+
+  /// Mangayomi (`mg:`) sources keep their own cookie jar, so they need
+  /// MangayomiCloudflare's solver rather than the shared source verifier.
   final bool isMangayomi;
+
+  /// Windows: the title's catalogue match, shown for manga so another source
+  /// can be picked. The remaining fields describe the same title.
+  final ZCanonical? canonical;
+  final String? title;
+  final String? altTitle;
+  final int? malId;
 
   @override
   State<_DetailCloudflareBlocked> createState() =>
@@ -292,11 +345,27 @@ class _DetailCloudflareBlockedState extends State<_DetailCloudflareBlocked> {
 
   Future<void> _solve() async {
     setState(() => _solving = true);
-    // A Z Mode candidate flagged by CfSolveNeeded is a JS provider: that
-    // runs on Dio, not the Mihon/Aniyomi native bridges, so it needs the
-    // matching solve (the cookie has to land in THIS host's own cache, not
-    // just the system-wide one MihonExtensionService's solve populates).
+    // Matching flags both JS and native providers. Send the solved session
+    // to the cookie jar used by the source that raised the challenge.
     final host = Uri.tryParse(widget.url)?.host ?? '';
+    if (_windowsDesktopUi) {
+      // Windows: show why a verification browser failed instead of letting
+      // the error escape, and reload only after it really passed.
+      try {
+        final verified = await source_actions
+            .verifySourceChallengeWithFeedback(
+              context,
+              widget.isMangayomi
+                  ? (CfSolveNeeded.sourceForHost(host) ?? 'mg:')
+                  : (CfSolveNeeded.sourceForHost(host) ?? ''),
+              widget.url,
+            );
+        if (mounted && verified) context.read<DetailCubit>().load();
+      } finally {
+        if (mounted) setState(() => _solving = false);
+      }
+      return;
+    }
     if (widget.isMangayomi) {
       await MangayomiCloudflare.solve(widget.url);
     } else if (CfSolveNeeded.hostFlagged(host)) {
@@ -342,8 +411,11 @@ class _DetailCloudflareBlockedState extends State<_DetailCloudflareBlocked> {
             ),
             const SizedBox(height: 10),
             Text(
-              'Complete the Cloudflare check once and this title will load '
-              'normally from then on.',
+              _windowsDesktopUi
+                  ? 'Verify this source, then retry. You can also choose '
+                        'another installed source.'
+                  : 'Complete the Cloudflare check once and this title will '
+                        'load normally from then on.',
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: AppColors.textSecondary,
@@ -352,6 +424,14 @@ class _DetailCloudflareBlockedState extends State<_DetailCloudflareBlocked> {
               ),
             ),
             const SizedBox(height: 24),
+            if (widget.canonical?.kind == ZKind.manga && widget.title != null)
+              MatchLine(
+                canonical: widget.canonical!,
+                title: widget.title!,
+                altTitle: widget.altTitle,
+                malId: widget.malId,
+              ),
+            const SizedBox(height: 12),
             ElevatedButton.icon(
               onPressed: _solving ? null : _solve,
               icon: _solving
@@ -405,6 +485,7 @@ class DetailScreen extends StatelessWidget {
     required this.item,
     this.prefer,
     this.initialTab = 0,
+    this.downloads,
   });
   final MediaItem item;
 
@@ -416,14 +497,53 @@ class DetailScreen extends StatelessWidget {
   /// AniList's page even when MyAnimeList is the app-wide choice.
   final PreferredProvider? prefer;
 
+  /// Windows downloaded show page (opened from Downloads): returns this
+  /// show's download records, re-read whenever the downloads change. When
+  /// set the page lists only the saved episodes, reads its details from the
+  /// cache saved with the downloads and never goes online by itself.
+  final List<DownloadRecord> Function()? downloads;
+
   /// Opens with a Cue spring while the lightweight tapped-title preview shows.
   static Route<void> route(MediaItem item, {PreferredProvider? prefer}) =>
       _CueDetailRoute(
         pageBuilder: (_, _, _) => DetailScreen(item: item, prefer: prefer),
       );
 
+  /// Windows: the show page in its downloaded mode (see [downloads]).
+  static Route<void> downloadsRoute(
+    MediaItem item, {
+    required List<DownloadRecord> Function() downloads,
+  }) => _CueDetailRoute(
+    pageBuilder: (_, _, _) => DetailScreen(item: item, downloads: downloads),
+  );
+
   @override
   Widget build(BuildContext context) {
+    final downloads = this.downloads;
+    if (downloads != null) {
+      // Downloaded mode: no link repair (that needs the network), the cubit
+      // reads the saved details and opens in the cut the files were saved in.
+      return BlocProvider(
+        key: ValueKey('downloads::${item.sourceId}::${item.id}'),
+        create: (_) => DetailCubit(
+          repo: sl<CatalogueRepository>(),
+          url: item.url,
+          sourceId: item.sourceId,
+          prefs: sl<TitlePrefsStore>(),
+          seedItem: item,
+          localCategory: mainDownloadCategory(
+            savedDownloadEpisodes(downloads()),
+          ),
+          localDetail: () =>
+              loadDownloadedShowDetail(item, records: downloads()),
+        )..load(),
+        child: _DetailView(item: item, downloads: downloads),
+      );
+    }
+    // Windows: repairs a saved title's broken source link before opening.
+    if (_windowsDesktopUi) {
+      return _RecoverableSavedDetail(item: item, prefer: prefer);
+    }
     return BlocProvider(
       create: (_) => DetailCubit(
         repo: sl<CatalogueRepository>(),
@@ -442,28 +562,130 @@ class DetailScreen extends StatelessWidget {
   }
 }
 
+/// Repairs a saved title's unavailable source link before opening its detail.
+class _RecoverableSavedDetail extends StatefulWidget {
+  const _RecoverableSavedDetail({required this.item, this.prefer});
+  final MediaItem item;
+  final PreferredProvider? prefer;
+  @override
+  State<_RecoverableSavedDetail> createState() =>
+      _RecoverableSavedDetailState();
+}
+
+/// Runs recovery once and preserves the original item when lookup fails.
+class _RecoverableSavedDetailState extends State<_RecoverableSavedDetail> {
+  late MediaItem item = repairedLibraryItem(widget.item);
+  bool attempted = false;
+  bool repairing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (sl.isRegistered<SourceRepository>() &&
+        !ZmodeIds.isZ(item.url) &&
+        !sl<SourceRepository>().hasSource(item.sourceId)) {
+      repairing = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) => _recover());
+    }
+  }
+
+  /// Looks up the canonical title and persists the repaired saved-library link.
+  /// Non-library items and failed lookups continue through the normal retry UI.
+  Future<void> _recover() async {
+    if (attempted || !mounted) return;
+    attempted = true;
+    final original = item;
+    if (!sl.isRegistered<MyListStore>() ||
+        !sl<MyListStore>().contains(original) ||
+        !sl.isRegistered<MetadataRepository>() ||
+        ZmodeIds.isZ(original.url)) {
+      if (mounted) setState(() => repairing = false);
+      return;
+    }
+    setState(() => repairing = true);
+    try {
+      final canonical = await sl<MetadataRepository>()
+          .canonicalFor(original)
+          .timeout(const Duration(seconds: 25));
+      if (canonical != null && mounted) {
+        final repaired = await sl<MyListStore>().repairLink(
+          original,
+          canonical,
+        );
+        if (mounted) setState(() => item = repaired);
+      }
+    } catch (_) {
+      /* keep the original entry and its normal retry UI */
+    }
+    if (mounted) setState(() => repairing = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (repairing) {
+      return Scaffold(
+        backgroundColor: AppColors.bg,
+        appBar: AppBar(),
+        body: const Center(child: CircularProgressIndicator()),
+      );
+    }
+    return BlocProvider(
+      key: ValueKey('${item.sourceId}::${item.url}'),
+      create: (_) => DetailCubit(
+        repo: sl<CatalogueRepository>(),
+        url: item.url,
+        sourceId: item.sourceId,
+        prefs: sl<TitlePrefsStore>(),
+        seedMalId: item.malId,
+        seedType: item.type,
+        seedItem: item,
+        prefer: widget.prefer ?? _preferFromName(item.savedFrom),
+      )..load(),
+      child: BlocListener<DetailCubit, DetailState>(
+        listenWhen: (_, state) =>
+            state.status == DetailStatus.error && state.cloudflareUrl == null,
+        listener: (_, _) => _recover(),
+        child: _DetailView(item: item, prefer: widget.prefer),
+      ),
+    );
+  }
+}
+
 class _CueDetailRoute extends PageRouteBuilder<void>
     with CueModalRouteMixin<void> {
   _CueDetailRoute({required super.pageBuilder})
     : super(
-        transitionDuration: const Duration(milliseconds: 350),
-        reverseTransitionDuration: const Duration(milliseconds: 220),
+        transitionDuration: Duration(milliseconds: _windowsDesktopUi ? 340 : 350),
+        reverseTransitionDuration: Duration(
+          milliseconds: _windowsDesktopUi ? 260 : 220,
+        ),
         // A fade, not a slide: the page eases in over 350ms on a long soft
         // curve and leaves in 220ms. The curve is applied by the motion below,
         // so the animation value is already shaped when it reaches here.
-        transitionsBuilder: (_, animation, _, child) =>
-            FadeTransition(opacity: animation, child: child),
+        // Windows keeps its slide in from the right.
+        transitionsBuilder: (_, animation, _, child) => _windowsDesktopUi
+            ? SlideTransition(
+                position: Tween(
+                  begin: const Offset(1, 0),
+                  end: Offset.zero,
+                ).animate(animation),
+                child: child,
+              )
+            : FadeTransition(opacity: animation, child: child),
       );
 
   @override
-  CueMotion get motion => const CueMotion.curved(
-    Duration(milliseconds: 350),
-    curve: Cubic(0.5, 0, 0.14, 1),
-  );
+  CueMotion get motion => _windowsDesktopUi
+      ? const Spring.smooth()
+      : const CueMotion.curved(
+          Duration(milliseconds: 350),
+          curve: Cubic(0.5, 0, 0.14, 1),
+        );
 
   @override
-  CueMotion? get reverseMotion =>
-      const CueMotion.easeIn(Duration(milliseconds: 220));
+  CueMotion? get reverseMotion => _windowsDesktopUi
+      ? const Spring.snappy()
+      : const CueMotion.easeIn(Duration(milliseconds: 220));
 
   @override
   AnimationStatusListener? get onAnimationStatusChanged => null;
@@ -481,12 +703,20 @@ class _CueDetailRoute extends PageRouteBuilder<void>
 // ─────────────────────────────────────────────────────────────────────────────
 
 class _DetailView extends StatefulWidget {
-  const _DetailView({required this.item, this.prefer, this.initialTab = 0});
+  const _DetailView({
+    required this.item,
+    this.prefer,
+    this.initialTab = 0,
+    this.downloads,
+  });
   final MediaItem item;
   final int initialTab;
 
   /// The catalogue this title was opened from, so the name matches the data.
   final PreferredProvider? prefer;
+
+  /// Windows downloaded show page; see [DetailScreen.downloads].
+  final List<DownloadRecord> Function()? downloads;
 
   @override
   State<_DetailView> createState() => _DetailViewState();
@@ -494,6 +724,9 @@ class _DetailView extends StatefulWidget {
 
 class _DetailViewState extends State<_DetailView>
     with TickerProviderStateMixin {
+  /// Windows compact hero extent, also used by collapse tracking and skeletons.
+  static const double _expandedHeight = 200;
+
   /// Banner height: tall, scaling with the screen width (about 490px on a
   /// typical phone). Set from the screen size each time the page builds.
   double _heroHeight = 320;
@@ -602,6 +835,227 @@ class _DetailViewState extends State<_DetailView>
     setState(() => _hasEntered = true);
   }
 
+  // ── Windows downloaded show page (opened from Downloads) ──────────────────
+  /// True when this page shows a downloaded show: only its saved episodes,
+  /// Episodes + Details tabs, "Show online" in place of Download, no trailer
+  /// and no Auto Resolve row.
+  bool get _fromDownloads => widget.downloads != null;
+
+  /// Index of the Details tab: last of two in downloaded mode, else fourth.
+  int get _detailsTab => _fromDownloads ? 1 : 3;
+
+  /// The saved episodes listed in downloaded mode, newest copy per episode.
+  List<DownloadRecord> _savedEpisodes = const [];
+
+  /// What [_savedEpisodes] was built from, so progress ticks of unrelated
+  /// downloads never rebuild the page.
+  List<Object?> _savedSignature = const [];
+
+  /// The fields of [saved] that change what the list shows.
+  static List<Object?> _signatureOf(List<DownloadRecord> saved) => [
+    for (final r in saved) (r.id, r.filePath, r.status, r.episodeTitle),
+  ];
+
+  /// Re-reads this show's saved episodes after a download change; repaints
+  /// only when the list really changed, and leaves the page (like the old
+  /// downloads page did) once the last episode is gone.
+  void _onDownloadsChanged() {
+    final read = widget.downloads;
+    if (read == null || !mounted) return;
+    final saved = savedDownloadEpisodes(read());
+    final signature = _signatureOf(saved);
+    if (listEquals(signature, _savedSignature)) return;
+    final hadEpisodes = _savedEpisodes.isNotEmpty;
+    setState(() {
+      _savedEpisodes = saved;
+      _savedSignature = signature;
+    });
+    if (hadEpisodes && saved.isEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && ModalRoute.of(context)?.isCurrent == true) {
+          Navigator.of(context).maybePop();
+        }
+      });
+    }
+  }
+
+  /// Plays saved episode [index] straight from disk, with the other saved
+  /// episodes queued after it. Downloaded mode never streams.
+  void _playSaved(int index) {
+    final saved = _savedEpisodes;
+    if (index < 0 || index >= saved.length) return;
+    unawaited(
+      launchDownloadedEpisode(
+        context,
+        saved[index],
+        episodes: episodesFromDownloads(saved),
+        startIndex: index,
+      ),
+    );
+  }
+
+  /// Deletes the saved files of [episodes] (the selection's Delete) after
+  /// one confirm. The manager recycles the files on Windows.
+  Future<void> _deleteSaved(List<Episode> episodes) async {
+    final ids = {for (final e in episodes) e.id};
+    final records = [
+      for (final r in _savedEpisodes)
+        if (ids.contains(r.episodeId)) r,
+    ];
+    if (records.isEmpty) return;
+    // Same wording as the Downloads page's own selection delete.
+    final ok = await showDesktopConfirm(
+      context,
+      title: '${context.l10n.deleteDownload} (${records.length})',
+      message: context.l10n.deleteSelectedDownloadsRecycle,
+      confirmLabel: context.l10n.delete,
+      destructive: true,
+    );
+    if (!ok || !mounted) return;
+    await sl<DownloadManager>().deleteAll(records);
+    if (mounted) showAppToast(context, context.l10n.downloadDeleted);
+  }
+
+  /// "Show online": the normal show page for the same title.
+  void _openOnline() {
+    unawaited(Navigator.of(context).push(DetailScreen.route(widget.item)));
+  }
+
+  /// Whether this show has downloads; looked up once per page (build runs
+  /// often), and set by [_cacheDetailsOnDownload] when one is queued here.
+  bool? _showHasDownloads;
+
+  /// Downloaded mode: the muted alternative-title line the online page shows
+  /// beside the buttons (its romaji line), from the saved metadata: the
+  /// first English/synonym title written in Latin script that differs from
+  /// the header title. Null when there is none.
+  Widget? _savedAltTitleLine(MediaDetail detail) {
+    final shown = detail.title.trim().toLowerCase();
+    final latin = RegExp(r'^[\x00-ɏḀ-ỿ\s\p{P}]+$', unicode: true);
+    for (final raw in [detail.englishTitle, ...detail.synonyms]) {
+      final t = raw?.trim() ?? '';
+      if (t.isEmpty || t.toLowerCase() == shown || !latin.hasMatch(t)) {
+        continue;
+      }
+      return Padding(
+        padding: const EdgeInsets.only(top: 10),
+        child: Text(
+          t,
+          key: const ValueKey('downloaded-alt-title'),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: AppText.caption.copyWith(
+            color: AppColors.textSecondary,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      );
+    }
+    return null;
+  }
+
+  /// What the last backfill saved (see [_detailsSignatureOf]); a save only
+  /// happens when the loaded metadata grew since.
+  String? _savedDetailsSignature;
+
+  /// Debounce for the backfill, so a burst of enrichment patches saves once.
+  Timer? _detailsSaveTimer;
+
+  /// Online page only (Windows): keeps the full metadata a downloaded show
+  /// page needs (Details fields, every episode's description / date /
+  /// rating / thumbnail, images) for shows that have downloads. Runs once
+  /// the episodes and the enrichment are in, and again (debounced, 2 s)
+  /// whenever later patches add more, so older downloads are filled in too.
+  void _cacheDetailsForDownloads(MediaDetail detail, DetailState state) {
+    if (_fromDownloads || !_windowsDesktopUi) return;
+    if (state.status != DetailStatus.success ||
+        state.episodesLoading ||
+        state.extrasLoading) {
+      return;
+    }
+    if (!sl.isRegistered<DownloadManager>()) return;
+    final item = widget.item;
+    _showHasDownloads ??= sl<DownloadManager>().all.any(
+      (r) => r.sourceId == item.sourceId && r.showId == item.id,
+    );
+    if (_showHasDownloads != true) return;
+    final cast = [for (final c in state.cast) c.name];
+    final signature = _detailsSignatureOf(detail, cast);
+    if (signature == _savedDetailsSignature) return;
+    _savedDetailsSignature = signature;
+    // The save itself needs no widget, so leaving the page early still runs
+    // it (see dispose).
+    void save() {
+      _pendingDetailsSave = null;
+      unawaited(
+        DownloadedShowDetails.save(
+          detail,
+          sourceId: item.sourceId,
+          showId: item.id,
+          castNames: cast,
+        ),
+      );
+    }
+
+    _pendingDetailsSave = save;
+    _detailsSaveTimer?.cancel();
+    _detailsSaveTimer = Timer(const Duration(seconds: 2), save);
+  }
+
+  /// The debounced save still waiting on [_detailsSaveTimer], if any.
+  VoidCallback? _pendingDetailsSave;
+
+  /// A cheap fingerprint of how complete [detail] is: changes when episodes,
+  /// their descriptions / thumbnails / ratings, tags, score or the synopsis
+  /// arrive, so the backfill re-saves only then.
+  static String _detailsSignatureOf(MediaDetail detail, List<String> cast) {
+    var described = 0, thumbs = 0, rated = 0;
+    for (final e in detail.episodes) {
+      if ((e.description ?? '').isNotEmpty) described++;
+      if ((e.thumbnail ?? '').isNotEmpty) thumbs++;
+      if (e.rating != null) rated++;
+    }
+    return [
+      detail.title,
+      detail.episodes.length,
+      described,
+      thumbs,
+      rated,
+      detail.tags.length,
+      detail.score,
+      detail.popularity,
+      detail.favourites,
+      detail.description?.length,
+      detail.genres.length,
+      detail.studios.length,
+      detail.cover,
+      detail.banner,
+      cast.length,
+    ].join('|');
+  }
+
+  /// Saves the details right when a download is queued, so its downloaded
+  /// show page has them even if this page is never opened again. Windows.
+  void _cacheDetailsOnDownload(MediaDetail detail) {
+    if (!_windowsDesktopUi || _fromDownloads) return;
+    // Later enrichment patches now keep this show's saved details current.
+    _showHasDownloads = true;
+    List<String> cast = const [];
+    try {
+      cast = [for (final c in context.read<DetailCubit>().state.cast) c.name];
+    } catch (_) {
+      /* no cubit above: provider cast only */
+    }
+    unawaited(
+      DownloadedShowDetails.save(
+        detail,
+        sourceId: widget.item.sourceId,
+        showId: widget.item.id,
+        castNames: cast,
+      ),
+    );
+  }
+
   Timer? _prefetchTimer;
 
   // Filler episode numbers (from Tenrai by MAL id), for the "Filler" badge in the
@@ -662,12 +1116,36 @@ class _DetailViewState extends State<_DetailView>
   late final ScrollController _scrollController = ScrollController()
     ..addListener(_onScroll);
 
+  // Downloaded mode has only Episodes + Details (no Cast / Relations).
   late final TabController _tabController = TabController(
-    animationDuration: Duration.zero,
-    initialIndex: widget.initialTab.clamp(0, 2),
-    length: 3,
+    // Phone: Overview / Episodes / Comments pages. Windows keeps its tabs:
+    // Episodes / Cast / Relations / Details (Episodes + Details downloaded).
+    animationDuration: _windowsDesktopUi ? null : Duration.zero,
+    initialIndex: _windowsDesktopUi ? 0 : widget.initialTab.clamp(0, 2),
+    length: _windowsDesktopUi ? (_fromDownloads ? 2 : 4) : 3,
     vsync: this,
   );
+
+  // ── Windows page keys (show-8) and failure retry (show-14) ────────────────
+  /// Focus for the page-level keys, autofocused so Enter/Space/D/Ctrl+1..4
+  /// work as soon as the page opens. Nested widgets (episode list, text
+  /// fields, buttons) still see their keys first.
+  final FocusScopeNode _pageKeysFocus = FocusScopeNode(
+    debugLabel: 'detail-page-keys',
+  );
+
+  /// What the desktop Play / Download buttons currently do, refreshed on every
+  /// body build so the keys never disagree with the buttons (null = disabled).
+  VoidCallback? _keyPlay;
+  VoidCallback? _keyDownload;
+
+  /// While rate-limited, the earliest time a retry is worth sending. Set from
+  /// `rate_limited:<secs>` the first time a failure is shown.
+  DateTime? _retryNotBefore;
+
+  /// The error [_retryNotBefore] was armed for, so a rebuild does not restart
+  /// the countdown. Cleared on every new load so a repeat failure re-arms.
+  String? _retryArmedFor;
 
   // ── My List (status-organised library) ────────────────────────────────────
   final MyListStore _myList = sl<MyListStore>();
@@ -686,6 +1164,25 @@ class _DetailViewState extends State<_DetailView>
   /// theme background). Extraction runs once per hero-art URL.
   final ValueNotifier<Color?> _tint = ValueNotifier(null);
   String? _tintUrl;
+
+  /// Windows (B3): the page's latest episodes by season, fed to an open batch
+  /// download dialog so it grows with the page (a long show loads 56, then
+  /// 104 episodes). Updated after the frame, never during build.
+  final ValueNotifier<Map<int, List<Episode>>> _batchEpisodesLive =
+      ValueNotifier(const {});
+  int _batchEpisodesPublished = -1;
+
+  /// Hands [bySeason] to [_batchEpisodesLive] when the episode count changed.
+  /// Windows only; the phone's bottom sheet keeps its snapshot as before.
+  void _publishBatchEpisodes(Map<int, List<Episode>> bySeason) {
+    if (!_windowsDesktopUi) return;
+    final count = batchEpisodeCount(bySeason);
+    if (count == _batchEpisodesPublished) return;
+    _batchEpisodesPublished = count;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _batchEpisodesLive.value = bySeason;
+    });
+  }
 
   /// Official TMDB title logo (null → plain text title). Resolved once per
   /// page when the Title artwork toggle is on; the service caches hits in
@@ -707,16 +1204,53 @@ class _DetailViewState extends State<_DetailView>
     );
   }
 
+  /// Watch progress that arrives after the page opened (cloud sync runs after
+  /// the splash, or a resume saved by the player) refreshes Continue at once.
+  final List<Listenable> _progressListenables = [];
+  Timer? _progressDebounce;
+
+  void _listenForProgress() {
+    for (final name in [WatchHistory.boxName, ResumeStore.boxName]) {
+      if (!Hive.isBoxOpen(name)) continue;
+      final l = Hive.box<Map>(name).listenable();
+      l.addListener(_onProgressChanged);
+      _progressListenables.add(l);
+    }
+  }
+
+  // Sync writes many rows at once; rebuild once when the burst settles.
+  void _onProgressChanged() {
+    _progressDebounce?.cancel();
+    _progressDebounce = Timer(const Duration(milliseconds: 300), () {
+      if (mounted) setState(() {});
+    });
+  }
+
   @override
   void initState() {
     super.initState();
+    // R1: lost focus (a text field left, a sheet closed) comes back to the
+    // page keys. No-op off Windows (the scope is not even built there).
+    DesktopFocusRepair.register(_pageKeysFocus);
     _tint.addListener(_onTintChanged);
     ThemeController.revision.addListener(_onThemeRevision);
+    // Windows: progress that arrives later (cloud sync) refreshes Continue.
+    if (_windowsDesktopUi) _listenForProgress();
+    // Downloaded mode: list the saved episodes now and follow deletes.
+    if (_fromDownloads && sl.isRegistered<DownloadManager>()) {
+      _savedEpisodes = savedDownloadEpisodes(widget.downloads!());
+      _savedSignature = _signatureOf(_savedEpisodes);
+      sl<DownloadManager>().addListener(_onDownloadsChanged);
+    }
     _loadLogo();
-    _loadTmdbBanner();
+    // The phone banner only; the Windows card uses its own hero art.
+    if (!_windowsDesktopUi) _loadTmdbBanner();
     _schedulePlayerWarmup();
     // Discord Rich Presence: "Looking at <title>" while this detail is open.
-    if (sl.isRegistered<DiscordRpc>()) {
+    // Windows: not while a video plays in the floating mini player; that
+    // keeps showing "Watching".
+    if (sl.isRegistered<DiscordRpc>() &&
+        !DesktopFloatingPlayer.instance.isActive) {
       sl<DiscordRpc>().setBrowsing(
         title: widget.item.title,
         posterUrl: widget.item.cover,
@@ -744,7 +1278,9 @@ class _DetailViewState extends State<_DetailView>
         return;
       }
       final prefs = sl<PlaybackPrefs>();
-      if (prefs.externalPlayerPackage.isNotEmpty) return;
+      // P4: the effective value ignores a phone player id carried over by a
+      // backup, so Windows always warms up its own mpv player.
+      if (prefs.effectiveExternalPlayerPackage.isNotEmpty) return;
       _playerWarmupPool = sl<MpvPlayerPool>();
       _playerWarmupPool!.warmUp(libass: prefs.styledSubtitles);
     });
@@ -790,8 +1326,11 @@ class _DetailViewState extends State<_DetailView>
   /// one has actually resolved — and back to text if it fails to load).
   Widget _headerTitleText(String title) => Text(
     title,
-    textAlign: TextAlign.center,
-    style: AppText.largeTitle.copyWith(fontSize: 28),
+    textAlign: _windowsDesktopUi ? null : TextAlign.center,
+    style: AppText.largeTitle.copyWith(
+      // Smaller on Windows, where the header sits in a narrow info pane.
+      fontSize: _windowsDesktopUi ? 23 : 28,
+    ),
     maxLines: 2,
     overflow: TextOverflow.ellipsis,
   );
@@ -846,6 +1385,13 @@ class _DetailViewState extends State<_DetailView>
 
   @override
   void dispose() {
+    _progressDebounce?.cancel();
+    for (final l in _progressListenables) {
+      l.removeListener(_onProgressChanged);
+    }
+    if (_fromDownloads && sl.isRegistered<DownloadManager>()) {
+      sl<DownloadManager>().removeListener(_onDownloadsChanged);
+    }
     _routeAnimation?.removeStatusListener(_onRouteStatusChanged);
     _playerWarmupTimer?.cancel();
     final prepared = _playerWarmupPool;
@@ -853,16 +1399,102 @@ class _DetailViewState extends State<_DetailView>
     // Leaving before the stay-delay elapsed: no viewer is here to warm a menu
     // for, so the pending resolve never starts.
     _prefetchTimer?.cancel();
+    // A details backfill still in its debounce: run it now rather than lose
+    // it (it needs no widget and never throws).
+    _detailsSaveTimer?.cancel();
+    _pendingDetailsSave?.call();
     // Back to generic "Browsing" when leaving the detail.
-    if (sl.isRegistered<DiscordRpc>()) sl<DiscordRpc>().setBrowsing();
+    if (sl.isRegistered<DiscordRpc>() &&
+        !DesktopFloatingPlayer.instance.isActive) {
+      sl<DiscordRpc>().setBrowsing();
+    }
     _pullBack.dispose();
     _pull.dispose();
     _scrollController.dispose();
     _tint.removeListener(_onTintChanged);
     ThemeController.revision.removeListener(_onThemeRevision);
     _tint.dispose();
+    _batchEpisodesLive.dispose();
     _tabController.dispose();
+    // R1: stop offering this scope to the focus repair.
+    DesktopFocusRepair.unregister(_pageKeysFocus);
+    _pageKeysFocus.dispose();
     super.dispose();
+  }
+
+  /// Windows (show-8 / show-14): page keys. Typing in a text field always
+  /// wins; Enter/Space only fire when no specific control has focus (a
+  /// focused button or row activates itself instead).
+  KeyEventResult _onPageKey(FocusNode node, KeyEvent event) {
+    if (!_windowsDesktopUi || event is KeyUpEvent) {
+      return KeyEventResult.ignored;
+    }
+    final focus = FocusManager.instance.primaryFocus;
+    final typing =
+        focus?.context?.findAncestorStateOfType<EditableTextState>() != null;
+    if (typing) return KeyEventResult.ignored;
+
+    // F5 (app.refresh): retry a failed load. Otherwise leave F5 to the
+    // episode list's own refresh and the app.
+    if (DesktopShortcuts.matches('app.refresh', event) && _isLoadFailed()) {
+      _retryLoad();
+      return KeyEventResult.handled;
+    }
+
+    // Nothing more specific focused: the page node itself or a bare scope.
+    final pageFocused = focus == null || focus == node || focus is FocusScopeNode;
+    if (pageFocused && DesktopShortcuts.matches('show.play', event)) {
+      final play = _keyPlay;
+      if (play == null) return KeyEventResult.ignored;
+      // A held key repeats: start playback once.
+      if (event is KeyDownEvent) play();
+      return KeyEventResult.handled;
+    }
+    if (DesktopShortcuts.matches('show.download', event)) {
+      final download = _keyDownload;
+      if (download == null) return KeyEventResult.ignored;
+      if (event is KeyDownEvent) download();
+      return KeyEventResult.handled;
+    }
+    // Ctrl+1..4: Episodes / More like this / Cast / Details tabs.
+    for (var i = 1; i <= _tabController.length; i++) {
+      if (DesktopShortcuts.matches('show.tab$i', event)) {
+        _revealTab(i - 1);
+        return KeyEventResult.handled;
+      }
+    }
+    return KeyEventResult.ignored;
+  }
+
+  /// True while the page shows a failed load (banner or error state).
+  bool _isLoadFailed() {
+    if (!mounted) return false;
+    return context.read<DetailCubit>().state.status == DetailStatus.error;
+  }
+
+  /// Windows (show-14): arms the rate-limit countdown for [error] once per
+  /// failure, so the banner's Retry and F5 wait for the same moment.
+  void _armRetry(String? error) {
+    if (error == _retryArmedFor) return;
+    _retryArmedFor = error;
+    final secs = _limitSeconds(error);
+    _retryNotBefore = secs == null
+        ? null
+        : DateTime.now().add(Duration(seconds: secs));
+  }
+
+  /// Windows (show-14): run the initial fetch again. While rate-limited it
+  /// only says how long is left, since the request would be refused anyway.
+  void _retryLoad() {
+    if (!_isLoadFailed()) return;
+    final wait = _retryNotBefore?.difference(DateTime.now());
+    if (wait != null && wait > Duration.zero) {
+      _snack(context.l10n.tryAgainInSeconds(wait.inSeconds + 1));
+      return;
+    }
+    _retryArmedFor = null;
+    _retryNotBefore = null;
+    unawaited(context.read<DetailCubit>().load());
   }
 
   /// Background-resolve [epUrl]'s sources once for this title, so the next Play
@@ -903,7 +1535,7 @@ class _DetailViewState extends State<_DetailView>
     if (!sl.isRegistered<MatchStore>()) return null;
     final c = ZmodeIds.parseShow(widget.item.url);
     if (c == null) return null;
-    return sl<MatchStore>().bestFor(c);
+    return sl<MatchStore>().bestFor(c, available: sl<SourceRepository>().hasSource);
   }
 
   // ── Scroll-driven app-bar title fade. PRESERVED EFFECT — reads the outer
@@ -912,9 +1544,31 @@ class _DetailViewState extends State<_DetailView>
   void _onScroll() {
     if (!_scrollController.hasClients) return;
     final shouldShow =
-        _scrollController.offset > (_heroHeight - kToolbarHeight - 24);
+        _scrollController.offset >
+        ((_windowsDesktopUi ? _expandedHeight : _heroHeight) -
+            kToolbarHeight -
+            24);
     if (shouldShow != _showAppBarTitle) {
       setState(() => _showAppBarTitle = shouldShow);
+    }
+  }
+
+  /// Switch to [index] AND collapse the header so the tab's content is actually
+  /// in view — otherwise tapping "… more"/"Read more" silently changes a tab
+  /// that's still below the fold (feels like nothing happened). Animates both
+  /// for a smooth transition into the Cast / Details tab.
+  void _revealTab(int index) {
+    _tabController.animateTo(index);
+    if (_windowsDesktopUi && MediaQuery.sizeOf(context).width >= 980) return;
+    if (_scrollController.hasClients) {
+      final target = _scrollController.position.maxScrollExtent;
+      if (_scrollController.offset < target - 1) {
+        _scrollController.animateTo(
+          target,
+          duration: const Duration(milliseconds: 380),
+          curve: Curves.easeOutCubic,
+        );
+      }
     }
   }
 
@@ -957,6 +1611,9 @@ class _DetailViewState extends State<_DetailView>
   DateTime? _nextAiringAt;
   bool _trackerFetchStarted = false;
 
+  /// The main reading CTA can await the initial tracker chapter lookup.
+  Future<void>? _trackerProgressLookup;
+
   /// Fetch the connected tracker's episode progress once, so episodes already
   /// watched on AniList/MAL/Simkl grey out even if never played in-app.
   /// Best-effort and additive — a null result changes nothing on screen.
@@ -971,7 +1628,7 @@ class _DetailViewState extends State<_DetailView>
     final pins = sl<TrackerBindingStore>().get(
       TrackerBindingStore.keyOf(widget.item.sourceId, widget.item.url),
     );
-    hub
+    _trackerProgressLookup = hub
         .fetchEntry(
           malId: detail.malId ?? widget.item.malId,
           title: (isAnime || reading) ? detail.title : null,
@@ -1007,6 +1664,9 @@ class _DetailViewState extends State<_DetailView>
             _nextAiringEpisode = ep;
             _nextAiringAt = at;
           });
+        })
+        .catchError((Object _) {
+          // Tracker outages must leave local/cloud resume available.
         });
   }
 
@@ -1086,12 +1746,66 @@ class _DetailViewState extends State<_DetailView>
   );
 
   void _share(MediaDetail detail, String sourceName) {
+    // Windows (show-11 B): most desktop users want the link copied, not the
+    // OS share flyout, so Share opens a small menu with every choice.
+    if (_windowsDesktopUi) {
+      unawaited(_showDesktopShareMenu(detail));
+      return;
+    }
     // Native OS share sheet with a Zangetsu deep link: on tap it opens the app
     // straight to this title (on its source) if installed, else the Zangetsu
     // site to download. The link carries the item, so sourceName is unused now.
     SharePlus.instance.share(
       ShareParams(text: ShareLink.shareText(widget.item)),
     );
+  }
+
+  /// Windows Share menu: Copy link / Copy title / Open source page / Share
+  /// via Windows. Opens at the click (DesktopPointer fallback).
+  Future<void> _showDesktopShareMenu(MediaDetail detail) {
+    final title = detail.title.isNotEmpty ? detail.title : widget.item.title;
+    // Grey out the source page row when there is no page to open.
+    final hasWebPage = _sourceWebUrl() != null;
+    return showDesktopContextMenu<void>(
+      context,
+      items: [
+        DesktopMenuItem(
+          label: context.l10n.copyLink,
+          icon: Icons.link_rounded,
+          onTap: () => _copyToClipboard(
+            ShareLink.forItem(widget.item),
+            context.l10n.linkCopied,
+          ),
+        ),
+        DesktopMenuItem(
+          label: context.l10n.copyTitle,
+          icon: Icons.title_rounded,
+          onTap: () => _copyToClipboard(title, context.l10n.titleCopied),
+        ),
+        DesktopMenuItem(
+          label: context.l10n.openSourcePage,
+          icon: Icons.public_rounded,
+          enabled: hasWebPage,
+          onTap: () => unawaited(_openSourceSite()),
+        ),
+        const DesktopMenuItem<void>.divider(),
+        DesktopMenuItem(
+          label: context.l10n.shareViaWindows,
+          icon: Icons.ios_share_rounded,
+          onTap: () => unawaited(
+            SharePlus.instance.share(
+              ShareParams(text: ShareLink.shareText(widget.item)),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Copies [text] and confirms with a toast.
+  Future<void> _copyToClipboard(String text, String done) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    _snack(done);
   }
 
   /// Globe — open the source's web page in the system browser. Falls back to
@@ -1138,7 +1852,7 @@ class _DetailViewState extends State<_DetailView>
   /// third-party extension.
   String? _matchedSourceWebUrl(ZCanonical c) {
     if (!sl.isRegistered<MatchStore>()) return null;
-    final m = sl<MatchStore>().bestFor(c);
+    final m = sl<MatchStore>().bestFor(c, available: sl<SourceRepository>().hasSource);
     if (m == null) return null;
     return source_actions.joinChapterUrl(
       sl<SourceRepository>().baseUrlFor(m.sourceId),
@@ -1178,9 +1892,13 @@ class _DetailViewState extends State<_DetailView>
               : ContentMode.anime,
         ),
       );
-      await NotificationService.instance.init(); // ask for permission now
+      // Windows has no notification permission to ask for: alerts land in
+      // the in-app inbox (and Windows notifications), so confirm directly.
+      if (!_windowsDesktopUi) {
+        await NotificationService.instance.init(); // ask for permission now
+      }
       _snack(
-        await NotificationService.instance.canShowAlerts
+        _windowsDesktopUi || await NotificationService.instance.canShowAlerts
             ? reading
                   ? l10n.youllBeNotifiedOfNewChaptersFor(item.title)
                   : l10n.youllBeNotifiedOfNewEpisodesFor(item.title)
@@ -1320,11 +2038,313 @@ class _DetailViewState extends State<_DetailView>
     ).showPicker(
       context,
       onPick: (id) async {
-        await matcher.chooseSource(c, id);
+        if (_windowsDesktopUi) {
+          // Windows (ar-1): pin THIS title only, exactly like the source pill
+          // above (SourceSelectCubit.selectSource -> pinTitleToSource).
+          // chooseSource re-pointed the kind-wide default, which silently
+          // switched Auto Resolve off for every other title of this kind.
+          final d = cubit.state.detail;
+          final title = (d?.title.isNotEmpty ?? false)
+              ? d!.title
+              : widget.item.title;
+          // P2: a source that lacks this title is NOT left pinned (an empty
+          // hand-picked pin dead-ends every Play); the title stays on Auto
+          // Resolve instead. See desktop_source_pick.dart.
+          final m = await desktopPinTitleOrStayOnAuto(
+            matcher,
+            c,
+            id,
+            title: title,
+            altTitle: d?.englishTitle ?? widget.item.englishTitle,
+            metadataAliases: [
+              if (d?.englishTitle != null) d!.englishTitle!,
+              if (d?.nativeTitle != null) d!.nativeTitle!,
+              ...?d?.synonyms,
+            ],
+            malId: d?.malId ?? widget.item.malId,
+          );
+          // No match: say why, and that the title keeps using Auto Resolve,
+          // then refresh below so the page shows what it resolves to now.
+          if (m == null && mounted) {
+            _snack(
+              context.l10n.desktopSourceLacksTitleStayAuto(
+                sl<SourceRepository>().displayName(id),
+              ),
+            );
+          }
+        } else {
+          await matcher.chooseSource(c, id);
+        }
         // dropCache: false — the source just switched TO was never in it.
         cubit.refresh(dropCache: false);
       },
     );
+  }
+
+  /// Windows: what is saved for [ep] in [category], for the right-click
+  /// menu's download rows. A finished file wins (it is what the menu can act
+  /// on); else a queued/active record reads as in progress; else nothing.
+  Future<({EpisodeDownloadMenuState state, DownloadRecord? record})>
+  _episodeDownloadState(Episode ep, MediaDetail detail, String category) async {
+    if (!sl.isRegistered<DownloadManager>()) {
+      return (state: EpisodeDownloadMenuState.unavailable, record: null);
+    }
+    final manager = sl<DownloadManager>();
+    // Downloaded show page: the row IS a saved file, whatever cut it was
+    // saved in, so the menu always offers Play offline / folder / delete.
+    if (_fromDownloads) {
+      for (final r in _savedEpisodes) {
+        if (r.episodeId == ep.id && r.season == ep.season) {
+          return (state: EpisodeDownloadMenuState.done, record: r);
+        }
+      }
+    }
+    // Same lookup the batch dialog and _confirmExistingDownloads use.
+    final saved = await manager.finishedForEpisode(
+      sourceId: widget.item.sourceId,
+      showId: widget.item.id,
+      episodeId: ep.id,
+      episodeUrl: ep.url,
+      episodeNumber: ep.number,
+      malId: detail.malId ?? widget.item.malId,
+      category: category,
+      season: ep.season,
+    );
+    if (saved != null) {
+      // Windows online page: a stub is not a real download, so it gets the
+      // broken rows (Download again / Delete) instead of the finished ones.
+      if (await _isBrokenHere(saved)) {
+        return (state: EpisodeDownloadMenuState.broken, record: saved);
+      }
+      return (state: EpisodeDownloadMenuState.done, record: saved);
+    }
+    final rec = manager.recordFor(
+      widget.item.sourceId,
+      widget.item.id,
+      ep.id,
+      category: category,
+    );
+    final active = switch (rec?.status) {
+      DownloadStatus.downloading ||
+      DownloadStatus.paused ||
+      DownloadStatus.queued ||
+      DownloadStatus.resolving => true,
+      _ => false,
+    };
+    // B1: nothing in this cut, but the episode may be saved in another one
+    // (a Dub download on a page that looks things up as Sub). The menu then
+    // still offers Play offline / Show in folder / Delete for that file.
+    if (!active) {
+      final other = await _savedInAnyCut(ep, detail, category);
+      if (other != null) {
+        return (state: EpisodeDownloadMenuState.done, record: other);
+      }
+      // No real copy anywhere, but a broken one (a stub, or a file found on
+      // disk that is too small) may still be saved. It is not shown as
+      // downloaded, yet the menu must still be able to delete it.
+      final broken = await _brokenInAnyCut(ep, detail, category);
+      if (broken != null) {
+        return (state: EpisodeDownloadMenuState.broken, record: broken);
+      }
+    }
+    return (
+      state: active
+          ? EpisodeDownloadMenuState.inProgress
+          : EpisodeDownloadMenuState.none,
+      record: rec,
+    );
+  }
+
+  /// Windows (B1): a finished download of [ep] saved in ANY cut whose file is
+  /// still on disk, or null. Used only after the cut-exact lookup found
+  /// nothing; the download manager itself stays cut-exact. Off on the phone
+  /// and on the downloaded show page (which already ignores the cut).
+  Future<DownloadRecord?> _savedInAnyCut(
+    Episode ep,
+    MediaDetail detail,
+    String category,
+  ) async {
+    if (!_windowsDesktopUi || _fromDownloads) return null;
+    if (!sl.isRegistered<DownloadManager>()) return null;
+    final manager = sl<DownloadManager>();
+    final candidates = savedEpisodeAnyCutCandidates(
+      manager.all,
+      sourceId: widget.item.sourceId,
+      showId: widget.item.id,
+      episodeId: ep.id,
+      episodeNumber: ep.number,
+      season: ep.season,
+      malId: detail.malId ?? widget.item.malId,
+      preferredCategory: category,
+    );
+    // Only a file that is on disk and big enough to be a real episode counts,
+    // so a broken stub (Frieren E9, 788 KB) streams instead of playing.
+    return firstRealSavedCopy(
+      candidates,
+      filePresent: manager.filePresent,
+      sizeOnDisk: _savedFileSize,
+    );
+  }
+
+  /// Windows: a broken saved copy of [ep] in any cut (file gone, or a stub),
+  /// or null. Asked only after [_savedInAnyCut] found no real copy, so the
+  /// right-click menu can still offer Delete download for it. Same scope as
+  /// [_savedInAnyCut]: off on the phone and the downloaded show page.
+  Future<DownloadRecord?> _brokenInAnyCut(
+    Episode ep,
+    MediaDetail detail,
+    String category,
+  ) async {
+    if (!_windowsDesktopUi || _fromDownloads) return null;
+    if (!sl.isRegistered<DownloadManager>()) return null;
+    final manager = sl<DownloadManager>();
+    final candidates = savedEpisodeAnyCutCandidates(
+      manager.all,
+      sourceId: widget.item.sourceId,
+      showId: widget.item.id,
+      episodeId: ep.id,
+      episodeNumber: ep.number,
+      season: ep.season,
+      malId: detail.malId ?? widget.item.malId,
+      preferredCategory: category,
+      keepStubs: true,
+    );
+    return firstBrokenSavedCopy(
+      candidates,
+      filePresent: manager.filePresent,
+      sizeOnDisk: _savedFileSize,
+    );
+  }
+
+  /// Windows online page: whether [saved] (a cut-exact finished copy) is
+  /// broken, a stub or a file that is gone, and so counts as not downloaded:
+  /// Play streams, the batch dialog does not mark it, and Download fetches
+  /// it again instead of saying it is already there. Always false on the
+  /// phone, the TV and the downloaded show page.
+  Future<bool> _isBrokenHere(DownloadRecord saved) async {
+    if (!_windowsDesktopUi || _fromDownloads) return false;
+    if (!sl.isRegistered<DownloadManager>()) return false;
+    return savedCopyIsBroken(
+      saved,
+      filePresent: sl<DownloadManager>().filePresent,
+      sizeOnDisk: _savedFileSize,
+    );
+  }
+
+  /// A saved file's real size, or null when it cannot be read that way (a
+  /// content URI, or the file is unreadable).
+  static Future<int?> _savedFileSize(DownloadRecord r) async {
+    final fp = r.filePath;
+    if (fp == null || isUriPath(fp)) return null;
+    try {
+      return await File(fp).length();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Windows: delete a finished download after a graphite confirm, since the
+  /// file is gone for good. Repaints so the row's tick clears.
+  Future<void> _deleteDownloadWithConfirm(
+    DownloadRecord rec,
+    String label,
+  ) async {
+    final ok = await showDesktopConfirm(
+      context,
+      title: context.l10n.deleteDownloadQuestion,
+      message: context.l10n.downloadedFileWillBeDeleted(label),
+      confirmLabel: context.l10n.delete,
+      destructive: true,
+    );
+    if (!ok || !mounted) return;
+    await sl<DownloadManager>().delete(rec);
+    if (!mounted) return;
+    setState(() {});
+    _snack(context.l10n.downloadDeleted);
+  }
+
+  /// Windows (show-1): the film Download button found a finished file, so
+  /// offer what people want for one instead of a new source search. Returns
+  /// true when the menu handled the click (including dismissing it).
+  Future<bool> _manageFinishedDownload(
+    Episode ep,
+    MediaDetail detail,
+    String category,
+  ) async {
+    final found = await _episodeDownloadState(ep, detail, category);
+    final rec = found.record;
+    if (!mounted || rec == null) return false;
+    final label = detail.title.isNotEmpty ? detail.title : widget.item.title;
+    if (found.state == EpisodeDownloadMenuState.broken) {
+      // A broken stub: the same rows as the episode's right-click menu
+      // (fetch it again, look at it, delete it), never Play offline.
+      await showDesktopContextMenu<void>(
+        context,
+        items: [
+          DesktopMenuItem(
+            label: context.l10n.download,
+            icon: Icons.download_rounded,
+            onTap: () =>
+                unawaited(_pickSourceAndDownload(ep, detail, category)),
+          ),
+          DesktopMenuItem(
+            label: context.l10n.showInFolder,
+            icon: Icons.folder_open_rounded,
+            onTap: () async {
+              final path = rec.filePath;
+              final shown = path != null && await revealInExplorer(path);
+              if (!shown && mounted) {
+                _snack(context.l10n.couldntFindDownloadedFile);
+              }
+            },
+          ),
+          DesktopMenuItem(
+            label: context.l10n.deleteDownload,
+            icon: Icons.delete_outline_rounded,
+            destructive: true,
+            onTap: () => unawaited(_deleteDownloadWithConfirm(rec, label)),
+          ),
+        ],
+      );
+      return true;
+    }
+    if (found.state != EpisodeDownloadMenuState.done) return false;
+    await showDesktopContextMenu<void>(
+      context,
+      items: [
+        DesktopMenuItem(
+          label: context.l10n.playOffline,
+          icon: Icons.play_arrow_rounded,
+          onTap: () {
+            if (mounted) unawaited(launchDownloadedEpisode(context, rec));
+          },
+        ),
+        DesktopMenuItem(
+          label: context.l10n.showInFolder,
+          icon: Icons.folder_open_rounded,
+          onTap: () async {
+            final path = rec.filePath;
+            final shown = path != null && await revealInExplorer(path);
+            if (!shown && mounted) _snack(context.l10n.couldntFindDownloadedFile);
+          },
+        ),
+        DesktopMenuItem(
+          label: context.l10n.deleteDownload,
+          icon: Icons.delete_outline_rounded,
+          destructive: true,
+          onTap: () => unawaited(_deleteDownloadWithConfirm(rec, label)),
+        ),
+        const DesktopMenuItem<void>.divider(),
+        // Another cut or quality: the normal picker (it still skips a cut
+        // that is already saved, with its own message).
+        DesktopMenuItem(
+          label: context.l10n.downloadAgain,
+          icon: Icons.download_rounded,
+          onTap: () => unawaited(_pickSourceAndDownload(ep, detail, category)),
+        ),
+      ],
+    );
+    return true;
   }
 
   /// Long-press an episode or chapter → the actions menu.
@@ -1364,10 +2384,27 @@ class _DetailViewState extends State<_DetailView>
     final readSource = detail.sourceId.isNotEmpty
         ? detail.sourceId
         : widget.item.sourceId;
-    bool markedDone(Episode e) => isReading
-        ? read.finished(readSource, readShowId, e.id)
-        : (resume.get(widget.item.sourceId, widget.item.url, e.id)?.finished ??
-              false);
+    bool markedDone(Episode e) {
+      if (isReading) return read.finished(readSource, readShowId, e.id);
+      final mark = resume.get(widget.item.sourceId, widget.item.url, e.id);
+      // Phone keeps the original local-mark-only rule.
+      if (!_windowsDesktopUi) return mark?.finished ?? false;
+      // Windows: the exact rule the row's tick uses, so a row ticked only by
+      // tracker progress offers "Mark as unwatched", and an unwatched
+      // override offers "Mark as watched".
+      return episodeShowsWatched(
+        mark: mark,
+        episodeNumber: e.number?.toInt(),
+        trackerProgress: _trackerProgress,
+        hasMultipleSeasons: seasonsOf(detail.episodes).length > 1,
+      );
+    }
+    // Windows: the right-click menu also carries download rows, picked from
+    // what is actually saved for this episode (finished file, queued, none).
+    final download = _windowsDesktopUi && !isReading
+        ? await _episodeDownloadState(ep, detail, category)
+        : (state: EpisodeDownloadMenuState.unavailable, record: null);
+    if (!mounted) return;
     final action = await showEpisodeActionSheet(
       context,
       reading: isReading,
@@ -1380,7 +2417,7 @@ class _DetailViewState extends State<_DetailView>
       // for something that opens the reader.
       currentPlayerLabel: isReading
           ? ''
-          : (prefs.externalPlayerPackage.isEmpty
+          : (prefs.effectiveExternalPlayerPackage.isEmpty
                 ? context.l10n.builtIn
                 : (prefs.externalPlayerLabel.isEmpty
                       ? context.l10n.external
@@ -1390,18 +2427,47 @@ class _DetailViewState extends State<_DetailView>
       // Metadata titles only, and only when there is something to survey: a
       // source-backed title already IS one source, and a row that opens an
       // empty dialog is worse than no row.
+      // Downloaded show page: no source survey ("Where to watch" is the
+      // per-episode Auto Resolve, hidden there like the page's own row).
       canSurveySources:
+          !_fromDownloads &&
           ZmodeIds.isZ(ep.url) &&
           sl<PlaybackResolver>().candidatesForEpisode(ep.url).isNotEmpty,
+      downloadState: download.state,
     );
     if (action == null || !mounted) return;
 
     switch (action) {
+      // ── Windows menu rows ─────────────────────────────────────────────────
+      case EpisodeAction.play:
+        // Exactly what a click on the row does (downloaded show page: the
+        // saved file, never a stream).
+        if (_fromDownloads) {
+          _playSaved(index);
+          return;
+        }
+        await _openPlayer(episodes, index, detail, category);
+
+      case EpisodeAction.download:
+        await _downloadSingle(ep, detail, category);
+
+      case EpisodeAction.showInFolder:
+        final path = download.record?.filePath;
+        final shown = path != null && await revealInExplorer(path);
+        if (!shown && mounted) {
+          showAppToast(context, context.l10n.couldntFindDownloadedFile);
+        }
+
+      case EpisodeAction.deleteDownload:
+        final rec = download.record;
+        if (rec == null) return;
+        await _deleteDownloadWithConfirm(rec, label);
+
       case EpisodeAction.pickPlayer:
         final choice = await showEpisodePlayerSheet(
           context,
           episodeLabel: label,
-          defaultPackage: prefs.externalPlayerPackage,
+          defaultPackage: prefs.effectiveExternalPlayerPackage,
         );
         if (choice == null || !mounted) return;
         await _openPlayer(
@@ -1578,8 +2644,11 @@ class _DetailViewState extends State<_DetailView>
   Future<VideoSource?> _pickStremioSource(
     List<Episode> episodes,
     int index,
-    MediaDetail detail,
-  ) async {
+    MediaDetail detail, {
+    // Cut used for playback; the Windows "Download this link" entry saves
+    // the link under the same category.
+    String? category,
+  }) async {
     if (_stremioSheetOpen ||
         index < 0 ||
         index >= episodes.length ||
@@ -1605,6 +2674,16 @@ class _DetailViewState extends State<_DetailView>
         title: title,
         bannerUrl: detail.banner ?? detail.cover,
         bannerHeaders: detail.coverHeaders,
+        // Windows (show-9): right-click "Download this link" queues that
+        // exact link instead of playing it.
+        onDownloadLink: _windowsDesktopUi && category != null
+            ? (source) => _enqueueStremioLink(
+                episodes[index],
+                detail,
+                source,
+                category,
+              )
+            : null,
       );
       if (!mounted || picked == null) return null;
       if (!manager.canOpen(ref, revision: revision)) {
@@ -1625,6 +2704,43 @@ class _DetailViewState extends State<_DetailView>
     }
   }
 
+  /// Windows (show-9): queues one picked Stremio link as a download, the
+  /// same way the single-download path enqueues a chosen source.
+  void _enqueueStremioLink(
+    Episode episode,
+    MediaDetail detail,
+    VideoSource source,
+    String category,
+  ) {
+    if (!mounted) return;
+    final item = widget.item;
+    // Windows: keep the details for the downloaded show page.
+    _cacheDetailsOnDownload(detail);
+    unawaited(
+      sl<DownloadManager>().enqueueSource(
+        sourceId: item.sourceId,
+        showId: item.id,
+        showTitle: detail.title,
+        cover: detail.cover ?? item.cover,
+        coverHeaders: detail.coverHeaders ?? item.coverHeaders,
+        showUrl: item.url,
+        category: category,
+        episode: episode,
+        source: source,
+        qualityLabel: source.quality ?? 'auto',
+        // Only this link: Stremio links carry their own headers and expiry.
+        fallbacks: [source],
+        nowMs: DateTime.now().millisecondsSinceEpoch,
+        malId: detail.malId ?? item.malId,
+        anilistId: item.anilistId,
+        tmdbId: detail.tmdbId ?? item.tmdbId,
+        tmdbIsTv: detail.tmdbIsTv || item.tmdbIsTv,
+        imdbId: detail.imdbId ?? item.imdbId,
+      ),
+    );
+    _snack(context.l10n.addedToDownloads);
+  }
+
   Future<void> _openPlayer(
     List<Episode> episodes,
     int index,
@@ -1638,6 +2754,10 @@ class _DetailViewState extends State<_DetailView>
     /// A mirror picked from the long-press menu, opened instead of the
     /// adaptive default. One-shot — the cubit clears it after this episode.
     VideoSource? initialSource,
+
+    /// The main Read/Continue action rechecks cloud progress before choosing a
+    /// chapter. Explicit chapter-row taps must keep the viewer's chosen chapter.
+    bool resumeReading = false,
   }) async {
     // Live channels always use the Android player: it decrypts DRM channels and
     // has live controls, mpv has neither. iOS has no other player, so it stays
@@ -1654,14 +2774,34 @@ class _DetailViewState extends State<_DetailView>
     // found from the metadata page and back.
     if (initialSource == null && index >= 0 && index < episodes.length) {
       final ep = episodes[index];
-      final dl = await sl<DownloadManager>().finishedForEpisode(
+      final exactCopy = await sl<DownloadManager>().finishedForEpisode(
         sourceId: widget.item.sourceId,
         showId: widget.item.id,
         episodeId: ep.id,
         episodeUrl: ep.url,
         malId: detail.malId ?? widget.item.malId,
         episodeNumber: ep.number,
+        category: category,
+        season: ep.season,
       );
+      // Windows online page: a broken stub streams instead of playing.
+      final exact = exactCopy != null && await _isBrokenHere(exactCopy)
+          ? null
+          : exactCopy;
+      // B1 (user's decision, 2026-11-22): when only another cut is saved,
+      // Windows plays that file rather than streaming, and says so, because
+      // the audio language differs from what the page asked for. The phone
+      // never gets here (_savedInAnyCut returns null off Windows).
+      final otherCut = exact == null
+          ? await _savedInAnyCut(ep, detail, category)
+          : null;
+      final dl = exact ?? otherCut;
+      if (otherCut != null && mounted) {
+        final cut = savedCutName(otherCut.category, context.l10n);
+        if (cut != null && otherCut.category != category) {
+          _snack(context.l10n.desktopPlayingDownloadedCut(cut));
+        }
+      }
       if (dl != null) {
         if (!mounted) return;
         await launchDownloadedEpisode(
@@ -1679,13 +2819,21 @@ class _DetailViewState extends State<_DetailView>
             sourceId: widget.item.sourceId,
           ),
           playerOverride: playerOverride?.package,
+          // Returning early skips the My List add below, so hand over this
+          // page's item and the saved-file path adds the same entry.
+          listItem: widget.item,
         );
         return;
       }
     }
     if (!mounted) return;
     if (usesStremioLinks(widget.item.sourceId, initialSource: initialSource)) {
-      final picked = await _pickStremioSource(episodes, index, detail);
+      final picked = await _pickStremioSource(
+        episodes,
+        index,
+        detail,
+        category: category,
+      );
       if (!mounted || picked == null) return;
       await _openPlayer(
         episodes,
@@ -1700,7 +2848,7 @@ class _DetailViewState extends State<_DetailView>
     // Only another app needs a link choice before launch; both in-app players
     // keep their automatic launch.
     final playerPackage =
-        playerOverride?.package ?? sl<PlaybackPrefs>().externalPlayerPackage;
+        playerOverride?.package ?? sl<PlaybackPrefs>().effectiveExternalPlayerPackage;
     if (initialSource == null &&
         index >= 0 &&
         index < episodes.length &&
@@ -1739,6 +2887,26 @@ class _DetailViewState extends State<_DetailView>
     //
     // Every play path funnels through this method, so this one check covers
     // the row tap, the grid tile, the Play button and resume.
+
+    // Opening something other than where they left off? Offer to look at it
+    // without moving their place. Asked here, before the reading/video split,
+    // so all three kinds behave the same. Dismissing means "never mind" —
+    // neither answer is assumed, and nothing opens.
+    final reading =
+        detail.type == ProviderType.novel ||
+        detail.type == ProviderType.manga ||
+        widget.item.type == ProviderType.novel ||
+        widget.item.type == ProviderType.manga;
+    final readingSourceId = _readingSourceId(detail);
+    if (reading) {
+      await _loadCloudReadHistory(readingSourceId);
+      if (resumeReading) await _trackerProgressLookup;
+      if (!mounted) return;
+    }
+    final resume = reading
+        ? _readResumeIndex(episodes, sourceId: readingSourceId)
+        : (index: _resumeIndex(episodes), hasResume: _hasVideoResume(episodes));
+    if (reading && resumeReading) index = resume.index;
     if (index >= 0 && index < episodes.length && !episodes[index].available) {
       final sweep = await showEpisodeUnavailable(
         context,
@@ -1755,24 +2923,6 @@ class _DetailViewState extends State<_DetailView>
       if (!await _sweepForEpisode(episodes[index])) return;
       if (!mounted) return;
     }
-
-    // Opening something other than where they left off? Offer to look at it
-    // without moving their place. Asked here, before the reading/video split,
-    // so all three kinds behave the same. Dismissing means "never mind" —
-    // neither answer is assumed, and nothing opens.
-    final reading =
-        detail.type == ProviderType.novel ||
-        detail.type == ProviderType.manga ||
-        widget.item.type == ProviderType.novel ||
-        widget.item.type == ProviderType.manga;
-    final readingSourceId = _readingSourceId(detail);
-    if (reading) {
-      await _loadCloudReadHistory(readingSourceId);
-      if (!mounted) return;
-    }
-    final resume = reading
-        ? _readResumeIndex(episodes, sourceId: readingSourceId)
-        : (index: _resumeIndex(episodes), hasResume: _hasVideoResume(episodes));
     var peek = false;
     if (shouldAskBeforeJump(
       resumeIndex: resume.index,
@@ -1807,7 +2957,7 @@ class _DetailViewState extends State<_DetailView>
         _myList.add(widget.item);
         _listStatus.setStatus(widget.item, WatchStatus.watching);
       }
-      _openReader(episodes, index, detail, peek: peek);
+      await _openReader(episodes, index, detail, peek: peek);
       return;
     }
 
@@ -1868,7 +3018,7 @@ class _DetailViewState extends State<_DetailView>
                       widget.item.sourceId,
                       initialSource,
                       playerOverride?.package ??
-                          sl<PlaybackPrefs>().externalPlayerPackage,
+                          sl<PlaybackPrefs>().effectiveExternalPlayerPackage,
                     ) ==
                     PlaybackPrefs.androidPlayerId,
             builder: (_) => PlayerScreen(
@@ -1960,16 +3110,45 @@ class _DetailViewState extends State<_DetailView>
     if (mounted) setState(() {});
   }
 
-  void _openReader(
+  Future<void> _openReader(
     List<Episode> chapters,
     int index,
     MediaDetail detail, {
     bool peek = false,
-  }) {
+  }) async {
     final readingType =
         (detail.type == ProviderType.novel || detail.type == ProviderType.manga)
         ? detail.type
         : widget.item.type;
+    // Cloud history syncs the last chapter position, while ReadStore is local.
+    // Bridge it once before opening the reader, using this provider's chapter
+    // ID. Never overwrite an existing local mark or save a look-ahead preview.
+    final sourceId = _readingSourceId(detail);
+    final entry = _readingHistoryEntry(sourceId);
+    final positions = sl<ReadStore>();
+    if (!peek &&
+        entry != null &&
+        !entry.finished &&
+        entry.total > 0 &&
+        index >= 0 &&
+        index < chapters.length &&
+        readingHistoryChapter(chapters, entry) == index &&
+        (positions.get(sourceId, widget.item.id, chapters[index].id) == null ||
+            entry.updatedMs >
+                positions.updatedMs(
+                  sourceId,
+                  widget.item.id,
+                  chapters[index].id,
+                ))) {
+      await positions.save(
+        sourceId,
+        widget.item.id,
+        chapters[index].id,
+        pos: entry.pos.clamp(0, entry.total),
+        total: entry.total,
+      );
+      if (!mounted) return;
+    }
     switch (readingType) {
       case ProviderType.novel:
         Navigator.of(context)
@@ -2059,12 +3238,19 @@ class _DetailViewState extends State<_DetailView>
   bool _hasVideoResume(List<Episode> eps) {
     final store = sl<ResumeStore>();
     for (final e in eps) {
-      if (store.get(widget.item.sourceId, widget.item.url, e.id) != null) {
+      // An "unwatched" override row is not progress (see _isResumeMark).
+      if (_isResumeMark(store.get(widget.item.sourceId, widget.item.url, e.id))) {
         return true;
       }
     }
     return false;
   }
+
+  /// Whether a stored row counts as real progress for Continue/resume. A
+  /// zero-position "Mark as unwatched" override (Windows) only exists to veto
+  /// tracker ticks, so it must not become the Continue target.
+  static bool _isResumeMark(ResumeMark? mark) =>
+      mark != null && !mark.isUnwatchedOverride;
 
   /// A film shows "Movie · 1h 52m" where an episode list would be.
   String? _filmMeta(MediaDetail detail) {
@@ -2082,7 +3268,7 @@ class _DetailViewState extends State<_DetailView>
     int? highestMarked;
     for (int j = 0; j < eps.length; j++) {
       final mark = store.get(widget.item.sourceId, widget.item.url, eps[j].id);
-      if (mark != null) {
+      if (_isResumeMark(mark)) {
         highestMarked = j;
       }
     }
@@ -2106,17 +3292,65 @@ class _DetailViewState extends State<_DetailView>
     if (eps.isEmpty) return (index: 0, hasResume: false);
     final store = sl<ResumeStore>();
     final hasLocal = eps.any(
-      (e) => store.get(widget.item.sourceId, widget.item.url, e.id) != null,
+      (e) => _isResumeMark(
+        store.get(widget.item.sourceId, widget.item.url, e.id),
+      ),
     );
     if (hasLocal) return (index: _resumeIndex(eps), hasResume: true);
+    // Watch history next: it is already on this PC, while the tracker answer
+    // below arrives over the network a moment later. A title opened from My
+    // List often carries a different source/url than the one you watched on,
+    // so match by url, id, MAL id or title rather than by source.
+    final history = _historyFor(widget.item);
+    final watchedNumber = history?.episodeNumber;
+    if (history != null && watchedNumber != null) {
+      final j = eps.indexWhere((e) => e.number == watchedNumber);
+      if (j >= 0) {
+        final next = history.finished && j + 1 < eps.length ? j + 1 : j;
+        return (index: next, hasResume: true);
+      }
+    }
     final p = _trackerProgress;
     if (p != null && p > 0 && seasonsOf(eps).length <= 1) {
+      // An episode the user marked unwatched at/below the tracker's count is
+      // the real gap, so Continue starts there rather than past the count.
+      for (var j = 0; j < eps.length; j++) {
+        final n = eps[j].number?.toInt();
+        if (n == null || n > p) continue;
+        final mark = store.get(widget.item.sourceId, widget.item.url, eps[j].id);
+        if (mark?.markedUnwatched ?? false) return (index: j, hasResume: true);
+      }
       for (var j = 0; j < eps.length; j++) {
         final n = eps[j].number?.toInt();
         if (n != null && n > p) return (index: j, hasResume: true);
       }
     }
     return (index: 0, hasResume: false);
+  }
+
+  /// The newest watch-history entry for [item] (history is newest first),
+  /// matched across sources by page url, show id, MAL id or exact title.
+  HistoryEntry? _historyFor(MediaItem item) {
+    if (!sl.isRegistered<WatchHistory>()) return null;
+    final title = item.title.trim().toLowerCase();
+    // History is only a hint for where to resume, so an unreadable store
+    // (its Hive box not open yet, as in widget tests) just means "no entry"
+    // instead of breaking the whole page build.
+    final List<HistoryEntry> entries;
+    try {
+      entries = sl<WatchHistory>().all();
+    } catch (_) {
+      return null;
+    }
+    for (final e in entries) {
+      if (e.showUrl == item.url ||
+          e.showId == item.id ||
+          (item.malId != null && e.malId == item.malId) ||
+          (title.isNotEmpty && e.showTitle.trim().toLowerCase() == title)) {
+        return e;
+      }
+    }
+    return null;
   }
 
   /// Reading counterpart of [_resumeTarget]: walks the chapters for the
@@ -2134,6 +3368,21 @@ class _DetailViewState extends State<_DetailView>
   String _readingSourceId(MediaDetail detail) =>
       detail.sourceId.isNotEmpty ? detail.sourceId : widget.item.sourceId;
 
+  /// Source-specific chapter IDs may change, but a canonical title ID does not.
+  /// Use the newest matching history across sources only for canonical titles;
+  /// plain provider IDs must never collide with another source's title.
+  ReadEntry? _readingHistoryEntry(String sourceId) {
+    final history = sl<ReadHistory>();
+    final exact = history.get(sourceId, widget.item.id);
+    if (!RegExp(r'^(?:al|mal):\d+$').hasMatch(widget.item.id)) return exact;
+    return readingHistoryForTitle(
+      history.all(),
+      sourceId: sourceId,
+      showId: widget.item.id,
+      type: widget.item.type,
+    );
+  }
+
   ({int index, bool hasResume}) _readResumeIndex(
     List<Episode> chapters, {
     required String sourceId,
@@ -2146,7 +3395,22 @@ class _DetailViewState extends State<_DetailView>
         highestMarked = j;
       }
     }
+    final entry = _readingHistoryEntry(sourceId);
+    final synced = readingHistoryTarget(chapters, entry: entry);
     if (highestMarked != null) {
+      // A local mark from yesterday must not hide progress synced from the
+      // phone today. Manual "mark read" actions also carry a timestamp, so a
+      // newer deliberate local change still wins. Legacy marks use zero.
+      if (entry != null &&
+          synced.hasResume &&
+          entry.updatedMs >
+              store.updatedMs(
+                sourceId,
+                widget.item.id,
+                chapters[highestMarked].id,
+              )) {
+        return synced;
+      }
       if (!store.finished(
         sourceId,
         widget.item.id,
@@ -2162,18 +3426,11 @@ class _DetailViewState extends State<_DetailView>
           highestMarked;
       return (index: next, hasResume: true);
     }
-    final entry = sl<ReadHistory>().get(sourceId, widget.item.id);
-    if (entry != null) {
-      var idx = chapters.indexWhere((c) => c.id == entry.chapterId);
-      if (idx < 0) idx = chapters.indexWhere((c) => c.url == entry.chapterUrl);
-      if (idx >= 0) {
-        if (entry.finished) {
-          idx = adjacentChapterIndex(chapters, idx, step: 1) ?? idx;
-        }
-        return (index: idx, hasResume: true);
-      }
-    }
-    return (index: 0, hasResume: false);
+    return readingHistoryTarget(
+      chapters,
+      entry: entry,
+      completedChapters: _trackerProgress,
+    );
   }
 
   Future<ReadEntry?> _loadCloudReadHistory(String sourceId) {
@@ -2218,6 +3475,16 @@ class _DetailViewState extends State<_DetailView>
       return;
     }
     if (total == 1) {
+      // Windows: a finished film opens its file menu instead of re-searching.
+      if (_windowsDesktopUi &&
+          await _manageFinishedDownload(
+            episodesBySeason.values.first.first,
+            detail,
+            category,
+          )) {
+        return;
+      }
+      if (!mounted) return;
       await _pickSourceAndDownload(
         episodesBySeason.values.first.first,
         detail,
@@ -2232,9 +3499,61 @@ class _DetailViewState extends State<_DetailView>
       if ((detail.subCount ?? 0) > 0) 'sub',
       if ((detail.dubCount ?? 0) > 0) 'dub',
     ];
+    if (_windowsDesktopUi) {
+      // Windows: centered batch dialog instead of the phone bottom sheet.
+      // Same record type, so _startDownload (with its existing-file check)
+      // enqueues exactly like the phone path.
+      final choice = await showDialog<DesktopBatchDownloadChoice>(
+        context: context,
+        builder: (_) => DesktopBatchDownloadDialog(
+          title: detail.title,
+          episodesBySeason: episodesBySeason,
+          // B3: grows with the page while the dialog is open.
+          liveEpisodesBySeason: _batchEpisodesLive,
+          initialSeason: initialSeason,
+          initialCategory: category,
+          availableCategories: availableCategories,
+          coverUrl: detail.cover ?? widget.item.cover ?? '',
+          coverHeaders: detail.coverHeaders ?? widget.item.coverHeaders,
+          wideCoverUrl: _desktopWideEpisodeArt(widget.item, detail),
+          resolve: (ep) => sl<CatalogueRepository>().sources(
+            ep.url,
+            sourceId: widget.item.sourceId,
+          ),
+          resolveEpisodes: _episodesByCategory,
+          downloadedIds: (cut, eps) => _downloadedEpisodeIds(detail, cut, eps),
+          estimateSize: _estimateBatchEpisodeSize,
+          readFreeBytes: () =>
+              windowsDownloadFreeBytes(sl<DownloadPrefs>().locationUri),
+          // Bounded first-episode probe with the playback fallback chain.
+          searchSources: (ep, cut) => episodeDownloadSourceSearch(
+            episode: ep,
+            category: cut,
+            sourceId: widget.item.sourceId,
+            preferredSourceId: detail.sourceId,
+          ),
+        ),
+      );
+      if (choice == null || !mounted) return;
+      _startDownload(
+        detail,
+        choice.category,
+        choice.quality,
+        choice.episodes,
+        server: choice.server,
+        // Each episode then resolves from the source the probe settled on.
+        resolveSourceId: _pickedResolveSource(choice.sourceId),
+      );
+      return;
+    }
     final res =
         await showModalBottomSheet<
-          ({String quality, String category, List<Episode> episodes})
+          ({
+            String quality,
+            String category,
+            List<Episode> episodes,
+            VideoSource? server,
+          })
         >(
           context: context,
           backgroundColor: AppColors.surface,
@@ -2263,7 +3582,61 @@ class _DetailViewState extends State<_DetailView>
           ),
         );
     if (res == null || !mounted) return;
-    _startDownload(detail, res.category, res.quality, res.episodes);
+    _startDownload(
+      detail,
+      res.category,
+      res.quality,
+      res.episodes,
+      server: res.server,
+    );
+  }
+
+  /// One-episode size probe for the Windows batch dialog, sharing the host
+  /// cooldown admission that DownloadSizePreview uses.
+  static Future<DownloadSizeEstimate?> _estimateBatchEpisodeSize(
+    VideoSource source,
+    Episode episode,
+    String quality,
+  ) async {
+    final prefs = sl<DownloadPrefs>();
+    final estimator = DownloadSizeEstimator(
+      cooldownUntil: (uri) => prefs.hostCooldownUntil(uri),
+      onRateLimited: (uri, hint) => prefs.rememberHostCooldown(uri, hint),
+    );
+    try {
+      return await estimator.estimate(
+        source,
+        runtimeMinutes: episode.runtimeMinutes,
+        quality: quality == 'best' ? null : quality,
+      );
+    } finally {
+      estimator.dispose();
+    }
+  }
+
+  /// Episode ids already saved for [category], using the same lookup as
+  /// [_confirmExistingDownloads] so the batch dialog marks what it would skip.
+  Future<Set<String>> _downloadedEpisodeIds(
+    MediaDetail detail,
+    String category,
+    List<Episode> episodes,
+  ) async {
+    final manager = sl<DownloadManager>();
+    final ids = <String>{};
+    for (final ep in episodes) {
+      final saved = await manager.finishedForEpisode(
+        sourceId: widget.item.sourceId,
+        showId: widget.item.id,
+        episodeId: ep.id,
+        episodeUrl: ep.url,
+        episodeNumber: ep.number,
+        malId: detail.malId ?? widget.item.malId,
+        category: category,
+        season: ep.season,
+      );
+      if (saved != null && !await _isBrokenHere(saved)) ids.add(ep.id);
+    }
+    return ids;
   }
 
   /// Re-resolve a title's episodes for a given sub/dub [category] (without
@@ -2326,6 +3699,7 @@ class _DetailViewState extends State<_DetailView>
       showId: item.id,
       showTitle: detail.title,
       cover: detail.cover ?? item.cover,
+      coverHeaders: detail.coverHeaders ?? item.coverHeaders,
       mode: detail.type == ProviderType.novel
           ? ContentMode.novel
           : ContentMode.manga,
@@ -2338,29 +3712,82 @@ class _DetailViewState extends State<_DetailView>
     String category,
   ) async {
     final item = widget.item;
-    final res = await showModalBottomSheet<_SingleDownloadChoice>(
-      context: context,
-      backgroundColor: AppColors.surface,
-      isScrollControlled: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (_) => _SourcePickerSheet(
-        title: ep.title.trim().isNotEmpty ? ep.title : detail.title,
-        category: category,
-        episode: ep,
-        availableCategories: [
-          if ((detail.subCount ?? 0) > 0) 'sub',
-          if ((detail.dubCount ?? 0) > 0) 'dub',
-        ],
-        resolveEpisodes: _episodesByCategory,
-        resolve: (episode) => sl<CatalogueRepository>().sources(
-          episode.url,
-          sourceId: item.sourceId,
+    _SingleDownloadChoice? res;
+    // Windows: the real source the picked links came from, so retries of a
+    // catalogue (`zm`) download ask that same source again.
+    String? resolveSourceId;
+    if (_windowsDesktopUi) {
+      final choice = await showDialog<DesktopSingleDownloadChoice>(context: context,
+        builder: (_) => DesktopSingleDownloadDialog(episode: ep, season: seasonOf(ep) ?? 1,
+          initialCategory: category, availableCategories: [
+            if ((detail.subCount ?? 0) > 0) 'sub', if ((detail.dubCount ?? 0) > 0) 'dub'],
+          resolveEpisodes: _episodesByCategory,
+          // Bounded per-source search with the playback fallback chain; the
+          // show page's matched source is asked first.
+          searchSources: (episode, cut) => episodeDownloadSourceSearch(
+            episode: episode, category: cut, sourceId: item.sourceId,
+            preferredSourceId: detail.sourceId),
+          resolveSources: (episode, cut) {
+            final repo = sl<CatalogueRepository>();
+            // Metadata episode URLs are shared across cuts; pass intent directly.
+            // Ordinary source URLs already identify their sub/dub episode.
+            final metadata = repo is MetadataRepository ? repo
+                : ZmodeIds.isZ(episode.url) && sl.isRegistered<MetadataRepository>()
+                    ? sl<MetadataRepository>() : null;
+            return metadata != null
+                ? metadata.sources(episode.url, sourceId: item.sourceId, category: cut)
+                : repo.sources(episode.url, sourceId: item.sourceId);
+          }));
+      if (choice == null || !mounted) return;
+      final pending = await _confirmExistingDownloads(detail, choice.category, [choice.episode]);
+      if (!mounted || pending.isEmpty) return;
+      // Adapt the desktop dialog's pick to the shared single-download record
+      // so both paths enqueue the same way.
+      res = (
+        chosen: choice.chosen,
+        all: choice.all,
+        episode: choice.episode,
+        category: choice.category,
+      );
+      resolveSourceId = _pickedResolveSource(choice.sourceId);
+    } else {
+      res = await showModalBottomSheet<_SingleDownloadChoice>(
+        context: context,
+        backgroundColor: AppColors.surface,
+        isScrollControlled: true,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
         ),
-      ),
-    );
+        builder: (_) => _SourcePickerSheet(
+          title: ep.title.trim().isNotEmpty ? ep.title : detail.title,
+          category: category,
+          episode: ep,
+          availableCategories: [
+            if ((detail.subCount ?? 0) > 0) 'sub',
+            if ((detail.dubCount ?? 0) > 0) 'dub',
+          ],
+          resolveEpisodes: _episodesByCategory,
+          resolve: (episode) => sl<CatalogueRepository>().sources(
+            episode.url,
+            sourceId: item.sourceId,
+          ),
+        ),
+      );
+    }
     if (res == null || !mounted) return;
+    if (resolveSourceId != null) {
+      sl<DownloadManager>().hintResolveSource(sourceId: item.sourceId,
+        showId: item.id, episodeIds: [res.episode.id], category: res.category,
+        resolveSourceId: resolveSourceId);
+    }
+    if (_windowsDesktopUi) {
+      // Windows: the link was picked by hand in the server dialog, so retries
+      // stay on that exact server and SUB/DUB kind (no silent switch).
+      sl<DownloadManager>().hintPinnedServer(sourceId: item.sourceId,
+        showId: item.id, episodeId: res.episode.id, category: res.category);
+    }
+    // Windows: keep the details for the downloaded show page.
+    _cacheDetailsOnDownload(detail);
     unawaited(
       sl<DownloadManager>().enqueueSource(
         sourceId: item.sourceId,
@@ -2376,18 +3803,127 @@ class _DetailViewState extends State<_DetailView>
         fallbacks: res.all,
         nowMs: DateTime.now().millisecondsSinceEpoch,
         malId: detail.malId ?? item.malId,
+        anilistId: item.anilistId,
+        tmdbId: detail.tmdbId ?? item.tmdbId,
+        tmdbIsTv: detail.tmdbIsTv || item.tmdbIsTv,
+        imdbId: detail.imdbId ?? item.imdbId,
       ),
     );
     _snack(context.l10n.addedToDownloads);
   }
 
-  void _startDownload(
+  /// A picked source worth saving on the record: only for catalogue (`zm`)
+  /// titles, whose record key stays on the catalogue entry (so the show page
+  /// still finds it) while re-resolves ask the source the links came from.
+  String? _pickedResolveSource(String? picked) =>
+      picked != null && picked.isNotEmpty && picked != widget.item.sourceId &&
+          (widget.item.sourceId == ZmodeIds.sourceId || ZmodeIds.isZ(widget.item.url))
+      ? picked
+      : null;
+
+  /// Unknown-language recovered files require an explicit reuse choice. This
+  /// only filters this request; it never relabels media or changes its owner.
+  Future<List<Episode>> _confirmExistingDownloads(MediaDetail detail,
+      String category, List<Episode> episodes) async {
+    if (!_windowsDesktopUi) return episodes;
+    final manager = sl<DownloadManager>();
+    final remaining = <Episode>[];
+    final recovered = <Episode, DownloadRecord>{};
+    final suggestions = recoveredDownloadSuggestions(title: detail.title,
+        episodes: episodes, records: manager.all);
+    for (final ep in episodes) {
+      final saved = await manager.finishedForEpisode(sourceId: widget.item.sourceId,
+        showId: widget.item.id, episodeId: ep.id, episodeUrl: ep.url,
+        episodeNumber: ep.number, malId: detail.malId ?? widget.item.malId,
+        category: category, season: ep.season);
+      // A broken stub is not "already downloaded": it is fetched again.
+      if (saved != null && !await _isBrokenHere(saved)) continue;
+      remaining.add(ep);
+      final candidate = suggestions[ep];
+      if (candidate != null && await manager.filePresent(candidate)) recovered[ep] = candidate;
+    }
+    if (!mounted) return const [];
+    if (recovered.isEmpty) {
+      if (remaining.isEmpty) _snack(context.l10n.desktopEpisodesAlreadyDownloaded);
+      return remaining;
+    }
+    // show-13: say "Dubbed"/"Subbed" rather than the raw category id.
+    final label = category == 'dub'
+        ? context.l10n.dubbed
+        : category == 'sub'
+        ? context.l10n.subbed
+        : category;
+    final reuse = await showDialog<bool>(context: context, builder: (context) => AlertDialog(
+      title: Text(context.l10n.existingDownloadedEpisodes),
+      content: Text(context.l10n.recoveredFilesQuestion(recovered.length, label)),
+      actions: [TextButton(onPressed: () => Navigator.pop(context, false),
+          child: Text(context.l10n.downloadSelectedVersion)),
+        FilledButton(onPressed: () => Navigator.pop(context, true),
+          child: Text(context.l10n.useExistingFiles))]));
+    if (!mounted || reuse == null) return const [];
+    return reuse ? omitReusableDownloads(remaining, recovered, manager.filePresent) : remaining;
+  }
+
+  /// Windows online page: removes the broken stub saved under the same key
+  /// as each of [episodes] (its file goes to the Recycle Bin), so the new
+  /// download can take its place. The download manager skips a key whose
+  /// finished file is still there, however small, so without this Download
+  /// on a broken episode did nothing.
+  Future<void> _dropBrokenCopies(
+    MediaDetail detail,
+    String category,
+    List<Episode> episodes,
+  ) async {
+    if (!_windowsDesktopUi || _fromDownloads) return;
+    final manager = sl<DownloadManager>();
+    for (final ep in episodes) {
+      final saved = await manager.finishedForEpisode(
+        sourceId: widget.item.sourceId,
+        showId: widget.item.id,
+        episodeId: ep.id,
+        episodeUrl: ep.url,
+        episodeNumber: ep.number,
+        malId: detail.malId ?? widget.item.malId,
+        category: category,
+        season: ep.season,
+      );
+      if (saved == null || !await _isBrokenHere(saved)) continue;
+      final atKey = manager.recordFor(
+        widget.item.sourceId,
+        widget.item.id,
+        ep.id,
+        category: category,
+      );
+      final sameKey = atKey != null && atKey.id == saved.id;
+      if (sameKey) await manager.delete(saved);
+    }
+  }
+
+  Future<void> _startDownload(
     MediaDetail detail,
     String category,
     String quality,
-    List<Episode> episodes,
-  ) {
+    List<Episode> episodes, {
+    VideoSource? server,
+    String? resolveSourceId,
+  }) async {
+    episodes = await _confirmExistingDownloads(detail, category, episodes);
+    if (!mounted || episodes.isEmpty) return;
+    await _dropBrokenCopies(detail, category, episodes);
+    if (!mounted) return;
     final item = widget.item;
+    if (resolveSourceId != null) {
+      // Each queued episode re-resolves from the source the probe settled on.
+      sl<DownloadManager>().hintResolveSource(
+        sourceId: item.sourceId,
+        showId: item.id,
+        episodeIds: episodes.map((e) => e.id),
+        category: category,
+        resolveSourceId: resolveSourceId,
+      );
+    }
+    // Windows: keep the details for the downloaded show page.
+    _cacheDetailsOnDownload(detail);
     unawaited(
       sl<DownloadManager>().enqueueEpisodes(
         sourceId: item.sourceId,
@@ -2399,8 +3935,15 @@ class _DetailViewState extends State<_DetailView>
         category: category,
         quality: quality,
         episodes: episodes,
+        serverPreference: server == null
+            ? null
+            : DownloadServerPreference.fromSource(server),
         nowMs: DateTime.now().millisecondsSinceEpoch,
         malId: detail.malId ?? item.malId,
+        anilistId: item.anilistId,
+        tmdbId: detail.tmdbId ?? item.tmdbId,
+        tmdbIsTv: detail.tmdbIsTv || item.tmdbIsTv,
+        imdbId: detail.imdbId ?? item.imdbId,
       ),
     );
     _snack(
@@ -2418,6 +3961,25 @@ class _DetailViewState extends State<_DetailView>
         onPrefetchEpisode: Platform.isAndroid
             ? (episodeUrl) => _maybePrefetch(episodeUrl, widget.item.sourceId)
             : null,
+      );
+    }
+    // Windows: the desktop page, wrapped in the page-keys scope (show-8).
+    if (_windowsDesktopUi) {
+      if (!_hasEntered) {
+        return _DetailOpeningPreview(
+          item: widget.item,
+          heroHeight: _expandedHeight,
+        );
+      }
+      // A scope, not a plain Focus: when a child gives focus back with
+      // unfocus(disposition: scope) (the episode list does when a selection
+      // ends), primary focus lands on this node, so Enter/Space still reach
+      // _onPageKey instead of stopping at the route's scope above it.
+      return FocusScope(
+        node: _pageKeysFocus,
+        autofocus: true,
+        onKeyEvent: _onPageKey,
+        child: _buildDesktopPage(context),
       );
     }
     _heroHeight = _heroFor(context);
@@ -2836,6 +4398,7 @@ class _DetailViewState extends State<_DetailView>
         // ── Episodes ──────────────────────────────────────────────────────
         _EpisodesTab(
           loading: state.episodesLoading,
+          category: state.category,
           versionPicker: showSubDubFor(detail)
               ? SegmentedButton<String>(
                   showSelectedIcon: false,
@@ -3255,6 +4818,1166 @@ class _DetailViewState extends State<_DetailView>
       ),
     );
   }
+
+  /// Windows: the desktop page itself (everything [build] returns once the
+  /// opening preview is done), wrapped by [build] in the page-keys scope.
+  Widget _buildDesktopPage(BuildContext context) {
+    return Scaffold(
+      backgroundColor: AppColors.bg,
+      body: Stack(
+        children: [
+          // Adaptive colour: poster-tinted wash behind the scroll view, only
+          // while the setting is on. The NestedScrollView's own background is
+          // transparent, so the tint shows through the body; the pinned bars
+          // paint that same tint themselves so content never shows through.
+          if (ThemeController.adaptiveColour)
+            PosterTintLayer(
+              notifier: _tint,
+              duration: detailAdaptiveColourDuration,
+            ),
+          Material(
+            type: MaterialType.transparency,
+            child: BlocBuilder<DetailCubit, DetailState>(
+              builder: (context, state) {
+                if (state.status == DetailStatus.loading) {
+                  // A new fetch: a failure after it re-arms the retry countdown.
+                  _retryArmedFor = null;
+                  // The row that was tapped already carried a title, a cover and a
+                  // year, and a full-screen skeleton throws all of that away to
+                  // animate a blank page. Frames prove the app is NOT stuck here -
+                  // 18ms median, 90th 23ms, while tapping through screens - it is
+                  // responsive and simply showing nothing new, because the episodes
+                  // are a source resolve that has not come back yet. The perceived
+                  // hang is the empty screen, not the wait.
+                  //
+                  // So paint what we already know, immediately, and let the episode
+                  // tab carry its own loading skeleton for the part genuinely still
+                  // in flight. A viewer who backs out before the resolve returns sees
+                  // the title they tapped either way, and nobody stares at a
+                  // placeholder for a source sweep.
+                  final partial = _detailFromItem(widget.item);
+                  if (partial != null) {
+                    return _buildDesktopBody(
+                      context,
+                      state.copyWith(
+                        status: DetailStatus.success,
+                        detail: partial,
+                        // Nothing is known yet, so the episode tab shows its skeleton
+                        // rather than an empty list reading as "this source has no
+                        // episodes".
+                        episodesLoading: true,
+                      ),
+                      partial,
+                      sourceMetadataReady: false,
+                    );
+                  }
+                  // Not const: the hero height is platform-dependent (shorter on Windows).
+                  return _DetailSkeleton(heroHeight: _expandedHeight);
+                }
+                if (state.cloudflareUrl != null) {
+                  return _DetailCloudflareBlocked(
+                    url: state.cloudflareUrl!,
+                    isMangayomi:
+                        widget.item.sourceId.startsWith('mg:') ||
+                        (state.detail?.sourceId.startsWith('mg:') ?? false),
+                    canonical: ZmodeIds.parseShow(widget.item.url),
+                    title: state.detail?.title ?? widget.item.title,
+                    altTitle:
+                        state.detail?.englishTitle ?? widget.item.englishTitle,
+                    malId: state.detail?.malId ?? widget.item.malId,
+                  );
+                }
+                if (state.status == DetailStatus.error ||
+                    state.detail == null) {
+                  // The row you tapped already carried a title and a cover, so a
+                  // failed fetch does not have to blank the page — keep what we
+                  // have and say what is missing over it. A rate limit especially:
+                  // it passes on its own, and the wait is the useful part.
+                  final fallback = _detailFromItem(widget.item);
+                  // Windows (show-14): start the rate-limit countdown that the
+                  // banner's Retry and F5 share.
+                  if (_windowsDesktopUi) _armRetry(state.error);
+                  if (fallback != null) {
+                    return Stack(
+                      children: [
+                        _buildDesktopBody(
+                          context,
+                          state,
+                          fallback,
+                          sourceMetadataReady: false,
+                        ),
+                        Positioned(
+                          left: 0,
+                          right: 0,
+                          bottom: 0,
+                          child: _LoadFailureBanner(
+                            service: _sourceLabel(
+                              widget.item.sourceId,
+                              url: widget.item.url,
+                              savedFrom: widget.item.savedFrom,
+                            ),
+                            // Same distinction Home draws: a metadata catalogue and
+                            // an installed source fail alike but read differently.
+                            isMetadataProvider:
+                                widget.item.sourceId == ZmodeIds.sourceId,
+                            error: state.error,
+                            // Windows: stays until dismissed, with Retry.
+                            persistent: _windowsDesktopUi,
+                            onRetry: _windowsDesktopUi ? _retryLoad : null,
+                            retryNotBefore: _retryNotBefore,
+                          ),
+                        ),
+                      ],
+                    );
+                  }
+                  // Offline is not the title failing: saying "failed to load this
+                  // title" over a dropped connection sends people hunting a
+                  // problem that isn't there.
+                  final offline = state.error == 'offline';
+                  return EmptyState(
+                    icon: offline
+                        ? Icons.wifi_off_rounded
+                        : Icons.error_outline,
+                    message: offline
+                        ? '${context.l10n.offlineTitle}\n${context.l10n.offlineBody}'
+                        : _limitSeconds(state.error) != null
+                        ? context.l10n.providerNeedsBreatherBody(
+                            _limitSeconds(state.error)!,
+                          )
+                        // Windows (src-11): a time-out says so; Retry below.
+                        : _windowsDesktopUi
+                        ? sourceFailureMessage(
+                            state.error,
+                            context.l10n.failedToLoadThisTitle,
+                          )
+                        : context.l10n.failedToLoadThisTitle,
+                    // Windows (show-14): no cached page to keep, so the Retry
+                    // lives here instead of on the banner. While rate-limited
+                    // it only says how long is left (same rule as F5).
+                    actionLabel: _windowsDesktopUi ? context.l10n.retry : null,
+                    onAction: _windowsDesktopUi ? _retryLoad : null,
+                  );
+                }
+                return _buildDesktopBody(context, state, state.detail!);
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Windows: the desktop detail layout (compact hero card, info pane,
+  /// Episodes / Cast / Relations / Details tabs).
+  Widget _buildDesktopBody(
+    BuildContext context,
+    DetailState state,
+    MediaDetail detail, {
+    bool sourceMetadataReady = true,
+  }) {
+    final item = widget.item;
+    final logoUrl = _logoUrl;
+    final cubit = context.read<DetailCubit>();
+    final category = state.category;
+    final selectedSeason = state.selectedSeason;
+    // Downloaded mode lists the saved files, not the source's episodes, each
+    // dressed with the show's saved episode metadata (description, date,
+    // rating, runtime, local thumbnail) so rows look like the online page.
+    final eps = _fromDownloads
+        ? mergeSavedEpisodeMeta(
+            episodesFromDownloads(_savedEpisodes),
+            detail.episodes,
+          )
+        : detail.episodes;
+    final store = sl<ResumeStore>();
+    // Online page of a show with downloads: keep its details for the
+    // downloaded show page (only once the full metadata is in; re-saved,
+    // debounced, when later enrichment adds more).
+    if (sourceMetadataReady) _cacheDetailsForDownloads(detail, state);
+    // Manga/novel: no player, no sub/dub, no video downloads — drives the
+    // Play→Read relabel and hides the download affordances below.
+    final isReading =
+        detail.type == ProviderType.novel || detail.type == ProviderType.manga;
+    // Kick the (cached, once-per-malId) filler lookup for the "Filler" badge.
+    _ensureFiller(detail.malId ?? item.malId);
+    // Kick the (once-per-detail) tracker-progress lookup for grey-out.
+    _maybeFetchTrackerProgress(detail);
+
+    // Resume / play button logic. Local playback first; else fall back to the
+    // tracker's watched count (see _resumeTarget). Local case is unchanged.
+    // Reading titles use their OWN progress store instead — _resumeTarget's
+    // ResumeStore never carries a mark for a chapter, so it would always
+    // (harmlessly but wrongly) say "start over".
+    final resume = _resumeTarget(eps);
+    final readingSourceId = _readingSourceId(detail);
+    if (isReading) unawaited(_loadCloudReadHistory(readingSourceId));
+    final readResume = isReading
+        ? _readResumeIndex(eps, sourceId: readingSourceId)
+        : null;
+    final resumeIdx = isReading ? readResume!.index : resume.index;
+    // Warm the episode Play/Continue will start, but only after the viewer has
+    // remained on the detail page. Reading providers do not resolve video.
+    // Downloaded mode plays from disk, so there is nothing to warm.
+    if (!isReading && eps.isNotEmpty && !_fromDownloads) {
+      _maybePrefetch(eps[resumeIdx].url, item.sourceId);
+    }
+    // Override-only "unwatched" rows don't count (see _isResumeMark).
+    final hasAnyMark = eps.any(
+      (e) => _isResumeMark(store.get(item.sourceId, item.url, e.id)),
+    );
+    final episodeNum = eps.isNotEmpty
+        ? (eps[resumeIdx].number?.toInt() ?? resumeIdx + 1)
+        : 1;
+    // Windows: with no episode list (offline, or the source returned none),
+    // this show's downloads stand in for both the Play button and the list.
+    // Target platform (not the host OS) so phone widget tests run on a
+    // Windows machine still take the phone path.
+    final offlineSaved =
+        defaultTargetPlatform == TargetPlatform.windows &&
+            eps.isEmpty &&
+            !isReading
+        ? downloadsForShow(
+            sl<DownloadManager>().all,
+            showUrl: item.url,
+            malId: detail.malId ?? item.malId,
+            anilistId: item.anilistId,
+            tmdbId: detail.tmdbId ?? item.tmdbId,
+            title: detail.title.isNotEmpty ? detail.title : item.title,
+          )
+        : const <DownloadRecord>[];
+    HistoryEntry? lastWatched;
+    if (offlineSaved.isNotEmpty && sl.isRegistered<WatchHistory>()) {
+      final urls = {item.url, for (final r in offlineSaved) r.showUrl};
+      for (final e in sl<WatchHistory>().all()) {
+        if (urls.contains(e.showUrl)) {
+          lastWatched = e;
+          break;
+        }
+      }
+    }
+    final offlineStart = downloadStartIndex(
+      offlineSaved,
+      lastEpisode: lastWatched?.episodeNumber,
+      lastFinished: lastWatched?.finished ?? false,
+    );
+    final offlineLabel = offlineSaved.isEmpty
+        ? null
+        : (lastWatched != null
+              ? context.l10n.continueEpisode(
+                  offlineSaved[offlineStart].episodeNumber?.toInt() ??
+                      offlineStart + 1)
+              : context.l10n.play);
+    final buttonLabel = offlineLabel ?? (isReading
+        ? (readResume!.hasResume
+              ? context.l10n.continueLabel
+              : context.l10n.read)
+        : (resume.hasResume
+              ? (detail.isFilm
+                    ? context.l10n.continueLabel
+                    : context.l10n.continueEpisode(episodeNum))
+              : context.l10n.play));
+
+    // Tall phone hero: prefer TMDB's portrait art; other sources stay as-is.
+    final coverUrl =
+        mobileHeroArt(
+          detail.cover ?? item.cover,
+          detail.banner ?? item.banner ?? item.landscapePoster,
+          sourceId: detail.sourceId,
+        ) ??
+        '';
+    final coverHeaders = detail.coverHeaders ?? item.coverHeaders;
+    final hasCover = coverUrl.isNotEmpty;
+
+    final tintPoster = (detail.cover ?? item.cover)?.trim();
+    final tintBackdrop = (detail.banner ?? item.banner)?.trim();
+    final tintArt = adaptiveArtUrl(tintPoster, tintBackdrop);
+    if (ThemeController.adaptiveColour &&
+        tintArt != null &&
+        _tintUrl != tintArt) {
+      _tintUrl = tintArt;
+      final sampleArt = adaptiveSampleUrl(
+        tintArt,
+        backdrop:
+            (tintPoster == null || tintPoster.isEmpty) &&
+            tintBackdrop != null &&
+            tintBackdrop.isNotEmpty,
+      );
+      unawaited(
+        extractAdaptiveColor(sampleArt, coverHeaders).then((c) {
+          if (!mounted || _tintUrl != tintArt) return;
+          _tint.value = c == null
+              ? null
+              : tintFromDominant(c, blend: adaptiveColourBlend);
+        }),
+      );
+    }
+
+    // The hero handles the lookup result without rebuilding the page.
+    // Downloaded mode shows the cover/banner instead of a trailer.
+    if (!_fromDownloads) _resolveTrailer(detail);
+
+    // Season data. PRESERVED.
+    final seasonSet = seasonsOf(eps);
+    final hasMultipleSeasons = seasonSet.length > 1;
+    final currentSeason = hasMultipleSeasons
+        ? (seasonSet.contains(selectedSeason)
+              ? selectedSeason
+              : seasonSet.first)
+        : 1;
+    final seasonEps = hasMultipleSeasons
+        ? episodesInSeason(eps, currentSeason)
+        : eps;
+
+    // Episodes grouped by season for the download sheet's season chips.
+    final episodesBySeason = <int, List<Episode>>{};
+    if (hasMultipleSeasons) {
+      for (final e in eps) {
+        (episodesBySeason[seasonOf(e) ?? 1] ??= <Episode>[]).add(e);
+      }
+    } else {
+      episodesBySeason[1] = eps;
+    }
+    // B3: keep an open Windows batch dialog in step with this list.
+    _publishBatchEpisodes(episodesBySeason);
+
+    // ── Status label (used by the meta line and Details tab) ────────────────
+    final statusStr = statusLabel(detail.status);
+
+    // ── Netflix-style meta line: "2010 · 10 Seasons · Completed" ────────────
+    // Join only what we actually HAVE with " · " (no faked rating/HD/CC).
+    // Seasons when multi-season, else episode count.
+    //
+    // Three items, and that is the whole line. It is ONE line with an
+    // ellipsis, so a fourth does not add anything — it pushes the end off the
+    // edge and shows less than three did. Score, format and per-episode
+    // duration each got a turn here and each cost more than it paid; they
+    // live in the Details tab now, where there is room to read them.
+    final metaParts = <String>[];
+    if ((detail.year ?? '').isNotEmpty) metaParts.add(detail.year!);
+    // A film has no episode count to fill the middle slot, so its run time
+    // takes it — there it IS the thing worth knowing before pressing play.
+    // Downloaded mode: the show's episode count from the saved metadata (same
+    // as online), not just how many files are saved. Also used by the
+    // run-time slot below and the Details tab's Episodes row.
+    final shownCount = _fromDownloads && detail.episodes.length > eps.length
+        ? detail.episodes.length
+        : eps.length;
+    if (!isReading &&
+        (detail.isFilm || shownCount <= 1) &&
+        (detail.durationMins ?? 0) > 0) {
+      metaParts.add('${detail.durationMins}m');
+    }
+    if (!detail.isFilm && hasMultipleSeasons) {
+      metaParts.add(context.l10n.seasonCount(seasonSet.length));
+    } else if (!detail.isFilm && eps.isNotEmpty) {
+      metaParts.add(
+        isReading
+            ? context.l10n.chapterCount(shownCount)
+            : context.l10n.episodeCount(shownCount),
+      );
+    }
+    if (statusStr.isNotEmpty) metaParts.add(statusStr);
+    final metaLine = metaParts.join('  ·  ');
+
+    // ── Download button label: "Download S{season}:E{n}" when we can derive
+    // the first episode of the current season, else a plain "Download". ──────
+    // Windows: a plain "Download" — it opens the batch dialog where the
+    // episodes are picked, so naming one episode here would mislead.
+    final downloadLabel = detail.isFilm || _windowsDesktopUi
+        ? context.l10n.download
+        : _downloadLabel(
+            context.l10n,
+            seasonEps,
+            hasMultipleSeasons,
+            currentSeason,
+          );
+
+    // ── Windows Play / Download actions (show-8) ────────────────────────────
+    // Built once so the desktop buttons and the page keys (Enter/Space, D)
+    // always do exactly the same thing. Null = the button is disabled.
+    final VoidCallback? desktopPlay = eps.isEmpty
+        ? (offlineSaved.isEmpty
+              ? null
+              : () => unawaited(
+                  launchDownloadedEpisode(
+                    context,
+                    offlineSaved[offlineStart],
+                    episodes: episodesFromDownloads(offlineSaved),
+                    startIndex: offlineStart,
+                  ),
+                ))
+        // Downloaded mode: Continue plays the saved file, never a stream.
+        : _fromDownloads
+        ? () => _playSaved(resumeIdx)
+        : () => _openPlayer(
+            eps,
+            resumeIdx,
+            detail,
+            category,
+            resumeReading: isReading,
+          );
+    // Downloaded mode has no Download button (and so no D key).
+    final VoidCallback? desktopDownload =
+        isReading || eps.isEmpty || _fromDownloads
+        ? null
+        : () => _openDownloadSheet(
+            detail: detail,
+            category: category,
+            episodesBySeason: episodesBySeason,
+            initialSeason: currentSeason,
+          );
+    if (_windowsDesktopUi) {
+      // Keys stay dead while the episode list is still loading, like the
+      // buttons (they show a spinner then).
+      _keyPlay = state.episodesLoading ? null : desktopPlay;
+      _keyDownload = state.episodesLoading ? null : desktopDownload;
+    }
+
+    // ── Starring / Creators (Genres fallback) muted lines ───────────────────
+    // Prefer enriched cast (AniList/TMDB) when available, else the provider's.
+    final castNames = state.cast.isNotEmpty
+        ? state.cast.map((c) => c.name).toList()
+        : detail.cast;
+    final starring = castNames.isNotEmpty ? castNames.take(3).join(', ') : null;
+    final starringMore = castNames.length > 3;
+    final creators = detail.studios.isNotEmpty
+        ? detail.studios.join(', ')
+        : null;
+    // For anime (or anything without cast) surface Genres instead of an empty
+    // Starring line — never show an empty label.
+    final genresLine = (starring == null && detail.genres.isNotEmpty)
+        ? detail.genres.take(4).join(', ')
+        : null;
+
+    // Friendly provider name + its origin repo, so the user can tell which repo
+    // a source came from. JS providers live in the registry; CloudStream sources
+    // live in the CS manager — without the CS lookup this fell back to the raw
+    // sourceId ("cs:Provider@31@tag"), leaking the file-id suffix.
+    final sourceName = _sourceLabel(
+      item.sourceId,
+      url: item.url,
+      prefer: widget.prefer ?? _preferFromName(item.savedFrom),
+      savedFrom: item.savedFrom,
+    );
+
+    // Built as a list (not inline in NestedScrollView) so the Windows wide
+    // layout below can split the header between two panes.
+    final headerSlivers = <Widget>[
+        // ── 1. Hero: backdrop + overlapping poster + status/total ──────────
+        SliverAppBar(
+          expandedHeight: _expandedHeight,
+          pinned: true,
+          // iOS-style chip with its own background (no top fade needed).
+          // Padded to sit 14px off the edge, mirroring the top-right
+          // trailer controls.
+          leadingWidth: 62,
+          leading: const Padding(
+            padding: EdgeInsets.only(left: 14),
+            child: _DetailBackButton(),
+          ),
+          // Opaque while adaptive colour is on, painted in the same wash as the
+          // body, so the pinned bar hides scrolled content instead of letting
+          // it show through (a transparent bar read as an unfinished page).
+          // Flat theme bg otherwise, exactly as before.
+          backgroundColor: ThemeController.adaptiveColour
+              ? (_tint.value ?? AppColors.bg)
+              : AppColors.bg,
+          surfaceTintColor: Colors.transparent,
+          shadowColor: Colors.transparent,
+          centerTitle: false,
+          titleSpacing: 0,
+          // PRESERVED EFFECT: title fades in once the hero scrolls past.
+          title: AnimatedOpacity(
+            opacity: _showAppBarTitle ? 1.0 : 0.0,
+            duration: const Duration(milliseconds: 180),
+            curve: Curves.easeOut,
+            // Mini title logo in the collapsed bar; plain text until (and
+            // unless) one resolves.
+            child: _logoUrl != null
+                ? Align(
+                    alignment: Alignment.centerLeft,
+                    child: CachedNetworkImage(
+                      imageUrl: logoUrl!,
+                      height: 24,
+                      fit: BoxFit.contain,
+                      alignment: Alignment.centerLeft,
+                      fadeInDuration: const Duration(milliseconds: 250),
+                      errorWidget: (_, _, _) => _barTitleText(detail.title),
+                      errorListener: widget.item.sourceId == stremioSourceId
+                          ? (_) => _loadLogo(failedUrl: logoUrl)
+                          : null,
+                    ),
+                  )
+                : _barTitleText(detail.title),
+          ),
+          flexibleSpace: FlexibleSpaceBar(
+            collapseMode: CollapseMode.parallax,
+            background: RepaintBoundary(
+              child: _Hero(
+                title: detail.title,
+                onTitleTap: () => _onTitleTap(detail.title),
+                coverUrl: coverUrl,
+                imageDecodeWidth: mobileHeroDecodeWidth(item.sourceId, 800),
+                coverHeaders: coverHeaders,
+                hasCover: hasCover,
+                tint: ThemeController.adaptiveColour ? _tint : null,
+                trailer: _trailerFuture,
+                // Pause the trailer once the hero has scrolled past (reuses
+                // the same signal that fades in the app-bar title).
+                collapsed: _showAppBarTitle,
+                onTapFullscreen: _openTrailer,
+              ),
+            ),
+          ),
+        ),
+
+        // ── 2. Title + meta line (Netflix header) ──────────────────────────
+        SliverToBoxAdapter(
+          child: RepaintBoundary(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Tapping the title opens the search popup (Cue pop-in):
+                  // pre-filled query, "Search" or "Search all sources".
+                  GestureDetector(
+                    onTap: () => _onTitleTap(detail.title),
+                    // Official title logo when the toggle resolved one —
+                    // grows in smoothly instead of shoving Play down.
+                    child: AnimatedSize(
+                      duration: const Duration(milliseconds: 250),
+                      curve: Curves.easeOut,
+                      alignment: Alignment.topCenter,
+                      child: _logoUrl != null
+                          // Compact natural-size box (never full-width): the
+                          // logo fades in exactly where it lands — no
+                          // centre-then-left snap while loading.
+                          ? ConstrainedBox(
+                              constraints: const BoxConstraints(
+                                maxHeight: 56,
+                                maxWidth: 220,
+                              ),
+                              child: CachedNetworkImage(
+                                imageUrl: logoUrl!,
+                                fit: BoxFit.contain,
+                                alignment: Alignment.centerLeft,
+                                fadeInDuration: const Duration(
+                                  milliseconds: 250,
+                                ),
+                                errorWidget: (_, _, _) =>
+                                    _headerTitleText(detail.title),
+                                errorListener:
+                                    widget.item.sourceId == stremioSourceId
+                                    ? (_) => _loadLogo(failedUrl: logoUrl)
+                                    : null,
+                              ),
+                            )
+                          : _headerTitleText(detail.title),
+                    ),
+                  ),
+                  // Late metadata grows this block instead of shoving Play
+                  // down a frame — that shove read as open-transition jitter.
+                  AnimatedSize(
+                    duration: const Duration(milliseconds: 250),
+                    curve: Curves.easeOut,
+                    alignment: Alignment.topCenter,
+                    child: metaLine.isNotEmpty
+                        ? Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const SizedBox(height: 8),
+                              Row(
+                                children: [
+                                  Flexible(
+                                    child: Text(
+                                      metaLine,
+                                      style: AppText.body.copyWith(
+                                        color: AppColors.textSecondary,
+                                      ),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                  // What the source claims it serves — "4K", "HD",
+                                  // "CAM". Only CloudStream reports one, so it is
+                                  // usually absent.
+                                  if ((item.quality ?? '')
+                                      .trim()
+                                      .isNotEmpty) ...[
+                                    const SizedBox(width: 8),
+                                    _MetaBadge(
+                                      item.quality!.trim().toUpperCase(),
+                                    ),
+                                  ],
+                                  if (detail.isAdult) ...[
+                                    const SizedBox(width: 8),
+                                    const _MetaBadge('18+'),
+                                  ],
+                                ],
+                              ),
+                            ],
+                          )
+                        : const SizedBox.shrink(),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+
+        // ── 3. White Play + gray Download buttons (full-width, stacked) ─────
+        // (The hero banner autoplays the trailer; tap it for fullscreen.)
+        //
+        // Each button carries its own 16px side padding (rather than one
+        // Padding wrapping the whole Column) so the Z Mode selector below
+        // can sit as a plain last child: it already supplies its own 16px
+        // side padding (it's normally a top-level sliver child), and a
+        // shared wrapper would double that indent.
+        SliverToBoxAdapter(
+          // Windows: desktop action strip (Play/Download/source side by side);
+          // phone keeps upstream's stacked buttons.
+          child: _windowsDesktopUi
+              ? Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                  child: DesktopDetailActions(
+                    play: _PlayButton(
+                      loading: state.episodesLoading,
+                      label: buttonLabel,
+                      icon: isReading
+                          ? Icons.menu_book_rounded
+                          : Icons.play_arrow_rounded,
+                      onPressed: desktopPlay,
+                    ),
+                    // Downloaded mode: "Show online" opens the normal page
+                    // (disabled for files recovered from disk, which have no
+                    // page to open).
+                    download: _fromDownloads
+                        ? _ShowOnlineButton(
+                            onPressed: widget.item.url.isEmpty
+                                ? null
+                                : _openOnline,
+                          )
+                        : isReading
+                        ? null
+                        : _DownloadButton(
+                            loading: state.episodesLoading,
+                            label: downloadLabel,
+                            onPressed: desktopDownload,
+                          ),
+                    // No Auto Resolve / Wrong title row for downloaded files;
+                    // only its alternative (romaji) title line, as plain text.
+                    source: _fromDownloads
+                        ? _savedAltTitleLine(detail)
+                        : !_fromDownloads &&
+                            sourceMetadataReady &&
+                            ZmodeIds.isZ(widget.item.url)
+                        ? MatchLine(
+                            canonical: ZmodeIds.parseShow(widget.item.url)!,
+                            title: detail.title,
+                            altTitle: detail.englishTitle,
+                            malId: detail.malId,
+                            metadataAliases: [
+                              if (detail.englishTitle != null)
+                                detail.englishTitle!,
+                              if (detail.nativeTitle != null) detail.nativeTitle!,
+                              ...detail.synonyms,
+                            ],
+                            compact: true,
+                          )
+                        : null,
+                  ),
+                )
+              : Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 18, 16, 0),
+                child: _PlayButton(
+                  loading: state.episodesLoading,
+                  label: buttonLabel,
+                  icon: isReading
+                      ? Icons.menu_book_rounded
+                      : Icons.play_arrow_rounded,
+                  onPressed: eps.isNotEmpty
+                      ? () => _openPlayer(
+                          eps,
+                          resumeIdx,
+                          detail,
+                          category,
+                          resumeReading: isReading,
+                        )
+                      : null,
+                ),
+              ),
+              // Reading downloads are out of scope for this plan.
+              if (!isReading)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+                  child: _DownloadButton(
+                    // Gated exactly like Play above: with no episodes there is
+                    // nothing to download, and leaving it live on a title no
+                    // source matched just moves the dead end one tap later.
+                    loading: state.episodesLoading,
+                    label: downloadLabel,
+                    onPressed: eps.isEmpty
+                        ? null
+                        : () => _openDownloadSheet(
+                            detail: detail,
+                            category: category,
+                            episodesBySeason: episodesBySeason,
+                            initialSeason: currentSeason,
+                          ),
+                  ),
+                ),
+              // Z Mode: matched source + "Wrong title?", kept with the
+              // actions it controls instead of under the synopsis.
+              // The first frame may be built from the tapped catalogue card,
+              // which has no synonyms/native title. Don't start a canonical
+              // source search until full metadata arrives: resolve() shares
+              // in-flight work by title id, so an early search would make the
+              // later alias-aware lookup reuse the incomplete one.
+              // Same late-arrival growth as the meta line above.
+              AnimatedSize(
+                duration: const Duration(milliseconds: 250),
+                curve: Curves.easeOut,
+                alignment: Alignment.topCenter,
+                child: sourceMetadataReady && ZmodeIds.isZ(widget.item.url)
+                    ? MatchLine(
+                        canonical: ZmodeIds.parseShow(widget.item.url)!,
+                        title: detail.title,
+                        altTitle: detail.englishTitle,
+                        malId: detail.malId,
+                        metadataAliases: [
+                          if (detail.englishTitle != null) detail.englishTitle!,
+                          if (detail.nativeTitle != null) detail.nativeTitle!,
+                          ...detail.synonyms,
+                        ],
+                      )
+                    : const SizedBox.shrink(),
+              ),
+            ],
+          ),
+        ),
+
+        // ── 4. Synopsis (clamped) + "Read more" → Details tab ───────────────
+        SliverToBoxAdapter(
+          child: AnimatedSize(
+            duration: const Duration(milliseconds: 250),
+            curve: Curves.easeOut,
+            alignment: Alignment.topCenter,
+            child: (cleanSynopsis(detail.description) ?? '').isNotEmpty
+                ? Padding(
+                    padding: EdgeInsets.fromLTRB(
+                      16,
+                      _windowsDesktopUi ? 8 : 18,
+                      16,
+                      0,
+                    ),
+                    child: _Description(
+                      text: cleanSynopsis(detail.description) ?? '',
+                      // "Read more" reveals the Details tab (full synopsis) rather
+                      // than expanding inline; the header stays clamped to 3 lines.
+                      onReadMore: () => _revealTab(_detailsTab),
+                    ),
+                  )
+                : const SizedBox.shrink(),
+          ),
+        ),
+
+        // ── 5. Starring / Creators / Genres muted lines ─────────────────────
+        SliverToBoxAdapter(
+          child: AnimatedSize(
+            duration: const Duration(milliseconds: 250),
+            curve: Curves.easeOut,
+            alignment: Alignment.topCenter,
+            child: starring != null || creators != null || genresLine != null
+                ? Padding(
+                    padding: EdgeInsets.fromLTRB(
+                      16,
+                      _windowsDesktopUi ? 8 : 14,
+                      16,
+                      0,
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (starring != null)
+                          _CreditLine(
+                            label: context.l10n.starring,
+                            value: starring,
+                            more: starringMore,
+                            // Tapping the line (or its "… more") reveals the Cast tab.
+                            // Downloaded mode has no Cast tab to open.
+                            onMore: starringMore && !_fromDownloads
+                                ? () => _revealTab(1)
+                                : null,
+                          ),
+                        if (genresLine != null)
+                          _CreditLine(
+                            label: context.l10n.genres,
+                            value: genresLine,
+                          ),
+                        if (creators != null)
+                          _CreditLine(
+                            label: context.l10n.creators,
+                            value: creators,
+                          ),
+                      ],
+                    ),
+                  )
+                : const SizedBox.shrink(),
+          ),
+        ),
+
+        // ── 6. Icon-over-label action row (My List / Trailer / Share / Web) ─
+        // "Trailer" is a CloudStream-style result action (recloudstream's
+        // result fragment exposes a Trailer button); it opens the fullscreen
+        // TrailerScreen and only appears once a trailer id has resolved.
+        SliverToBoxAdapter(
+          child: Padding(
+            padding: EdgeInsets.fromLTRB(
+              _windowsDesktopUi ? 16 : 8,
+              _windowsDesktopUi ? 8 : 20,
+              8,
+              8,
+            ),
+            child: _DetailActionRow(
+              children: [
+                _IconAction(
+                  icon: _inMyList ? Icons.check_rounded : Icons.add_rounded,
+                  active: _inMyList,
+                  // Reading-aware: a manga on your list is "Reading", not
+                  // "Watching". Display only — the stored status is still
+                  // WatchStatus.watching, so My List and the trackers are
+                  // untouched, and reading:false returns the plain label
+                  // unchanged for anime.
+                  label: _status == null
+                      ? context.l10n.myList
+                      : shortLabelFor(_status!, reading: isReading),
+                  tooltip: _inMyList
+                      ? context.l10n.changeStatus
+                      : context.l10n.addToMyList,
+                  onTap: () => _openListSheet(detail),
+                ),
+                // Windows shows the bell too (track-1): subscriptions feed the
+                // in-app New episodes inbox and Windows notifications.
+                // Not in downloaded mode: its list is the saved files, not
+                // the source's episodes a subscription has to compare with.
+                if ((Platform.isAndroid || _windowsDesktopUi) &&
+                    !_fromDownloads &&
+                    (_subscribed || (!state.episodesLoading && eps.isNotEmpty)))
+                  _IconAction(
+                    icon: _subscribed
+                        ? Icons.notifications_active_rounded
+                        : Icons.notifications_none_rounded,
+                    active: _subscribed,
+                    label: context.l10n.notify,
+                    tooltip: _subscribed
+                        ? context.l10n.stopAlerts
+                        : (isReading
+                              ? context.l10n.notifyOnNewChapters
+                              : context.l10n.notifyOnNewEpisodes),
+                    onTap: () => _toggleSubscribe(detail),
+                  ),
+                if (_trackingAvailable(detail))
+                  _IconAction(
+                    icon: _tracked
+                        ? Icons.published_with_changes_rounded
+                        : Icons.sync_rounded,
+                    active: _tracked,
+                    label: context.l10n.tracking,
+                    tooltip: _tracked
+                        ? context.l10n.trackedEditStatusScoreProgress
+                        : context.l10n.syncStatusScoreProgress,
+                    onTap: () => _openTrackingSheet(detail),
+                  ),
+                _IconAction(
+                  icon: Icons.ios_share_rounded,
+                  label: context.l10n.share,
+                  tooltip: context.l10n.share,
+                  onTap: () => _share(detail, sourceName),
+                ),
+                _IconAction(
+                  icon: Icons.public_rounded,
+                  label: context.l10n.web,
+                  tooltip: context.l10n.openSourceSite,
+                  onTap: _openSourceSite,
+                ),
+                // Novel only — a manga chapter is images, not text, and
+                // there's nothing to put in an EPUB.
+                if (detail.type == ProviderType.novel)
+                  _IconAction(
+                    icon: Icons.output,
+                    label: context.l10n.epub,
+                    tooltip: context.l10n.exportAsEpub,
+                    onTap: () => showEpubExportSheet(
+                      context,
+                      sourceId: detail.sourceId.isNotEmpty
+                          ? detail.sourceId
+                          : item.sourceId,
+                      showTitle: detail.title,
+                      chapters: eps,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+
+        // ── 7. Pinned tab bar ───────────────────────────────────────────────
+        SliverPersistentHeader(
+          pinned: true,
+          delegate: _TabBarDelegate(
+            TabBar(
+              controller: _tabController,
+              isScrollable: true,
+              tabAlignment: TabAlignment.start,
+              // Hug the left edge: the first tab starts flush with the 16px
+              // content gutter (title/synopsis), and labelPadding(right: 24)
+              // spaces the tabs apart while keeping them left-anchored —
+              // never centered/spread (matches Sozo Read).
+              padding: const EdgeInsetsDirectional.only(start: 16),
+              labelPadding: const EdgeInsetsDirectional.only(end: 24),
+              labelColor: AppColors.accent,
+              unselectedLabelColor: AppColors.textSecondary,
+              indicatorSize: TabBarIndicatorSize.label,
+              indicator: UnderlineTabIndicator(
+                borderSide: BorderSide(color: AppColors.accent, width: 2.5),
+                // Bottom inset lifts the line toward the label. A Tab is 46
+                // high for 15px text, so the indicator otherwise draws at the
+                // bottom of that box with a visible gap under the word.
+                // Raising the line rather than shortening the tab keeps the
+                // tap target at its full height.
+                insets: EdgeInsetsDirectional.only(start: 2, end: 2, bottom: 8),
+              ),
+              // Remove the full-width underline divider under the bar.
+              dividerColor: Colors.transparent,
+              dividerHeight: 0,
+              splashFactory: NoSplash.splashFactory,
+              overlayColor: WidgetStateProperty.all(Colors.transparent),
+              labelStyle: AppText.headline.copyWith(fontSize: 15),
+              unselectedLabelStyle: AppText.headline.copyWith(
+                fontSize: 15,
+                fontWeight: FontWeight.w500,
+              ),
+              tabs: [
+                Tab(
+                  text: isReading
+                      ? context.l10n.chapters
+                      : (detail.isFilm
+                            ? context.l10n.movie
+                            : context.l10n.episodes),
+                ),
+                // Downloaded mode keeps only Episodes + Details.
+                if (!_fromDownloads) ...[
+                  Tab(
+                    text: isReading
+                        ? context.l10n.characters
+                        : context.l10n.cast,
+                  ),
+                  Tab(text: context.l10n.relations),
+                ],
+                Tab(text: context.l10n.details),
+              ],
+            ),
+            tint: ThemeController.adaptiveColour ? _tint : null,
+          ),
+        ),
+    ];
+    final contentTabs = TabBarView(
+        controller: _tabController,
+        children: [
+          // ── Episodes ──────────────────────────────────────────────────────
+          _EpisodesTab(
+            category: category,
+            // Windows: an empty list falls back to this show's downloads.
+            downloadedFallback: offlineSaved,
+            loading: state.episodesLoading,
+            eps: eps,
+            seasonEps: seasonEps,
+            fillerEps: _fillerEps,
+            hasMultipleSeasons: hasMultipleSeasons,
+            seasonSet: seasonSet,
+            currentSeason: currentSeason,
+            onSelectSeason: cubit.selectSeason,
+            coverUrl: coverUrl,
+            coverHeaders: coverHeaders,
+            wideCoverUrl: _desktopWideEpisodeArt(item, detail),
+            sourceId: item.sourceId,
+            // Downloads name the source that has the files; progress above
+            // stays on the canonical id.
+            downloadSourceId: detail.sourceId.isNotEmpty
+                ? detail.sourceId
+                : item.sourceId,
+            showId: item.id,
+            showUrl: item.url,
+            resumeIndex: _resumeIndex,
+            hasAnyMark: hasAnyMark,
+            trackerProgress: _trackerProgress,
+            nextAiringEpisode: _nextAiringEpisode,
+            nextAiringAt: _nextAiringAt,
+            // Downloaded mode: a row plays its saved file directly.
+            onOpen: (fullIndex) => _fromDownloads
+                ? _playSaved(fullIndex)
+                : _openPlayer(eps, fullIndex, detail, category),
+            // Reading has no player to pick, but it does have the marking
+            // rows — gating the whole menu on the player is what hid them.
+            // (Its Windows download rows give Play offline / Show in folder /
+            // Delete for a saved episode, which downloaded mode relies on.)
+            onEpisodeMenu: (fullIndex) =>
+                _pickPlayerFor(eps, fullIndex, detail, category),
+            // Downloaded mode has no source list to refresh.
+            onRefresh: _fromDownloads ? null : cubit.refresh,
+            // Downloaded mode: the selection deletes files instead of
+            // downloading them.
+            onDeleteMany: _fromDownloads ? _deleteSaved : null,
+            onDownload: (ep) => isReading
+                ? _downloadChapter(ep, detail)
+                : _downloadSingle(ep, detail, category),
+            onDownloadMany: isReading
+                ? (eps) => _downloadChapters(eps, detail)
+                : null,
+            resumeChapter: readResume == null || eps.isEmpty
+                ? null
+                : eps[readResume.index],
+            // Only a catalogue title has another source to fall back on.
+            onSwitchSource: ZmodeIds.isZ(item.url) && !_fromDownloads
+                ? _switchSource
+                : null,
+            isReading: isReading,
+            filmMeta: _filmMeta(detail),
+            filmTitle: detail.title,
+            // B1: the ticks use the same any-cut lookup (and MAL id) as the
+            // right-click menu and Play (_savedInAnyCut), Windows online page
+            // only.
+            malId: detail.malId ?? item.malId,
+            anyCutFallback: _windowsDesktopUi && !_fromDownloads,
+          ),
+          // Downloaded mode has no Cast / Relations tabs (Details only).
+          if (!_fromDownloads) ...[
+            // ── Cast ──────────────────────────────────────────────────────────
+            _CastTab(
+              loading: state.extrasLoading,
+              cast: state.cast.isNotEmpty
+                  ? state.cast
+                  : [for (final n in detail.cast) CastMember(name: n)],
+              onOpenPerson: (ref) => Navigator.of(
+                context,
+              ).push(PersonPage.route(ref, sourceId: widget.item.sourceId)),
+            ),
+            // ── Relations ───────────────────────────────────────────────────────
+            _RelationsTab(
+              loading: state.extrasLoading,
+              relations: state.relations,
+              seasons: state.seasons,
+              onOpen: _openRelation,
+            ),
+          ],
+          // ── Details ──────────────────────────────────────────────────────────
+          _DetailsTab(
+            sourceName: sourceName,
+            statusStr: statusStr,
+            reading: isReading,
+            genres: detail.genres,
+            studios: detail.studios,
+            // Downloaded mode: the show's total, like the header line.
+            episodeCount: shownCount,
+            isMovie: detail.isFilm,
+            year: detail.year,
+            description: cleanSynopsis(detail.description),
+            detail: detail,
+          ),
+        ],
+    );
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (_windowsDesktopUi && constraints.maxWidth >= 980) {
+          final infoWidth = (constraints.maxWidth * 0.31).clamp(340.0, 420.0);
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              SizedBox(
+                width: infoWidth,
+                child: CustomScrollView(
+                  controller: _scrollController,
+                  slivers: headerSlivers
+                      .take(headerSlivers.length - 1)
+                      .toList(),
+                ),
+              ),
+              VerticalDivider(
+                width: 1,
+                thickness: 1,
+                color: AppColors.hairline,
+              ),
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+                  child: NestedScrollView(
+                    headerSliverBuilder: (_, _) => [headerSlivers.last],
+                    body: contentTabs,
+                  ),
+                ),
+              ),
+            ],
+          );
+        }
+        return NestedScrollView(
+          controller: _scrollController,
+          headerSliverBuilder: (_, _) => headerSlivers,
+          body: contentTabs,
+        );
+      },
+    );
+  }
+}
+
+/// Windows downloaded show page: "Show online", sitting where Download sits
+/// on the normal page and drawn like it (graphite fill, 40px high), opening
+/// the normal online page for the same title. Null [onPressed] dims it.
+class _ShowOnlineButton extends StatelessWidget {
+  const _ShowOnlineButton({required this.onPressed});
+
+  final VoidCallback? onPressed;
+
+  /// Lets tests find the button.
+  static const buttonKey = ValueKey('detail-show-online');
+
+  @override
+  Widget build(BuildContext context) {
+    return Opacity(
+      opacity: onPressed != null ? 1.0 : 0.4,
+      child: Material(
+        key: buttonKey,
+        color: AppColors.surface2,
+        borderRadius: BorderRadius.circular(8),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: onPressed,
+          child: SizedBox(
+            height: 40,
+            width: double.infinity,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(Icons.public_rounded, color: Colors.white, size: 22),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    // Hardcoded like the other Windows-only labels.
+                    'Show online',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: AppText.button.copyWith(color: Colors.white),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 /// What a detail page shows until it has loaded: the page colour and one
@@ -3281,12 +6004,29 @@ class _DetailLoading extends StatelessWidget {
 /// recoveries already — switching source re-runs the fetch, and reopening it
 /// starts clean — and a button that mostly cannot help (a rate limit rejects
 /// it before it leaves the device) is worse than no button.
+///
+/// Windows (show-14) differs: a desktop user who looked away missed the
+/// 4-second notice, so there it stays until dismissed ([persistent]) and adds
+/// Retry ([onRetry]), disabled with a countdown until [retryNotBefore] while
+/// rate-limited so it never fires a request that would be refused.
 class _LoadFailureBanner extends StatefulWidget {
   const _LoadFailureBanner({
     required this.service,
     required this.isMetadataProvider,
     required this.error,
+    this.persistent = false,
+    this.onRetry,
+    this.retryNotBefore,
   });
+
+  /// Windows: no auto-hide; only the close button removes the banner.
+  final bool persistent;
+
+  /// Windows: shows a Retry button that re-runs the fetch.
+  final VoidCallback? onRetry;
+
+  /// Rate-limited: Retry stays disabled (counting down) until this time.
+  final DateTime? retryNotBefore;
 
   /// What failed, in the user's terms — "AniList", "Simkl", "AniKoto".
   final String service;
@@ -3308,29 +6048,58 @@ class _LoadFailureBannerState extends State<_LoadFailureBanner> {
   bool _dismissed = false;
   Timer? _hide;
 
+  /// Windows: ticks once a second while the Retry countdown runs.
+  Timer? _tick;
+
   @override
   void initState() {
     super.initState();
     _armAutoHide();
+    _armCountdown();
   }
 
   @override
   void didUpdateWidget(_LoadFailureBanner old) {
     super.didUpdateWidget(old);
     if (old.error != widget.error) _armAutoHide(); // a new failure, shown again
+    if (old.retryNotBefore != widget.retryNotBefore) _armCountdown();
   }
 
   @override
   void dispose() {
     _hide?.cancel();
+    _tick?.cancel();
     super.dispose();
   }
 
   void _armAutoHide() {
     _hide?.cancel();
     _dismissed = false;
+    // Windows keeps it up until the user closes it.
+    if (widget.persistent) return;
     _hide = Timer(_visibleFor, () {
       if (mounted) setState(() => _dismissed = true);
+    });
+  }
+
+  /// Seconds left before Retry is worth pressing (0 = ready).
+  int get _retryWait {
+    final until = widget.retryNotBefore;
+    if (until == null) return 0;
+    final left = until.difference(DateTime.now());
+    if (left <= Duration.zero) return 0;
+    // Round up so it never reads 0 while still disabled.
+    return (left.inMilliseconds / 1000).ceil();
+  }
+
+  /// Repaints every second until the countdown reaches 0.
+  void _armCountdown() {
+    _tick?.cancel();
+    if (widget.onRetry == null || _retryWait == 0) return;
+    _tick = Timer.periodic(const Duration(seconds: 1), (t) {
+      if (!mounted) return t.cancel();
+      setState(() {});
+      if (_retryWait == 0) t.cancel();
     });
   }
 
@@ -3364,6 +6133,11 @@ class _LoadFailureBannerState extends State<_LoadFailureBanner> {
                 : l10n.sourceNotAnswering(widget.service),
             l10n.showingWhatWeHave,
           );
+    // Windows (src-11): an extension time-out reads "Source timed out"
+    // (the Retry button is unchanged). onRetry is only set on Windows.
+    final shownTitle = widget.onRetry != null
+        ? sourceFailureMessage(widget.error, title)
+        : title;
     return IgnorePointer(
       ignoring: _dismissed,
       child: AnimatedOpacity(
@@ -3401,7 +6175,7 @@ class _LoadFailureBannerState extends State<_LoadFailureBanner> {
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           Text(
-                            title,
+                            shownTitle,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: AppText.body.copyWith(
@@ -3414,6 +6188,29 @@ class _LoadFailureBannerState extends State<_LoadFailureBanner> {
                         ],
                       ),
                     ),
+                    // Windows: Retry, counting down while rate-limited.
+                    if (widget.onRetry != null) ...[
+                      const SizedBox(width: 8),
+                      Builder(
+                        builder: (context) {
+                          final wait = _retryWait;
+                          return TextButton(
+                            key: const ValueKey('detail-load-retry'),
+                            onPressed: wait > 0 ? null : widget.onRetry,
+                            style: TextButton.styleFrom(
+                              foregroundColor: AppColors.accent,
+                              visualDensity: VisualDensity.compact,
+                            ),
+                            child: Text(
+                              wait > 0
+                                  ? l10n.retryInSeconds(wait)
+                                  : l10n.retry,
+                            ),
+                          );
+                        },
+                      ),
+                      const SizedBox(width: 2),
+                    ],
                     IconButton(
                       tooltip: l10n.dismiss,
                       visualDensity: VisualDensity.compact,

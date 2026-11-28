@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/material.dart';
 
 import '../../core/di/injector.dart';
@@ -13,8 +15,11 @@ import '../../core/ui/app_toast.dart';
 import '../../l10n/l10n.dart';
 import '../../core/ui/settings_widgets.dart';
 import '../../core/ui/settings_search_target.dart';
+import '../../core/ui/desktop_settings_surface.dart';
 import '../reader/manga_page_translation_settings_sheet.dart';
 import '../reader/manga_translation_appearance_sheet.dart';
+import '../reader/novel_desktop_fonts.dart';
+import 'desktop_settings_slider.dart';
 import 'tap_zones_screen.dart';
 
 /// Global reader defaults — manga and novel. These are the same
@@ -36,6 +41,11 @@ class ReaderSettingsScreen extends StatefulWidget {
 
 class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
   ReaderPrefs get _prefs => sl<ReaderPrefs>();
+
+  /// Windows layout: page translation is hidden (no OCR engine there) and the
+  /// settings both readers share get one row each instead of two.
+  bool get _desktop => defaultTargetPlatform == TargetPlatform.windows;
+
   final MangaPageTranslationService _translationService =
       MangaPageTranslationService();
 
@@ -103,10 +113,13 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
     required List<(String, String)> options,
     required String current,
     required Future<void> Function(String) onPicked,
+    String? subtitle,
   }) {
     return SettingsTile(
       icon: icon,
       title: title,
+      subtitle: subtitle,
+      subtitleMaxLines: null,
       onTap: () => _openPicker(title, options, current, onPicked),
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
@@ -132,6 +145,18 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
     String current,
     Future<void> Function(String) onPicked,
   ) async {
+    if (DesktopSettingsScope.contains(context)) {
+      final picked = await showGraphiteSettingsChoice<String>(
+        context,
+        title: title,
+        options: options,
+        current: current,
+      );
+      if (picked == null || !mounted) return;
+      await onPicked(picked);
+      if (mounted) setState(() {});
+      return;
+    }
     final picked = await showModalBottomSheet<String>(
       context: context,
       backgroundColor: AppColors.surface,
@@ -222,12 +247,41 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
         ),
       );
     } on Object {
-      if (mounted) showAppToast(context, context.l10n.mangaTranslationError);
+      if (mounted) {
+        showAppToast(
+          context,
+          _desktop
+              ? 'Page translation needs an OCR engine, which is not available on Windows yet.'
+              : context.l10n.mangaTranslationError,
+        );
+      }
     }
   }
 
   Future<void> _openMangaTranslationAppearanceSettings() async {
     final prefs = _prefs;
+    if (DesktopSettingsScope.contains(context)) {
+      await showDialog<void>(
+        context: context,
+        useRootNavigator: false,
+        builder: (context) => Dialog(
+          backgroundColor: const Color(0xFF1A1B20),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+            side: const BorderSide(color: Color(0xFF36373E)),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxWidth: 640,
+              maxHeight: MediaQuery.sizeOf(context).height * 0.8,
+            ),
+            child: MangaTranslationAppearanceSheet(prefs: prefs),
+          ),
+        ),
+      );
+      return;
+    }
     await showModalBottomSheet<void>(
       context: context,
       backgroundColor: AppColors.surface,
@@ -291,7 +345,36 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
     int? divisions,
     required String Function(double) format,
     required Future<void> Function(double) onChangeEnd,
+    // Desktop step: the Windows row snaps to it and persists a clean value
+    // (17, not 17.43). Phones keep their continuous slider untouched.
+    required double desktopStep,
+    // Windows only: unit after the number, the shipped default, and an
+    // optional live sample shown while dragging (font size, margins...).
+    String Function(double)? unit,
+    double? defaultValue,
+    DesktopSliderPreviewBuilder? preview,
   }) {
+    if (DesktopSettingsScope.contains(context)) {
+      return DesktopSettingsSlider(
+        // Keys kept from the older row so tests and search still find it.
+        sliderKey: ValueKey('reader-slider-$title'),
+        valueKey: ValueKey('reader-slider-value-$title'),
+        icon: icon,
+        title: title,
+        value: value,
+        min: min,
+        max: max,
+        divisions: ((max - min) / desktopStep).round(),
+        format: format,
+        unit: unit,
+        defaultValue: defaultValue,
+        preview: preview,
+        onChangeEnd: (v) async {
+          await onChangeEnd(v);
+          if (mounted) setState(() {});
+        },
+      );
+    }
     double val = value.clamp(min, max);
     final slider = StatefulBuilder(
       builder: (context, setLocal) => Padding(
@@ -352,7 +435,7 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
   Widget build(BuildContext context) {
     final prefs = _prefs;
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: settingsPageBackground(context),
       appBar: settingsAppBar(context.l10n.reader),
       body: SettingsSearchList(
         padding: const EdgeInsets.only(top: 4, bottom: 28),
@@ -393,17 +476,26 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
               _pickerRow(
                 icon: Icons.filter_b_and_w_rounded,
                 title: context.l10n.colourFilter,
+                // Desktop: says why a pick may not show — the reader's own
+                // custom colour tint replaces this preset while it is on.
+                subtitle: _desktop && prefs.customColorFilter
+                    ? 'The custom colour tint set in the reader is on and '
+                          'replaces this filter'
+                    : null,
                 options: _filterOptions,
                 current: prefs.colorFilter,
                 onPicked: prefs.setColorFilter,
               ),
-              _pickerRow(
-                icon: Icons.screen_rotation_outlined,
-                title: context.l10n.orientationLock,
-                options: _orientationOptions,
-                current: prefs.orientation,
-                onPicked: prefs.setOrientation,
-              ),
+              // Desktop windows resize freely; phone orientation locks have no
+              // Windows implementation and must not appear as working controls.
+              if (!_desktop)
+                _pickerRow(
+                  icon: Icons.screen_rotation_outlined,
+                  title: context.l10n.orientationLock,
+                  options: _orientationOptions,
+                  current: prefs.orientation,
+                  onPicked: prefs.setOrientation,
+                ),
               _toggleRow(
                 icon: Icons.vertical_split_rounded,
                 title: context.l10n.doublePageLandscape,
@@ -433,63 +525,66 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
                 divisions: 7,
                 format: (v) => '${v.round()}',
                 onChangeEnd: (v) => prefs.setPreloadCount(v.round()),
+                desktopStep: 1,
+                // Not visual: the unit and default (6) give the scale.
+                unit: (v) => context.l10n.desktopPagesAheadUnit(v.round()),
+                defaultValue: 6,
               ),
-              _toggleRow(
-                icon: Icons.screen_lock_portrait_outlined,
-                title: context.l10n.keepScreenOn,
-                value: prefs.keepScreenOn,
-                onChanged: (v) async {
-                  await prefs.setKeepScreenOn(v);
-                  if (mounted) setState(() {});
-                },
-              ),
-              _toggleRow(
-                icon: Icons.fullscreen_rounded,
-                title: context.l10n.readerFullscreen,
-                value: prefs.fullscreen,
-                onChanged: (v) async {
-                  await prefs.setFullscreen(v);
-                  if (mounted) setState(() {});
-                },
-              ),
-              SettingsTile(
-                icon: Icons.translate_rounded,
-                title: context.l10n.mangaTranslationSettings,
-                onTap: _openMangaTranslationSettings,
-              ),
-              SettingsTile(
-                icon: Icons.palette_outlined,
-                title: context.l10n.mangaTranslationAppearance,
-                subtitle: context.l10n.mangaTranslationAppearanceSubtitle,
-                onTap: _openMangaTranslationAppearanceSettings,
-              ),
+              // Windows shows these once, in the shared card below.
+              if (!_desktop) ...[
+                _keepScreenOnRow(prefs),
+                _fullscreenRow(prefs),
+              ],
+              // Page translation needs an OCR engine Windows does not have:
+              // both rows (and their appearance values) could only fail
+              // there, so they are left out of the Windows page.
+              if (!_desktop) ...[
+                SettingsTile(
+                  icon: Icons.translate_rounded,
+                  title: context.l10n.mangaTranslationSettings,
+                  onTap: _openMangaTranslationSettings,
+                ),
+                SettingsTile(
+                  icon: Icons.palette_outlined,
+                  title: context.l10n.mangaTranslationAppearance,
+                  subtitle: context.l10n.mangaTranslationAppearanceSubtitle,
+                  onTap: _openMangaTranslationAppearanceSettings,
+                ),
+              ],
             ],
           ),
-          SettingsSectionLabel(context.l10n.gestures),
-          SettingsCard(
-            children: [
-              SettingsTile(
-                icon: Icons.touch_app_outlined,
-                title: context.l10n.tapZones,
-                subtitle: context.l10n.whatTappingEachPartOfThePageDoes,
-                onTap: () => Navigator.of(context).push(
-                  MaterialPageRoute<void>(
-                    builder: (_) => const TapZonesScreen(),
+          // Desktop readers use keyboard/mouse navigation. Touch-zone editing
+          // cannot affect them and should not look like a functioning PC setting.
+          if (!_desktop) ...[
+            SettingsSectionLabel(context.l10n.gestures),
+            SettingsCard(
+              children: [
+                SettingsTile(
+                  icon: Icons.touch_app_outlined,
+                  title: context.l10n.tapZones,
+                  subtitle: context.l10n.whatTappingEachPartOfThePageDoes,
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => const TapZonesScreen(),
+                    ),
                   ),
                 ),
-              ),
-            ],
-          ),
+              ],
+            ),
+          ],
           SettingsSectionLabel(context.l10n.modeNovel),
           SettingsCard(
             children: [
-              _pickerRow(
-                icon: Icons.font_download_outlined,
-                title: context.l10n.font,
-                options: _fontOptions,
-                current: prefs.fontFamily,
-                onPicked: prefs.setFontFamily,
-              ),
+              if (_desktop)
+                _desktopFontRow(prefs)
+              else
+                _pickerRow(
+                  icon: Icons.font_download_outlined,
+                  title: context.l10n.font,
+                  options: _fontOptions,
+                  current: prefs.fontFamily,
+                  onPicked: prefs.setFontFamily,
+                ),
               _pickerRow(
                 icon: Icons.style_outlined,
                 title: context.l10n.theme,
@@ -497,23 +592,34 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
                 current: prefs.theme,
                 onPicked: prefs.setTheme,
               ),
+              // Ranges are wider on Windows (reader-11 B), unchanged on phones.
               _sliderRow(
                 icon: Icons.format_size_rounded,
                 title: context.l10n.fontSize,
                 value: prefs.fontSize,
-                min: 12,
-                max: 28,
+                min: ReaderPrefs.minFontSize,
+                max: ReaderPrefs.maxFontSize,
                 format: (v) => v.round().toString(),
                 onChangeEnd: prefs.setFontSize,
+                desktopStep: 1,
+                // Windows: "Aa" at the dragged size shows how big it gets.
+                unit: (_) => 'px',
+                defaultValue: ReaderPrefs.defaultFontSize,
+                preview: (_, v) => DesktopSliderPreviews.fontSize(v),
               ),
               _sliderRow(
                 icon: Icons.format_line_spacing_rounded,
                 title: context.l10n.lineHeight,
                 value: prefs.lineHeight,
-                min: 1.2,
-                max: 2.4,
+                min: ReaderPrefs.minLineHeight,
+                max: ReaderPrefs.maxLineHeight,
                 format: (v) => v.toStringAsFixed(1),
                 onChangeEnd: prefs.setLineHeight,
+                desktopStep: 0.1,
+                // Windows: three sample lines at the dragged spacing.
+                unit: (_) => '×',
+                defaultValue: 1.6,
+                preview: (_, v) => DesktopSliderPreviews.lineHeight(v),
               ),
               _sliderRow(
                 icon: Icons.format_indent_increase_rounded,
@@ -523,6 +629,11 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
                 max: 48,
                 format: (v) => '${v.round()}',
                 onChangeEnd: prefs.setMarginWidth,
+                desktopStep: 2,
+                // Windows: a page outline with text inset by the margin.
+                unit: (_) => 'px',
+                defaultValue: 20,
+                preview: (_, v) => DesktopSliderPreviews.margin(v),
               ),
               _toggleRow(
                 icon: Icons.format_align_justify_rounded,
@@ -545,9 +656,14 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
                 title: context.l10n.paragraphSpacing,
                 value: prefs.paragraphSpacing,
                 min: 0,
-                max: 24,
+                max: ReaderPrefs.maxParagraphSpacing,
                 format: (v) => '${v.round()}',
                 onChangeEnd: prefs.setParagraphSpacing,
+                desktopStep: 1,
+                // Windows: two paragraphs with the dragged gap between.
+                unit: (_) => 'px',
+                defaultValue: 8,
+                preview: (_, v) => DesktopSliderPreviews.paragraphSpacing(v),
               ),
               _toggleRow(
                 icon: Icons.auto_stories_outlined,
@@ -559,28 +675,112 @@ class _ReaderSettingsScreenState extends State<ReaderSettingsScreen> {
                   if (mounted) setState(() {});
                 },
               ),
-              _toggleRow(
-                icon: Icons.screen_lock_portrait_outlined,
-                title: context.l10n.keepScreenOn,
-                value: prefs.keepScreenOn,
-                onChanged: (v) async {
-                  await prefs.setKeepScreenOn(v);
-                  if (mounted) setState(() {});
-                },
-              ),
-              _toggleRow(
-                icon: Icons.fullscreen_rounded,
-                title: context.l10n.readerFullscreen,
-                value: prefs.fullscreen,
-                onChanged: (v) async {
-                  await prefs.setFullscreen(v);
-                  if (mounted) setState(() {});
-                },
-              ),
+              if (!_desktop) ...[
+                _keepScreenOnRow(prefs),
+                _fullscreenRow(prefs),
+              ],
             ],
           ),
+          // Windows: one row per setting both readers share. It is a single
+          // preference, so a row under each reader only looked like two.
+          if (_desktop) ...[
+            SettingsSectionLabel('Both readers'),
+            SettingsCard(
+              children: [
+                _keepScreenOnRow(
+                  prefs,
+                  subtitle:
+                      'Stops the display from sleeping while a manga or '
+                      'novel is open',
+                ),
+                _fullscreenRow(
+                  prefs,
+                  subtitle: context.l10n.readerFullscreenWindowsSubtitle,
+                ),
+                // reader-7: left/right click turns the page in paged modes.
+                _toggleRow(
+                  icon: Icons.ads_click_rounded,
+                  title: context.l10n.clickToTurnPages,
+                  subtitle: context.l10n.clickToTurnPagesSubtitle,
+                  value: prefs.clickToTurn,
+                  onChanged: (v) async {
+                    await prefs.setClickToTurn(v);
+                    if (mounted) setState(() {});
+                  },
+                ),
+                // The click zones use the same layout editor as phone taps.
+                SettingsTile(
+                  icon: Icons.touch_app_outlined,
+                  title: context.l10n.clickZones,
+                  subtitle: context.l10n.clickZonesSubtitle,
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => const TapZonesScreen(),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
         ],
       ),
     );
   }
+
+  /// Windows font row (reader-11 B): shows the current face and opens the
+  /// searchable list of built-in and installed fonts.
+  Widget _desktopFontRow(ReaderPrefs prefs) => SettingsTile(
+    icon: Icons.font_download_outlined,
+    title: context.l10n.font,
+    onTap: () async {
+      final picked = await pickNovelFont(
+        context,
+        current: prefs.fontFamily,
+        title: context.l10n.font,
+        systemLabel: context.l10n.system,
+      );
+      if (picked == null) return;
+      await prefs.setFontFamily(picked);
+      if (mounted) setState(() {});
+    },
+    trailing: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          novelFontLabel(prefs.fontFamily, systemLabel: context.l10n.system),
+          style: AppText.caption.copyWith(color: AppColors.textSecondary),
+        ),
+        const SizedBox(width: 6),
+        const Icon(
+          Icons.chevron_right_rounded,
+          color: AppColors.textTertiary,
+          size: 20,
+        ),
+      ],
+    ),
+  );
+
+  /// Keep screen on — one pref shared by both readers (wakelock while open).
+  Widget _keepScreenOnRow(ReaderPrefs prefs, {String? subtitle}) => _toggleRow(
+    icon: Icons.screen_lock_portrait_outlined,
+    title: context.l10n.keepScreenOn,
+    subtitle: subtitle,
+    value: prefs.keepScreenOn,
+    onChanged: (v) async {
+      await prefs.setKeepScreenOn(v);
+      if (mounted) setState(() {});
+    },
+  );
+
+  /// Reader fullscreen — one pref shared by both readers.
+  Widget _fullscreenRow(ReaderPrefs prefs, {String? subtitle}) => _toggleRow(
+    icon: Icons.fullscreen_rounded,
+    title: context.l10n.readerFullscreen,
+    subtitle: subtitle,
+    value: prefs.fullscreen,
+    onChanged: (v) async {
+      await prefs.setFullscreen(v);
+      if (mounted) setState(() {});
+    },
+  );
 }

@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:hive/hive.dart';
+import 'package:watch_app/core/desktop/desktop_memory.dart';
 import 'package:watch_app/core/hive/safe_box.dart';
 
 /// Subtitle font families bundled in the app (registered in pubspec's
@@ -64,10 +65,14 @@ String providerInfoLabel(String id, String? Function(String) lookup) {
 /// Pure so the "auto changes nothing" guarantee is testable.
 String? resolveVideoOutput({
   required bool isTv,
+  bool isWindows = false,
   required String choice,
   required String shaderStyle,
 }) {
   if (isTv) return null;
+  // Windows embeds mpv through its render API. gpu/gpu-next instead create
+  // a separate native window, bypassing Flutter's controls and subtitles.
+  if (isWindows) return 'libmpv';
   if (choice != 'auto') return choice;
   return shaderStyle != 'off' ? 'gpu-next' : null;
 }
@@ -202,6 +207,50 @@ String resolveHwdec({
       };
   }
 }
+
+/// Windows wording for the Video decoder choices. Same stored ids as the
+/// phone list; each label names what [resolveHwdec] hands mpv on a PC
+/// (`d3d11va-copy`, `d3d11va`, `no`, `auto-safe`).
+const List<(String, String)> kWindowsDecoderOptions = [
+  ('copy', 'Hardware, D3D11 copy (recommended)'),
+  ('direct', 'Hardware, D3D11 direct (lighter)'),
+  ('sw', 'Software, CPU (most compatible)'),
+  ('auto', 'Automatic (mpv picks)'),
+];
+
+/// Windows wording for the player-orientation pref. A PC never rotates, so
+/// the stored value only picks the layout the player opens in.
+/// 'system' is kept for saves made before: it follows the window's shape.
+const List<(String, String)> kWindowsPlayerOpensInOptions = [
+  ('portrait', 'Watch page'),
+  ('landscape', 'Full window'),
+];
+
+/// Label for a stored orientation value on Windows.
+String windowsPlayerOpensInLabel(String value) => switch (value) {
+  'portrait' => 'Watch page',
+  'system' => 'Match window shape',
+  _ => 'Full window',
+};
+
+/// Windows wording for Close confirmation. A PC closes the player with Esc,
+/// the mouse Back button or the on-screen back arrow, not a BACK key.
+const List<(String, String)> kWindowsCloseConfirmOptions = [
+  ('double_back', 'Press Esc or Back twice to close'),
+  ('confirm', 'Ask before closing the player'),
+  ('direct', 'Close at once'),
+];
+
+/// Label for a stored Close confirmation value on Windows.
+String windowsCloseConfirmLabel(String value) {
+  for (final (v, label) in kWindowsCloseConfirmOptions) {
+    if (v == value) return label;
+  }
+  return kWindowsCloseConfirmOptions.first.$2;
+}
+
+/// The Windows "double back" hint shown after the first press.
+const String kWindowsPressAgainToClose = 'Press Esc or Back again to close';
 
 /// Persistent, app-wide playback preferences (default quality, sub/dub
 /// category, autoplay, speed, seek step, keep-screen-on, auto-resume). Backed
@@ -429,6 +478,16 @@ class PlaybackPrefs {
   Future<void> setCloseConfirmation(String value) =>
       _box.put('closeConfirmation', value);
 
+  /// What to do when online playback keeps failing or stalling and a finished
+  /// download of the same episode exists:
+  ///  • 'auto' = switch to the downloaded copy at the same position.
+  ///  • 'ask'  = offer the downloaded copy and switch only if accepted.
+  ///  • 'off'  = never switch; show the usual error.
+  String get localDownloadFallback =>
+      _box.get('localDownloadFallback', defaultValue: 'auto') as String;
+  Future<void> setLocalDownloadFallback(String value) =>
+      _box.put('localDownloadFallback', value);
+
   /// Whether installed extensions (Zangetsu / CloudStream / Aniyomi) auto-update
   /// in the background on launch, throttled to ~once a day. Off by default —
   /// updates otherwise happen only when the user taps Update in Sources. A
@@ -554,8 +613,9 @@ class PlaybackPrefs {
   /// devices whose GPU driver can't run that renderer the video is black while
   /// audio and controls work fine, and no source or decoder change helps —
   /// this is the only knob that does. TV is unaffected (it doesn't use mpv).
-  String get videoOutput =>
-      _box.get('videoOutput', defaultValue: 'auto') as String;
+  String get videoOutput => Platform.isWindows
+      ? 'auto'
+      : _box.get('videoOutput', defaultValue: 'auto') as String;
   Future<void> setVideoOutput(String value) => _box.put('videoOutput', value);
 
   /// The mpv `hwdec` property value for the current [videoDecoder] choice, for
@@ -569,8 +629,10 @@ class PlaybackPrefs {
   // ── Anime4K enhancement (GLSL upscaling) ───────────────────────────────────
   // Real-time neural upscaling for low-res anime. STYLE = the filter: 'off'
   // (default), 'a' Sharpen, 'b' De-blur, 'c' Denoise. TIER = GPU cost: 'mid'
-  // (light) / 'high' (heavy). Applied via `glsl-shaders`; routed through the
-  // gpu-next renderer + deband/HQ-scaling render tuning when style != 'off'.
+  // (light) / 'high' (heavy). Applied via `glsl-shaders` with deband/HQ-scaling
+  // render tuning when style != 'off'. Phones route it through gpu-next;
+  // Windows keeps its embedded libmpv output, and the player turns the style
+  // back to 'off' if mpv reports the shaders failing there.
   String get videoShaderStyle =>
       _box.get('videoShaderStyle', defaultValue: 'off') as String;
   Future<void> setVideoShaderStyle(String value) =>
@@ -615,8 +677,13 @@ class PlaybackPrefs {
   static const List<String> bufferPresets = ['low', 'default', 'high', 'max'];
 
   /// Forward+back demuxer buffer SIZE preset: 'low' | 'default' | 'high'.
-  String get videoBufferSize =>
-      _box.get('videoBufferSize', defaultValue: 'default') as String;
+  /// On Windows a stored 'max' size reads as 'high' (they share one cap).
+  String get videoBufferSize {
+    final value =
+        _box.get('videoBufferSize', defaultValue: 'default') as String;
+    return Platform.isWindows && value == 'max' ? 'high' : value;
+  }
+
   Future<void> setVideoBufferSize(String value) =>
       _box.put('videoBufferSize', value);
 
@@ -653,10 +720,22 @@ class PlaybackPrefs {
       _box.put('phoneDiskCacheGb', value.clamp(1, 20));
 
   /// mpv `demuxer-max-bytes` for the current size preset (default = 128MiB).
-  String get bufferMaxBytes => bufferMaxBytesFor(videoBufferSize);
+  String get bufferMaxBytes =>
+      _lightWindowsBuffer ? '64MiB' : bufferMaxBytesFor(videoBufferSize);
 
   /// mpv `demuxer-max-back-bytes`, scaled with the size preset (default = 48MiB).
-  String get bufferMaxBackBytes => bufferMaxBackBytesFor(videoBufferSize);
+  String get bufferMaxBackBytes =>
+      _lightWindowsBuffer ? '16MiB' : bufferMaxBackBytesFor(videoBufferSize);
+
+  /// Windows PCs with 8 GB of memory or less that never picked a buffer size
+  /// get a smaller default buffer (64 MiB ahead, 16 MiB behind, instead of
+  /// 128 + 48), saving about 90 MB while a video plays. The 60 seconds of
+  /// readahead stay. Any size the user chose in Settings still wins, and
+  /// phones and TV keep the normal default.
+  bool get _lightWindowsBuffer =>
+      Platform.isWindows &&
+      DesktopMemory.isLowMemory &&
+      !_box.containsKey('videoBufferSize');
 
   /// Seconds for mpv `cache-secs` + `demuxer-readahead-secs` (default = 60).
   int get bufferSecs => bufferSecsFor(videoBufferLength);
@@ -946,6 +1025,22 @@ class PlaybackPrefs {
       _box.get('externalPlayerPackage', defaultValue: '') as String;
   String get externalPlayerLabel =>
       _box.get('externalPlayerLabel', defaultValue: '') as String;
+
+  /// The external player the app should actually use right now. Windows has no
+  /// Android player apps, but a phone backup can still carry a package here
+  /// (migrated phones store [androidPlayerId]). Treating that as "use an
+  /// external player" on Windows would skip the mpv warm-up and force a link
+  /// prompt, so on Windows this always reads as the built-in player. The stored
+  /// value is left untouched so restoring the backup on a phone keeps it.
+  String get effectiveExternalPlayerPackage =>
+      windowsIgnoresExternalPlayer() ? '' : externalPlayerPackage;
+
+  /// True when the stored external player must be ignored (Windows desktop).
+  /// Split out so tests can flip the platform with
+  /// `debugDefaultTargetPlatformOverride`.
+  @visibleForTesting
+  static bool windowsIgnoresExternalPlayer() =>
+      defaultTargetPlatform == TargetPlatform.windows;
   Future<void> setExternalPlayer(String package, String label) async {
     await _box.put('externalPlayerPackage', package);
     await _box.put('externalPlayerLabel', label);

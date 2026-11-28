@@ -1083,6 +1083,37 @@ void main() {
     );
   });
 
+  test(
+    'explicit queued cut overrides remembered browsing cut without changing it',
+    () async {
+      kind = ZKind.anime;
+      await repo.detail('zm://anime/mal:100', category: 'sub');
+      src.log.clear();
+      await repo.sources(
+        'zm://anime/mal:100/ep/1',
+        fast: true,
+        category: 'dub',
+      );
+      expect(src.log, contains('episodes:https://src/fma:dub'));
+      src.log.clear();
+      await repo.sources('zm://anime/mal:100/ep/1', fast: true);
+      expect(src.log, contains('episodes:https://src/fma:sub'));
+    },
+  );
+
+  test('download fallback sweep explicitly requests saved dub cut', () async {
+    kind = ZKind.anime;
+    await repo.detail('zm://anime/mal:100', category: 'sub');
+    src.log.clear();
+    final result = await repo.sourcesWhere(
+      'zm://anime/mal:100/ep/1',
+      (streams) => streams.isNotEmpty,
+      category: 'dub',
+    );
+    expect(result.streams, isNotEmpty);
+    expect(src.log, contains('episodes:https://src/fma:dub'));
+  });
+
   test('sources() uses the cut Detail last showed', () async {
     // zm:// episode urls carry no sub/dub. CatalogueRepository.sources has no
     // category arg either, so the cut is remembered when Detail fetches it and

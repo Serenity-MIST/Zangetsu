@@ -21,6 +21,24 @@ void main() {
     CfSolveNeeded.clear('animepahe.pw');
   });
 
+  test('a flagged native source is routed to its own solver', () {
+    for (final id in ['mihon:123', 'ani:123', 'cs:AnimePahe', 'lnr:plugin']) {
+      CfSolveNeeded.needsSolve(
+        'animepahe.pw',
+        'https://animepahe.pw/',
+        sourceId: id,
+      );
+      expect(CfSolveNeeded.hostFlagged('animepahe.pw'), isTrue);
+      expect(CfSolveNeeded.usesJsSolver('animepahe.pw'), isFalse);
+    }
+    CfSolveNeeded.needsSolve(
+      'animepahe.pw',
+      'https://animepahe.pw/',
+      sourceId: 'js-provider',
+    );
+    expect(CfSolveNeeded.usesJsSolver('animepahe.pw'), isTrue);
+  });
+
   test('a completed solve lifts the latch for that host', () async {
     CfSolveNeeded.needsSolve(
       'animepahe.pw',

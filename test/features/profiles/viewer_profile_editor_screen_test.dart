@@ -5,6 +5,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:get_it/get_it.dart';
 import 'package:dio/dio.dart';
 import 'package:watch_app/core/profiles/klipy_gif_service.dart';
+import 'package:watch_app/core/profiles/profile_lock_store.dart';
+import 'package:watch_app/core/profiles/profile_pin_store.dart';
 import 'package:watch_app/core/profiles/viewer_profile.dart';
 import 'package:watch_app/core/supabase/auth_user.dart';
 import 'package:watch_app/core/theme/app_colors.dart';
@@ -398,6 +400,52 @@ void main() {
     },
   );
 
+  testWidgets(
+    'Windows editor shows the synced Profile lock card, not a PC-only PIN',
+    (tester) async {
+      // Windows still registers the old PC PIN store (only to move old PINs).
+      GetIt.instance
+        ..registerSingleton<ProfilePinStore>(
+          ProfilePinStore(storage: _NoPinStorage(), owner: () => 'local'),
+        )
+        ..registerSingleton<ProfileLockStore>(_UnlockedLocks());
+      addTearDown(() async {
+        await GetIt.instance.unregister<ProfilePinStore>();
+        await GetIt.instance.unregister<ProfileLockStore>();
+      });
+      await tester.pumpWidget(_profileEditorHost((_) {}));
+      await tester.tap(find.text('Open editor'));
+      await tester.pumpAndSettle();
+
+      final card = find.byKey(const ValueKey('profile-editor-lock-card'));
+      await _scrollTo(tester, card);
+      expect(card, findsOneWidget);
+      expect(
+        find.descendant(of: card, matching: find.text('Profile lock')),
+        findsOneWidget,
+      );
+      expect(find.text('Ask for a PIN before opening this profile'),
+          findsOneWidget);
+      expect(find.textContaining('stored only on this PC'), findsNothing);
+      expect(
+        find.byKey(const ValueKey('profile-editor-lock-remove')),
+        findsNothing,
+      );
+      expect(find.textContaining('phone, TV and PC'), findsOneWidget);
+
+      // Setting the PIN opens the desktop dialog, not a bottom sheet.
+      await tester.tap(card);
+      await tester.pumpAndSettle();
+      expect(find.byType(Dialog), findsOneWidget);
+      expect(find.byType(BottomSheet), findsNothing);
+      expect(find.text('Set profile PIN'), findsWidgets);
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.pumpAndSettle();
+      expect(find.byType(Dialog), findsNothing);
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.windows),
+  );
+
   testWidgets('renaming Home updates the sign-in account name', (tester) async {
     final store = _RecordingProfileStore();
     final auth = _RecordingAuthCubit();
@@ -632,4 +680,22 @@ class _FakeKlipyGifService extends KlipyGifService {
   @override
   Future<String?> avatarUrlForSlug(String slug) async =>
       slug == gif.slug ? gif.avatarUrl : null;
+}
+
+/// Old PC PIN storage with nothing in it.
+class _NoPinStorage implements PinSecretStorage {
+  @override
+  Future<String?> read(String key) async => null;
+  @override
+  Future<void> write(String key, String value) async {}
+  @override
+  Future<void> delete(String key) async {}
+}
+
+/// Synced lock fake: the profile has no lock yet.
+class _UnlockedLocks extends ProfileLockStore {
+  @override
+  Future<bool> isLocked(String profileId) async => false;
+  @override
+  Future<bool> get canUseBiometrics async => false;
 }

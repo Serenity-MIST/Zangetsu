@@ -1,5 +1,21 @@
 import '../../core/models/episode.dart';
 
+// Windows Episodes-tab widgets (filter box, selection toolbar) travel with
+// the filter helpers, so the show page (which already imports this file)
+// gets them without a new import line in detail_screen.dart.
+export 'detail_episodes_desktop.dart'
+    show
+        EpisodeFilterField,
+        EpisodeSelectionBar,
+        EpisodeSelectableTile,
+        PinnedBoxDelegate,
+        DesktopSelection,
+        DesktopSelectionShortcuts,
+        DesktopSelectionCheckbox,
+        showAdaptiveSheet,
+        DesktopSheetStyle,
+        DesktopSheetScope;
+
 /// CloudStream-style chunk size for long season navigation (1–50, 51–100, …).
 const kEpisodeRangeChunk = 50;
 

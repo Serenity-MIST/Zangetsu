@@ -89,4 +89,19 @@ void main() {
       expect(cached[1].lazyFallback, isTrue);
     },
   );
+
+  test('pruning drops only snapshots older than the max age', () async {
+    final box = Hive.box(HomeCache.boxName);
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final old = now - HomeCache.maxAge.inMilliseconds - 1000;
+    await box.put('stale|anime', {'savedAtMs': old, 'sections': []});
+    await box.put('fresh|anime', {'savedAtMs': now, 'sections': []});
+    await box.put('not-a-snapshot', 'kept');
+
+    await HomeCache.pruneExpired();
+
+    expect(box.containsKey('stale|anime'), isFalse);
+    expect(box.containsKey('fresh|anime'), isTrue);
+    expect(box.get('not-a-snapshot'), 'kept');
+  });
 }

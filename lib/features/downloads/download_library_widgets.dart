@@ -1,7 +1,9 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:cue/cue.dart';
+import '../../core/desktop/desktop_context_menu.dart';
 import '../../core/theme/app_colors.dart';
+import '../../core/ui/desktop_docked_panel.dart' show desktopPanelsEnabled;
 import '../../core/theme/app_text.dart';
 import '../../l10n/l10n.dart';
 
@@ -102,9 +104,36 @@ class DownloadLibraryPoster extends StatelessWidget {
   final VoidCallback onDelete;
   final String deleteTooltip;
 
+  /// Windows menu rows, shared by the overflow button, right-click and the
+  /// Menu key / Shift+F10, so all three offer the same actions.
+  List<DesktopMenuItem<Object?>> _desktopMenuItems(AppLocalizations l10n) => [
+    DesktopMenuItem(
+      label: l10n.open,
+      icon: Icons.open_in_new_rounded,
+      onTap: onOpen,
+    ),
+    const DesktopMenuItem.divider(),
+    DesktopMenuItem(
+      label: l10n.deleteAll,
+      icon: Icons.delete_outline_rounded,
+      destructive: true,
+      onTap: onDelete,
+    ),
+  ];
+
   @override
   Widget build(BuildContext context) {
     final l10n = context.l10n;
+    // Right-click / Menu key menu on Windows; the region returns the poster
+    // untouched on phone and TV.
+    return DesktopContextMenuRegion(
+      items: () => _desktopMenuItems(l10n),
+      child: _poster(context, l10n),
+    );
+  }
+
+  /// The poster itself: artwork, title row with overflow, size and status.
+  Widget _poster(BuildContext context, AppLocalizations l10n) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -193,6 +222,33 @@ class DownloadLibraryPoster extends StatelessWidget {
                 ),
               ),
             ),
+            // Windows: a hoverable overflow button that opens the compact
+            // graphite menu under itself (same items as right-click).
+            if (desktopPanelsEnabled)
+              SizedBox(
+                width: 28,
+                height: 32,
+                child: Builder(
+                  builder: (buttonContext) => IconButton(
+                    key: const ValueKey('download-poster-overflow'),
+                    padding: EdgeInsets.zero,
+                    visualDensity: VisualDensity.compact,
+                    tooltip: MaterialLocalizations.of(context).moreButtonTooltip,
+                    icon: const Icon(
+                      Icons.more_vert_rounded,
+                      size: 18,
+                      color: AppColors.textSecondary,
+                    ),
+                    onPressed: () => showDesktopContextMenu<Object?>(
+                      context,
+                      anchor: buttonContext,
+                      items: _desktopMenuItems(l10n),
+                    ),
+                  ),
+                ),
+              )
+            else
+            // Phone keeps the Material popup menu exactly as before.
             SizedBox(
               width: 24,
               height: 32,
@@ -249,10 +305,15 @@ class DownloadTitleSummary extends StatelessWidget {
     this.coverHeaders,
     required this.onDelete,
     required this.deleteTooltip,
+    this.actions = const [],
   });
   final String title;
   final Object heroTag;
   final String subtitle;
+
+  /// Buttons under the subtitle (Windows: Continue and Open show page, dl-8).
+  /// Empty on phone, so its header is unchanged.
+  final List<Widget> actions;
   final String? cover;
   final Map<String, String>? coverHeaders;
   final VoidCallback? onDelete;
@@ -286,6 +347,10 @@ class DownloadTitleSummary extends StatelessWidget {
               ),
               const SizedBox(height: 6),
               Text(subtitle, style: AppText.caption.copyWith(fontSize: 11)),
+              if (actions.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                Wrap(spacing: 8, runSpacing: 8, children: actions),
+              ],
             ],
           ),
         ),

@@ -32,6 +32,9 @@ class _PlayerSegmentSkipButtonState extends State<PlayerSegmentSkipButton>
     _timer.forward();
   }
 
+  /// Windows: the skip runs on the mouse press itself (see [build]).
+  bool get _windows => defaultTargetPlatform == TargetPlatform.windows;
+
   @override
   void dispose() {
     _timer.dispose();
@@ -58,36 +61,53 @@ class _PlayerSegmentSkipButtonState extends State<PlayerSegmentSkipButton>
           color: Colors.black.withValues(alpha: 0.76),
           borderRadius: BorderRadius.circular(22),
           clipBehavior: Clip.antiAlias,
-          child: InkWell(
-            onTap: widget.onTap,
-            child: Stack(
-              alignment: Alignment.center,
-              children: [
-                SizedBox(
-                  height: 44,
-                  child: Center(widthFactor: 1, child: label),
-                ),
-                if (_timer.value > 0)
-                  Positioned.fill(
-                    child: ExcludeSemantics(
-                      child: ClipRect(
-                        clipper: _SkipFillClipper(_timer.value),
-                        child: ColoredBox(
-                          color: Colors.white,
-                          child: Center(
-                            child: RichText(
-                              text: TextSpan(
-                                text: widget.label,
-                                style: labelStyle.copyWith(color: Colors.black),
+          // Windows: skip on the primary-button press, not on release.
+          // The player rebuilds often while it plays (position ticks,
+          // controls showing or hiding); a rebuild or a moved pill
+          // between press and release used to drop the tap, so a click
+          // sometimes did nothing. The InkWell stays for the hover and
+          // press look only.
+          child: Listener(
+            onPointerDown: _windows
+                ? (e) {
+                    if (e.buttons & kPrimaryMouseButton == 0) return;
+                    AppLogger.instance.log('[skip] pressed: ${widget.label}');
+                    widget.onTap();
+                  }
+                : null,
+            child: InkWell(
+              onTap: _windows ? () {} : widget.onTap,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  SizedBox(
+                    height: 44,
+                    child: Center(widthFactor: 1, child: label),
+                  ),
+                  if (_timer.value > 0)
+                    Positioned.fill(
+                      child: ExcludeSemantics(
+                        child: ClipRect(
+                          clipper: _SkipFillClipper(_timer.value),
+                          child: ColoredBox(
+                            color: Colors.white,
+                            child: Center(
+                              child: RichText(
+                                text: TextSpan(
+                                  text: widget.label,
+                                  style: labelStyle.copyWith(
+                                    color: Colors.black,
+                                  ),
+                                ),
+                                textScaler: MediaQuery.textScalerOf(context),
                               ),
-                              textScaler: MediaQuery.textScalerOf(context),
                             ),
                           ),
                         ),
                       ),
                     ),
-                  ),
-              ],
+                ],
+              ),
             ),
           ),
         );
@@ -121,7 +141,6 @@ class _MegaSkipPill extends StatelessWidget {
     // Deliberately the twin of the timestamp chip it now sits beside — same
     // fill, radius and type. The accent-outlined stadium it used to be was
     // louder than anything else on the bar and read as a stray element.
-    // No tooltip: "+85s" already says what it does.
     return Material(
       color: Colors.black.withValues(alpha: 0.3),
       borderRadius: BorderRadius.circular(13),
@@ -174,20 +193,20 @@ class _RoundIconButton extends StatelessWidget {
     return _withTooltip(
       semanticLabel,
       Semantics(
-      button: true,
-      label: semanticLabel,
-      child: Material(
-        color: Colors.black.withValues(alpha: 0.5),
-        shape: const CircleBorder(),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: onTap,
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Icon(icon, color: Colors.white, size: 24),
+        button: true,
+        label: semanticLabel,
+        child: Material(
+          color: Colors.black.withValues(alpha: 0.5),
+          shape: const CircleBorder(),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: onTap,
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Icon(icon, color: Colors.white, size: 24),
+            ),
           ),
         ),
-      ),
       ),
     );
   }
@@ -248,7 +267,12 @@ class _BarGroup extends StatelessWidget {
 /// A single icon button inside a [_BarGroup] — uniform square footprint so the
 /// row never reflows, transparent itself since the group carries the backdrop.
 class _BarButton extends StatelessWidget {
-  const _BarButton({required this.icon, required this.onTap, this.tooltip});
+  const _BarButton({
+    super.key,
+    required this.icon,
+    required this.onTap,
+    this.tooltip,
+  });
 
   final IconData icon;
   final VoidCallback onTap;
@@ -277,16 +301,38 @@ class _BarButton extends StatelessWidget {
 /// A single leading-icon row in the ⋮ More overflow sheet.
 class _MoreRow extends StatelessWidget {
   const _MoreRow({
+    super.key,
     required this.icon,
     required this.label,
     required this.onTap,
+    this.subtitle,
+    this.hint,
+    this.trailing,
+    this.chevron = false,
+    this.enabled = true,
   });
   final IconData icon;
   final String label;
   final VoidCallback onTap;
 
+  /// Optional second line (e.g. a warning about an external player).
+  final String? subtitle;
+
+  /// Optional shortcut hint shown on the right (e.g. 'Ctrl+M').
+  final String? hint;
+
+  /// Optional widget on the right (e.g. a switch).
+  final Widget? trailing;
+
+  /// Windows More panel: a chevron for rows that open a sub-page in place.
+  final bool chevron;
+
+  /// Greyed out and not clickable when false.
+  final bool enabled;
+
   @override
   Widget build(BuildContext context) {
+    final color = enabled ? AppColors.textPrimary : AppColors.textTertiary;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
       child: Material(
@@ -294,26 +340,65 @@ class _MoreRow extends StatelessWidget {
         borderRadius: BorderRadius.circular(10),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
-          onTap: onTap,
+          onTap: enabled ? onTap : null,
           child: Padding(
             // Tighter than the old 14 — the panel is narrower now, and these
             // rows were spaced like a settings screen rather than a menu.
-            padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
+            padding: EdgeInsets.symmetric(
+              horizontal: 13,
+              vertical: trailing != null ? 4 : 11,
+            ),
             child: Row(
               children: [
-                Icon(icon, color: AppColors.textPrimary, size: 20),
+                Icon(icon, color: color, size: 20),
                 const SizedBox(width: 12),
                 Expanded(
-                  child: Text(
-                    label,
-                    style: AppText.body.copyWith(
-                      color: AppColors.textPrimary,
-                      fontSize: 14,
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        label,
+                        style: AppText.body.copyWith(
+                          color: color,
+                          fontSize: 14,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      if (subtitle != null)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 2),
+                          child: Text(
+                            subtitle!,
+                            style: AppText.caption.copyWith(
+                              color: AppColors.textSecondary,
+                            ),
+                          ),
+                        ),
+                    ],
                   ),
                 ),
+                if (hint != null)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 8),
+                    child: Text(
+                      hint!,
+                      style: AppText.caption.copyWith(
+                        color: AppColors.textTertiary,
+                      ),
+                    ),
+                  ),
+                ?trailing,
+                if (chevron)
+                  const Padding(
+                    padding: EdgeInsets.only(left: 6),
+                    child: Icon(
+                      Icons.chevron_right_rounded,
+                      color: AppColors.textTertiary,
+                      size: 20,
+                    ),
+                  ),
               ],
             ),
           ),
@@ -462,8 +547,112 @@ class _TransportButton extends StatelessWidget {
   }
 }
 
+/// Windows: the "back N seconds" / "forward N seconds" disc either side of
+/// play / pause. Same size and look as the episode arrows. Unlike those it
+/// carries a tooltip, because a mouse user cannot tell how far it jumps
+/// otherwise. The InkWell inside the disc can take keyboard focus (Tab) and
+/// is pressed with Enter, like any other button.
+class _SeekStepButton extends StatelessWidget {
+  const _SeekStepButton({
+    super.key,
+    required this.seconds,
+    required this.onTap,
+  });
+
+  /// Signed jump: negative seeks back, positive seeks forward.
+  final int seconds;
+  final VoidCallback onTap;
+
+  /// Material has numbered arrows for 5, 10 and 30 seconds; any other step
+  /// shows the plain arrow with the number written under it.
+  IconData? get _numberedIcon {
+    final back = seconds < 0;
+    return switch (seconds.abs()) {
+      5 => back ? Icons.replay_5_rounded : Icons.forward_5_rounded,
+      10 => back ? Icons.replay_10_rounded : Icons.forward_10_rounded,
+      30 => back ? Icons.replay_30_rounded : Icons.forward_30_rounded,
+      _ => null,
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = context.l10n;
+    final back = seconds < 0;
+    // "Seek back 10s" / "Seek forward 10s", from the existing shortcut names.
+    final label =
+        '${back ? l10n.shortcutPlayerSeekBack : l10n.shortcutPlayerSeekForward}'
+        ' ${l10n.secondsShort(seconds.abs())}';
+    final numbered = _numberedIcon;
+    return Tooltip(
+      message: label,
+      child: Semantics(
+        button: true,
+        label: label,
+        excludeSemantics: true,
+        child: _TransportDisc(
+          size: 46,
+          onTap: onTap,
+          child: numbered != null
+              ? Icon(numbered, color: Colors.white, size: 26)
+              : Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      back ? Icons.replay_rounded : Icons.forward_rounded,
+                      color: Colors.white,
+                      size: 20,
+                    ),
+                    Text(
+                      '${seconds.abs()}',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w700,
+                        height: 1,
+                      ),
+                    ),
+                  ],
+                ),
+        ),
+      ),
+    );
+  }
+}
+
 /// The player's bottom-sheet surface: a SOLID, detached card that floats above
 /// the screen edges (margins + full-radius + soft shadow), centred in landscape
 /// — instead of an edge-to-edge frosted panel. Drop-in for the old
 /// `FrostedSurface(...)` sheet wrappers: it accepts (and ignores) blur/opacity/
 /// borderRadius so those call sites only needed a rename.
+
+/// Height of the bottom controls block (timestamp, seek bar, button groups)
+/// while it is laid out, so overlays that must stay clickable above it — the
+/// Skip Intro/Outro pill — can sit exactly over it instead of guessing a
+/// screen fraction. One player is on screen at a time, so one value suffices.
+final ValueNotifier<double> _controlsBottomBlockHeight = ValueNotifier(0);
+
+/// Reports its child's laid-out height into [_controlsBottomBlockHeight].
+class _ReportBottomBlockHeight extends SingleChildRenderObjectWidget {
+  const _ReportBottomBlockHeight({required super.child});
+
+  @override
+  RenderObject createRenderObject(BuildContext context) =>
+      _RenderReportHeight();
+}
+
+/// Render box behind [_ReportBottomBlockHeight]: publishes its height after
+/// each layout.
+class _RenderReportHeight extends RenderProxyBox {
+  @override
+  void performLayout() {
+    super.performLayout();
+    final h = size.height;
+    if ((h - _controlsBottomBlockHeight.value).abs() > 0.5) {
+      // Notify after layout; listeners rebuild on the next frame.
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => _controlsBottomBlockHeight.value = h,
+      );
+    }
+  }
+}
